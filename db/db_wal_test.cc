@@ -7569,6 +7569,28 @@ TEST_F(DBWALIndexTest, IndexedDataWithoutMarkerFailsRecovery) {
     Destroy(options);
   }
 }
+
+TEST_F(DBWALTest, SingleWalPartition) {
+  // The WAL containers are per-partition; with wal_partitions > 1 rejected
+  // at Open there is exactly one partition throughout the WAL lifecycle.
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  DestroyAndReopen(options);
+  ASSERT_EQ(1, dbfull()->TEST_NumWalPartitions());
+
+  ASSERT_OK(Put("foo", "v1"));
+  ASSERT_EQ(1, dbfull()->TEST_NumWalPartitions());
+
+  // Roll the WAL and flush; the partition count never changes.
+  ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+  ASSERT_EQ(1, dbfull()->TEST_NumWalPartitions());
+  ASSERT_OK(Flush());
+  ASSERT_EQ(1, dbfull()->TEST_NumWalPartitions());
+
+  Reopen(options);
+  ASSERT_EQ(1, dbfull()->TEST_NumWalPartitions());
+  ASSERT_EQ("v1", Get("foo"));
+}
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
