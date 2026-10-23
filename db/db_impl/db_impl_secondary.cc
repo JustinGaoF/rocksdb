@@ -418,6 +418,24 @@ Status DBImplSecondary::RecoverLogFiles(
   mutex_.AssertHeld();
   Status status;
   for (auto log_number : log_numbers) {
+    if (log_readers_.find(log_number) == log_readers_.end() &&
+        log::PeekWALPartition(
+            env_, LogFileName(immutable_db_options_.GetWalDir(), log_number),
+            log_number) != 0) {
+      // Sequences interleave across files in a set written with
+      // wal_partitions > 1, which file-by-file replay cannot order. Refuse
+      // rather than expose a non-prefix read view. Only new files are
+      // peeked: a file's marker is its first record, so a file peeked
+      // before still names what it named.
+      return Status::NotSupported(
+          "Secondary cannot catch up over WALs written with wal_partitions "
+          "> 1 (log #" +
+          std::to_string(log_number) +
+          " names a nonzero partition); file-by-file replay cannot order "
+          "sequences that interleave across files");
+    }
+  }
+  for (auto log_number : log_numbers) {
     log::FragmentBufferedReader* reader = nullptr;
     status = MaybeInitLogReader(log_number, &reader);
     if (!status.ok()) {

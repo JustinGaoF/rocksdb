@@ -5,13 +5,16 @@
 
 #include <table/block_based/block_based_table_factory.h>
 
+#include <array>
 #include <atomic>
 #include <functional>
 #include <memory>
 #include <sstream>
 
+#include "db/db_impl/db_impl.h"
 #include "db/db_test_util.h"
 #include "db/dbformat.h"
+#include "db/write_batch_internal.h"
 #include "file/filename.h"
 #include "options/options_helper.h"
 #include "port/port.h"
@@ -20,11 +23,13 @@
 #include "rocksdb/sst_file_writer.h"
 #include "table/format.h"
 #include "table/prepared_file_info.h"
+#include "test_util/sync_point.h"
 #include "test_util/testutil.h"
 #include "util/defer.h"
 #include "util/random.h"
 #include "util/thread_guard.h"
 #include "utilities/fault_injection_env.h"
+#include "utilities/fault_injection_fs.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -5575,6 +5580,233 @@ TEST_P(IngestDBGeneratedFileTest2, ZeroAndNonZeroSeqno) {
     temp_db.reset();
     ASSERT_OK(DestroyDB(temp_db_name, temp_db_opts));
   } while (ChangeOptions(kSkipPlainTable | kSkipFIFOCompaction));
+}
+
+// Q3 (G-35) ingestion at N>1: the quiesce holds all N write queues, so every
+// partition's durability range is idle; a range pinned by a failed append
+// fails the ingestion cleanly.
+class ExternalSSTFilePartitionTest : public ExternalSSTFileTestBase {
+ public:
+  void OpenWithPartitions(size_t num_partitions, Options options) {
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::ValidateOptions:AllowWalPartitions",
+        [](void* arg) { *static_cast<bool*>(arg) = true; });
+    SyncPoint::GetInstance()->EnableProcessing();
+    DestroyAndRecreateExternalSSTFilesDir();
+    std::vector<std::string> cf_names;
+    cf_for_partition_.assign(num_partitions, 0);
+    std::vector<bool> covered(num_partitions, false);
+    size_t num_covered = 0;
+    for (uint32_t cf_id = 1; num_covered < num_partitions; ++cf_id) {
+      WriteBatch batch;
+      ASSERT_OK(WriteBatchInternal::Put(&batch, cf_id, "key", "value"));
+      size_t partition = num_partitions;
+      ASSERT_OK(
+          DBImpl::TEST_WalPartitionForWrite(batch, num_partitions, &partition));
+      cf_names.push_back("cf" + std::to_string(cf_id));
+      if (!covered[partition]) {
+        covered[partition] = true;
+        cf_for_partition_[partition] = static_cast<int>(cf_id);
+        ++num_covered;
+      }
+    }
+    options.wal_partitions = static_cast<uint32_t>(num_partitions);
+    if (num_partitions > 1) {
+      options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+      options.track_and_verify_wals_in_manifest = true;
+    }
+    options.avoid_flush_during_shutdown = true;
+    options.avoid_flush_during_recovery = true;
+    CreateAndReopenWithCF(cf_names, options);
+    ASSERT_EQ(num_partitions, dbfull()->TEST_NumWalPartitions());
+    last_ingest_options_ = options;
+    cf_names_ = cf_names;
+  }
+
+  void ReopenWithAllColumnFamilies() {
+    std::vector<std::string> all = {kDefaultColumnFamilyName};
+    all.insert(all.end(), cf_names_.begin(), cf_names_.end());
+    ReopenWithColumnFamilies(all, last_ingest_options_);
+  }
+
+  Status GenerateAndIngest(
+      ColumnFamilyHandle* cf,
+      const std::vector<std::pair<std::string, std::string>>& data,
+      int file_id) {
+    std::string file_path = sst_files_dir_ + std::to_string(file_id);
+    SstFileWriter writer(EnvOptions(), last_ingest_options_, cf);
+    Status s = writer.Open(file_path);
+    if (!s.ok()) {
+      return s;
+    }
+    for (const auto& entry : data) {
+      s = writer.Put(entry.first, entry.second);
+      if (!s.ok()) {
+        writer.Finish().PermitUncheckedError();
+        return s;
+      }
+    }
+    s = writer.Finish();
+    if (!s.ok()) {
+      return s;
+    }
+    return db_->IngestExternalFile(cf, {file_path},
+                                   IngestExternalFileOptions());
+  }
+
+ protected:
+  std::vector<int> cf_for_partition_;
+  Options last_ingest_options_;
+  std::vector<std::string> cf_names_;
+};
+
+// Q3: writer threads on every partition run while the main thread ingests
+// 100 files with alternating overlapping and non-overlapping ranges at N=8.
+// Every acknowledged write and every ingested key is readable afterwards
+// and after a reopen. Neuter: make the idle check compare the safe point
+// to allocated; the disableWAL leg below fires it.
+TEST_F(ExternalSSTFilePartitionTest, IngestionConcurrentWritesAtN8) {
+  constexpr size_t kPartitions = 8;
+  constexpr int kIngestions = 100;
+  constexpr int kKeysPerFile = 10;
+  Options options = CurrentOptions();
+  DestroyAndReopen(options);
+  OpenWithPartitions(kPartitions, options);
+  std::atomic<bool> stop{false};
+  std::array<std::atomic<uint64_t>, kPartitions> acked{};
+  std::vector<port::Thread> writers;
+  for (size_t p = 0; p < kPartitions; ++p) {
+    writers.emplace_back([&, p] {
+      for (int i = 0; !stop.load(); ++i) {
+        Status s =
+            Put(cf_for_partition_[p], "wkey" + std::to_string(i), "wval");
+        EXPECT_OK(s);
+        if (!s.ok()) {
+          return;
+        }
+        acked[p].store(i + 1, std::memory_order_relaxed);
+      }
+    });
+  }
+  for (int ingestion = 0; ingestion < kIngestions; ++ingestion) {
+    std::vector<std::pair<std::string, std::string>> data;
+    if (ingestion % 2 == 0) {
+      for (int i = 0; i < kKeysPerFile; ++i) {
+        data.emplace_back(
+            "ingest_" + std::to_string(ingestion) + "_" + std::to_string(i),
+            "ival");
+      }
+    } else {
+      for (int i = 0; i < kKeysPerFile; ++i) {
+        data.emplace_back("shared_" + std::to_string(i),
+                          "sval" + std::to_string(ingestion));
+      }
+    }
+    ASSERT_OK(GenerateAndIngest(handles_[0], data, ingestion))
+        << "ingestion " << ingestion;
+  }
+  stop.store(true);
+  for (auto& w : writers) {
+    w.join();
+  }
+  std::array<uint64_t, kPartitions> written{};
+  for (size_t p = 0; p < kPartitions; ++p) {
+    written[p] = acked[p].load(std::memory_order_relaxed);
+    EXPECT_GT(written[p], 0u);
+    for (uint64_t i = 0; i < written[p]; ++i) {
+      EXPECT_EQ("wval", Get(cf_for_partition_[p], "wkey" + std::to_string(i)));
+    }
+  }
+  for (int ingestion = 0; ingestion < kIngestions; ingestion += 2) {
+    for (int i = 0; i < kKeysPerFile; ++i) {
+      EXPECT_EQ("ival", Get(0, "ingest_" + std::to_string(ingestion) + "_" +
+                                   std::to_string(i)));
+    }
+  }
+  for (int i = 0; i < kKeysPerFile; ++i) {
+    EXPECT_EQ("sval" + std::to_string(kIngestions - 1),
+              Get(0, "shared_" + std::to_string(i)));
+  }
+  Close();
+  ReopenWithAllColumnFamilies();
+  for (size_t p = 0; p < kPartitions; ++p) {
+    for (uint64_t i = 0; i < written[p]; ++i) {
+      EXPECT_EQ("wval", Get(cf_for_partition_[p], "wkey" + std::to_string(i)));
+    }
+  }
+  for (int ingestion = 0; ingestion < kIngestions; ingestion += 2) {
+    for (int i = 0; i < kKeysPerFile; ++i) {
+      EXPECT_EQ("ival", Get(0, "ingest_" + std::to_string(ingestion) + "_" +
+                                   std::to_string(i)));
+    }
+  }
+}
+
+// Q3: a disableWAL write leaves the safe point below allocated while every
+// partition is idle, so ingestion proceeds. The SafePoint < LastAllocated
+// assertion pins the neuter precondition: checking "safe point ==
+// allocated" instead of per-partition idleness fires here.
+TEST_F(ExternalSSTFilePartitionTest, IngestionAfterDisableWalAtN2) {
+  Options options = CurrentOptions();
+  DestroyAndReopen(options);
+  OpenWithPartitions(2, options);
+  ASSERT_OK(Put(cf_for_partition_[0], "key0", "value"));
+  WriteOptions no_wal;
+  no_wal.disableWAL = true;
+  ASSERT_OK(
+      db_->Put(no_wal, handles_[cf_for_partition_[1]], "walkey", "value"));
+  EXPECT_LT(dbfull()->WalDurabilitySafePoint(),
+            dbfull()->GetVersionSet()->LastAllocatedSequence());
+  ASSERT_OK(GenerateAndIngest(handles_[0], {{"ingest", "ival"}}, 1));
+  EXPECT_EQ("value", Get(cf_for_partition_[0], "key0"));
+  EXPECT_EQ("value", Get(cf_for_partition_[1], "walkey"));
+  EXPECT_EQ("ival", Get(0, "ingest"));
+}
+
+// Q3: a failed WAL append pins its range instead of completing it, so the
+// next ingestion fails cleanly instead of asserting or jumping sequences
+// past an undurable hole. Without paranoid_checks the idle check below is
+// the gate (IOError naming the pinned partition); with it, the sticky
+// background error the failed append recorded surfaces first, from
+// ReserveFileNumbersBeforeIngestion. Either way the ingested key is absent.
+TEST_F(ExternalSSTFilePartitionTest, IngestionFailsCleanlyAfterFailedAppend) {
+  std::shared_ptr<FaultInjectionTestFS> fault_fs(
+      new FaultInjectionTestFS(FileSystem::Default()));
+  std::unique_ptr<Env> fault_env(NewCompositeEnv(fault_fs));
+  Defer close_before_env([this] { Close(); });
+  for (bool paranoid_checks : {false, true}) {
+    SCOPED_TRACE("paranoid_checks=" + std::to_string(paranoid_checks));
+    Options options = CurrentOptions();
+    options.env = fault_env.get();
+    options.paranoid_checks = paranoid_checks;
+    DestroyAndReopen(options);
+    OpenWithPartitions(2, options);
+    ASSERT_OK(Put(cf_for_partition_[0], "key0", "value"));
+    std::atomic<bool> fail_append{true};
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::WriteToWAL:log_entry", [&](void*) {
+          if (fail_append.exchange(false)) {
+            fault_fs->SetFilesystemActive(false);
+          }
+        });
+    ASSERT_NOK(Put(cf_for_partition_[1], "key1", "value"));
+    ASSERT_FALSE(fail_append.load());
+    fault_fs->SetFilesystemActive(true);
+    SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:log_entry");
+    EXPECT_LT(dbfull()->WalDurabilitySafePoint(),
+              dbfull()->GetVersionSet()->LastAllocatedSequence());
+    const Status s = GenerateAndIngest(handles_[0], {{"ingest", "ival"}}, 1);
+    ASSERT_FALSE(s.ok()) << "ingestion proceeded past a pinned range";
+    if (!paranoid_checks) {
+      ASSERT_TRUE(s.IsIOError()) << s.ToString();
+      EXPECT_NE(std::string::npos, s.ToString().find("pinned")) << s.ToString();
+      EXPECT_NE(std::string::npos, s.ToString().find("wal_partitions"))
+          << s.ToString();
+    }
+    EXPECT_EQ("NOT_FOUND", Get(0, "ingest"));
+    Close();
+    fault_fs->ResetState();
+  }
 }
 
 }  // namespace ROCKSDB_NAMESPACE

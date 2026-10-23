@@ -1524,4 +1524,28 @@ bool FragmentBufferedReader::TryReadFragment(Slice* fragment, size_t* drop_size,
   }
 }
 
+uint32_t PeekWALPartition(Env* env, const std::string& fname,
+                          uint64_t log_number) {
+  struct SwallowReporter : public Reader::Reporter {
+    void Corruption(size_t, const Status&,
+                    uint64_t /*log_number*/ = kMaxSequenceNumber) override {}
+  };
+  std::unique_ptr<SequentialFileReader> file_reader;
+  Status s = SequentialFileReader::Create(
+      env->GetFileSystem(), fname, FileOptions(), &file_reader,
+      nullptr /* dbg */, nullptr /* rate_limiter */);
+  if (!s.ok()) {
+    return 0;
+  }
+  SwallowReporter reporter;
+  Reader reader(nullptr /* info_log */, std::move(file_reader), &reporter,
+                true /* checksum */, log_number);
+  std::string scratch;
+  Slice record;
+  if (!reader.ReadRecord(&record, &scratch)) {
+    return 0;
+  }
+  return reader.WALPartition();
+}
+
 }  // namespace ROCKSDB_NAMESPACE::log

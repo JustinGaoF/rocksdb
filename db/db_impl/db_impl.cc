@@ -10,11 +10,8 @@
 
 #include <algorithm>
 #include <array>
-#include <cstdint>
-
-#include "db/db_impl/db_impl_metadata.h"
-
 #include <cinttypes>
+#include <cstdint>
 #include <cstdio>
 #include <deque>
 #include <forward_list>
@@ -39,6 +36,7 @@
 #include "db/coalescing_iterator.h"
 #include "db/compaction/compaction_job.h"
 #include "db/convenience_impl.h"
+#include "db/db_impl/db_impl_metadata.h"
 #include "db/db_info_dumper.h"
 #include "db/db_iter.h"
 #include "db/dbformat.h"
@@ -6624,6 +6622,11 @@ Status DBImpl::GetUpdatesSince(SequenceNumber seq,
         "This API is not yet compatible with write-prepared/write-unprepared "
         "transactions");
   }
+  if (NumWalPartitions() > 1) {
+    return Status::NotSupported(
+        "GetUpdatesSince is not supported with wal_partitions > 1: sequences "
+        "interleave across files, which number order cannot reproduce");
+  }
   if (seq > versions_->LastSequence()) {
     return Status::NotFound("Requested sequence not yet written in the db");
   }
@@ -8011,6 +8014,37 @@ Status DBImpl::PrepareFileIngestion(
   return Status::OK();
 }
 
+Status DBImpl::CheckWalPartitionsIdleForIngestion() {
+  // At one partition the tracker is never fed, so there is nothing to check.
+  if (NumWalPartitions() == 1) {
+    return Status::OK();
+  }
+  // Above one partition every write registers its range before its WAL
+  // append lands and completes it after, so once ingestion holds all N
+  // write queues and has drained pending writes, no range can be
+  // outstanding. The scan takes sequence_wal_index_mutex_, which serializes
+  // every tracker op, for a consistent multi-partition snapshot. The idle
+  // check is per-partition PendingLow, not "safe point == allocated": a
+  // disableWAL write leaves the safe point below allocated while idle.
+  mutex_.AssertHeld();
+  InstrumentedMutexLock seq_lock(&sequence_wal_index_mutex_);
+  for (size_t p = 0; p < NumWalPartitions(); ++p) {
+    if (wal_durability_tracker_->PendingLow(p) != WalDurabilityTracker::kIdle) {
+      // A failed WAL append pins its range instead of completing it
+      // (WriteGroupToWAL), so the frontier can never advance past it.
+      // Ingestion fails cleanly here rather than jumping sequences past an
+      // undurable hole.
+      return Status::IOError(
+          "Ingestion refused: WAL partition " + std::to_string(p) +
+          " has a range pinned by a failed append (wal_partitions=" +
+          std::to_string(NumWalPartitions()) + ")");
+    }
+    assert(wal_durability_tracker_->PendingLow(p) ==
+           WalDurabilityTracker::kIdle);
+  }
+  return Status::OK();
+}
+
 Status DBImpl::CommitFileIngestionHandles(
     std::vector<std::unique_ptr<FileIngestionHandle>> handles) {
   if (handles.empty()) {
@@ -8116,6 +8150,12 @@ Status DBImpl::CommitFileIngestionHandles(
     // So wait here to ensure there is no pending write to memtable.
     WaitForPendingWrites();
 
+    // No write is in flight now, so every partition's durability range is
+    // idle; a range pinned by a failed append fails the ingestion below.
+    if (status.ok()) {
+      status = CheckWalPartitionsIdleForIngestion();
+    }
+
     num_running_ingest_file_ += static_cast<int>(num_jobs);
     TEST_SYNC_POINT("DBImpl::IngestExternalFile:AfterIncIngestFileCounter");
     TEST_SYNC_POINT("DBImpl::IngestExternalFile:AfterIncIngestFileCounter:2");
@@ -8123,6 +8163,9 @@ Status DBImpl::CommitFileIngestionHandles(
     bool at_least_one_cf_need_flush = false;
     std::vector<bool> need_flush(num_jobs, false);
     for (size_t i = 0; i != num_jobs; ++i) {
+      if (!status.ok()) {
+        break;
+      }
       auto* cfd = ingestion_jobs[i]->GetColumnFamilyData();
       if (cfd->IsDropped()) {
         // TODO (yanqin) investigate whether we should abort ingestion or
@@ -8443,10 +8486,17 @@ Status DBImpl::CreateColumnFamilyWithImport(
         nonmem_w.EnterUnbatched();
       }
 
+      // As in CommitFileIngestionHandles above.
+      if (status.ok()) {
+        status = CheckWalPartitionsIdleForIngestion();
+      }
+
       num_running_ingest_file_++;
       assert(!cfd->IsDropped());
       mutex_.AssertHeld();
-      status = import_job.Run();
+      if (status.ok()) {
+        status = import_job.Run();
+      }
 
       // Install job edit [Mutex will be unlocked here]
       if (status.ok()) {

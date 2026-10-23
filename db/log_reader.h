@@ -26,6 +26,7 @@
 #include "util/xxhash.h"
 
 namespace ROCKSDB_NAMESPACE {
+class Env;
 class Logger;
 
 namespace log {
@@ -431,6 +432,13 @@ class FragmentBufferedReader : public Reader {
   FragmentBufferedReader(FragmentBufferedReader&&) = delete;
   void operator=(FragmentBufferedReader&&) = delete;
 };
+
+// Opens the WAL file at `fname`, reads through its first record, and returns
+// the WAL partition its index marker names. Returns 0 when the file carries
+// no marker, names partition 0, or cannot be read: callers that refuse N>1
+// sets meet an unreadable head through their normal corruption handling.
+uint32_t PeekWALPartition(Env* env, const std::string& fname,
+                          uint64_t log_number);
 
 }  // namespace log
 }  // namespace ROCKSDB_NAMESPACE

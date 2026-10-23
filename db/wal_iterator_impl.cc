@@ -80,6 +80,35 @@ WalIteratorImpl::WalIteratorImpl(
   current_status_.PermitUncheckedError();  // Clear on start
   reporter_.env = options_->env;
   reporter_.info_log = options_->info_log.get();
+  // A range containing a file written with wal_partitions > 1 cannot be
+  // iterated in number order: sequences interleave across files, so even a
+  // partition-0 file's own records are not contiguous. Refuse before
+  // reading anything rather than yield out-of-order batches or report a
+  // misleading gap. A live file may have moved to the archive since the
+  // listing, so live files are peeked in both places.
+  for (const auto& file : *files_) {
+    const uint64_t number = file->LogNumber();
+    uint32_t partition = 0;
+    if (file->Type() == kArchivedLogFile) {
+      partition = log::PeekWALPartition(
+          options_->env, ArchivedLogFileName(dir_, number), number);
+    } else {
+      partition = log::PeekWALPartition(options_->env,
+                                        LogFileName(dir_, number), number);
+      if (partition == 0) {
+        partition = log::PeekWALPartition(
+            options_->env, ArchivedLogFileName(dir_, number), number);
+      }
+    }
+    if (partition != 0) {
+      current_status_ = Status::NotSupported(
+          "GetUpdatesSince does not support WALs written with wal_partitions "
+          "> 1 (log #" +
+          std::to_string(number) + " names partition " +
+          std::to_string(partition) + ")");
+      return;
+    }
+  }
   SeekToStartSequence();  // Seek till starting sequence
 }
 
@@ -298,6 +327,18 @@ bool WalIteratorImpl::IsBatchExpected(const WriteBatch* batch,
 }
 
 void WalIteratorImpl::UpdateCurrentWriteBatch(const Slice& record) {
+  if (current_log_reader_->WALPartition() != 0) {
+    // Backstop for the constructor's pre-scan: a file that changed under
+    // the iterator (or was unreadable then) still refuses rather than
+    // yielding out-of-order batches or a misleading gap.
+    is_valid_ = false;
+    current_status_ = Status::NotSupported(
+        "GetUpdatesSince does not support WALs written with wal_partitions "
+        "> 1 (log #" +
+        std::to_string(files_->at(current_file_index_)->LogNumber()) +
+        " names a nonzero partition)");
+    return;
+  }
   std::unique_ptr<WriteBatch> batch(new WriteBatch());
   Status s = WriteBatchInternal::SetContents(batch.get(), record);
   s.PermitUncheckedError();  // TODO: What should we do with this error?

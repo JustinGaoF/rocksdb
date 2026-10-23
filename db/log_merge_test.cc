@@ -137,6 +137,7 @@ class LogMergeTest : public ::testing::TestWithParam<std::tuple<int, bool>> {
       Pull kind = Pull::kIdle;
       uint64_t wal_index = 0;
       std::string payload;
+      uint64_t checksum = 0;
     };
     ScriptMember(uint64_t wal_number, std::vector<Step> script)
         : wal_number_(wal_number), script_(std::move(script)) {}
@@ -150,6 +151,7 @@ class LogMergeTest : public ::testing::TestWithParam<std::tuple<int, bool>> {
         return fin;
       }
       const Step& step = script_[pos_++];
+      last_checksum_ = step.checksum;
       if (step.kind == Pull::kIdle) {
         ++idle_pulls_;
       } else if (step.kind == Pull::kRecord) {
@@ -219,6 +221,7 @@ class LogMergeTest : public ::testing::TestWithParam<std::tuple<int, bool>> {
     bool SawWALIndexMarker() const override { return saw_marker; }
     uint64_t IndexedDataPulled() const override { return indexed_pulled; }
     uint64_t UnindexedDataPulled() const override { return unindexed_pulled; }
+    uint64_t LastRecordChecksum() const override { return last_checksum_; }
 
     bool saw_marker = true;
     uint64_t indexed_pulled = 0;
@@ -235,6 +238,7 @@ class LogMergeTest : public ::testing::TestWithParam<std::tuple<int, bool>> {
     PredecessorSpan span;
     int pulls_ = 0;
     int idle_pulls_ = 0;
+    uint64_t last_checksum_ = 0;
 
    private:
     uint64_t wal_number_;
@@ -245,10 +249,12 @@ class LogMergeTest : public ::testing::TestWithParam<std::tuple<int, bool>> {
     uint64_t first_indexed_ = 0;
   };
 
-  static ScriptMember::Step Rec(uint64_t idx, uint64_t seq) {
+  static ScriptMember::Step Rec(uint64_t idx, uint64_t seq,
+                                uint64_t checksum = 0) {
     ScriptMember::Step step;
     step.kind = WALIndexMerger::Member::Pull::kRecord;
     step.wal_index = idx;
+    step.checksum = checksum;
     PutFixed64(&step.payload, seq);
     step.payload += "s";
     return step;
@@ -263,10 +269,12 @@ class LogMergeTest : public ::testing::TestWithParam<std::tuple<int, bool>> {
     step.kind = WALIndexMerger::Member::Pull::kFinishedStop;
     return step;
   }
-  static ScriptMember::Step Unindexed(const std::string& payload) {
+  static ScriptMember::Step Unindexed(const std::string& payload,
+                                      uint64_t checksum = 0) {
     ScriptMember::Step step;
     step.kind = WALIndexMerger::Member::Pull::kUnindexed;
     step.payload = payload;
+    step.checksum = checksum;
     return step;
   }
 
@@ -923,6 +931,30 @@ TEST_P(LogMergeTest, UnindexedRecordsPassThrough) {
   ASSERT_EQ(0U, driven.records[0].index);
   ASSERT_EQ("u1", driven.records[0].payload.substr(2 * kWALIndexSize));
   ASSERT_EQ(std::vector<uint64_t>({2, 3, 4, 5}), DrivenIndices(driven));
+}
+
+// The merge captures each unindexed record's checksum when it is pulled, not
+// when it drains: the member reads past it first, so the member's current
+// checksum would be a later record's. `GetLastEmittedChecksum` therefore
+// reports the last record actually emitted, indexed or not. Found and fixed
+// by D126834369. Neuter: drain the member's current checksum instead of the
+// captured one; the unindexed emission reports the indexed record's checksum.
+TEST_P(LogMergeTest, LastEmittedChecksumCapturedAtPull) {
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(std::unique_ptr<WALIndexMerger::Member>(
+      new ScriptMember(120, {Unindexed("legacy", 0xC2), Rec(1, 100, 0xC3)})));
+  auto merger = MakeMerger(std::move(members), {120});
+  Slice record;
+  // The queued unindexed record drains before the indexed decision and
+  // reports its own pulled checksum, not the indexed record's.
+  ASSERT_EQ(WALIndexMerger::Result::kRecord, merger->Next(&record));
+  ASSERT_EQ("legacy", record.ToString());
+  ASSERT_EQ(0U, merger->GetLastEmittedWALIndex());
+  ASSERT_EQ(0xC2U, merger->GetLastEmittedChecksum());
+  ASSERT_EQ(WALIndexMerger::Result::kRecord, merger->Next(&record));
+  ASSERT_EQ(1U, merger->GetLastEmittedWALIndex());
+  ASSERT_EQ(0xC3U, merger->GetLastEmittedChecksum());
+  ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, merger->Next(&record));
 }
 
 // Data below the member's own asserted progress bound contradicts the

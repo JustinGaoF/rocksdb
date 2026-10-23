@@ -235,6 +235,12 @@ class PessimisticTransactionDB : public TransactionDB {
   friend class TransactionTest_TwoPhaseDoubleRecoveryTest_Test;
   friend class TransactionTest_TwoPhaseOutOfOrderDelete_Test;
   friend class TransactionStressTest_TwoPhaseLongPrepareTest_Test;
+  // GC12 Q5: crash simulation between prepare and recovery across partitions.
+  friend class
+      WritePreparedPartitionedWalTest_PrepareCommitAcrossPartitionsRecover_Test;
+  // GC12 Q10: crash with a prepare pinning one partition's WAL.
+  friend class
+      WritePreparedPartitionedWalTest_PinnedPrepareRecoversAfterMatesRetire_Test;
   friend class WriteUnpreparedTransactionTest_RecoveryTest_Test;
   friend class WriteUnpreparedTransactionTest_MarkLogWithPrepSection_Test;
 

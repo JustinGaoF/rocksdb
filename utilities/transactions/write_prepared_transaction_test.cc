@@ -32,6 +32,7 @@
 #include "util/random.h"
 #include "util/string_util.h"
 #include "utilities/fault_injection_env.h"
+#include "utilities/fault_injection_fs.h"
 #include "utilities/merge_operators.h"
 #include "utilities/merge_operators/string_append/stringappend.h"
 #include "utilities/transactions/pessimistic_transaction_db.h"
@@ -4644,6 +4645,9 @@ class WritePreparedPartitionedWalTest : public testing::Test {
   // whose ids follow creation order, until one routes to every partition.
   void Open(size_t num_partitions) {
     options_.wal_partitions = static_cast<uint32_t>(num_partitions);
+    // Open may run again on a fresh DB (multi-mode tests); the families are
+    // recreated below, so drop the previous iteration's names.
+    cf_names_.clear();
     ASSERT_OK(TransactionDB::Open(options_, txn_db_options_, dbname_, &db_));
     cf_for_partition_.assign(num_partitions, 0);
     std::vector<bool> covered(num_partitions, false);
@@ -4952,6 +4956,237 @@ TEST_F(WritePreparedPartitionedWalTest,
     writer.join();
   }
   Close();
+}
+
+// Partitions route the prepare batch by its lowest column family id and the
+// commit-only batch by its transaction name, so a caller must pick names
+// whose commit lands off the prepare's partition. Sequential prepares only:
+// concurrent prepares across partitions are an open hazard (PreparedHeap
+// demands increasing sequences; see DISABLED_ConcurrentPreparesAcrossPartitions
+// and the Q5 audit).
+TEST_F(WritePreparedPartitionedWalTest, PrepareCommitAcrossPartitionsRecover) {
+  constexpr size_t kPartitions = 4;
+  constexpr size_t kPreparePartition = 1;
+  options_.avoid_flush_during_shutdown = true;
+  options_.avoid_flush_during_recovery = true;
+  Open(kPartitions);
+
+  auto commit_partition_of = [&](const std::string& name) {
+    WriteBatch commit_probe;
+    EXPECT_OK(WriteBatchInternal::MarkCommit(&commit_probe, name));
+    size_t partition = kPartitions;
+    EXPECT_OK(DBImpl::TEST_WalPartitionForWrite(commit_probe, kPartitions,
+                                                &partition));
+    return partition;
+  };
+  std::vector<std::string> names;
+  for (int i = 0; names.size() < 4; ++i) {
+    const std::string name = "txn" + std::to_string(i);
+    if (commit_partition_of(name) != kPreparePartition) {
+      names.push_back(name);
+    }
+  }
+  ASSERT_EQ(4, names.size());
+
+  TransactionOptions txn_options;
+  auto get = [&](ColumnFamilyHandle* cf, const std::string& key,
+                 std::string* value) {
+    return db_->Get(ReadOptions(), cf, key, value);
+  };
+
+  // Crash after commit: the data is visible after the reopen.
+  {
+    std::unique_ptr<Transaction> txn(
+        db_->BeginTransaction(WriteOptions(), txn_options));
+    ASSERT_OK(txn->SetName(names[0]));
+    ASSERT_OK(txn->Put(CfOnPartition(kPreparePartition), "committed", "value"));
+    ASSERT_OK(txn->Prepare());
+    ASSERT_OK(txn->Commit());
+  }
+  Reopen();
+  std::string value;
+  ASSERT_OK(get(CfOnPartition(kPreparePartition), "committed", &value));
+  ASSERT_EQ("value", value);
+
+  // Crash after prepare: committing the recovered transaction works.
+  {
+    std::unique_ptr<Transaction> txn(
+        db_->BeginTransaction(WriteOptions(), txn_options));
+    ASSERT_OK(txn->SetName(names[1]));
+    ASSERT_OK(
+        txn->Put(CfOnPartition(kPreparePartition), "prepared_commit", "value"));
+    ASSERT_OK(txn->Prepare());
+  }
+  static_cast<PessimisticTransactionDB*>(db_)->TEST_Crash();
+  Reopen();
+  {
+    Transaction* recovered = db_->GetTransactionByName(names[1]);
+    ASSERT_NE(nullptr, recovered);
+    ASSERT_OK(recovered->Commit());
+    delete recovered;
+  }
+  ASSERT_OK(get(CfOnPartition(kPreparePartition), "prepared_commit", &value));
+  ASSERT_EQ("value", value);
+
+  // Crash after prepare: rolling the recovered transaction back works too.
+  {
+    std::unique_ptr<Transaction> txn(
+        db_->BeginTransaction(WriteOptions(), txn_options));
+    ASSERT_OK(txn->SetName(names[2]));
+    ASSERT_OK(txn->Put(CfOnPartition(kPreparePartition), "prepared_rollback",
+                       "value"));
+    ASSERT_OK(txn->Prepare());
+  }
+  static_cast<PessimisticTransactionDB*>(db_)->TEST_Crash();
+  Reopen();
+  {
+    Transaction* recovered = db_->GetTransactionByName(names[2]);
+    ASSERT_NE(nullptr, recovered);
+    ASSERT_OK(recovered->Rollback());
+    delete recovered;
+  }
+  ASSERT_TRUE(get(CfOnPartition(kPreparePartition), "prepared_rollback", &value)
+                  .IsNotFound());
+
+  // Interleaved prepares and commits across partitions.
+  {
+    std::unique_ptr<Transaction> txn_a(
+        db_->BeginTransaction(WriteOptions(), txn_options));
+    std::unique_ptr<Transaction> txn_b(
+        db_->BeginTransaction(WriteOptions(), txn_options));
+    std::unique_ptr<Transaction> txn_c(
+        db_->BeginTransaction(WriteOptions(), txn_options));
+    ASSERT_OK(txn_a->SetName(names[0]));
+    ASSERT_OK(txn_b->SetName(names[3]));
+    ASSERT_OK(txn_c->SetName(names[1]));
+    ASSERT_OK(
+        txn_a->Put(CfOnPartition(kPreparePartition), "interleaved_a", "value"));
+    ASSERT_OK(
+        txn_b->Put(CfOnPartition(kPreparePartition), "interleaved_b", "value"));
+    ASSERT_OK(
+        txn_c->Put(CfOnPartition(kPreparePartition), "interleaved_c", "value"));
+    ASSERT_OK(txn_a->Prepare());
+    ASSERT_OK(txn_b->Prepare());
+    ASSERT_OK(txn_a->Commit());
+    ASSERT_OK(txn_c->Prepare());
+    ASSERT_OK(txn_c->Commit());
+    ASSERT_OK(txn_b->Commit());
+  }
+  Close();
+  Reopen();
+  ASSERT_OK(get(CfOnPartition(kPreparePartition), "interleaved_a", &value));
+  ASSERT_EQ("value", value);
+  ASSERT_OK(get(CfOnPartition(kPreparePartition), "interleaved_b", &value));
+  ASSERT_EQ("value", value);
+  ASSERT_OK(get(CfOnPartition(kPreparePartition), "interleaved_c", &value));
+  ASSERT_EQ("value", value);
+  Close();
+}
+
+TEST_F(WritePreparedPartitionedWalTest, SyncedCommitSurvivesUnsyncedDrop) {
+  // A sync commit pins prepare and commit bytes on both partitions' WALs;
+  // dropping everything unsynced still recovers the committed data.
+  constexpr size_t kPartitions = 4;
+  constexpr size_t kPreparePartition = 1;
+  std::shared_ptr<FaultInjectionTestFS> fault_fs(
+      new FaultInjectionTestFS(FileSystem::Default()));
+  std::unique_ptr<Env> fault_env(NewCompositeEnv(fault_fs));
+  options_.env = fault_env.get();
+  options_.avoid_flush_during_shutdown = true;
+  options_.avoid_flush_during_recovery = true;
+  options_.disable_auto_compactions = true;
+  Open(kPartitions);
+
+  std::string name;
+  for (int i = 0; name.empty(); ++i) {
+    const std::string candidate = "txn" + std::to_string(i);
+    WriteBatch commit_probe;
+    ASSERT_OK(WriteBatchInternal::MarkCommit(&commit_probe, candidate));
+    size_t partition = kPartitions;
+    ASSERT_OK(DBImpl::TEST_WalPartitionForWrite(commit_probe, kPartitions,
+                                                &partition));
+    if (partition != kPreparePartition) {
+      name = candidate;
+    }
+  }
+  WriteOptions sync_wopts;
+  sync_wopts.sync = true;
+  TransactionOptions txn_options;
+  {
+    std::unique_ptr<Transaction> txn(
+        db_->BeginTransaction(sync_wopts, txn_options));
+    ASSERT_OK(txn->SetName(name));
+    ASSERT_OK(txn->Put(CfOnPartition(kPreparePartition), "durable", "value"));
+    ASSERT_OK(txn->Prepare());
+    ASSERT_OK(txn->Commit());
+  }
+  Close();
+  ASSERT_OK(fault_fs->DropUnsyncedFileData());
+  fault_fs->ResetState();
+  Reopen();
+  std::string value;
+  ASSERT_OK(db_->Get(ReadOptions(), CfOnPartition(kPreparePartition), "durable",
+                     &value));
+  ASSERT_EQ("value", value);
+  Close();
+  options_.env = Env::Default();
+}
+
+TEST_F(WritePreparedPartitionedWalTest, PinnedPrepareRecoversAfterMatesRetire) {
+  // Under 2PC at N > 1 a prepare can pin one partition's WAL after its
+  // generation-mates retire. Recovery meets the retired mates' indices
+  // below the pinned WAL's: they are explained by spans and the retirement
+  // bound, not treated as holes, so the open succeeds in every mode and
+  // the prepared transaction is recovered.
+  constexpr size_t kPartitions = 2;
+  options_.avoid_flush_during_shutdown = true;
+  options_.avoid_flush_during_recovery = true;
+  for (WALRecoveryMode mode : {WALRecoveryMode::kTolerateCorruptedTailRecords,
+                               WALRecoveryMode::kAbsoluteConsistency,
+                               WALRecoveryMode::kPointInTimeRecovery,
+                               WALRecoveryMode::kSkipAnyCorruptedRecords}) {
+    SCOPED_TRACE("mode " + std::to_string(static_cast<int>(mode)));
+    options_.wal_recovery_mode = mode;
+    ASSERT_OK(DestroyDB(dbname_, options_));
+    Open(kPartitions);
+
+    TransactionOptions txn_options;
+    Transaction* txn = db_->BeginTransaction(WriteOptions(), txn_options);
+    ASSERT_OK(txn->SetName("xid"));
+    ASSERT_OK(txn->Put(CfOnPartition(1), "prepared", "value"));
+    ASSERT_OK(txn->Prepare());
+    DBImpl* db_impl = static_cast_with_check<DBImpl>(db_->GetRootDB());
+    const uint64_t prep_log = txn->GetLogNumber();
+    ASSERT_EQ(db_impl->TEST_CurrentWalNumber(1), prep_log);
+
+    // Rotate and flush until partition 0's generation-mates retire while
+    // the prepare keeps partition 1's WAL alive.
+    for (int round = 0; round < 4; ++round) {
+      for (size_t p = 0; p < kPartitions; ++p) {
+        ASSERT_OK(db_->Put(WriteOptions(), CfOnPartition(p),
+                           "k" + std::to_string(round), "v"));
+      }
+      ASSERT_OK(db_impl->TEST_SwitchWAL());
+      FlushAll();
+      if (db_impl->TEST_AliveWalFiles(0).front().first > prep_log) {
+        break;
+      }
+    }
+    ASSERT_EQ(prep_log, db_impl->TEST_AliveWalFiles(1).front().first);
+    ASSERT_GT(db_impl->TEST_AliveWalFiles(0).front().first, prep_log);
+
+    delete txn;
+    static_cast<PessimisticTransactionDB*>(db_)->TEST_Crash();
+    Reopen();
+    Transaction* recovered = db_->GetTransactionByName("xid");
+    ASSERT_NE(nullptr, recovered);
+    ASSERT_OK(recovered->Commit());
+    delete recovered;
+    std::string value;
+    ASSERT_OK(db_->Get(ReadOptions(), CfOnPartition(1), "prepared", &value));
+    ASSERT_EQ("value", value);
+    Close();
+  }
 }
 
 #if USE_COROUTINES

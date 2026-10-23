@@ -729,6 +729,12 @@ class DBImpl : public DB
   Status CommitFileIngestionHandles(
       std::vector<std::unique_ptr<FileIngestionHandle>> handles) override;
 
+  // While ingestion holds all N write queues, no write is in flight, so
+  // every partition's durability range must be idle. Fails cleanly when a
+  // failed WAL append pinned a range instead of completing it.
+  // REQUIRES: all N write queues entered, mutex_ held.
+  Status CheckWalPartitionsIdleForIngestion();
+
   using DB::CreateColumnFamilyWithImport;
   Status CreateColumnFamilyWithImport(
       const ColumnFamilyOptions& options, const std::string& column_family_name,

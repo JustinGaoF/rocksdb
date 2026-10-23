@@ -188,6 +188,11 @@ Status DBImpl::GetSortedWalFilesImpl(VectorWalPtr& files, bool need_seqnos) {
 }
 
 Status DBImpl::GetCurrentWalFile(std::unique_ptr<WalFile>* current_wal_file) {
+  if (NumWalPartitions() > 1) {
+    return Status::NotSupported(
+        "GetCurrentWalFile is not supported with wal_partitions > 1: the DB "
+        "has one current WAL per partition, not one current WAL.");
+  }
   uint64_t current_logfile_number;
   {
     InstrumentedMutexLock l(&mutex_);
@@ -477,7 +482,21 @@ Status DBImpl::GetLiveFilesStorageInfoImpl(
   const uint64_t options_number = versions_->options_file_number();
   const uint64_t min_log_num = MinLogNumberToKeep();
   // Ensure consistency with manifest for track_and_verify_wals_in_manifest
-  const uint64_t max_log_num = cur_wal_number_;
+  uint64_t max_log_num = cur_wal_number_;
+  if (NumWalPartitions() > 1) {
+    // Partition 0 takes the lowest WAL number of each generation, so
+    // cur_wal_number_ excludes every other partition's current WAL. Bound by
+    // the highest current WAL across partitions instead, read under mutex_
+    // plus all WAL write mutexes (LOCK ORDER rule 1): rotation is excluded,
+    // so no WAL created after this point is included.
+    AllWalWriteMutexesLock wal_locks(this);
+    for (size_t p = 0; p < NumWalPartitions(); ++p) {
+      const LogWriterNumber* current_wal = CurrentWalOrNull(p);
+      if (current_wal != nullptr) {
+        max_log_num = std::max(max_log_num, current_wal->number);
+      }
+    }
+  }
 
   if (options_number != 0) {
     // A concurrent SetOptions() may otherwise delete this OPTIONS file before

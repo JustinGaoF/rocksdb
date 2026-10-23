@@ -3233,6 +3233,27 @@ void DumpWalFile(Options options, const std::string& wal_file,
       // bogus input, carry on as best we can
       log_number = 0;
     }
+    const uint32_t wal_partition =
+        log::PeekWALPartition(options.env, wal_file, log_number);
+    if (wal_partition != 0) {
+      std::cout << "WAL partition: " << wal_partition << std::endl;
+    }
+    if (only_print_seqno_gaps && wal_partition != 0) {
+      // Sequences interleave across files in a set written with
+      // wal_partitions > 1, so per-file order is not sequence order and
+      // every partition boundary would print as a gap. Refuse rather than
+      // misreport.
+      std::string msg = "Cannot report sequence gaps over partitioned WALs (" +
+                        wal_file + " names partition " +
+                        std::to_string(wal_partition) +
+                        "); dump files individually";
+      if (exec_state) {
+        *exec_state = LDBCommandExecuteResult::Failed(msg);
+      } else {
+        std::cerr << "Error: " << msg << std::endl;
+      }
+      return;
+    }
     log::Reader reader(options.info_log, std::move(wal_file_reader), &reporter,
                        true /* checksum */, log_number);
     std::unordered_set<uint32_t> encountered_cf_ids;
@@ -3519,7 +3540,10 @@ void CheckWALIndexCommand::Help(std::string& ret) {
       "fails unless there are none. Scans --" +
       ARG_WAL_DIR +
       ", else the wal_dir in the OPTIONS file, or the DB directory when that "
-      "is empty, and fails if the OPTIONS file cannot be read or that "
+      "is empty. Without --" +
+      ARG_WAL_DIR +
+      " the check fails if the OPTIONS file cannot be read; with it an "
+      "unreadable OPTIONS file is ignored. It fails if the scanned "
       "directory does not exist. Each WAL is read in "
       "point-in-time mode, which resumes after a checksum failure at the "
       "next block and stops at a truncated tail");

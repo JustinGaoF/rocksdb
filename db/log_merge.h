@@ -319,6 +319,10 @@ class WALIndexMerger {
   // nothing was emitted. Recovery attributes each record to its source WAL
   // for filtering, memtable log references, and per-file cuts.
   const Member* GetLastEmittedMember() const { return last_emitted_member_; }
+  // Protection checksum of the most recently emitted record, captured when
+  // it was pulled. Unindexed records drain after their member read past
+  // them, so the member's current checksum would be a later record's.
+  uint64_t GetLastEmittedChecksum() const { return last_emitted_checksum_; }
   // Details of the most recently skipped tail gap. Valid after kTailGap.
   const TailGap& GetTailGap() const { return tail_gap_; }
 
@@ -328,6 +332,15 @@ class WALIndexMerger {
   // the frontier at or after the first index it bore. Call before the first
   // Next(). Without a call every absent predecessor counts as retired.
   void SetRetirementBound(uint64_t bound) { retirement_bound_ = bound; }
+  // First-session history floor (GC12 Q6, narrowed from D126834369): when
+  // nonzero and no live WAL attests a predecessor range, the lower bound
+  // floors at this index instead of rising to the lowest surviving one, so
+  // a bottom loss in a brand-new DB's first WAL generation surfaces as a
+  // hole. The caller passes a nonzero floor only when no WAL was recovered
+  // ahead of the merge and no user data ever made it durable
+  // (`LastSequence() == 0`), and only for a set written at N > 1, so after
+  // any flush the floor stays off. Call before the first Next().
+  void SetHistoryStartIndex(uint64_t index) { history_start_index_ = index; }
   // An attested predecessor the merge stopped for, or zero. Valid after
   // kFrontier.
   uint64_t GetLostPredecessor() const { return lost_predecessor_; }
@@ -396,10 +409,16 @@ class WALIndexMerger {
   std::function<Status(Slice, SequenceNumber*)> sequence_of_;
   bool continue_past_discarded_holes_;
   std::vector<MemberState> states_;
-  // Buffered unindexed payloads with their source member (payloads copied:
-  // member buffers do not outlive the pulls that produced them). Drained
-  // before any indexed decision so encounter order is preserved.
-  std::deque<std::pair<Member*, std::string>> unindexed_queue_;
+  // Buffered unindexed payloads with their source member and record checksum
+  // (payloads copied: member buffers do not outlive the pulls that produced
+  // them; checksums captured: the member reads past them before they drain).
+  // Drained before any indexed decision so encounter order is preserved.
+  struct UnindexedQueued {
+    Member* member;
+    std::string payload;
+    uint64_t checksum;
+  };
+  std::deque<UnindexedQueued> unindexed_queue_;
   bool queue_outstanding_ = false;
   Result terminal_ = Result::kWaiting;
   bool membership_checked_ = false;
@@ -409,10 +428,20 @@ class WALIndexMerger {
   uint64_t last_sequence_ = 0;
   uint64_t last_emitted_index_ = 0;
   const Member* last_emitted_member_ = nullptr;
+  uint64_t last_emitted_checksum_ = 0;
   TailGap tail_gap_;
   uint64_t frontier_ = 0;
   Status error_ = Status::OK();
   uint64_t retirement_bound_ = std::numeric_limits<uint64_t>::max();
+  uint64_t history_start_index_ = 0;
+  // Index ranges attested by live WALs as borne by retired predecessors
+  // (absent below the retirement bound). A 2PC prepare can pin one
+  // partition's WAL past its generation-mates' retirement; the mates'
+  // indices then fall below the pinned WAL's without a live bearer. Each
+  // such index is explained by its bearer's span, not treated as a hole:
+  // a retired bearer was flushed, so replaying nothing is correct, exactly
+  // like sequential recovery skipping WALs below the cutoff.
+  std::vector<std::pair<uint64_t, uint64_t>> retired_spans_;
   // First index a lost predecessor bore: no hole at or above it is explained
   // as a tail gap.
   uint64_t lost_floor_ = std::numeric_limits<uint64_t>::max();

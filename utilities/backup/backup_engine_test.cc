@@ -26,6 +26,7 @@
 
 #include "db/db_impl/db_impl.h"
 #include "db/db_test_util.h"
+#include "db/write_batch_internal.h"
 #include "env/composite_env_wrapper.h"
 #include "env/env_chroot.h"
 #include "file/filename.h"
@@ -808,6 +809,59 @@ class BackupEngineTest : public testing::Test {
     backup_engine_.reset();
   }
 
+  // Opens db_ with `num_partitions` WAL partitions (test hook) and column
+  // families covering every partition. Returns the handle index whose writes
+  // route to each partition, and fills `cf_names`/`cf_handles` for the open.
+  std::vector<int> OpenWithPartitions(
+      size_t num_partitions, std::vector<std::string>* cf_names,
+      std::vector<ColumnFamilyHandle*>* cf_handles) {
+    ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::ValidateOptions:AllowWalPartitions",
+        [](void* arg) { *static_cast<bool*>(arg) = true; });
+    ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+    std::vector<int> cf_for_partition(num_partitions, 0);
+    std::vector<bool> covered(num_partitions, false);
+    size_t num_covered = 0;
+    cf_names->clear();
+    for (uint32_t cf_id = 1; num_covered < num_partitions; ++cf_id) {
+      WriteBatch batch;
+      EXPECT_OK(WriteBatchInternal::Put(&batch, cf_id, "key", "value"));
+      size_t partition = num_partitions;
+      EXPECT_OK(
+          DBImpl::TEST_WalPartitionForWrite(batch, num_partitions, &partition));
+      cf_names->push_back("cf" + std::to_string(cf_id));
+      if (!covered[partition]) {
+        covered[partition] = true;
+        cf_for_partition[partition] = static_cast<int>(cf_id);
+        ++num_covered;
+      }
+    }
+    options_.wal_partitions = static_cast<uint32_t>(num_partitions);
+    options_.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+    options_.track_and_verify_wals_in_manifest = true;
+    options_.avoid_flush_during_shutdown = true;
+    options_.avoid_flush_during_recovery = true;
+    options_.create_missing_column_families = true;
+    // The fixture enables blob files, which N>1 rejects.
+    options_.enable_blob_files = false;
+    std::vector<ColumnFamilyDescriptor> column_families;
+    column_families.emplace_back(kDefaultColumnFamilyName,
+                                 ColumnFamilyOptions(options_));
+    for (const auto& name : *cf_names) {
+      column_families.emplace_back(name, ColumnFamilyOptions(options_));
+    }
+    EXPECT_OK(DB::Open(options_, dbname_, column_families, cf_handles, &db_));
+    EXPECT_EQ(num_partitions, dbfull()->TEST_NumWalPartitions());
+    return cf_for_partition;
+  }
+
+  void CloseHandles(std::vector<ColumnFamilyHandle*>* handles) {
+    for (auto* h : *handles) {
+      delete h;
+    }
+    handles->clear();
+  }
+
   void OpenBackupEngine(bool destroy_old_data = false) {
     engine_options_->destroy_old_data = destroy_old_data;
     engine_options_->info_log = logger_.get();
@@ -1538,6 +1592,76 @@ TEST_F(BackupEngineTest, BackupWithoutFlushCopiesIndexedWAL) {
   ASSERT_GT(test::CountIndexedWALFiles(db_chroot_env_.get(), dbname_), 0);
   std::unique_ptr<DB> db = OpenDB();
   AssertExists(db.get(), 0, 100);
+}
+
+// Q1 (G-30, G-31): at N>1 a backup with flush_before_backup=false copies
+// every partition's current WAL, and the restored DB replays every
+// acknowledged write. Repeated with a flush and writes between the switch
+// and the capture. Neuter: restore max_log_num = cur_wal_number_; the
+// no-flush cases lose the partition 1..N-1 keys.
+TEST_F(BackupEngineTest, BackupIncludesEveryPartitionCurrentWal) {
+  for (size_t num_partitions : {size_t{2}, size_t{8}}) {
+    for (bool flush_before : {false, true}) {
+      SCOPED_TRACE("partitions=" + std::to_string(num_partitions) +
+                   " flush_before=" + std::to_string(flush_before));
+      DestroyDBWithoutCheck(dbname_, options_);
+      std::vector<std::string> cf_names;
+      std::vector<ColumnFamilyHandle*> handles;
+      const std::vector<int> cf_for_partition =
+          OpenWithPartitions(num_partitions, &cf_names, &handles);
+      for (size_t p = 0; p < num_partitions; ++p) {
+        ASSERT_OK(db_->Put(WriteOptions(), handles[cf_for_partition[p]],
+                           "key" + std::to_string(p),
+                           "value" + std::to_string(p)));
+      }
+      if (flush_before) {
+        for (auto* h : handles) {
+          ASSERT_OK(db_->Flush(FlushOptions(), h));
+        }
+        ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+        for (size_t p = 0; p < num_partitions; ++p) {
+          ASSERT_OK(db_->Put(WriteOptions(), handles[cf_for_partition[p]],
+                             "post" + std::to_string(p),
+                             "postval" + std::to_string(p)));
+        }
+      }
+      OpenBackupEngine(/*destroy_old_data=*/true);
+      ASSERT_OK(backup_engine_->CreateNewBackup(db_.get(),
+                                                /*flush_before_backup=*/false));
+      CloseHandles(&handles);
+      CloseDBAndBackupEngine();
+      DestroyDBWithoutCheck(dbname_, options_);
+      OpenBackupEngine();
+      ASSERT_OK(backup_engine_->RestoreDBFromBackup(1, dbname_, dbname_));
+      CloseBackupEngine();
+      std::vector<ColumnFamilyDescriptor> column_families;
+      column_families.emplace_back(kDefaultColumnFamilyName,
+                                   ColumnFamilyOptions(options_));
+      for (const auto& name : cf_names) {
+        column_families.emplace_back(name, ColumnFamilyOptions(options_));
+      }
+      std::vector<ColumnFamilyHandle*> restored_handles;
+      std::unique_ptr<DB> restored_db;
+      options_.create_if_missing = false;
+      ASSERT_OK(DB::Open(options_, dbname_, column_families, &restored_handles,
+                         &restored_db));
+      options_.create_if_missing = true;
+      for (size_t p = 0; p < num_partitions; ++p) {
+        std::string value;
+        ASSERT_OK(restored_db->Get(ReadOptions(),
+                                   restored_handles[cf_for_partition[p]],
+                                   "key" + std::to_string(p), &value));
+        EXPECT_EQ("value" + std::to_string(p), value);
+        if (flush_before) {
+          ASSERT_OK(restored_db->Get(ReadOptions(),
+                                     restored_handles[cf_for_partition[p]],
+                                     "post" + std::to_string(p), &value));
+          EXPECT_EQ("postval" + std::to_string(p), value);
+        }
+      }
+      CloseHandles(&restored_handles);
+    }
+  }
 }
 
 // this will make sure that backup does not copy the same file twice

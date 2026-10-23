@@ -25,7 +25,7 @@
 //    recovered, and with it everything acknowledged below it.
 //  - Published but lost (off by default, see kCheckPublished below).
 // A hole entirely below the lowest sequence recovery replayed from the WALs
-// fails like any other (kStrictLowerBound, see Verify).
+// fails like any other: strict is the only mode (see Verify).
 //
 // The cycle's seed fixes its configuration: N, the crash kind, the crash
 // point (the n-th acknowledgement, WAL append, leadership sync or gate park),
@@ -38,8 +38,6 @@
 //   ROCKSDB_WAL_ORACLE_SEED    seed of the first cycle; cycle i uses seed + i
 //   ROCKSDB_WAL_ORACLE_CHECK_PUBLISHED  1 turns the published-but-lost check
 //                              on (see kCheckPublished)
-//   ROCKSDB_WAL_ORACLE_STRICT_LOWER_BOUND  1 fails the known lower-bound
-//                              holes too (see kStrictLowerBound)
 
 #include <algorithm>
 #include <atomic>
@@ -91,12 +89,6 @@ constexpr uint64_t kSelfTestMaxCycles = 400;
 // durability until GC07 lands. GC07 turns it on. Cycles where it would fail
 // are counted and printed either way.
 constexpr bool kCheckPublished = false;
-
-// Holes entirely below the lowest sequence recovery replayed from the WALs
-// were a known base failure (see Verify) until WALs attested their
-// predecessors (G-20), which anchors the merge's lower bound; they now fail
-// like any other hole.
-constexpr bool kStrictLowerBound = true;
 
 uint64_t EnvU64(const char* name, uint64_t default_value) {
   const char* value = getenv(name);
@@ -269,8 +261,6 @@ std::string ValueFor(uint64_t seed, int thread, int index) {
 
 struct CycleResult {
   std::vector<std::string> violations;
-  // The first hole of the known lower-bound failure (see Verify), if any.
-  std::string lower_bound_hole;
   bool published_lost = false;
   // A power-loss cycle lost an acknowledged write (see Verify): the proof
   // the crash actually dropped unsynced data (G-54).
@@ -314,11 +304,6 @@ class DBWalOracleTest : public DBTestBase {
   // handle index of one column family per partition.
   std::vector<int> OpenWithEveryPartitionCovered(
       const Options& options, std::vector<std::string>* names);
-  // The lowest recovered sequence still in a memtable, i.e. replayed from
-  // the WALs, or kMaxSequenceNumber when recovery replayed nothing.
-  SequenceNumber ReplayFloor(
-      const std::map<std::string, std::pair<SequenceNumber, std::string>>&
-          recovered);
   void Verify(const CycleConfig& config,
               const std::vector<std::vector<WriteRecord>>& history,
               SequenceNumber safe_point, SequenceNumber published,
@@ -543,27 +528,6 @@ CycleResult DBWalOracleTest::RunCycle(const CycleConfig& config) {
   return result;
 }
 
-SequenceNumber DBWalOracleTest::ReplayFloor(
-    const std::map<std::string, std::pair<SequenceNumber, std::string>>&
-        recovered) {
-  SequenceNumber floor = kMaxSequenceNumber;
-  ReadOptions memtable_only;
-  memtable_only.read_tier = kMemtableTier;
-  for (ColumnFamilyHandle* handle : handles_) {
-    std::unique_ptr<Iterator> it(db_->NewIterator(memtable_only, handle));
-    for (it->SeekToFirst(); it->Valid(); it->Next()) {
-      const std::map<std::string,
-                     std::pair<SequenceNumber, std::string>>::const_iterator
-          found = recovered.find(it->key().ToString());
-      if (found != recovered.end()) {
-        floor = std::min(floor, found->second.first);
-      }
-    }
-    EXPECT_OK(it->status());
-  }
-  return floor;
-}
-
 void DBWalOracleTest::Verify(
     const CycleConfig& config,
     const std::vector<std::vector<WriteRecord>>& history,
@@ -629,28 +593,11 @@ void DBWalOracleTest::Verify(
   // the crash, so no index is burned and covered before it: the recovered
   // sequences must be exactly 1..S. This also covers writes that reported
   // failure, whose sequence the history does not know.
-  //
-  // Formerly a known base failure, reported apart unless kStrictLowerBound:
-  // without predecessor spans the merge derived its lower bound from the
-  // lowest index any live WAL still held, so when the lowest records of the
-  // live WALs were lost while a higher record on another partition survived,
-  // recovery replayed from that record over a hole entirely below the lowest
-  // sequence it replayed from the WALs (replay_floor).
-  const SequenceNumber replay_floor = ReplayFloor(recovered);
-  const bool strict_lower_bound =
-      kStrictLowerBound ||
-      EnvU64("ROCKSDB_WAL_ORACLE_STRICT_LOWER_BOUND", 0) != 0;
-  auto hole = [&](SequenceNumber missing, const std::string& what) {
-    if (missing < replay_floor && !strict_lower_bound) {
-      if (result->lower_bound_hole.empty()) {
-        result->lower_bound_hole = what +
-                                   " (below the lowest replayed "
-                                   "sequence " +
-                                   std::to_string(replay_floor) + ")";
-      }
-    } else {
-      violation(what);
-    }
+  // Strict is the only mode: a hole entirely below the lowest replayed
+  // sequence fails like any other hole (predecessor spans anchor the merge's
+  // lower bound, G-20).
+  auto hole = [&](SequenceNumber /*missing*/, const std::string& what) {
+    violation(what);
   };
   std::set<SequenceNumber> sequences;
   for (const auto& entry : recovered) {
@@ -717,7 +664,6 @@ uint64_t DBWalOracleTest::RunCycles(
   uint64_t first_violation = 0;
   uint64_t published_lost = 0;
   uint64_t cycles_with_holes = 0;
-  uint64_t lower_bound_cycles = 0;
   uint64_t two_partition_cycles = 0;
   uint64_t power_loss_cycles = 0;
   uint64_t power_loss_lost = 0;
@@ -740,14 +686,6 @@ uint64_t DBWalOracleTest::RunCycles(
             ? 1
             : 0;
     slow_cycles += config.slow ? 1 : 0;
-    if (!result.lower_bound_hole.empty()) {
-      ++lower_bound_cycles;
-      fprintf(stderr,
-              "prefix oracle: known lower-bound hole in cycle %" PRIu64
-              ": %s\n  %s\n",
-              i + 1, config.ToString().c_str(),
-              result.lower_bound_hole.c_str());
-    }
     acked += result.acked;
     recovered += result.recovered;
     published_lost += result.published_lost ? 1 : 0;
@@ -776,14 +714,13 @@ uint64_t DBWalOracleTest::RunCycles(
           "prefix oracle: %" PRIu64 " cycles from seed %" PRIu64
           " in %.1f s; %" PRIu64 " writes acknowledged, %" PRIu64
           " recovered; %" PRIu64
-          " recoveries stopped at a cross-partition hole; %" PRIu64
-          " known lower-bound holes; published-but-lost"
+          " recoveries stopped at a cross-partition hole; published-but-lost"
           " in %" PRIu64 " process-crash cycles (check %s); N=2 in %" PRIu64
           ", N=8 in %" PRIu64 ", power loss in %" PRIu64
           ", a slow partition in %" PRIu64
           "; power loss lost an acknowledged write in %" PRIu64 "\n",
           ran, seed, (SystemClock::Default()->NowMicros() - start) / 1e6, acked,
-          recovered, cycles_with_holes, lower_bound_cycles, published_lost,
+          recovered, cycles_with_holes, published_lost,
           kCheckPublished || EnvU64("ROCKSDB_WAL_ORACLE_CHECK_PUBLISHED", 0)
               ? "on"
               : "off",
@@ -850,6 +787,84 @@ TEST_F(DBWalOracleTest, CatchesSafePointOffByOne) {
   ASSERT_NE(0u, caught_at);
   EXPECT_EQ(0u, RunCycles(seed, caught_at, process_crash,
                           /*stop_at_violation=*/false));
+}
+
+TEST_F(DBWalOracleTest, CatchesBottomLossWithoutSpans) {
+  // G-20: without predecessor spans the merge derives its lower bound from
+  // the lowest index any live WAL still holds, so a bottom loss replays a
+  // non-prefix. Seed 20261809 crashes on cross-partition skew (a completion
+  // gate park) with a slow partition and delayed appends; rerunning its
+  // single cycle 60 times violates the prefix property without bottom-loss
+  // protections (43 of 60 here, 58 of 60 under TSan; GC11 measured 44 of 60
+  // for spans alone before the Q6 floor existed) and passes with them. The
+  // neuter disables span emission and the first-session floor together: the
+  // floor masks first-session spanless loss by design, so proving the oracle
+  // sees it needs both off. Post-flush spanless loss, where the floor
+  // honestly does not apply, is pinned deterministically with spans alone by
+  // DBWritePartitionTest.PostFlushBottomLossNeedsSpans. The slow partition
+  // stalls 50 ms per append so the skew forms under instrumentation too.
+  constexpr uint64_t kReproSeed = 20261809;
+  constexpr uint64_t kReruns = 60;
+  CycleConfig config = ConfigForSeed(kReproSeed);
+  config.partitions = 2;
+  config.slow_partition %= config.partitions;
+  config.crash = CrashKind::kProcessCrash;
+  config.trigger = CrashTrigger::kPark;
+  // Vary the race window across reruns: different builds interleave
+  // differently (instrumentation slows the operations the delays race), and
+  // the skew must be in flight when the crash lands.
+  config.threads = 6;
+  config.delay_append_every = 2;
+  config.delay_append_micros = 2000;
+  config.slow = true;
+  config.slow_partition = 0;
+  config.slow_latency.append_micros = 2000;
+  config.slow_latency.sync_micros = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::StartWALFile:SkipPredecessorSpan",
+      [](void* arg) { *static_cast<bool*>(arg) = true; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::ProcessLogFilesMerged:SkipHistoryFloor",
+      [](void* arg) { *static_cast<bool*>(arg) = true; });
+  uint64_t caught_at = 0;
+  uint64_t hits = 0;
+  for (uint64_t i = 0; i < kReruns; ++i) {
+    config.crash_at = 1;
+    config.delay_append_micros = 2000 * (1 + (i % 5));
+    config.slow_latency.append_micros = 50000;
+    const CycleResult result = RunCycle(config);
+    if (!result.violations.empty()) {
+      ++hits;
+      if (caught_at == 0) {
+        caught_at = i + 1;
+        fprintf(
+            stderr,
+            "bottom loss without spans first caught at rerun %llu/%llu: %s\n",
+            (unsigned long long)caught_at, (unsigned long long)kReruns,
+            config.ToString().c_str());
+        for (const std::string& v : result.violations) {
+          fprintf(stderr, "  %s\n", v.c_str());
+        }
+      }
+    }
+  }
+  SyncPoint::GetInstance()->ClearCallBack(
+      "DBImpl::StartWALFile:SkipPredecessorSpan");
+  SyncPoint::GetInstance()->ClearCallBack(
+      "DBImpl::ProcessLogFilesMerged:SkipHistoryFloor");
+  fprintf(stderr,
+          "bottom loss without spans: %" PRIu64 " of %" PRIu64
+          " reruns violated\n",
+          hits, kReruns);
+  ASSERT_NE(0u, caught_at);
+  for (uint64_t i = 0; i < caught_at; ++i) {
+    config.crash_at = 1;
+    config.delay_append_micros = 2000 * (1 + (i % 5));
+    config.slow_latency.append_micros = 50000;
+    const CycleResult result = RunCycle(config);
+    EXPECT_TRUE(result.violations.empty())
+        << "rerun " << i + 1 << " with spans on";
+  }
 }
 
 TEST_F(DBWalOracleTest, CatchesMergeStopOffByOne) {

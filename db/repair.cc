@@ -206,6 +206,9 @@ class Repairer {
       return status;
     }
     status = FindFiles();
+    if (status.ok()) {
+      status = FailOnPartitionedWals();
+    }
     DBImpl* db_impl = nullptr;
     if (status.ok()) {
       // Discard older manifests and start a fresh one
@@ -339,6 +342,23 @@ class Repairer {
     }
     if (!found_file) {
       return Status::Corruption(dbname_, "repair found no files");
+    }
+    return Status::OK();
+  }
+
+  // A WAL set written with wal_partitions > 1 interleaves sequences
+  // across files, which per-file salvage cannot order (and could salvage
+  // past a hole). Refuse before modifying anything: everything above only
+  // read.
+  Status FailOnPartitionedWals() {
+    const auto& wal_dir = immutable_db_options_.GetWalDir();
+    for (uint64_t log : logs_) {
+      if (log::PeekWALPartition(env_, LogFileName(wal_dir, log), log) != 0) {
+        return Status::NotSupported(
+            "RepairDB does not support WALs written with wal_partitions > 1 "
+            "(log #" +
+            std::to_string(log) + " names a nonzero partition)");
+      }
     }
     return Status::OK();
   }

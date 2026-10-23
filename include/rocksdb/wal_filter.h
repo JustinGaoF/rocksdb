@@ -70,7 +70,15 @@ class WalFilter : public Customizable {
   //    (by returning kStop replay) - please note that this implies
   //    discarding the logs from current record onwards.
   //
-  // @params log_number     log_number of the current log.
+  // Records arrive in the order recovery replays them: file by file in log
+  // number order for unindexed WALs, and in merged wal_index (hence
+  // sequence) order, interleaved across files, when indexed WALs recover
+  // through the merge.
+  //
+  // @params log_number     log_number of the current log: the file the
+  //                        record was read from, which under merged recovery
+  //                        is each record's own file, not the file whose
+  //                        turn it is in number order.
   //                        Filter might use this to determine if the log
   //                        record is applicable to a certain column family.
   // @params log_file_name  log file name - only for informational purposes

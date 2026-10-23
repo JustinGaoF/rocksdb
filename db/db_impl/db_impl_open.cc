@@ -1071,6 +1071,8 @@ Status DBImpl::Recover(
       bool corrupted_wal_found = false;
       s = RecoverLogFiles(wals, &next_sequence, read_only, is_retry,
                           &corrupted_wal_found, recovery_ctx);
+      TEST_SYNC_POINT_CALLBACK("DBImpl::Recover:CorruptedWALFound",
+                               &corrupted_wal_found);
       if (corrupted_wal_found && recovered_seq != nullptr) {
         *recovered_seq = next_sequence;
       }
@@ -1838,6 +1840,11 @@ Status DBImpl::ProcessLogFilesMerged(
   std::vector<uint64_t> held_wals;
   std::vector<const log::WALIndexMerger::ReaderMember*> readers;
   PredecessorWALInfo predecessor_wal_info;
+  // Whether the sequential unindexed prefix recovered a WAL at or above the
+  // cutoff (files below it are skipped, not recovered). The first-session
+  // history floor needs none: any prefix WAL may bear indices below the
+  // live set.
+  bool prefix_recovered = false;
   for (uint64_t wal_number : wal_numbers) {
     if (wal_number < merge_from) {
       const SequenceNumber prev_next_sequence = *next_sequence;
@@ -1847,6 +1854,7 @@ Status DBImpl::ProcessLogFilesMerged(
                          &stop_replay_by_wal_filter, &corrupted_wal_number,
                          corrupted_wal_found, version_edits, &flushed,
                          predecessor_wal_info, supersessions);
+      prefix_recovered = prefix_recovered || wal_number >= min_wal_number;
       if (status.ok()) {
         status = CheckSeqnoNotSetBackDuringRecovery(prev_next_sequence,
                                                     *next_sequence);
@@ -1915,6 +1923,32 @@ Status DBImpl::ProcessLogFilesMerged(
   // Recovery reads every WAL at or above min_wal_number, so an attested
   // predecessor there that the merge does not hold is missing from disk.
   merger.SetRetirementBound(min_wal_number);
+  // The merge floors its bound at the session start when the recovered set
+  // was written at N > 1, no live WAL attests any predecessor range, no WAL
+  // was recovered ahead of the merge, and no user data ever made it durable
+  // (the MANIFEST's sequence is still zero): then nothing precedes the live
+  // set, so a gap below the first seen data is loss, not retired history.
+  // Once user data is durable, retired history may precede the live WALs
+  // and the floor stays off. At N == 1 a shifted start (first index above
+  // one, intact head) is legal, so the floor cannot apply there.
+  uint64_t history_start_index = !recovered_wal_partitions_.empty() &&
+                                         !prefix_recovered &&
+                                         versions_->LastSequence() == 0
+                                     ? log::kWALIndexStartNumber
+                                     : 0;
+#ifndef NDEBUG
+  // Test-only: the G-20 self-test disables the floor along with span
+  // emission. The floor masks first-session bottom loss by design, so
+  // proving the oracle sees spanless bottom loss needs both off; post-flush
+  // spanless loss is pinned separately with spans alone.
+  bool skip_floor = false;
+  TEST_SYNC_POINT_CALLBACK("DBImpl::ProcessLogFilesMerged:SkipHistoryFloor",
+                           &skip_floor);
+  if (skip_floor) {
+    history_start_index = 0;
+  }
+#endif
+  merger.SetHistoryStartIndex(history_start_index);
 
   const UnorderedMap<uint32_t, size_t>& running_ts_sz =
       versions_->GetRunningColumnFamiliesTimestampSize();
@@ -2181,7 +2215,7 @@ Status DBImpl::ProcessLogFilesMerged(
     const bool filter_before = stop_replay_by_wal_filter;
     const bool status_before_ok = status.ok();
     const SequenceNumber prev_next_sequence = *next_sequence;
-    uint64_t record_checksum = member->LastRecordChecksum();
+    uint64_t record_checksum = merger.GetLastEmittedChecksum();
     bool dropped = true;
     if (empty_record) {
       // An empty record reaches the WAL filter like any other record, then
@@ -3874,6 +3908,16 @@ IOStatus DBImpl::StartWALFile(
   // partition only) writes no span and keeps that layout.
   if (io_s.ok() && wal_index_predecessor.wal_number != 0 &&
       immutable_db_options_.recycle_log_file_num == 0) {
+#ifndef NDEBUG
+    // Test-only: the G-20 self-test disables span emission to prove the
+    // oracle catches the resulting bottom loss.
+    bool skip_span = false;
+    TEST_SYNC_POINT_CALLBACK("DBImpl::StartWALFile:SkipPredecessorSpan",
+                             &skip_span);
+    if (skip_span) {
+      return io_s;
+    }
+#endif
     io_s = new_log->AddWALIndexPredecessorSpanRecord(
         write_options, wal_index_predecessor.wal_number,
         wal_index_predecessor.first, wal_index_predecessor.last);
