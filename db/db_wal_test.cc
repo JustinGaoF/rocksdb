@@ -4340,6 +4340,101 @@ TEST_F(DBWALIndexTest, TwoWriteQueuesIsRejected) {
   ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
 }
 
+// The M1.4 gates at one indexed partition (the table above
+// DBImpl::ValidateOptions): each option opens, and every key written comes
+// back from an indexed WAL after a clean reopen.
+class DBWALIndexOnePartitionGateTest : public DBWALIndexTest {
+ protected:
+  void ExpectIndexedWALRoundTrip(const Options& options) {
+    ASSERT_EQ(1U, options.wal_partitions);
+    DestroyAndReopen(options);
+    WriteKeys();
+    if (options.manual_wal_flush) {
+      ASSERT_OK(db_->FlushWAL(/*sync=*/false));
+    }
+    const uint64_t wal_number = LatestWALNumber();
+    Close();
+    const std::vector<uint8_t> types = ReadWALRecordTypes(WALPath(wal_number));
+    ASSERT_FALSE(types.empty());
+    EXPECT_TRUE(types.front() == log::kWALIndexMarkerType ||
+                types.front() == log::kRecyclableWALIndexMarkerType)
+        << static_cast<int>(types.front());
+    Reopen(options);
+    VerifyKeys();
+    Close();
+    Destroy(options);
+  }
+};
+
+TEST_F(DBWALIndexOnePartitionGateTest, ManualWALFlush) {
+  Options options =
+      WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+  options.manual_wal_flush = true;
+  ExpectIndexedWALRoundTrip(options);
+}
+
+// The keys land in a recycled WAL: the flushes free the first WAL, and the
+// WAL switch at the second flush reuses it.
+TEST_F(DBWALIndexOnePartitionGateTest, RecycleLogFileNum) {
+  Options options =
+      WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+  options.wal_recovery_mode = WALRecoveryMode::kPointInTimeRecovery;
+  options.recycle_log_file_num = 1;
+  DestroyAndReopen(options);
+  std::atomic<int> reused{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::CreateWAL:BeforeReuseWritableFile1",
+      [&](void* /*arg*/) { reused.fetch_add(1); });
+  SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_OK(Put("before0", "value"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("before1", "value"));
+  ASSERT_OK(Flush());
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_GT(reused.load(), 0);
+  WriteKeys();
+  const uint64_t wal_number = LatestWALNumber();
+  Close();
+  const std::vector<uint8_t> types = ReadWALRecordTypes(WALPath(wal_number));
+  ASSERT_FALSE(types.empty());
+  EXPECT_EQ(log::kRecyclableWALIndexMarkerType, types.front());
+  Reopen(options);
+  ASSERT_EQ(1U, dbfull()->GetDBOptions().recycle_log_file_num);
+  VerifyKeys();
+  EXPECT_EQ("value", Get("before0"));
+  EXPECT_EQ("value", Get("before1"));
+  Close();
+  Destroy(options);
+}
+
+TEST_F(DBWALIndexOnePartitionGateTest, UnorderedWrite) {
+  Options options =
+      WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+  options.unordered_write = true;
+  ExpectIndexedWALRoundTrip(options);
+}
+
+TEST_F(DBWALIndexOnePartitionGateTest, PipelinedWrite) {
+  Options options =
+      WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+  options.enable_pipelined_write = true;
+  ExpectIndexedWALRoundTrip(options);
+}
+
+// two_write_queues is the one M1.4 gate that keys on usage at N=1.
+TEST_F(DBWALIndexOnePartitionGateTest, TwoWriteQueues) {
+  Options options = WALIndexOptions(PartitionWALUsage::kNone);
+  options.two_write_queues = true;
+  DestroyAndReopen(options);
+  Close();
+  options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  const Status s = TryReopen(options);
+  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+  ASSERT_STREQ("partition_wal_usage is not supported with two_write_queues. ",
+               s.getState());
+}
+
 TEST_F(DBWALIndexTest, SequenceAndWALIndexAllocationIsAtomic) {
   Options options =
       WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);

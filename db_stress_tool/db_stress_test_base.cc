@@ -4677,6 +4677,9 @@ Status StressTest::PrepareOptionsForRestoredDB(Options* options) {
   }
 
   *options = Options(db_options, cf_options);
+  // Not serialized, so the string round trip above drops it.
+  options->experimental_allow_wal_partitions_for_testing =
+      options_.experimental_allow_wal_partitions_for_testing;
   options->best_efforts_recovery = false;
   options->listeners.clear();
   // Avoid dangling/shared file descriptors, for reliable destroy
@@ -7177,6 +7180,9 @@ void InitializeOptionsFromFlags(
     }
     options.partition_wal_usage = parsed_db_options.partition_wal_usage;
   }
+  options.wal_partitions = FLAGS_wal_partitions;
+  options.experimental_allow_wal_partitions_for_testing =
+      FLAGS_wal_partitions > 1;
 
   options.last_level_temperature =
       StringToTemperature(FLAGS_last_level_temperature.c_str());

@@ -500,8 +500,9 @@ enum class PartitionWALUsage : char {
   // readable by (and are bit-for-bit compatible with) older RocksDB versions.
   kNone = 0x00,
   // Every WAL record carries the ordering number (wal_index), and every WAL
-  // file starts with the marker record. How writes are assigned to WAL files
-  // is internal and unspecified.
+  // file starts with the marker record. The number of WAL files written at a
+  // time is set by `DBOptions::wal_partitions`, not by this value. How writes
+  // are assigned to WAL files is internal and unspecified.
   kPartitionByColumnFamily = 0x02,
 };
 
@@ -1537,6 +1538,53 @@ struct DBOptions {
   //
   // Default: 1 MB
   uint64_t max_write_batch_group_size_bytes = 1 << 20;
+
+  // EXPERIMENTAL
+  //
+  // The number of WAL files ("partitions") that writes are spread across.
+  //
+  // A single WAL file admits only one append in flight at a time, because
+  // durability granularity is per file descriptor. On storage where append
+  // latency is high relative to bandwidth, that single outstanding I/O bounds
+  // write throughput no matter how fast the device is. Spreading writes over N
+  // WAL files allows N concurrent appends. Recovery merges the partitions back
+  // into a single sequence-ordered stream, so the logical log is unchanged.
+  //
+  // Recovery reads the partitions as one stream in WAL index order, so a
+  // record lost from one partition while another holds later records is a
+  // hole in that stream, not a torn tail. kTolerateCorruptedTailRecords and
+  // kAbsoluteConsistency refuse to open on it, kPointInTimeRecovery opens with
+  // the records below it, and kSkipAnyCorruptedRecords skips it and applies
+  // the records above it; see WALRecoveryMode. A loss at the end of the
+  // stream is a tail, handled as each mode handles a torn tail with one WAL.
+  //
+  // manual_wal_flush is supported but not recommended with more than one
+  // partition: FlushWAL() flushes every partition's buffer while holding every
+  // partition's WAL write lock, which re-imposes the coordinated flushing that
+  // partitions exist to avoid.
+  //
+  // Not dynamically changeable via SetOptions().
+  //
+  // Values greater than 1 are not implemented yet and are rejected at Open()
+  // with Status::NotSupported, except for testing through
+  // experimental_allow_wal_partitions_for_testing. With the default of 1 the
+  // WAL is byte-for-byte identical to a build without this option. Values
+  // above 64 are rejected with Status::InvalidArgument.
+  //
+  // Default: 1
+  uint32_t wal_partitions = 1;
+
+  // EXPERIMENTAL, for testing only. Not for production use; it will be
+  // removed once wal_partitions > 1 is supported.
+  //
+  // Lets Open() accept wal_partitions > 1 when partition_wal_usage is not
+  // kNone, instead of rejecting it with Status::NotSupported. Every other
+  // rejection of wal_partitions > 1 still applies. It is not written to the
+  // OPTIONS file, so a DB reopened from its OPTIONS file never gets it. It has
+  // no effect when wal_partitions is 1.
+  //
+  // Default: false
+  bool experimental_allow_wal_partitions_for_testing = false;
 
   // The maximum number of microseconds that a write operation will use
   // a yielding spin loop to coordinate with other write threads before
