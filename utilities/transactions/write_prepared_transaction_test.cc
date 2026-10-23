@@ -111,6 +111,23 @@ TEST(PreparedHeap, BasicsTest) {
   heap.pop();
   // Test that empty works
   ASSERT_TRUE(heap.empty());
+
+  // With wal_partitions > 1 prepares are pushed out of sequence order: a
+  // smaller one becomes the top, and erases still pop in sequence order.
+  {
+    MutexLock ml(heap.push_pop_mutex());
+    heap.push(100l);
+    heap.push(90l);
+    ASSERT_EQ(90l, heap.top());
+    heap.push(95l);
+    ASSERT_EQ(90l, heap.top());
+  }
+  heap.erase(100l);
+  ASSERT_EQ(90l, heap.top());
+  heap.erase(90l);
+  ASSERT_EQ(95l, heap.top());
+  heap.erase(95l);
+  ASSERT_TRUE(heap.empty());
 }
 
 // This is a scenario reconstructed from a buggy trace. Test that the bug does

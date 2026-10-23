@@ -1915,6 +1915,16 @@ Status DBImpl::ProcessLogFilesMerged(
   // Recovery reads every WAL at or above min_wal_number, so an attested
   // predecessor there that the merge does not hold is missing from disk.
   merger.SetRetirementBound(min_wal_number);
+  // Until a flush persists a sequence (or the MANIFEST retires a WAL), no WAL
+  // was retired, so no index below the held ones was either. A brand-new
+  // DB's first WALs attest no predecessor, and with more than one partition
+  // a loss at the bottom of one chain leaves records above it in another;
+  // the floor makes the merge expect the first index (ported, narrowed, from
+  // D126834369). One chain cannot lose its bottom without damaging its head.
+  if (!recovered_wal_partitions_.empty() && versions_->LastSequence() == 0 &&
+      versions_->GetWalSet().GetMinWalNumberToKeep() == 0) {
+    merger.SetHistoryFloor(log::kWALIndexStartNumber);
+  }
 
   const UnorderedMap<uint32_t, size_t>& running_ts_sz =
       versions_->GetRunningColumnFamiliesTimestampSize();
@@ -2181,7 +2191,7 @@ Status DBImpl::ProcessLogFilesMerged(
     const bool filter_before = stop_replay_by_wal_filter;
     const bool status_before_ok = status.ok();
     const SequenceNumber prev_next_sequence = *next_sequence;
-    uint64_t record_checksum = member->LastRecordChecksum();
+    uint64_t record_checksum = merger.GetLastEmittedChecksum();
     bool dropped = true;
     if (empty_record) {
       // An empty record reaches the WAL filter like any other record, then
@@ -3872,8 +3882,11 @@ IOStatus DBImpl::StartWALFile(
   // Recycled files keep their previous use's bytes behind the head, which
   // recovery reads as a lost tail by position, so a DB that recycles WALs (one
   // partition only) writes no span and keeps that layout.
-  if (io_s.ok() && wal_index_predecessor.wal_number != 0 &&
-      immutable_db_options_.recycle_log_file_num == 0) {
+  bool write_span = wal_index_predecessor.wal_number != 0 &&
+                    immutable_db_options_.recycle_log_file_num == 0;
+  // Lets the prefix oracle's G-20 self-test write WALs without spans.
+  TEST_SYNC_POINT_CALLBACK("DBImpl::StartWALFile:WriteSpan", &write_span);
+  if (io_s.ok() && write_span) {
     io_s = new_log->AddWALIndexPredecessorSpanRecord(
         write_options, wal_index_predecessor.wal_number,
         wal_index_predecessor.first, wal_index_predecessor.last);

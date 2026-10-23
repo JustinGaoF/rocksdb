@@ -314,7 +314,8 @@ Status WALIndexMerger::PullMembers(uint64_t threshold, PullOutcome* outcome) {
           return coherence;
         }
       } else if (pulled.kind == Member::Pull::kUnindexed) {
-        unindexed_queue_.emplace_back(s.member, pulled.payload.ToString());
+        unindexed_queue_.push_back({s.member, pulled.payload.ToString(),
+                                    s.member->LastRecordChecksum()});
         outcome->advanced = true;
         if (Status coherence = CheckMemberCoherence(s); !coherence.ok()) {
           return coherence;
@@ -449,7 +450,13 @@ Status WALIndexMerger::ComputeLowerBound() {
     } else if (span.second != std::numeric_limits<uint64_t>::max()) {
       lower = std::min(lower, span.second + 1);
       have_lower = true;
+      if (span.first != 0) {
+        retired_spans_.emplace_back(span.first, span.second);
+      }
     }
+  }
+  if (have_lower && history_floor_ != 0 && attested.empty()) {
+    lower = std::min(lower, history_floor_);
   }
   if (!have_lower) {
     frontier_ = 0;
@@ -474,9 +481,10 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
     // Buffered unindexed records drain before any indexed decision so
     // encounter order is preserved.
     if (!unindexed_queue_.empty()) {
-      *record = Slice(unindexed_queue_.front().second);
+      *record = Slice(unindexed_queue_.front().payload);
       last_emitted_index_ = 0;
-      last_emitted_member_ = unindexed_queue_.front().first;
+      last_emitted_member_ = unindexed_queue_.front().member;
+      last_emitted_checksum_ = unindexed_queue_.front().checksum;
       queue_outstanding_ = true;
       return Result::kRecord;
     }
@@ -602,6 +610,7 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
       *record = winner->lookahead.payload;
       last_emitted_index_ = expected_;
       last_emitted_member_ = winner->member;
+      last_emitted_checksum_ = winner->member->LastRecordChecksum();
       for (auto* h : holders) {
         h->has_lookahead = false;  // superseded copies die silently.
       }
@@ -678,6 +687,21 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
       tail_gap_ = gap;
       expected_++;
       return Result::kTailGap;
+    }
+    // A retired predecessor bore indices in its span, and a held
+    // generation-mate (a WAL a 2PC prepare kept alive) interleaves with
+    // them: the retired file's records left with it, once recovery no longer
+    // needed them.
+    bool retired = false;
+    for (const auto& [first, last] : retired_spans_) {
+      if (first <= expected_ && expected_ <= last) {
+        retired = true;
+        break;
+      }
+    }
+    if (retired) {
+      expected_++;
+      continue;
     }
 #ifndef NDEBUG
     // Lets the prefix oracle's self-test move the stop one index later.

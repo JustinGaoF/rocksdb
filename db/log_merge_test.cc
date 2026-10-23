@@ -1304,10 +1304,28 @@ TEST_P(LogMergeTest, EmittedRecordsCarrySourceAndChecksum) {
   members.push_back(MakeMember(b, b.Bytes()));
   auto merger = MakeMerger(std::move(members), {120, 121});
   Slice record;
+  // The merge emits the unindexed u0 after a read on to a2, so the checksum
+  // it reports for u0 is the one captured when u0 was pulled (GC12 Q9).
+  uint64_t u0_checksum = 0;
+  {
+    std::unique_ptr<FSSequentialFile> source(new InMemorySource(a_bytes, 0));
+    Reader reader(/*info_log=*/nullptr,
+                  std::make_unique<SequentialFileReader>(std::move(source), ""),
+                  /*reporter=*/nullptr, /*checksum=*/true, a.log_number());
+    std::string scratch;
+    Slice first;
+    ASSERT_TRUE(reader.ReadRecord(
+        &first, &scratch, WALRecoveryMode::kTolerateCorruptedTailRecords,
+        &u0_checksum));
+  }
   ASSERT_EQ(WALIndexMerger::Result::kRecord, merger->Next(&record));
   EXPECT_EQ(0U, merger->GetLastEmittedWALIndex());
   ASSERT_NE(nullptr, merger->GetLastEmittedMember());
   EXPECT_EQ(120U, merger->GetLastEmittedMember()->wal_number());
+  if (!fragment_buffered()) {
+    EXPECT_NE(0U, u0_checksum);
+    EXPECT_EQ(u0_checksum, merger->GetLastEmittedChecksum());
+  }
   ASSERT_EQ(WALIndexMerger::Result::kRecord, merger->Next(&record));
   EXPECT_EQ(1U, merger->GetLastEmittedWALIndex());
   ASSERT_NE(nullptr, merger->GetLastEmittedMember());
@@ -1322,6 +1340,9 @@ TEST_P(LogMergeTest, EmittedRecordsCarrySourceAndChecksum) {
   EXPECT_EQ(2U, merger->GetLastEmittedWALIndex());
   ASSERT_NE(nullptr, merger->GetLastEmittedMember());
   EXPECT_EQ(120U, merger->GetLastEmittedMember()->wal_number());
+  if (!fragment_buffered()) {
+    EXPECT_NE(u0_checksum, merger->GetLastEmittedChecksum());
+  }
   ASSERT_EQ(WALIndexMerger::Result::kRecord, merger->Next(&record));
   EXPECT_EQ(3U, merger->GetLastEmittedWALIndex());
   ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, merger->Next(&record));

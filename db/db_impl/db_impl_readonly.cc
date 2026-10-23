@@ -246,6 +246,15 @@ Status DB::OpenForReadOnly(const Options& options, const std::string& dbname,
 
   *dbptr = nullptr;
 
+  if (options.wal_partitions != 1) {
+    // The same wal_partitions checks a read-write open applies, ahead of the
+    // fully compacted path, which would otherwise skip them.
+    s = DBImpl::ValidateOptions(DBOptions(options));
+    if (!s.ok()) {
+      return s;
+    }
+  }
+
   // Try to first open DB as fully compacted DB
   s = CompactedDBImpl::Open(options, dbname, dbptr);
   if (s.ok()) {

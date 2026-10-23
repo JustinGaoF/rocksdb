@@ -188,6 +188,11 @@ Status DBImpl::GetSortedWalFilesImpl(VectorWalPtr& files, bool need_seqnos) {
 }
 
 Status DBImpl::GetCurrentWalFile(std::unique_ptr<WalFile>* current_wal_file) {
+  if (NumWalPartitions() > 1) {
+    return Status::NotSupported(
+        "GetCurrentWalFile: with wal_partitions > 1 each partition has its "
+        "own current WAL");
+  }
   uint64_t current_logfile_number;
   {
     InstrumentedMutexLock l(&mutex_);
@@ -477,7 +482,12 @@ Status DBImpl::GetLiveFilesStorageInfoImpl(
   const uint64_t options_number = versions_->options_file_number();
   const uint64_t min_log_num = MinLogNumberToKeep();
   // Ensure consistency with manifest for track_and_verify_wals_in_manifest
-  const uint64_t max_log_num = cur_wal_number_;
+  uint64_t max_log_num = cur_wal_number_;
+  // cur_wal_number_ is partition 0's current WAL, the lowest one; every other
+  // partition's current WAL is numbered above it.
+  for (size_t p = 1; p < NumWalPartitions(); ++p) {
+    max_log_num = std::max(max_log_num, NewestAliveWalNumber(p));
+  }
 
   if (options_number != 0) {
     // A concurrent SetOptions() may otherwise delete this OPTIONS file before
@@ -563,6 +573,22 @@ Status DBImpl::GetLiveFilesStorageInfoImpl(
   TEST_SYNC_POINT("CheckpointImpl::CreateCheckpoint:SavedLiveFiles1");
   TEST_SYNC_POINT("CheckpointImpl::CreateCheckpoint:SavedLiveFiles2");
 
+  // At N > 1 partitions append concurrently, so one partition's WAL can hold
+  // a record above another partition's allocated but not yet appended one,
+  // and a copy cut there holds a hole only point-in-time recovery opens past.
+  // Holding every write queue lets those groups finish, so the sizes below
+  // cut every WAL at one point of the sequence order. Under LockWAL no group
+  // is in flight, and waiting on its stall would never end.
+  AllPartitionsWriter quiesce(this, /*nonmem=*/false);
+  bool quiesced = false;
+  if (NumWalPartitions() > 1) {
+    InstrumentedMutexLock l(&mutex_);
+    if (lock_wal_owner_thread_id_counts_.empty()) {
+      quiesce.EnterUnbatched();
+      quiesced = true;
+    }
+  }
+
   // FlushWAL is required to ensure we can physically copy everything
   // logically written to the WAL. (Sync not strictly required for
   // active WAL to be copied rather than hard linked, even when
@@ -602,6 +628,9 @@ Status DBImpl::GetLiveFilesStorageInfoImpl(
   bool recycling_log_files = immutable_db_options_.recycle_log_file_num > 0;
   if (s.ok() && !recycling_log_files) {
     s = GetOpenWalSizes(open_wal_number_to_size);
+  }
+  if (quiesced) {
+    quiesce.ExitUnbatched();
   }
 
   // [old comment] If we have more than one column family, we also need to get

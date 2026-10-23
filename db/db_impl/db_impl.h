@@ -4434,6 +4434,18 @@ class DBImpl : public DB
     assert(!alive_wal_files_[partition].empty());
     alive_wal_files_[partition].front().getting_flushed = true;
   }
+  // Number of partition p's newest live-file entry, which is its current WAL
+  // once open has installed one, or zero when p tracks none. The number never
+  // changes after the push, and pushes hold mutex_.
+  // REQUIRES: mutex_ held.
+  uint64_t NewestAliveWalNumber(size_t partition) {
+    mutex_.AssertHeld();
+    assert(partition < alive_wal_files_.size());
+    if (alive_wal_files_[partition].empty()) {
+      return 0;
+    }
+    return alive_wal_files_[partition].back().number;
+  }
   // Number of live-file entries on partition p.
   // REQUIRES: mutex_ held.
   size_t NumAliveWalFiles(size_t partition) {
