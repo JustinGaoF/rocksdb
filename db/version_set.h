@@ -1996,7 +1996,10 @@ class VersionSet {
   // The last seq visible to reads. It normally indicates the last sequence in
   // the memtable but when using two write queues it could also indicate the
   // last sequence in the WAL visible to reads.
-  std::atomic<uint64_t> last_sequence_;
+  // Written on every publication and read by every reader; above one WAL
+  // partition last_allocated_sequence_ below is written on every allocation,
+  // so each starts its own cache line.
+  ALIGN_AS(CACHE_LINE_SIZE) std::atomic<uint64_t> last_sequence_;
   // The last sequence number of data committed to the descriptor (manifest
   // file).
   SequenceNumber descriptor_last_sequence_ = 0;
@@ -2007,7 +2010,7 @@ class VersionSet {
   // two write queues. In that case seq might or might not have appreated in
   // memtable but it is expected to appear in the WAL.
   // We have last_sequence <= last_allocated_sequence_
-  std::atomic<uint64_t> last_allocated_sequence_;
+  ALIGN_AS(CACHE_LINE_SIZE) std::atomic<uint64_t> last_allocated_sequence_;
   // The last allocated sequence that is also published to the readers. This is
   // applicable only when last_seq_same_as_publish_seq_ is not set. Otherwise
   // last_sequence_ also indicates the last published seq.
