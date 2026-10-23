@@ -940,12 +940,14 @@ class DBImpl : public DB
   // (and after the AfterAddRecord hook may have replaced its status, so
   // `ok` is the outcome the write path acts on). Tests record these to
   // prove a failed write was attempted exactly once, never moved between
-  // partitions, and that no acknowledged sequence lies above a failed hole.
+  // partitions, and that no acknowledged sequence lies above a failed hole,
+  // and to prove which WAL file an append went to.
   struct WalAppendOutcome {
     size_t wal_partition = 0;
     SequenceNumber first_sequence = 0;
     size_t sequence_count = 0;
     bool ok = true;
+    uint64_t wal_number = 0;
   };
 
   // REQUIRES: joined the main write queue if two_write_queues is disabled, and
@@ -1542,14 +1544,19 @@ class DBImpl : public DB
       const WriteBatch& batch, size_t num_partitions, size_t* wal_partition,
       const std::vector<uint32_t>* deferred_cf_ids = nullptr);
 
+  // A WAL partition's alive WALs in deque order, as {number, size} pairs, and
+  // the number of the WAL its writer appends to.
+  std::vector<std::pair<uint64_t, uint64_t>> TEST_AliveWalFiles(
+      size_t partition);
+  uint64_t TEST_CurrentWalNumber(size_t partition);
+  // A WAL partition's open-WAL entries in deque order, as {number,
+  // getting_synced} pairs.
+  std::vector<std::pair<uint64_t, bool>> TEST_WalSyncMarks(size_t partition);
+
   // Returns the reusable merge buffer for a WAL partition.
   const WriteBatch* TEST_GetWalMergeBuffer(size_t partition) {
     return &WalMergeBuffer(partition);
   }
-
-  // A WAL partition's open-WAL entries in deque order, as {number,
-  // getting_synced} pairs.
-  std::vector<std::pair<uint64_t, bool>> TEST_WalSyncMarks(size_t partition);
 
   // Waiters currently parked in WaitForWalDurability. Tests use it to prove
   // a write is parked in its completion gate before injecting a failure.
@@ -2796,6 +2803,9 @@ class DBImpl : public DB
   IOStatus WriteWALIndexSupersessions(
       const WriteOptions& write_options, log::Writer* new_log,
       const std::vector<WALIndexSupersession>& supersessions);
+  // With more than one partition, writes the index floor into the head of
+  // every WAL Open created whose predecessor span carries none.
+  IOStatus WriteWALIndexHeadFloors(const WriteOptions& write_options);
 
   void SetupLogFilesRecovery(
       const std::vector<uint64_t>& wal_numbers,
@@ -2814,20 +2824,34 @@ class DBImpl : public DB
   // the same per-record path as ProcessLogFile. Predecessor chaining is
   // absent (track_and_verify_wals falls back to ProcessLogFiles), so this
   // takes no predecessor info.
+  // WALs numbered below `merge_from` carry no index; they replay
+  // sequentially, as ProcessLogFiles would, before the merge reads the rest.
+  // WALs numbered at or above a nonzero `merge_until` carry no index either,
+  // and every record in them is newer than every indexed one: they replay
+  // sequentially after the merge.
   Status ProcessLogFilesMerged(
-      const std::vector<uint64_t>& wal_numbers, bool read_only, bool is_retry,
+      const std::vector<uint64_t>& wal_numbers, uint64_t merge_from,
+      uint64_t merge_until, bool read_only, bool is_retry,
       uint64_t min_wal_number, int job_id, SequenceNumber* next_sequence,
       std::unordered_map<int, VersionEdit>* version_edits,
       bool* corrupted_wal_found, RecoveryContext* recovery_ctx,
       std::vector<WALIndexSupersession>* supersessions);
 
-  // Pre-replay peek at each WAL head: sets *all_indexed unless some live WAL
-  // carries no index, in which case the set must replay sequentially. Fails
+  // Pre-replay peek at each WAL head: sets *unindexed_high to the highest live
+  // WAL that carries no index (zero when none), and *indexed_low to the lowest
+  // live WAL carrying a marker or indexed data (UINT64_MAX when none). Fails
   // fast on indexed data without a marker over an intact head; a damaged
-  // head stays merge-side for the attestation path.
+  // head stays merge-side for the attestation path. Sets *superseding when a
+  // head declares a supersession for a WAL in the set. Sets *indexed_high to
+  // the highest such indexed WAL (zero when none), and *unindexed_inside to
+  // the highest unindexed WAL numbered between two indexed ones (zero when
+  // none).
   Status CheckWALFilesCarryWALIndex(const std::vector<uint64_t>& wal_numbers,
                                     uint64_t min_wal_number, bool is_retry,
-                                    bool* all_indexed);
+                                    uint64_t* unindexed_high,
+                                    uint64_t* indexed_low, bool* superseding,
+                                    uint64_t* indexed_high,
+                                    uint64_t* unindexed_inside);
 
   Status ProcessLogFile(uint64_t wal_number, uint64_t min_wal_number,
                         bool is_retry, bool read_only, int job_id,
@@ -3907,14 +3931,41 @@ class DBImpl : public DB
 
   // Starts an opened WAL file by writing the initial records required before it
   // can be installed as the current WAL for foreground writes.
-  IOStatus StartWALFile(const WriteOptions& write_options,
-                        const PredecessorWALInfo& predecessor_wal_info,
-                        log::Writer* new_log);
+  // `wal_index_predecessor` is the span the file attests for its partition's
+  // previous WAL (log::MakeWALIndexPredecessorSpan); none when its wal_number
+  // is zero or WAL indexing is off.
+  IOStatus StartWALFile(
+      const WriteOptions& write_options,
+      const PredecessorWALInfo& predecessor_wal_info,
+      const log::WALIndexPredecessorSpan& wal_index_predecessor,
+      log::Writer* new_log);
+  // `wal_partition` is recorded in the file's WAL index marker so recovery
+  // can return the file to that partition.
   IOStatus CreateWAL(const DBOptions& db_options,
                      const WriteOptions& write_options, uint64_t log_file_num,
                      uint64_t recycle_log_number, size_t preallocate_block_size,
                      const PredecessorWALInfo& predecessor_wal_info,
-                     log::Writer** new_log);
+                     const log::WALIndexPredecessorSpan& wal_index_predecessor,
+                     size_t wal_partition, log::Writer** new_log);
+
+  // The span the first WAL Open creates for `wal_partition` attests, which
+  // CreateWAL() writes: the first of RecoveredWALIndexPredecessors(). None
+  // when no WAL placed there was recovered.
+  log::WALIndexPredecessorSpan RecoveredWALIndexPredecessor(
+      size_t wal_partition) const;
+  // Every span the first WAL Open creates for `wal_partition` attests, in
+  // ascending WAL order: the newest WAL recovered through the merge of each
+  // partition that wrote one (a chain head), placed as RestoreAliveLogFiles()
+  // places it. Only partition 0, which a lower wal_partitions folds the
+  // higher partitions into, can attest more than one: otherwise a retired
+  // folded head would leave its indices unexplained among a pinned WAL's.
+  std::vector<log::WALIndexPredecessorSpan> RecoveredWALIndexPredecessors(
+      size_t wal_partition) const;
+  // Writes the spans after the first of RecoveredWALIndexPredecessors(0)
+  // into partition 0's new WAL `new_log`, right after CreateWAL() wrote the
+  // first.
+  IOStatus WriteFurtherWALIndexPredecessors(const WriteOptions& write_options,
+                                            log::Writer* new_log);
 
   // Validate self-consistency of DB options
   static Status ValidateOptions(const DBOptions& db_options);
@@ -4472,6 +4523,14 @@ class DBImpl : public DB
   //    FindObsoleteFiles().
   std::vector<std::deque<WalFileNumberSize>> alive_wal_files_ =
       std::vector<std::deque<WalFileNumberSize>>(1);
+  // Nonzero WAL partitions read from recovered WALs' markers, by WAL number.
+  // Filled by CheckWALFilesCarryWALIndex() and read by RestoreAliveLogFiles(),
+  // both during Open with mutex_ held.
+  UnorderedMap<uint64_t, uint32_t> recovered_wal_partitions_;
+  // First wal_index of each WAL recovered through the merge (zero when it
+  // bears none), by WAL number. Filled by ProcessLogFilesMerged() and read by
+  // RecoveredWALIndexPredecessors(), both during Open with mutex_ held.
+  UnorderedMap<uint64_t, uint64_t> recovered_wal_first_indices_;
 
   // Total size of all "alive" WALs (for easy access without synchronization)
   RelaxedAtomic<uint64_t> wals_total_size_{0};

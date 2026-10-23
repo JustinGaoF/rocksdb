@@ -164,6 +164,10 @@ class Reader {
   // whether the file claims to carry indices, before its data is consumed.
   bool SawWALIndexMarker() const { return saw_wal_index_marker_; }
 
+  // The WAL partition recorded in the marker; 0 if the marker recorded none
+  // or none has been read.
+  uint32_t WALPartition() const { return wal_partition_; }
+
   // Highest wal_index covered by any valid void record read so far, or zero
   // if no void record has been read.
   uint64_t GetMaxVoidWALIndexHi() const { return max_void_wal_index_hi_; }
@@ -332,6 +336,7 @@ class Reader {
   bool has_predecessor_span_ = false;
   // Whether a supersession record followed a data or progress record.
   bool saw_misplaced_supersession_ = false;
+  uint32_t wal_partition_ = 0;
 
   // Extend record types with the following special values
   enum : uint8_t {

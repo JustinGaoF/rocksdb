@@ -4827,6 +4827,97 @@ class WritePreparedPartitionedWalTest : public testing::Test {
   std::mutex prepare_mu_;
 };
 
+TEST_F(WritePreparedPartitionedWalTest,
+       FailedSyncCommitAndPrepareNeverVisible) {
+  // GC25 Q2 (D-9, G3-E-1): above one partition a sync 2PC write's
+  // pre-release callbacks run only once it is fsynced. A WritePrepared or
+  // WriteUnprepared commit with sync=true whose gate sync fails returns an
+  // IOError and is never visible: before Resume(), after it, and after a
+  // reopen; Rollback() then succeeds. A sync Prepare whose gate sync fails
+  // leaves no prepared-heap entry: once Resume() publishes past it, a new
+  // snapshot's min_uncommitted lies above it.
+  // Neuters: run the sync writers' callbacks in the group, before the gate
+  // (as at the base): the failed commit reads back after Resume() (and
+  // Rollback() asserts in debug), and the failed Prepare's sequence stays
+  // the snapshot's min_uncommitted.
+  options_.paranoid_checks = true;
+  options_.max_bgerror_resume_count = 0;
+  for (const TxnDBWritePolicy policy : {WRITE_PREPARED, WRITE_UNPREPARED}) {
+    for (const size_t partitions : {size_t{2}, size_t{8}}) {
+      SCOPED_TRACE("policy=" + std::to_string(policy) +
+                   " partitions=" + std::to_string(partitions));
+      Close();
+      cf_names_.clear();
+      ASSERT_OK(DestroyDB(dbname_, options_));
+      txn_db_options_.write_policy = policy;
+      Open(partitions);
+      ColumnFamilyHandle* cf = CfOnPartition(0);
+      auto read = [&](const std::string& key) {
+        std::string value;
+        // CfOnPartition again: Reopen() replaces the handles.
+        Status s = db_->Get(ReadOptions(), CfOnPartition(0), key, &value);
+        if (s.IsNotFound()) {
+          return std::string("NOT_FOUND");
+        }
+        EXPECT_OK(s);
+        return value;
+      };
+      std::atomic<int> fail_syncs{0};
+      SyncPoint::GetInstance()->SetCallBack(
+          "DBImpl::SyncWalsFromCompletionGate:AfterGateSync", [&](void* arg) {
+            if (fail_syncs.load() > 0) {
+              --fail_syncs;
+              IOStatus error = IOStatus::IOError("injected gate sync error");
+              error.SetRetryable(true);
+              *static_cast<IOStatus*>(arg) = error;
+            }
+          });
+      WriteOptions sync_wo;
+      sync_wo.sync = true;
+
+      std::unique_ptr<Transaction> committing(db_->BeginTransaction(sync_wo));
+      ASSERT_OK(committing->SetName("committing"));
+      ASSERT_OK(committing->Put(cf, "committed", "v"));
+      ASSERT_OK(committing->Prepare());
+      fail_syncs = 1;
+      const Status commit_status = committing->Commit();
+      ASSERT_TRUE(commit_status.IsIOError()) << commit_status.ToString();
+      ASSERT_EQ(0, fail_syncs.load());
+      EXPECT_EQ("NOT_FOUND", read("committed"));
+      ASSERT_OK(db_->Resume());
+      EXPECT_EQ("NOT_FOUND", read("committed"));
+      ASSERT_OK(committing->Rollback());
+      EXPECT_EQ("NOT_FOUND", read("committed"));
+      committing.reset();
+
+      std::unique_ptr<Transaction> preparing(db_->BeginTransaction(sync_wo));
+      ASSERT_OK(preparing->SetName("preparing"));
+      ASSERT_OK(preparing->Put(cf, "prepared", "v"));
+      const SequenceNumber before = db_->GetLatestSequenceNumber();
+      fail_syncs = 1;
+      const Status prepare_status = preparing->Prepare();
+      ASSERT_TRUE(prepare_status.IsIOError()) << prepare_status.ToString();
+      ASSERT_EQ(0, fail_syncs.load());
+      ASSERT_OK(db_->Resume());
+      ASSERT_GT(db_->GetLatestSequenceNumber(), before);
+      const Snapshot* snapshot = db_->GetSnapshot();
+      EXPECT_GT(static_cast_with_check<const SnapshotImpl>(snapshot)
+                    ->min_uncommitted_,
+                before + 1);
+      db_->ReleaseSnapshot(snapshot);
+      EXPECT_EQ("NOT_FOUND", read("prepared"));
+      preparing.reset();
+      SyncPoint::GetInstance()->ClearCallBack(
+          "DBImpl::SyncWalsFromCompletionGate:AfterGateSync");
+
+      Reopen();
+      EXPECT_EQ("NOT_FOUND", read("committed"));
+      EXPECT_EQ("NOT_FOUND", read("prepared"));
+      EXPECT_EQ(nullptr, db_->GetTransactionByName("committing"));
+    }
+  }
+}
+
 TEST_F(WritePreparedPartitionedWalTest, ConcurrentRecoverableStateCaching) {
   // G-18: leaders of all four partitions cache the recoverable state at the
   // same moment, with flushes draining it in between. A barrier at the cache
