@@ -379,6 +379,181 @@ TEST_F(DBWALTest, SyncWALNotWaitWrite) {
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
 }
 
+// A flush's SyncClosedWals that marks nothing, because partition 0 holds
+// only the current WAL, must leave the current WAL's mark to the sync that
+// set it: SyncWAL or a sync=true write's leadership sync (param 0), which
+// then succeeds or fails (param 1). Finishing that mark from SyncClosedWals
+// unpins the WAL under the owner's fsync and trips the owner's
+// FinishSync() assertion.
+class DBWALSyncMarkOwnershipTest
+    : public DBWALTest,
+      public testing::WithParamInterface<std::tuple<bool, bool>> {};
+
+TEST_P(DBWALSyncMarkOwnershipTest, SyncClosedWalsLeavesOtherSyncsMark) {
+  const bool leader = std::get<0>(GetParam());
+  const bool fail = std::get<1>(GetParam());
+  Options options = CurrentOptions();
+  options.env = env_;
+  CreateAndReopenWithCF({"pikachu"}, options);
+
+  // Flushing cf 0 rotates the WAL, and its SyncClosedWals syncs, closes and
+  // drops the old one, leaving the empty current WAL alone in partition 0
+  // while cf 1 still has unflushed data. Flushing cf 1 then switches no WAL.
+  ASSERT_OK(Put(1, "k1", "v1"));
+  ASSERT_OK(Put(0, "k0", "v0"));
+  ASSERT_OK(Flush(0));
+  const uint64_t cur = dbfull()->TEST_GetCurrentLogNumber();
+  using Marks = std::vector<std::pair<uint64_t, bool>>;
+  ASSERT_EQ((Marks{{cur, false}}), dbfull()->TEST_WalSyncMarks(0));
+
+  // The owner parks holding its mark, right after its claim (SyncWAL) or
+  // after its WAL append and before its leadership fsync (sync=true write),
+  // until the flush has finished; the flush's SyncClosedWals starts only
+  // once the owner is parked. A failing owner fails right after the park.
+  SyncPoint::GetInstance()->LoadDependency({
+      {"DBWALSyncMarkOwnershipTest:OwnerParked",
+       "DBImpl::SyncClosedWals:Start"},
+      {"DBWALSyncMarkOwnershipTest:FlushChecked",
+       "DBWALSyncMarkOwnershipTest:ReleaseOwner"},
+  });
+  std::atomic<bool> parked{false};
+  auto park = [&]() {
+    if (parked.exchange(true)) {
+      return false;
+    }
+    TEST_SYNC_POINT("DBWALSyncMarkOwnershipTest:OwnerParked");
+    TEST_SYNC_POINT("DBWALSyncMarkOwnershipTest:ReleaseOwner");
+    return true;
+  };
+  if (leader) {
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::WriteToWAL:AfterAddRecord", [&](void* arg) {
+          if (park() && fail) {
+            *static_cast<IOStatus*>(arg) = IOStatus::IOError("injected");
+          }
+        });
+  } else {
+    SyncPoint::GetInstance()->SetCallBack("DBWALTest::SyncWALNotWaitWrite:1",
+                                          [&](void*) { park(); });
+    if (fail) {
+      SyncPoint::GetInstance()->SetCallBack(
+          "DBImpl::SyncWalImpl:AfterSyncWAL", [&](void* arg) {
+            auto* wal_and_status =
+                static_cast<std::pair<log::Writer*, IOStatus*>*>(arg);
+            if (wal_and_status->first->get_log_number() == cur) {
+              *wal_and_status->second = IOStatus::IOError("injected");
+            }
+          });
+    }
+  }
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  FlushOptions no_wait;
+  no_wait.wait = false;
+  ASSERT_OK(db_->Flush(no_wait, handles_[1]));
+  Status owner_status;
+  port::Thread owner([&]() {
+    if (leader) {
+      WriteOptions sync_wo;
+      sync_wo.sync = true;
+      owner_status = Put(0, "k2", "v2", sync_wo);
+    } else {
+      owner_status = db_->SyncWAL();
+    }
+  });
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable(handles_[1]));
+  ASSERT_EQ(cur, dbfull()->TEST_GetCurrentLogNumber());
+  EXPECT_EQ((Marks{{cur, true}}), dbfull()->TEST_WalSyncMarks(0));
+  TEST_SYNC_POINT("DBWALSyncMarkOwnershipTest:FlushChecked");
+  owner.join();
+
+  EXPECT_TRUE(parked.load());
+  if (fail) {
+    EXPECT_TRUE(owner_status.IsIOError()) << owner_status.ToString();
+  } else {
+    EXPECT_OK(owner_status);
+  }
+  // The owner finished or cancelled its own mark.
+  EXPECT_EQ((Marks{{cur, false}}), dbfull()->TEST_WalSyncMarks(0));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+INSTANTIATE_TEST_CASE_P(DBWALSyncMarkOwnershipTest, DBWALSyncMarkOwnershipTest,
+                        testing::Combine(testing::Bool(), testing::Bool()));
+
+TEST_F(DBWALTest, SyncClosedWalsEmptiedByWaitLeavesLaterMark) {
+  // A flush's SyncClosedWals finds a closed WAL ahead of the current WAL and
+  // waits for the SyncWAL syncing it. That SyncWAL reclaims it, so after the
+  // wait the partition holds only the current WAL and SyncClosedWals marks
+  // nothing. A second SyncWAL then marks the current WAL, and SyncClosedWals
+  // must leave that mark alone when it finishes.
+  Options options = CurrentOptions();
+  options.env = env_;
+  // Lets a sync reclaim a fully synced inactive WAL.
+  options.background_close_inactive_wals = true;
+  CreateAndReopenWithCF({"pikachu"}, options);
+  ASSERT_OK(Put(1, "k1", "v1"));
+  ASSERT_OK(Put(0, "k0", "v0"));
+  const uint64_t old_wal = dbfull()->TEST_GetCurrentLogNumber();
+
+  SyncPoint::GetInstance()->LoadDependency({
+      {"DBImpl::ClaimWalPartitionForSyncWalImpl:Wait",
+       "SyncClosedWalsEmptiedByWait:ClosedWalsWaiting"},
+      {"SyncClosedWalsEmptiedByWait:ReleaseFirst",
+       "SyncClosedWalsEmptiedByWait:FirstReleased"},
+      {"SyncClosedWalsEmptiedByWait:ClosedWalsParked",
+       "SyncClosedWalsEmptiedByWait:StartSecond"},
+      {"SyncClosedWalsEmptiedByWait:SecondParked",
+       "SyncClosedWalsEmptiedByWait:ReleaseClosedWals"},
+      {"SyncClosedWalsEmptiedByWait:FlushChecked",
+       "SyncClosedWalsEmptiedByWait:SecondReleased"},
+  });
+  std::atomic<int> syncwal_claims{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBWALTest::SyncWALNotWaitWrite:1", [&](void*) {
+        if (syncwal_claims.fetch_add(1) == 0) {
+          TEST_SYNC_POINT("SyncClosedWalsEmptiedByWait:FirstReleased");
+        } else {
+          TEST_SYNC_POINT("SyncClosedWalsEmptiedByWait:SecondParked");
+          TEST_SYNC_POINT("SyncClosedWalsEmptiedByWait:SecondReleased");
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SyncClosedWals:BeforeReLock", [&](void*) {
+        TEST_SYNC_POINT("SyncClosedWalsEmptiedByWait:ClosedWalsParked");
+        TEST_SYNC_POINT("SyncClosedWalsEmptiedByWait:ReleaseClosedWals");
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  // The first SyncWAL marks the old WAL and parks; flushing cf 0 then
+  // rotates, and the flush's SyncClosedWals waits on the marked old WAL.
+  port::Thread first([&]() { ASSERT_OK(db_->SyncWAL()); });
+  FlushOptions no_wait;
+  no_wait.wait = false;
+  ASSERT_OK(db_->Flush(no_wait, handles_[0]));
+  const uint64_t cur = dbfull()->TEST_GetCurrentLogNumber();
+  ASSERT_GT(cur, old_wal);
+  TEST_SYNC_POINT("SyncClosedWalsEmptiedByWait:ClosedWalsWaiting");
+  TEST_SYNC_POINT("SyncClosedWalsEmptiedByWait:ReleaseFirst");
+  first.join();
+
+  // SyncClosedWals woke to the current WAL alone and parked before its
+  // finish; the second SyncWAL marks the current WAL and parks.
+  TEST_SYNC_POINT("SyncClosedWalsEmptiedByWait:StartSecond");
+  using Marks = std::vector<std::pair<uint64_t, bool>>;
+  ASSERT_EQ((Marks{{cur, false}}), dbfull()->TEST_WalSyncMarks(0));
+  port::Thread second([&]() { ASSERT_OK(db_->SyncWAL()); });
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable(handles_[0]));
+  EXPECT_EQ((Marks{{cur, true}}), dbfull()->TEST_WalSyncMarks(0));
+  TEST_SYNC_POINT("SyncClosedWalsEmptiedByWait:FlushChecked");
+  second.join();
+
+  EXPECT_EQ((Marks{{cur, false}}), dbfull()->TEST_WalSyncMarks(0));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
 TEST_F(DBWALTest, Recover) {
   do {
     CreateAndReopenWithCF({"pikachu"}, CurrentOptions());
