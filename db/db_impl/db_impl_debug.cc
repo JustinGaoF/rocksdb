@@ -269,6 +269,16 @@ void DBImpl::TEST_SetBGError(const IOStatus& error,
   error_handler_.SetBGError(error, reason);
 }
 
+std::vector<std::pair<uint64_t, bool>> DBImpl::TEST_WalSyncMarks(
+    size_t partition) {
+  WalWriteMutexLock wl(&WalWriteMutex(partition));
+  std::vector<std::pair<uint64_t, bool>> marks;
+  for (auto& log : logs_[partition]) {
+    marks.emplace_back(log.number, log.IsSyncing());
+  }
+  return marks;
+}
+
 bool DBImpl::TEST_IsRecoveryInProgress() {
   InstrumentedMutexLock l(&mutex_);
   return error_handler_.IsRecoveryInProgress();
