@@ -4,6 +4,7 @@
 //  (found in the LICENSE.Apache file in the root directory).
 
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <string>
@@ -2674,6 +2675,55 @@ INSTANTIATE_TEST_CASE_P(
     InstanceOccGroup, OptimisticTransactionTest,
     testing::Values(OccValidationPolicy::kValidateSerial,
                     OccValidationPolicy::kValidateParallel));
+
+// Serial validation runs on the write group leader, and N partitions run N
+// leaders, so it is rejected at Open with N > 1. Parallel validation commits.
+TEST(OptimisticTransactionWalPartitionsTest, ValidatePolicyAtNPartitions) {
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::ValidateOptions:AllowWalPartitions",
+      [](void* arg) { *static_cast<bool*>(arg) = true; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  Options options;
+  options.create_if_missing = true;
+  options.wal_partitions = 2;
+  options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  options.track_and_verify_wals_in_manifest = true;
+  options.avoid_flush_during_shutdown = true;
+  const std::string dbname = test::PerThreadDBPath("occ_wal_partitions");
+  ASSERT_OK(DestroyDB(dbname, options));
+  std::vector<ColumnFamilyDescriptor> column_families;
+  column_families.emplace_back(kDefaultColumnFamilyName,
+                               ColumnFamilyOptions(options));
+  std::vector<ColumnFamilyHandle*> handles;
+  OptimisticTransactionDBOptions occ_opts;
+  occ_opts.validate_policy = OccValidationPolicy::kValidateSerial;
+  OptimisticTransactionDB* raw_txn_db = nullptr;
+  Status s = OptimisticTransactionDB::Open(
+      options, occ_opts, dbname, column_families, &handles, &raw_txn_db);
+  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+  EXPECT_NE(nullptr, std::strstr(s.getState(), "wal_partitions"));
+  EXPECT_NE(nullptr, std::strstr(s.getState(), "kValidateSerial"));
+  ASSERT_EQ(nullptr, raw_txn_db);
+
+  occ_opts.validate_policy = OccValidationPolicy::kValidateParallel;
+  ASSERT_OK(OptimisticTransactionDB::Open(
+      options, occ_opts, dbname, column_families, &handles, &raw_txn_db));
+  std::unique_ptr<OptimisticTransactionDB> txn_db(raw_txn_db);
+  ASSERT_EQ(1U, handles.size());
+  delete handles[0];
+  std::unique_ptr<Transaction> txn(txn_db->BeginTransaction(WriteOptions()));
+  ASSERT_OK(txn->Put("key", "value"));
+  ASSERT_OK(txn->Commit());
+  std::string value;
+  ASSERT_OK(txn_db->Get(ReadOptions(), "key", &value));
+  ASSERT_EQ("value", value);
+  txn.reset();
+  ASSERT_OK(txn_db->Close());
+  txn_db.reset();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_OK(DestroyDB(dbname, options));
+}
 
 TEST(OccLockBucketsTest, CacheAligned) {
   // Typical x86_64 is 40 byte mutex, 64 byte cache line

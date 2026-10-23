@@ -360,6 +360,13 @@ Status DBImpl::Write(const WriteOptions& write_options, WriteBatch* my_batch) {
 Status DBImpl::WriteWithCallback(const WriteOptions& write_options,
                                  WriteBatch* my_batch, WriteCallback* callback,
                                  UserWriteCallback* user_write_cb) {
+  if (callback != nullptr && NumWalPartitions() > 1) {
+    // The callback runs on its write group's leader, and each partition has
+    // its own leader, so callbacks on different partitions run concurrently.
+    return Status::NotSupported(
+        "WriteWithCallback with a WriteCallback is not supported with "
+        "wal_partitions > 1");
+  }
   Status s;
   if (write_options.protection_bytes_per_key > 0) {
     s = WriteBatchInternal::UpdateProtectionInfo(
@@ -422,6 +429,9 @@ Status DBImpl::IngestWBWIAsMemtable(
     const WBWIMemTable::SeqnoRange& assigned_seqno, uint64_t min_prep_log,
     SequenceNumber last_seqno_after_ingest, bool memtable_updated,
     bool ingest_wbwi_for_commit, bool ignore_missing_cf) {
+  // Rejected in WriteImpl above one partition: the switch below assumes
+  // no other leader is inserting.
+  assert(NumWalPartitions() == 1);
   // Keys in new memtable have seqno > last_seqno_after_ingest >= keys in wbwi.
   assert(assigned_seqno.upper_bound <= last_seqno_after_ingest);
   // Keys in the current memtable have seqno <= LastSequence() < keys in wbwi.
@@ -498,9 +508,9 @@ Status DBImpl::IngestWBWIAsMemtable(
   }
 
   // Stop writes to the DB by entering both write threads
-  WriteThread::Writer nonmem_w;
+  AllPartitionsWriter nonmem_w(this, /*nonmem=*/true);
   if (two_write_queues_) {
-    nonmem_write_thread_.EnterUnbatched(&nonmem_w, &mutex_);
+    nonmem_w.EnterUnbatched();
   }
   WaitForPendingWrites();
 
@@ -568,7 +578,7 @@ Status DBImpl::IngestWBWIAsMemtable(
 
   // exit the second queue before returning
   if (two_write_queues_) {
-    nonmem_write_thread_.ExitUnbatched(&nonmem_w);
+    nonmem_w.ExitUnbatched();
   }
   if (s.ok()) {
     // Trigger flushes for the new immutable memtables.
@@ -1134,6 +1144,15 @@ Status DBImpl::WriteImpl(
       return Status::NotSupported(
           "WriteBatchWithIndex ingestion requires overwrite_key=true");
     }
+    // Ingestion switches memtables, which assumes no other leader is
+    // inserting; at N>1 other partitions' leaders may be. This rejects
+    // both direct ingestion (IngestWriteBatchWithIndex) and commit-time
+    // ingestion.
+    if (NumWalPartitions() > 1) {
+      return Status::NotSupported(
+          "WriteBatchWithIndex ingestion is not supported with "
+          "wal_partitions > 1");
+    }
   }
   // Otherwise IsLatestPersistentState optimization does not make sense
   assert(!WriteBatchInternal::IsLatestPersistentState(my_batch) ||
@@ -1151,11 +1170,11 @@ Status DBImpl::WriteImpl(
         seq_per_batch_ ? kDoAssignOrder : kDontAssignOrder;
     // Otherwise it is WAL-only Prepare batches in WriteCommitted policy and
     // they don't consume sequence.
-    return WriteImplWALOnly(&nonmem_write_thread_, write_options, my_batch,
-                            my_batch, callback, user_write_cb, wal_used,
-                            log_ref, seq_used, batch_cnt, pre_release_callback,
-                            assign_order, kDontPublishLastSeq, disable_memtable,
-                            wal_partition);
+    return WriteImplWALOnly(
+        &NonmemWriteThread(wal_partition), write_options, my_batch, my_batch,
+        callback, user_write_cb, wal_used, log_ref, seq_used, batch_cnt,
+        pre_release_callback, assign_order, kDontPublishLastSeq,
+        disable_memtable, wal_partition);
   }
 
   const bool maybe_use_blob_direct_write = wbwi == nullptr &&
@@ -1205,11 +1224,11 @@ Status DBImpl::WriteImpl(
     uint64_t seq = 0;
     // Use a write thread to i) optimize for WAL write, ii) publish last
     // sequence in in increasing order, iii) call pre_release_callback serially
-    Status status =
-        WriteImplWALOnly(&write_thread_, write_options, my_batch, trace_batch,
-                         callback, user_write_cb, wal_used, log_ref, &seq,
-                         sub_batch_cnt, pre_release_callback, kDoAssignOrder,
-                         kDoPublishLastSeq, disable_memtable, wal_partition);
+    Status status = WriteImplWALOnly(
+        &PartitionWriteThread(wal_partition), write_options, my_batch,
+        trace_batch, callback, user_write_cb, wal_used, log_ref, &seq,
+        sub_batch_cnt, pre_release_callback, kDoAssignOrder, kDoPublishLastSeq,
+        disable_memtable, wal_partition);
     TEST_SYNC_POINT("DBImpl::WriteImpl:UnorderedWriteAfterWriteWAL");
     if (!status.ok()) {
       return status;
@@ -1237,6 +1256,7 @@ Status DBImpl::WriteImpl(
                         pre_release_callback, post_memtable_callback,
                         /*_ingest_wbwi=*/wbwi != nullptr, trace_batch);
   w.wal_partition = wal_partition;
+  WriteThread& write_thread = PartitionWriteThread(wal_partition);
   StopWatch write_sw(immutable_db_options_.clock, stats_, DB_WRITE);
 
   {
@@ -1244,10 +1264,10 @@ Status DBImpl::WriteImpl(
     // write-partition routing could relieve.
     StopWatch join_sw(immutable_db_options_.clock, stats_,
                       JOIN_BATCH_GROUP_WAIT_MICROS);
-    write_thread_.JoinBatchGroup(&w);
+    write_thread.JoinBatchGroup(&w);
   }
   if (w.state == WriteThread::STATE_PARALLEL_MEMTABLE_CALLER) {
-    write_thread_.SetMemWritersEachStride(&w);
+    write_thread.SetMemWritersEachStride(&w);
   }
   if (w.state == WriteThread::STATE_PARALLEL_MEMTABLE_WRITER) {
     // we are a non-leader in a parallel group
@@ -1268,7 +1288,7 @@ Status DBImpl::WriteImpl(
       PERF_TIMER_START(write_pre_and_post_process_time);
     }
 
-    if (write_thread_.CompleteParallelMemTableWriter(&w)) {
+    if (write_thread.CompleteParallelMemTableWriter(&w)) {
       // we're responsible for exit batch group
       // TODO(myabandeh): propagate status to write_group
       auto last_sequence = w.write_group->last_sequence;
@@ -1283,11 +1303,12 @@ Status DBImpl::WriteImpl(
         }
       }
       if (w.status.ok()) {  // Don't publish a partial batch write
-        versions_->SetLastSequence(last_sequence);
+        PublishLastSequence(last_sequence);
       } else {
         HandleMemTableInsertFailure(w.status);
       }
-      write_thread_.ExitAsBatchGroupFollower(&w);
+      ExitMemTableSwitchGate();
+      write_thread.ExitAsBatchGroupFollower(&w);
     }
     assert(w.state == WriteThread::STATE_COMPLETED);
     // STATE_COMPLETED conditional below handles exit
@@ -1342,8 +1363,8 @@ Status DBImpl::WriteImpl(
   // into memtables
 
   TEST_SYNC_POINT("DBImpl::WriteImpl:BeforeLeaderEnters");
-  last_batch_group_size_ =
-      write_thread_.EnterAsBatchGroupLeader(&w, &write_group);
+  last_batch_group_size_[wal_partition].StoreRelaxed(
+      write_thread.EnterAsBatchGroupLeader(&w, &write_group));
   if (wbwi) {
     assert(write_group.size == 1);
   }
@@ -1417,8 +1438,16 @@ Status DBImpl::WriteImpl(
     // assumed to be true.  Rule 3 is checked for each batch.  We could
     // relax rules 2 if we could prevent write batches from referring
     // more than once to a particular key.
+    // With more than one WAL partition, other partitions' leaders insert into
+    // the same memtables, so even a single-writer group inserts concurrently.
+    // Rule 3 is lifted there: a Merge batch that left the parallel path
+    // would insert non-concurrently while other leaders insert into the
+    // same memtable. Concurrent Merge inserts are safe with
+    // max_successive_merges == 0, which Open requires at N>1 (as with
+    // unordered_write); the successive-merge counting is the only
+    // concurrent-unsafe part of the merge path.
     bool parallel = immutable_db_options_.allow_concurrent_memtable_write &&
-                    write_group.size > 1;
+                    (write_group.size > 1 || NumWalPartitions() > 1);
     size_t total_count = 0;
     size_t valid_batches = 0;
     size_t total_byte_size = 0;
@@ -1431,13 +1460,19 @@ Status DBImpl::WriteImpl(
           total_count += WriteBatchInternal::Count(writer->batch);
           total_byte_size = WriteBatchInternal::AppendedByteSize(
               total_byte_size, WriteBatchInternal::ByteSize(writer->batch));
-          parallel = parallel && !writer->batch->HasMerge();
+          if (NumWalPartitions() == 1) {
+            parallel = parallel && !writer->batch->HasMerge();
+          }
         }
         if (writer->pre_release_callback) {
           pre_release_callback_cnt++;
         }
       }
     }
+    // At N>1 every memtable insert is concurrent (other leaders may be
+    // inserting into the same memtable): the non-parallel path below is
+    // unreachable, and a regression that revives it fails here loudly.
+    assert(parallel || NumWalPartitions() == 1);
     // TODO: this use of operator bool on `tracer_` can avoid unnecessary lock
     // grabs but does not seem thread-safe.
     if (tracer_) {
@@ -1481,7 +1516,7 @@ Status DBImpl::WriteImpl(
       seq_inc += wbwi->GetWriteBatch()->Count();
     }
 
-    const bool concurrent_update = two_write_queues_;
+    const bool concurrent_update = two_write_queues_ || NumWalPartitions() > 1;
     // Update stats while we are an exclusive group leader, so we know
     // that nobody else can be writing to these particular stats.
     // We're optimistic, updating the stats before we successfully
@@ -1517,8 +1552,11 @@ Status DBImpl::WriteImpl(
 
     uint64_t wal_index = 0;
     if (!two_write_queues_) {
+      // With more than one WAL partition, leaders allocate concurrently, so
+      // the LastSequence() read above no longer reserves anything.
       if (status.ok() &&
-          log::WALIndexEnabled(immutable_db_options_.partition_wal_usage)) {
+          (log::WALIndexEnabled(immutable_db_options_.partition_wal_usage) ||
+           NumWalPartitions() > 1)) {
         // Overwrites the last_sequence read after PreprocessWrite above; that
         // read still serves the kNone path, which never reaches the allocator.
         // The two agree because the allocator catches last_allocated_sequence_
@@ -1533,7 +1571,7 @@ Status DBImpl::WriteImpl(
         wal_context.prev_size = wal_context.writer->file()->GetFileSize();
         PERF_TIMER_GUARD(write_wal_time);
         io_s = WriteGroupToWAL(write_group, wal_context, wal_used,
-                               last_sequence + 1, wal_index);
+                               last_sequence + 1, wal_index, seq_inc);
         if (!io_s.ok()) {
           // The index was consumed; if its record never landed, cover it
           // before the error escapes, so the hole is declared rather than
@@ -1635,7 +1673,14 @@ Status DBImpl::WriteImpl(
             0 /*recovery_log_number*/, this, seq_per_batch_, batch_per_txn_);
       } else {
         write_group.last_sequence = last_sequence;
-        write_thread_.LaunchParallelMemTableWriters(&write_group);
+        if (NumWalPartitions() > 1) {
+          // A failed insert is recorded under the leader's state mutex
+          // (CompleteParallelMemTableWriter), which exists only once the
+          // leader has waited. Above one partition every group takes this
+          // path, a lone writer that never waited included.
+          w.CreateMutex();
+        }
+        write_thread.LaunchParallelMemTableWriters(&write_group);
         in_parallel_group = true;
 
         // Each parallel follower is doing each own writes. The leader should
@@ -1663,8 +1708,11 @@ Status DBImpl::WriteImpl(
   if (!io_s.ok()) {
     // Check WriteToWAL status
     TEST_SYNC_POINT_CALLBACK("DBImpl::WriteImpl:BeforeWALIOStatusCheck", &io_s);
-    WALIOStatusCheck(io_s, wal_write_number, last_sequence,
-                     last_sequence + 1 - seq_inc);
+    WALIOStatusCheck(io_s,
+                     wal_context.sync_failed_wal_number != 0
+                         ? wal_context.sync_failed_wal_number
+                         : wal_write_number,
+                     last_sequence, last_sequence + 1 - seq_inc);
   }
   if (!w.CallbackFailed()) {
     if (!io_s.ok()) {
@@ -1680,7 +1728,7 @@ Status DBImpl::WriteImpl(
   if (in_parallel_group) {
     // CompleteParallelWorker returns true if this thread should
     // handle exit, false means somebody else did
-    should_exit_batch_group = write_thread_.CompleteParallelMemTableWriter(&w);
+    should_exit_batch_group = write_thread.CompleteParallelMemTableWriter(&w);
   }
   if (wbwi && status.ok() && w.status.ok()) {
     uint32_t wbwi_count = wbwi->GetWriteBatch()->Count();
@@ -1729,7 +1777,7 @@ Status DBImpl::WriteImpl(
             "DBImpl::WriteImpl:AfterWBWIIngestBeforeSetLastSequence:pause");
         TEST_SYNC_POINT(
             "DBImpl::WriteImpl:AfterWBWIIngestBeforeSetLastSequence:resume");
-        versions_->SetLastSequence(last_sequence);
+        PublishLastSequence(last_sequence);
       }
     }
     if (!w.status.ok()) {
@@ -1746,7 +1794,8 @@ Status DBImpl::WriteImpl(
       }
       HandleMemTableInsertFailure(w.status);
     }
-    write_thread_.ExitAsBatchGroupLeader(write_group, status);
+    ExitMemTableSwitchGate();
+    write_thread.ExitAsBatchGroupLeader(write_group, status);
   }
 
   if (status.ok()) {
@@ -1772,18 +1821,19 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
                         /*_post_memtable_callback=*/nullptr,
                         /*_ingest_wbwi=*/false, trace_batch);
   w.wal_partition = wal_partition;
+  WriteThread& write_thread = PartitionWriteThread(wal_partition);
   {
     // Time blocked waiting to join a write batch group: the queueing that
     // write-partition routing could relieve.
     StopWatch join_sw(immutable_db_options_.clock, stats_,
                       JOIN_BATCH_GROUP_WAIT_MICROS);
-    write_thread_.JoinBatchGroup(&w);
+    write_thread.JoinBatchGroup(&w);
   }
   TEST_SYNC_POINT("DBImplWrite::PipelinedWriteImpl:AfterJoinBatchGroup");
   if (w.state == WriteThread::STATE_GROUP_LEADER) {
     WriteThread::WriteGroup wal_write_group;
     if (w.callback && !w.callback->AllowWriteBatching()) {
-      write_thread_.WaitForMemTableWriters();
+      write_thread.WaitForMemTableWriters();
     }
     WalContext wal_context(!write_options.disableWAL && write_options.sync);
     // PreprocessWrite does its own perf timing.
@@ -1793,8 +1843,8 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
     PERF_TIMER_START(write_pre_and_post_process_time);
 
     // This can set non-OK status if callback fail.
-    last_batch_group_size_ =
-        write_thread_.EnterAsBatchGroupLeader(&w, &wal_write_group);
+    last_batch_group_size_[wal_partition].StoreRelaxed(
+        write_thread.EnterAsBatchGroupLeader(&w, &wal_write_group));
     const bool wal_index_enabled =
         log::WALIndexEnabled(immutable_db_options_.partition_wal_usage);
     // With WAL index the sequence block is reserved jointly with the index,
@@ -1804,7 +1854,7 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
     SequenceNumber current_sequence =
         wal_index_enabled
             ? 0
-            : write_thread_.UpdateLastSequence(versions_->LastSequence()) + 1;
+            : write_thread.UpdateLastSequence(versions_->LastSequence()) + 1;
     size_t total_count = 0;
     size_t total_byte_size = 0;
     uint64_t wal_index = 0;
@@ -1870,7 +1920,7 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
       // Without WAL index this is unreachable, so the kNone path keeps its
       // unconditional update.
       if (!wal_index_enabled || w.status.ok()) {
-        write_thread_.UpdateLastSequence(current_sequence + total_count - 1);
+        write_thread.UpdateLastSequence(current_sequence + total_count - 1);
       }
     }
 
@@ -1905,7 +1955,7 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
       }
       assert(wal_context.wal_file_number_size);
       io_s = WriteGroupToWAL(wal_write_group, wal_context, wal_used,
-                             current_sequence, wal_index);
+                             current_sequence, wal_index, total_count);
       if (!io_s.ok()) {
         // As in WriteImpl: declare the burned index before the error escapes.
         const IOStatus cover_io_s =
@@ -1938,7 +1988,10 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
       const ReadOptions read_options;
       w.status = ApplyWALToManifest(read_options, write_options, &synced_wals);
     }
-    write_thread_.ExitAsBatchGroupLeader(wal_write_group, w.status);
+    write_thread.ExitAsBatchGroupLeader(wal_write_group, w.status);
+    // Only now is the group linked as a memtable writer, which a switch waits
+    // for.
+    ExitMemTableSwitchGate();
   }
 
   // NOTE: the memtable_write_group is declared before the following
@@ -1950,10 +2003,10 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
   if (w.state == WriteThread::STATE_MEMTABLE_WRITER_LEADER) {
     PERF_TIMER_FOR_WAIT_GUARD(write_memtable_time);
     assert(w.ShouldWriteToMemtable());
-    write_thread_.EnterAsMemTableWriter(&w, &memtable_write_group);
+    write_thread.EnterAsMemTableWriter(&w, &memtable_write_group);
     if (memtable_write_group.size > 1 &&
         immutable_db_options_.allow_concurrent_memtable_write) {
-      write_thread_.LaunchParallelMemTableWriters(&memtable_write_group);
+      write_thread.LaunchParallelMemTableWriters(&memtable_write_group);
     } else {
       memtable_write_group.status = WriteBatchInternal::InsertInto(
           memtable_write_group, w.sequence, column_family_memtables_.get(),
@@ -1966,7 +2019,7 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
       } else {
         HandleMemTableInsertFailure(memtable_write_group.status);
       }
-      write_thread_.ExitAsMemTableWriter(&w, memtable_write_group);
+      write_thread.ExitAsMemTableWriter(&w, memtable_write_group);
     }
   } else {
     // NOTE: the memtable_write_group is never really used,
@@ -1974,7 +2027,7 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
     memtable_write_group.status.PermitUncheckedError();
   }
   if (w.state == WriteThread::STATE_PARALLEL_MEMTABLE_CALLER) {
-    write_thread_.SetMemWritersEachStride(&w);
+    write_thread.SetMemWritersEachStride(&w);
   }
   if (w.state == WriteThread::STATE_PARALLEL_MEMTABLE_WRITER) {
     PERF_TIMER_STOP(write_pre_and_post_process_time);
@@ -1993,13 +2046,13 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
     PERF_TIMER_STOP(write_memtable_time);
     PERF_TIMER_START(write_pre_and_post_process_time);
 
-    if (write_thread_.CompleteParallelMemTableWriter(&w)) {
+    if (write_thread.CompleteParallelMemTableWriter(&w)) {
       if (w.status.ok()) {  // Don't publish a partial batch write
         versions_->SetLastSequence(w.write_group->last_sequence);
       } else {
         HandleMemTableInsertFailure(w.status);
       }
-      write_thread_.ExitAsMemTableWriter(&w, *w.write_group);
+      write_thread.ExitAsMemTableWriter(&w, *w.write_group);
     }
   }
   if (seq_used != nullptr) {
@@ -2119,6 +2172,7 @@ Status DBImpl::WriteImplWALOnly(
     if (!status.ok()) {
       WriteThread::WriteGroup write_group;
       write_thread->EnterAsBatchGroupLeader(&w, &write_group);
+      ExitMemTableSwitchGate();
       write_thread->ExitAsBatchGroupLeader(write_group, status);
       return status;
     }
@@ -2223,6 +2277,9 @@ Status DBImpl::WriteImplWALOnly(
     // last_sequence.
     if (!io_s.ok()) {
       WALIOStatusCheck(io_s);
+      if (publish_last_seq == kDoPublishLastSeq) {
+        ExitMemTableSwitchGate();
+      }
       write_thread->ExitAsBatchGroupLeader(write_group, status);
       return status;
     }
@@ -2235,6 +2292,9 @@ Status DBImpl::WriteImplWALOnly(
     assert(wal_index == 0);
     status = io_s;
     if (!io_s.ok()) {
+      if (publish_last_seq == kDoPublishLastSeq) {
+        ExitMemTableSwitchGate();
+      }
       write_thread->ExitAsBatchGroupLeader(write_group, status);
       return status;
     }
@@ -2290,12 +2350,17 @@ Status DBImpl::WriteImplWALOnly(
     }
   }
   if (publish_last_seq == kDoPublishLastSeq) {
-    versions_->SetLastSequence(last_sequence + seq_inc);
+    PublishLastSequence(last_sequence + seq_inc);
     // Currently we only use kDoPublishLastSeq in unordered_write
     assert(immutable_db_options_.unordered_write);
   }
   if (immutable_db_options_.unordered_write && status.ok()) {
     pending_memtable_writes_ += memtable_write_cnt;
+  }
+  if (publish_last_seq == kDoPublishLastSeq) {
+    // This group's memtable writes follow it out of the group, but they are
+    // already counted in pending_memtable_writes_, which a switch waits on.
+    ExitMemTableSwitchGate();
   }
   write_thread->ExitAsBatchGroupLeader(write_group, status);
   if (status.ok()) {
@@ -2372,6 +2437,9 @@ void DBImpl::WALIOStatusCheck(const IOStatus& io_status,
     }
     mutex_.Unlock();
   } else {
+    // Reset-and-continue would reset partition 0 whichever partition failed;
+    // above one partition every failure takes the branch above instead.
+    assert(NumWalPartitions() == 1);
     // Force writable file to be continue writable.
     CurrentWal().writer->file()->reset_seen_error();
   }
@@ -2422,16 +2490,20 @@ Status DBImpl::PreprocessWrite(const WriteOptions& write_options,
     size_t num_cfs = column_families->NumberOfColumnFamilies();
     assert(num_cfs >= 1);
     if (num_cfs > 1) {
+      CloseMemTableSwitchGate();
       WaitForPendingWrites();
       status = SwitchWAL(write_context);
+      OpenMemTableSwitchGate();
     }
   }
 
   if (UNLIKELY(status.ok() && write_buffer_manager_->ShouldFlush())) {
     if (write_buffer_manager_->TryAcquireLocalFlush()) {
       InstrumentedMutexLock l(&mutex_);
+      CloseMemTableSwitchGate();
       WaitForPendingWrites();
       status = HandleWriteBufferManagerFlush(write_context);
+      OpenMemTableSwitchGate();
     }
   }
 
@@ -2442,8 +2514,10 @@ Status DBImpl::PreprocessWrite(const WriteOptions& write_options,
 
   if (UNLIKELY(status.ok() && !flush_scheduler_.Empty())) {
     InstrumentedMutexLock l(&mutex_);
+    CloseMemTableSwitchGate();
     WaitForPendingWrites();
     status = ScheduleFlushes(write_context);
+    OpenMemTableSwitchGate();
   }
 
   PERF_TIMER_STOP(write_scheduling_flushes_compactions_time);
@@ -2458,7 +2532,8 @@ Status DBImpl::PreprocessWrite(const WriteOptions& write_options,
     // might happen for smaller writes but larger writes can go through.
     // Can optimize it if it is an issue.
     InstrumentedMutexLock l(&mutex_);
-    status = DelayWrite(last_batch_group_size_, write_thread_, write_options);
+    status = DelayWrite(last_batch_group_size_[wal_partition].LoadRelaxed(),
+                        PartitionWriteThread(wal_partition), write_options);
     PERF_TIMER_START(write_pre_and_post_process_time);
   }
 
@@ -2476,9 +2551,13 @@ Status DBImpl::PreprocessWrite(const WriteOptions& write_options,
       status = Status::Incomplete("Write stall");
     } else {
       InstrumentedMutexLock l(&mutex_);
-      status = WriteBufferManagerStallWrites(write_context);
+      status = WriteBufferManagerStallWrites(wal_partition, write_context);
     }
   }
+  // Enter before binding a WAL, so another partition's rotation cannot
+  // replace it between the bind and the append. Every caller exits once its
+  // group has exited.
+  EnterMemTableSwitchGate();
   if (status.ok() && wal_context->need_wal_sync) {
     // Wait until the parallel syncs are finished. Any sync process has to sync
     // the front log too so it is enough to check the status of front()
@@ -2591,12 +2670,15 @@ Status DBImpl::MergeBatch(const WriteThread::WriteGroup& write_group,
 IOStatus DBImpl::AllocateSequenceAndWALIndex(
     size_t sequence_count, bool write_wal, SequenceNumber* last_sequence_before,
     uint64_t* wal_index) {
-  assert(log::WALIndexEnabled(immutable_db_options_.partition_wal_usage));
+  const bool wal_index_enabled =
+      log::WALIndexEnabled(immutable_db_options_.partition_wal_usage);
+  assert(wal_index_enabled || NumWalPartitions() > 1);
   assert(last_sequence_before != nullptr);
   assert(wal_index != nullptr);
 
   InstrumentedMutexLock lock(&sequence_wal_index_mutex_);
-  if (write_wal && next_wal_index_ == std::numeric_limits<uint64_t>::max()) {
+  if (wal_index_enabled && write_wal &&
+      next_wal_index_ == std::numeric_limits<uint64_t>::max()) {
     return IOStatus::Corruption("WAL index exhausted");
   }
 
@@ -2611,8 +2693,17 @@ IOStatus DBImpl::AllocateSequenceAndWALIndex(
   }
   *last_sequence_before =
       versions_->FetchAddLastAllocatedSequence(sequence_count);
-  *wal_index = write_wal ? next_wal_index_++ : 0;
+  *wal_index = wal_index_enabled && write_wal ? next_wal_index_++ : 0;
   return IOStatus::OK();
+}
+
+void DBImpl::AssertLastSequenceCoversAllocated() {
+#ifndef NDEBUG
+  mutex_.AssertHeld();
+  if (NumWalPartitions() > 1 && error_handler_.GetBGError().ok()) {
+    assert(versions_->LastSequence() >= versions_->LastAllocatedSequence());
+  }
+#endif
 }
 
 IOStatus DBImpl::CoverBurnedWALIndex(const WriteOptions& write_options,
@@ -2680,7 +2771,7 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
                             const WriteOptions& write_options,
                             WalContext& wal_context, uint64_t* wal_used,
                             uint64_t* log_size, SequenceNumber sequence,
-                            uint64_t wal_index) {
+                            uint64_t wal_index, size_t sequence_count) {
   assert(log_size != nullptr);
   assert(wal_context.writer != nullptr);
   assert(wal_context.wal_file_number_size != nullptr);
@@ -2716,8 +2807,18 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
   if (!io_s.ok()) {
     return io_s;
   }
+  // Sequence order equals byte order within a file: no record may start at
+  // or below a sequence an earlier record in the same file consumed.
+  assert(sequence > log_writer->last_sequence_consumed());
   io_s = log_writer->AddRecord(write_options, log_entry, sequence, wal_index);
   TEST_SYNC_POINT_CALLBACK("DBImpl::WriteToWAL:AfterAddRecord", &io_s);
+#ifndef NDEBUG
+  if (io_s.ok() && sequence_count > 0) {
+    log_writer->set_last_sequence_consumed(sequence + sequence_count - 1);
+  }
+#else
+  (void)sequence_count;
+#endif
 
   if (UNLIKELY(needs_locking)) {
     WalWriteMutex(wal_context.wal_partition).Unlock();
@@ -2734,7 +2835,8 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
 
 IOStatus DBImpl::WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
                                  WalContext& wal_context, uint64_t* wal_used,
-                                 SequenceNumber sequence, uint64_t wal_index) {
+                                 SequenceNumber sequence, uint64_t wal_index,
+                                 size_t sequence_count) {
   IOStatus io_s;
   assert(!two_write_queues_);
   assert(!write_group.leader->disable_wal);
@@ -2772,10 +2874,18 @@ IOStatus DBImpl::WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
   write_options.rate_limiter_priority =
       write_group.leader->rate_limiter_priority;
   io_s = WriteToWAL(*merged_batch, write_options, wal_context, wal_used,
-                    &log_size, sequence, wal_index);
+                    &log_size, sequence, wal_index, sequence_count);
   if (to_be_cached_state) {
-    cached_recoverable_state_ = *to_be_cached_state;
-    cached_recoverable_state_empty_ = false;
+    TEST_SYNC_POINT("DBImpl::WriteGroupToWAL:BeforeCacheRecoverableState");
+    // Leaders of different partitions get here concurrently and in no
+    // particular sequence order, so keep the highest-sequence state.
+    InstrumentedMutexLock state_lock(&cached_recoverable_state_mutex_);
+    if (cached_recoverable_state_empty_ ||
+        sequence > cached_recoverable_state_seq_) {
+      cached_recoverable_state_ = *to_be_cached_state;
+      cached_recoverable_state_seq_ = sequence;
+      cached_recoverable_state_empty_ = false;
+    }
   }
 
   if (io_s.ok() && need_wal_sync) {
@@ -2814,6 +2924,7 @@ IOStatus DBImpl::WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
             io_s = immutable_db_options_.use_fsync ? f->Fsync(opts)
                                                    : f->Sync(opts);
             if (!io_s.ok()) {
+              wal_context.sync_failed_wal_number = log.number;
               break;
             }
           }
@@ -2844,14 +2955,18 @@ IOStatus DBImpl::WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
     merge_buffer.Clear();
   }
   if (io_s.ok()) {
+    // Leaders of other partitions update the same stats concurrently.
+    const bool concurrent = NumWalPartitions() > 1;
     auto stats = default_cf_internal_stats_;
     if (need_wal_sync) {
-      stats->AddDBStats(InternalStats::kIntStatsWalFileSynced, 1);
+      stats->AddDBStats(InternalStats::kIntStatsWalFileSynced, 1, concurrent);
       RecordTick(stats_, WAL_FILE_SYNCED);
     }
-    stats->AddDBStats(InternalStats::kIntStatsWalFileBytes, log_size);
+    stats->AddDBStats(InternalStats::kIntStatsWalFileBytes, log_size,
+                      concurrent);
     RecordTick(stats_, WAL_FILE_BYTES, log_size);
-    stats->AddDBStats(InternalStats::kIntStatsWriteWithWal, write_with_wal);
+    stats->AddDBStats(InternalStats::kIntStatsWriteWithWal, write_with_wal,
+                      concurrent);
     RecordTick(stats_, WRITE_WITH_WAL, write_with_wal);
     for (auto* writer : write_group) {
       if (!writer->CallbackFailed()) {
@@ -2920,7 +3035,7 @@ IOStatus DBImpl::ConcurrentWriteGroupToWAL(
   write_options.rate_limiter_priority =
       write_group.leader->rate_limiter_priority;
   io_s = WriteToWAL(*merged_batch, write_options, wal_context, wal_used,
-                    &log_size, sequence, wal_index);
+                    &log_size, sequence, wal_index, seq_inc);
   if (!io_s.ok()) {
     // Not reachable today: this path needs two_write_queues or
     // unordered_write, and Open() rejects the first alongside WAL indexing.
@@ -2985,6 +3100,10 @@ Status DBImpl::WriteRecoverableState() {
       if (two_write_queues_) {
         versions_->FetchAddLastAllocatedSequence(last_seq - seq);
         versions_->SetLastPublishedSequence(last_seq);
+      } else if (NumWalPartitions() > 1 &&
+                 versions_->LastAllocatedSequence() < last_seq) {
+        // Every leader is excluded, so nothing allocates concurrently.
+        versions_->SetLastAllocatedSequence(last_seq);
       }
       versions_->SetLastSequence(last_seq);
     } else {
@@ -3132,9 +3251,9 @@ Status DBImpl::SwitchWAL(WriteContext* write_context) {
     }
     MaybeFlushStatsCF(&cfds);
   }
-  WriteThread::Writer nonmem_w;
+  AllPartitionsWriter nonmem_w(this, /*nonmem=*/true);
   if (two_write_queues_) {
-    nonmem_write_thread_.EnterUnbatched(&nonmem_w, &mutex_);
+    nonmem_w.EnterUnbatched();
   }
 
   const bool defer_wbm_accounting_refresh =
@@ -3156,7 +3275,7 @@ Status DBImpl::SwitchWAL(WriteContext* write_context) {
     UpdateWBMAccountingAfterMemtableSwitch(true /* refresh_now */);
   }
   if (two_write_queues_) {
-    nonmem_write_thread_.ExitUnbatched(&nonmem_w);
+    nonmem_w.ExitUnbatched();
   }
 
   if (status.ok()) {
@@ -3224,9 +3343,9 @@ Status DBImpl::HandleWriteBufferManagerFlush(WriteContext* write_context) {
         write_buffer_manager_->buffer_size());
   }
 
-  WriteThread::Writer nonmem_w;
+  AllPartitionsWriter nonmem_w(this, /*nonmem=*/true);
   if (two_write_queues_) {
-    nonmem_write_thread_.EnterUnbatched(&nonmem_w, &mutex_);
+    nonmem_w.EnterUnbatched();
   }
   const bool defer_wbm_accounting_refresh =
       immutable_db_options_.atomic_flush && cfds.size() > 1;
@@ -3245,7 +3364,7 @@ Status DBImpl::HandleWriteBufferManagerFlush(WriteContext* write_context) {
     }
   }
   if (two_write_queues_) {
-    nonmem_write_thread_.ExitUnbatched(&nonmem_w);
+    nonmem_w.ExitUnbatched();
   }
 
   if (status.ok()) {
@@ -3294,17 +3413,19 @@ Status DBImpl::DelayWrite(uint64_t num_bytes, WriteThread& write_thread,
   uint64_t start_time = 0;
   bool delayed = false;
   {
-    // To avoid parallel timed delays (bad throttling), only support them
-    // on the primary write queue.
+    // Timed delays apply on every partition's main write queue, never on a
+    // nonmem queue. Partition leaders may sleep in parallel, but each one
+    // charges the single write controller, whose refill time accumulates
+    // every charge, so together they still admit about delayed_write_rate.
     uint64_t delay;
-    if (&write_thread == &write_thread_) {
+    if (IsMainWriteThread(write_thread)) {
       delay =
           write_controller_.GetDelay(immutable_db_options_.clock, num_bytes);
     } else {
       assert(num_bytes == 0);
       delay = 0;
     }
-    TEST_SYNC_POINT("DBImpl::DelayWrite:Start");
+    TEST_SYNC_POINT_CALLBACK("DBImpl::DelayWrite:Start", &num_bytes);
     start_time = immutable_db_options_.clock->NowMicros();
 
     if (delay > 0) {
@@ -3352,7 +3473,7 @@ Status DBImpl::DelayWrite(uint64_t num_bytes, WriteThread& write_thread,
       // Notify write_thread about the stall so it can setup a barrier and
       // fail any pending writers with no_slowdown
       write_thread.BeginWriteStall();
-      if (&write_thread == &write_thread_) {
+      if (IsMainWriteThread(write_thread)) {
         TEST_SYNC_POINT("DBImpl::DelayWrite:Wait");
       } else {
         TEST_SYNC_POINT("DBImpl::DelayWrite:NonmemWait");
@@ -3392,24 +3513,27 @@ Status DBImpl::DelayWrite(uint64_t num_bytes, WriteThread& write_thread,
 
 // REQUIRES: mutex_ is held
 // REQUIRES: this thread is currently at the front of the writer queue
-Status DBImpl::WriteBufferManagerStallWrites(WriteContext* write_context) {
+Status DBImpl::WriteBufferManagerStallWrites(size_t wal_partition,
+                                             WriteContext* write_context) {
   mutex_.AssertHeld();
+  WriteThread& write_thread = PartitionWriteThread(wal_partition);
+  WBMStallInterface* const stall =
+      static_cast<WBMStallInterface*>(wbm_stall_[wal_partition].get());
   for (;;) {
     // First block future writer threads who want to add themselves to the
     // queue of WriteThread.
-    write_thread_.BeginWriteStall();
+    write_thread.BeginWriteStall();
     const bool hid_flush_initiator =
         wbm_flush_initiator_ != nullptr &&
         write_buffer_manager_->ShouldTrackFlushInitiator();
-    if (hid_flush_initiator) {
+    if (hid_flush_initiator && wbm_leaders_hiding_flush_initiator_++ == 0) {
       wbm_flush_initiator_->SetFlushable(false);
     }
     mutex_.Unlock();
 
-    WBMStallInterface* const stall =
-        static_cast<WBMStallInterface*>(wbm_stall_.get());
     stall->SetState(WBMStallInterface::State::BLOCKED);
-    write_buffer_manager_->BeginWriteStall(wbm_stall_.get());
+    write_buffer_manager_->BeginWriteStall(stall);
+    TEST_SYNC_POINT("DBImpl::WriteBufferManagerStallWrites:BeforeBlock");
     bool retry_local_flush = false;
     if (write_buffer_manager_->ShouldTrackFlushInitiator()) {
       for (;;) {
@@ -3417,8 +3541,8 @@ Status DBImpl::WriteBufferManagerStallWrites(WriteContext* write_context) {
                 write_buffer_manager_->GetLocalFlushRetryMicros())) {
           break;
         }
-        if (write_buffer_manager_->TryAcquireLocalFlush(wbm_stall_.get())) {
-          write_buffer_manager_->RemoveDBFromQueue(wbm_stall_.get());
+        if (write_buffer_manager_->TryAcquireLocalFlush(stall)) {
+          write_buffer_manager_->RemoveDBFromQueue(stall);
           retry_local_flush = true;
           break;
         }
@@ -3426,15 +3550,17 @@ Status DBImpl::WriteBufferManagerStallWrites(WriteContext* write_context) {
     } else {
       stall->Block();
     }
+    TEST_SYNC_POINT_CALLBACK("DBImpl::WriteBufferManagerStallWrites:Unblocked",
+                             &retry_local_flush);
 
     mutex_.Lock();
     // Allow this front writer to retry the manager-wide emergency lease. It
     // must not let its write through while the hard limit is still exceeded.
-    write_thread_.EndWriteStall();
+    write_thread.EndWriteStall();
     // Restore the state hidden by this stall even if the runtime policy
     // changed while the writer was blocked. Otherwise switching back to the
     // across-DB policy can leave this DB permanently ineligible.
-    if (hid_flush_initiator) {
+    if (hid_flush_initiator && --wbm_leaders_hiding_flush_initiator_ == 0) {
       wbm_flush_initiator_->SetFlushable(true);
       if (write_buffer_manager_->ShouldTrackFlushInitiator()) {
         write_buffer_manager_->NotifyFlushInitiatorChanged();
@@ -3443,11 +3569,70 @@ Status DBImpl::WriteBufferManagerStallWrites(WriteContext* write_context) {
     if (!retry_local_flush || !write_buffer_manager_->ShouldStall()) {
       return Status::OK();
     }
+    CloseMemTableSwitchGate();
     WaitForPendingWrites();
     Status status = HandleWriteBufferManagerFlush(write_context);
+    OpenMemTableSwitchGate();
     if (!status.ok()) {
       return status;
     }
+  }
+}
+
+void DBImpl::CloseMemTableSwitchGate() {
+  mutex_.AssertHeld();
+  if (NumWalPartitions() == 1) {
+    return;
+  }
+  // Another leader's switch may still be in flight with mutex_ released.
+  while (switch_gate_closed_.load()) {
+    bg_cv_.Wait();
+  }
+  switch_gate_closed_.store(true);
+  while (leaders_past_switch_gate_.load() != 0) {
+    TEST_SYNC_POINT("DBImpl::CloseMemTableSwitchGate:WaitForLeaders");
+    bg_cv_.Wait();
+  }
+}
+
+void DBImpl::OpenMemTableSwitchGate() {
+  mutex_.AssertHeld();
+  if (NumWalPartitions() == 1) {
+    return;
+  }
+  switch_gate_closed_.store(false);
+  bg_cv_.SignalAll();
+}
+
+void DBImpl::EnterMemTableSwitchGate() {
+  if (NumWalPartitions() == 1) {
+    return;
+  }
+  // Pairs with CloseMemTableSwitchGate(): each side publishes its own flag
+  // before reading the other's, so at least one of them sees the other.
+  while (true) {
+    leaders_past_switch_gate_.fetch_add(1);
+    if (!switch_gate_closed_.load()) {
+      return;
+    }
+    ExitMemTableSwitchGate();
+    InstrumentedMutexLock l(&mutex_);
+    while (switch_gate_closed_.load()) {
+      bg_cv_.Wait();
+    }
+  }
+}
+
+void DBImpl::ExitMemTableSwitchGate() {
+  if (NumWalPartitions() == 1) {
+    return;
+  }
+  if (leaders_past_switch_gate_.fetch_sub(1) == 1 &&
+      switch_gate_closed_.load()) {
+    // Taking mutex_ orders this signal after the closer's last check, which
+    // it makes holding mutex_.
+    InstrumentedMutexLock l(&mutex_);
+    bg_cv_.SignalAll();
   }
 }
 
@@ -3570,9 +3755,9 @@ Status DBImpl::ScheduleFlushes(WriteContext* context) {
     MaybeFlushStatsCF(&cfds);
   }
   Status status;
-  WriteThread::Writer nonmem_w;
+  AllPartitionsWriter nonmem_w(this, /*nonmem=*/true);
   if (two_write_queues_) {
-    nonmem_write_thread_.EnterUnbatched(&nonmem_w, &mutex_);
+    nonmem_w.EnterUnbatched();
   }
 
   TEST_SYNC_POINT_CALLBACK("DBImpl::ScheduleFlushes:PreSwitchMemtable",
@@ -3602,7 +3787,7 @@ Status DBImpl::ScheduleFlushes(WriteContext* context) {
   }
 
   if (two_write_queues_) {
-    nonmem_write_thread_.ExitUnbatched(&nonmem_w);
+    nonmem_w.ExitUnbatched();
   }
 
   if (status.ok()) {
@@ -3676,11 +3861,18 @@ Status DBImpl::SwitchMemtableImpl(ColumnFamilyData* cfd, WriteContext* context,
   const WriteOptions write_options;
 
   log::Writer* new_log = nullptr;
+  // WALs for partitions 1..N-1; partition 0's is new_log.
+  std::vector<uint64_t> extra_wal_numbers;
+  std::vector<log::Writer*> extra_wals;
   UnpublishedWAL prepared_wal;
   MemTable* new_mem = nullptr;
   IOStatus io_s;
   bool current_wal_write_buffer_failed = false;
+  uint64_t failed_wal_number = 0;
 
+  // Covers WriteRecoverableState's stamp and the new memtable's earliest
+  // sequence.
+  AssertLastSequenceCoversAllocated();
   // Recoverable state is persisted in WAL. After memtable switch, WAL might
   // be deleted, so we write the state to memtable to be persisted as well.
   Status s = WriteRecoverableState();
@@ -3700,6 +3892,17 @@ Status DBImpl::SwitchMemtableImpl(ColumnFamilyData* cfd, WriteContext* context,
   if (two_write_queues_) {
     WalWriteMutex(0).Unlock();
   }
+  // All partitions rotate together, so any partition holding appends rotates
+  // every partition.
+  for (size_t p = 1; p < NumWalPartitions() && !creating_new_log; ++p) {
+    if (two_write_queues_) {
+      WalWriteMutex(p).Lock();
+    }
+    creating_new_log = !WalEmpty(p);
+    if (two_write_queues_) {
+      WalWriteMutex(p).Unlock();
+    }
+  }
   uint64_t recycle_log_number = 0;
   // If file deletion is disabled, don't recycle logs since it'll result in
   // the file getting renamed
@@ -3715,6 +3918,13 @@ Status DBImpl::SwitchMemtableImpl(ColumnFamilyData* cfd, WriteContext* context,
     } else {
       assert(prepared_wal.log_number == 0);
       new_log_number = versions_->NewFileNumber();
+    }
+    // Partition 0 takes the lowest number of the new generation, so
+    // cur_wal_number_ still bounds from below every WAL written after this
+    // switch.
+    for (size_t p = 1; p < NumWalPartitions(); ++p) {
+      extra_wal_numbers.push_back(versions_->NewFileNumber());
+      assert(extra_wal_numbers.back() > new_log_number);
     }
   }
   // For use outside of holding DB mutex
@@ -3742,16 +3952,19 @@ Status DBImpl::SwitchMemtableImpl(ColumnFamilyData* cfd, WriteContext* context,
   const auto preallocate_block_size =
       GetWalPreallocateBlockSize(mutable_cf_options_copy.write_buffer_size);
   mutex_.Unlock();
-  if (creating_new_log) {
+  auto predecessor_wal_info = [this](size_t partition) {
     PredecessorWALInfo info;
-    WalWriteMutex(0).Lock();
-    if (!WalLogs(0).empty()) {
-      log::Writer* cur_log_writer = CurrentWal().writer;
+    WalWriteMutexLock l(&WalWriteMutex(partition));
+    if (!WalLogs(partition).empty()) {
+      log::Writer* cur_log_writer = WalLogs(partition).back().writer;
       info = PredecessorWALInfo(cur_log_writer->get_log_number(),
                                 cur_log_writer->file()->GetFileSize(),
                                 cur_log_writer->GetLastSeqnoRecorded());
     }
-    WalWriteMutex(0).Unlock();
+    return info;
+  };
+  if (creating_new_log) {
+    PredecessorWALInfo info = predecessor_wal_info(0);
     // TODO: Write buffer size passed in should be max of all CF's instead
     // of mutable_cf_options.write_buffer_size.
     if (prepared_wal.writer) {
@@ -3767,6 +3980,16 @@ Status DBImpl::SwitchMemtableImpl(ColumnFamilyData* cfd, WriteContext* context,
     TEST_SYNC_POINT_CALLBACK("DBImpl::SwitchMemtable:AfterCreateWAL", &io_s);
     if (s.ok()) {
       s = io_s;
+    }
+    for (size_t i = 0; s.ok() && i < extra_wal_numbers.size(); ++i) {
+      log::Writer* extra_wal = nullptr;
+      io_s = CreateWAL(db_options_snapshot, write_options, extra_wal_numbers[i],
+                       /*recycle_log_number=*/0, preallocate_block_size,
+                       predecessor_wal_info(i + 1), &extra_wal);
+      s = io_s;
+      if (s.ok()) {
+        extra_wals.push_back(extra_wal);
+      }
     }
   }
   if (!s.ok() && prepared_wal.writer) {
@@ -3824,16 +4047,19 @@ Status DBImpl::SwitchMemtableImpl(ColumnFamilyData* cfd, WriteContext* context,
     wal_recycle_files_.pop_front();
   }
   if (s.ok() && creating_new_log) {
-    // Rotation targets partition 0 and holds only its mutex (plus mutex_,
-    // already held): readers of the globals touched below hold mutex_ or
-    // all N, so they always share one of those.
-    WalWriteMutexLock l(&WalWriteMutex(0));
+    // Rotation holds every partition's mutex (plus mutex_, already held):
+    // readers of the globals touched below hold mutex_ or all N, so they
+    // always share one of those.
+    AllWalWriteMutexesLock l(this);
     assert(new_log != nullptr);
-    if (!WalLogs(0).empty()) {
+    for (size_t p = 0; s.ok() && p < NumWalPartitions(); ++p) {
+      if (WalLogs(p).empty()) {
+        continue;
+      }
       // Always flush the buffer of the last log before switching to a new one,
       // except when recovery is replacing a file-scoped failed WAL. Its
       // accepted contents are persisted by the atomic recovery flush.
-      log::Writer* cur_log_writer = CurrentWal().writer;
+      log::Writer* cur_log_writer = WalLogs(p).back().writer;
       const bool abandon_current_wal =
           recovering_from_wal_write_error_ &&
           cur_log_writer->get_log_number() <= recover_wal_through_number_;
@@ -3851,6 +4077,9 @@ Status DBImpl::SwitchMemtableImpl(ColumnFamilyData* cfd, WriteContext* context,
       if (!abandon_current_wal) {
         io_s = cur_log_writer->WriteBuffer(write_options);
         current_wal_write_buffer_failed = !io_s.ok();
+        if (current_wal_write_buffer_failed) {
+          failed_wal_number = cur_log_writer->get_log_number();
+        }
       }
       if (s.ok()) {
         s = io_s;
@@ -3865,10 +4094,15 @@ Status DBImpl::SwitchMemtableImpl(ColumnFamilyData* cfd, WriteContext* context,
     }
     if (s.ok()) {
       cur_wal_number_ = new_log_number;
-      WalEmpty(0) = true;
       wal_dir_synced_ = false;
-      WalLogs(0).emplace_back(cur_wal_number_, new_log);
-      AliveWalFiles(0).emplace_back(cur_wal_number_);
+      for (size_t p = 0; p < NumWalPartitions(); ++p) {
+        const uint64_t number =
+            p == 0 ? new_log_number : extra_wal_numbers[p - 1];
+        assert(p == 0 || number > cur_wal_number_);
+        WalEmpty(p) = true;
+        WalLogs(p).emplace_back(number, p == 0 ? new_log : extra_wals[p - 1]);
+        AliveWalFiles(p).emplace_back(number);
+      }
     }
   }
 
@@ -3877,6 +4111,9 @@ Status DBImpl::SwitchMemtableImpl(ColumnFamilyData* cfd, WriteContext* context,
     assert(creating_new_log);
     delete new_mem;
     delete new_log;
+    for (log::Writer* extra_wal : extra_wals) {
+      delete extra_wal;
+    }
     context->superversion_context.new_superversion.reset();
     // Only a WriteBuffer() failure belongs to the current WAL. CreateWAL() and
     // StartWALFile() operate on an unpublished replacement, so a failure there
@@ -3893,7 +4130,7 @@ Status DBImpl::SwitchMemtableImpl(ColumnFamilyData* cfd, WriteContext* context,
           !io_s.IsIOFenced() &&
           io_s.GetScope() == IOStatus::IOErrorScope::kIOErrorScopeFile) {
         DBRecoverContext recovery_context;
-        recovery_context.failed_wal_number = cur_wal_number_;
+        recovery_context.failed_wal_number = failed_wal_number;
         ExtendWALRecoveryCutoff(recovery_context.failed_wal_number);
         error_handler_.SetBGError(io_s, BackgroundErrorReason::kMemTable,
                                   /*wal_related=*/true, recovery_context);
