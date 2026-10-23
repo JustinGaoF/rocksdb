@@ -307,6 +307,7 @@ DECLARE_bool(use_attribute_group);
 DECLARE_bool(use_multi_cf_iterator);
 DECLARE_bool(use_full_merge_v1);
 DECLARE_int32(sync_wal_one_in);
+DECLARE_int32(sync_write_one_in);
 DECLARE_bool(avoid_unnecessary_blocking_io);
 DECLARE_bool(write_dbid_to_manifest);
 DECLARE_bool(track_options_file_number_in_manifest);
