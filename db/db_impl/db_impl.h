@@ -28,6 +28,7 @@
 #include "db/column_family.h"
 #include "db/compaction/compaction_iterator.h"
 #include "db/compaction/compaction_job.h"
+#include "db/db_impl/wal_durability_tracker.h"
 #include "db/error_handler.h"
 #include "db/event_helpers.h"
 #include "db/external_sst_file_ingestion_job.h"
@@ -924,8 +925,18 @@ class DBImpl : public DB
     }
   }
 
+  // Durability frontier: every sequence at or below it completed its WAL
+  // append's write(). Computed on the I/O-completion path; nothing gates on
+  // it yet. Separate from last_published_sequence_, which ingestion and
+  // recovery jump forward and which must never overstate this lower bound.
+  SequenceNumber WalDurabilitySafePoint() const {
+    return wal_durability_tracker_->SafePoint();
+  }
+
   // REQUIRES: joined the main write queue if two_write_queues is disabled, and
-  // the second write queue otherwise.
+  // the second write queue otherwise. With more than one WAL partition
+  // (two_write_queues is rejected there) nothing calls it: write groups
+  // publish only through PublishLastSequence, bounded by the applied prefix.
   virtual void SetLastPublishedSequence(SequenceNumber seq);
   // Returns LastSequence in last_seq_same_as_publish_seq_
   // mode and LastAllocatedSequence otherwise. This is useful when visiblility
@@ -1521,6 +1532,19 @@ class DBImpl : public DB
     return &WalMergeBuffer(partition);
   }
 
+  // Partition p's lowest registered, not yet completed sequence, or
+  // WalDurabilityTracker::kIdle. Tests use it to observe a registration
+  // directly, whether or not it is later completed.
+  uint64_t TEST_WalDurabilityPendingLow(size_t partition) const {
+    return wal_durability_tracker_->PendingLow(partition);
+  }
+
+  // Highest sequence partition p has completed. Tests use it to observe
+  // that nothing was ever completed.
+  uint64_t TEST_WalDurabilityDurableUpto(size_t partition) const {
+    return wal_durability_tracker_->DurableUpto(partition);
+  }
+
   // The inclusive WAL-number cutoff a file-scoped WAL failure quarantines.
   uint64_t TEST_WalRecoveryCutoff() const {
     return wal_recovery_cutoff_.load(std::memory_order_acquire);
@@ -1543,7 +1567,9 @@ class DBImpl : public DB
       size_t sequence_count, bool write_wal,
       SequenceNumber* last_sequence_before, uint64_t* wal_index) {
     return AllocateSequenceAndWALIndex(sequence_count, write_wal,
-                                       last_sequence_before, wal_index);
+                                       last_sequence_before, wal_index,
+                                       /*wal_partition=*/0,
+                                       /*register_durability=*/false);
   }
 
   void TEST_SetNextWALIndex(uint64_t next_wal_index) {
@@ -2881,17 +2907,33 @@ class DBImpl : public DB
   // Called once per group that entered, by whichever thread exits the group.
   void ExitMemTableSwitchGate();
 
-  // Publishes `seq` as the last visible sequence. With more than one WAL
-  // partition, leaders publish out of sequence order; a publish that a higher
-  // one has already overtaken is skipped rather than moving LastSequence()
-  // backwards.
-  void PublishLastSequence(SequenceNumber seq) {
+  // Publishes a write group that allocated [first_sequence, last_sequence]
+  // on `wal_partition` (first_sequence > last_sequence when it consumed none),
+  // once its memtable insert is done. At one partition that publishes
+  // last_sequence. With more than one, groups finish out of sequence order,
+  // so the group only marks its range applied and publishes the contiguous
+  // applied prefix (PublishAppliedPrefix).
+  void PublishLastSequence(size_t wal_partition, SequenceNumber first_sequence,
+                           SequenceNumber last_sequence, bool wal_record) {
     if (NumWalPartitions() == 1) {
-      versions_->SetLastSequence(seq);
+      versions_->SetLastSequence(last_sequence);
     } else {
-      versions_->SetLastSequenceAtLeast(seq);
+      PublishAppliedPrefix(wal_partition, first_sequence, last_sequence,
+                           wal_record);
     }
   }
+
+  // N>1 only. Marks the group's range applied in applied_tracker_ and raises
+  // LastSequence() to the applied frontier: the highest sequence at or below
+  // which every allocated range, on any partition, has been inserted. A range
+  // with a WAL record is marked applied only after its append completed, so
+  // the frontier is also at or below the WAL durability safe point for every
+  // sequence that has a record; ranges without one (disableWAL) are bounded
+  // only by the ranges below them. Never lowers LastSequence(), which
+  // ingestion and recovery may have raised past the frontier.
+  // REQUIRES: the group was registered by AllocateSequenceAndWALIndex.
+  void PublishAppliedPrefix(size_t wal_partition, SequenceNumber first_sequence,
+                            SequenceNumber last_sequence, bool wal_record);
 
   // N>1, debug only. For code holding every write queue (or the closed
   // memtable switch gate) before it assigns or stamps LastSequence() + 1:
@@ -3127,19 +3169,21 @@ class DBImpl : public DB
 
   // Reserves a sequence block and, when a WAL record will be written, its
   // wal_index in one DB-wide critical section. The mutex is released before
-  // batch merging, WAL append, or any other I/O. The future durability
-  // watermark's RegisterPending operation belongs in this same section.
+  // batch merging, WAL append, or any other I/O. The durability watermark's
+  // Register runs in this same section when register_durability is set, so
+  // no later scan can miss the outstanding range.
   //
-  // Rule for that watermark diff: a failed append leaves its entry in
-  // pending_low[p], and the cover for the burned index must be written and
-  // synced before that entry may be popped. Popping first would advance the
-  // watermark past an uncovered hole and acknowledge writes above it. With
-  // one WAL at a time (the only layout today) no extra sync is needed --
-  // appends to one file are ordered, so the cover inherits the durability of
-  // whatever is synced after it.
+  // Rule: a failed append leaves its entry in pending_low[p], and the cover
+  // for the burned index must be written and synced before that entry may be
+  // popped. Popping first would advance the watermark past an uncovered hole
+  // and acknowledge writes above it. With one WAL at a time (the only layout
+  // today) no extra sync is needed -- appends to one file are ordered, so
+  // the cover inherits the durability of whatever is synced after it.
   IOStatus AllocateSequenceAndWALIndex(size_t sequence_count, bool write_wal,
                                        SequenceNumber* last_sequence_before,
-                                       uint64_t* wal_index);
+                                       uint64_t* wal_index,
+                                       size_t wal_partition,
+                                       bool register_durability);
 
   // Writes a void record covering `wal_index`, which was allocated but whose
   // data record never reached the WAL. Every allocated index must end up
@@ -3181,7 +3225,7 @@ class DBImpl : public DB
   IOStatus WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
                            WalContext& wal_context, uint64_t* wal_used,
                            SequenceNumber sequence, uint64_t wal_index,
-                           size_t sequence_count);
+                           size_t sequence_count, bool complete_durability);
 
   IOStatus ConcurrentWriteGroupToWAL(const WriteThread::WriteGroup& write_group,
                                      uint64_t* wal_used,
@@ -4134,8 +4178,8 @@ class DBImpl : public DB
     assert(partition < nonmem_write_threads_.size());
     return *nonmem_write_threads_[partition];
   }
-  // Number of WAL partitions. All nine vectors always have this many
-  // entries.
+  // Number of WAL partitions. All nine vectors plus the durability tracker
+  // always have this many entries.
   size_t NumWalPartitions() const {
     assert(logs_.size() == alive_wal_files_.size());
     assert(logs_.size() == wal_merge_buffers_.size());
@@ -4145,6 +4189,7 @@ class DBImpl : public DB
     assert(logs_.size() == wals_to_free_.size());
     assert(logs_.size() == write_threads_.size());
     assert(logs_.size() == nonmem_write_threads_.size());
+    assert(logs_.size() == wal_durability_tracker_->num_partitions());
     return logs_.size();
   }
 
@@ -4349,6 +4394,19 @@ class DBImpl : public DB
   // These are used in 2PC to batch the prepares separately from the serial
   // commit.
   std::vector<std::unique_ptr<WriteThread>> nonmem_write_threads_;
+
+  // Per-partition WAL durability frontier, sized with the partition vectors
+  // in the constructor and never resized. Every Register/Complete runs under
+  // sequence_wal_index_mutex_, which orders each registration before any
+  // later scan.
+  std::unique_ptr<WalDurabilityTracker> wal_durability_tracker_;
+  // Per-partition memtable-applied frontier (N>1 only), with the same range
+  // bookkeeping: AllocateSequenceAndWALIndex registers every range the
+  // durability tracker registers plus every disableWAL range that consumes
+  // sequences, and PublishAppliedPrefix completes it after the memtable
+  // insert. Its safe point is the highest sequence N>1 may publish. Every
+  // Register/Complete runs under sequence_wal_index_mutex_.
+  std::unique_ptr<WalDurabilityTracker> applied_tracker_;
 
   // See CloseMemTableSwitchGate().
   std::atomic<size_t> leaders_past_switch_gate_{0};
