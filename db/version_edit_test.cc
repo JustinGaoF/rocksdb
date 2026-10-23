@@ -339,6 +339,38 @@ TEST_F(VersionEditTest, AtomicGroupTest) {
   TestEncodeDecode(edit);
 }
 
+// The WAL index guard must stop a binary that does not know it: its tag lacks
+// kTagSafeIgnoreMask, and a reader that meets such a tag it does not know
+// rejects the edit. With the bit set, the same field would be skipped.
+TEST_F(VersionEditTest, WALIndexGuardFailsClosedOnUnawareReaders) {
+  static_assert((kWALIndexGuard & kTagSafeIgnoreMask) == 0,
+                "the WAL index guard must not be safely ignorable");
+  VersionEdit edit;
+  edit.SetWALIndexGuard(42);
+  TestEncodeDecode(edit);
+
+  // A reader that predates the guard: the same field under a tag it does
+  // not know, with and without the safe-ignore bit.
+  auto encode_with_tag = [](uint32_t tag) {
+    std::string encoded;
+    PutVarint32Varint64(&encoded, kLogNumber, 66);
+    PutVarint32(&encoded, tag);
+    std::string field;
+    PutVarint64(&field, 42);
+    PutLengthPrefixedSlice(&encoded, field);
+    return encoded;
+  };
+  constexpr uint32_t kUnknownTag = kWALIndexGuard + 1;
+  VersionEdit unaware;
+  const Status s = unaware.DecodeFrom(encode_with_tag(kUnknownTag));
+  ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+  EXPECT_NE(std::string::npos, s.ToString().find("unknown tag"));
+  VersionEdit ignoring;
+  ASSERT_OK(
+      ignoring.DecodeFrom(encode_with_tag(kUnknownTag | kTagSafeIgnoreMask)));
+  EXPECT_EQ(66U, ignoring.GetLogNumber());
+}
+
 TEST_F(VersionEditTest, IgnorableField) {
   VersionEdit ve;
   std::string encoded;

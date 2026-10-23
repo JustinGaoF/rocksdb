@@ -60,6 +60,9 @@ enum Tag : uint32_t {
   kBlobFileAddition = 400,
   kBlobFileGarbage,
 
+  // Forward incompatible on purpose: see VersionEdit::SetWALIndexGuard.
+  kWALIndexGuard = 500,
+
   // Mask for an unidentified tag from the future which can be safely ignored.
   kTagSafeIgnoreMask = 1 << 13,
 
@@ -1054,6 +1057,18 @@ class VersionEdit {
     return committed_options_file_number_;
   }
 
+  // Records that live WALs numbered at or below `max_wal_number` may carry WAL
+  // index records (partition_wal_usage), which binaries that predate the
+  // option drop instead of replaying. The tag lacks kTagSafeIgnoreMask, so
+  // those binaries fail to open the DB instead. Absent means no live WAL is
+  // indexed; that state is reached only by writing a MANIFEST without it.
+  void SetWALIndexGuard(uint64_t max_wal_number) {
+    has_wal_index_guard_ = true;
+    wal_index_guard_ = max_wal_number;
+  }
+  bool HasWALIndexGuard() const { return has_wal_index_guard_; }
+  uint64_t GetWALIndexGuard() const { return wal_index_guard_; }
+
   // Marks a live OPTIONS-only MANIFEST write as DB-wide metadata that does not
   // change an LSM Version. This is intentionally not encoded; recovery applies
   // the persisted fields through VersionEditHandler instead.
@@ -1119,6 +1134,7 @@ class VersionEdit {
   WalDeletion wal_deletion_;
   uint64_t last_compacted_manifest_file_size_ = 0;
   uint64_t committed_options_file_number_ = 0;
+  uint64_t wal_index_guard_ = 0;
 
   // Compaction cursors for round-robin compaction policy
   CompactCursors compact_cursors_;
@@ -1172,6 +1188,7 @@ class VersionEdit {
   bool has_subcompaction_progress_ = false;
   bool has_last_compacted_manifest_file_size_ = false;
   bool has_committed_options_file_number_ = false;
+  bool has_wal_index_guard_ = false;
 
   // Non-persisted marker for the live MANIFEST writer fast path.
   bool is_options_file_manipulation_ = false;
