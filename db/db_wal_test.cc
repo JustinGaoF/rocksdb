@@ -4952,6 +4952,72 @@ TEST_F(DBWALIndexTest, UncoveredWALIndexFailsSubsequentWrites) {
 
 // Indexing off means no void records, the same way it means no marker and no
 // indexed data types: the WAL stays byte-for-byte vanilla.
+// A sync that fails after the append burned nothing: the record is in the
+// file, so a void over its index would trail the reader's order mark and fail
+// every open that rejects corruption. The write still fails.
+TEST_F(DBWALIndexTest, SyncFailureAfterAppendWritesNoCover) {
+  enum class Failure { kLeadershipSync, kPipelinedLeadershipSync, kWalDirSync };
+  auto fault_fs = std::make_shared<FaultInjectionTestFS>(env_->GetFileSystem());
+  std::unique_ptr<Env> fault_fs_env(NewCompositeEnv(fault_fs));
+  for (const Failure failure :
+       {Failure::kLeadershipSync, Failure::kPipelinedLeadershipSync,
+        Failure::kWalDirSync}) {
+    SCOPED_TRACE(static_cast<int>(failure));
+    Options options =
+        WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+    options.env = fault_fs_env.get();
+    options.enable_pipelined_write =
+        failure == Failure::kPipelinedLeadershipSync;
+    DestroyAndReopen(options);
+    // Unsynced, so the synced write below is the first to sync the new WAL's
+    // directory.
+    WriteKeys();
+    const uint64_t wal_number = LatestWALNumber();
+
+    if (failure == Failure::kWalDirSync) {
+      fault_fs->SetThreadLocalErrorContext(
+          FaultInjectionIOType::kMetadataWrite, 7 /* seed */, 1 /* one_in */,
+          false /* retryable */, false /* has_data_loss */);
+      fault_fs->EnableThreadLocalErrorInjection(
+          FaultInjectionIOType::kMetadataWrite);
+    } else {
+      SyncPoint::GetInstance()->SetCallBack(
+          "DBImpl::WriteGroupToWAL:AfterLeadershipSync", [](void* arg) {
+            *static_cast<IOStatus*>(arg) = IOStatus::IOError("injected");
+          });
+      SyncPoint::GetInstance()->EnableProcessing();
+    }
+    WriteOptions sync_write;
+    sync_write.sync = true;
+    ASSERT_NOK(Put(Key(kNumKeys), "synced", sync_write));
+    fault_fs->DisableThreadLocalErrorInjection(
+        FaultInjectionIOType::kMetadataWrite);
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    ASSERT_NOK(dbfull()->TEST_GetBGError());
+    Close();
+
+    std::vector<uint64_t> expected;
+    for (int i = 0; i <= kNumKeys; i++) {
+      expected.push_back(log::kWALIndexStartNumber + i);
+    }
+    EXPECT_EQ(expected, ReadWALIndices(WALPath(wal_number), wal_number));
+    EXPECT_TRUE(ReadWALVoidRanges(WALPath(wal_number)).empty());
+
+    for (const WALRecoveryMode mode :
+         {WALRecoveryMode::kTolerateCorruptedTailRecords,
+          WALRecoveryMode::kAbsoluteConsistency}) {
+      SCOPED_TRACE(static_cast<int>(mode));
+      options.wal_recovery_mode = mode;
+      Reopen(options);
+      VerifyKeys();
+      EXPECT_EQ("synced", Get(Key(kNumKeys)));
+      Close();
+    }
+    Destroy(options);
+  }
+}
+
 TEST_F(DBWALIndexTest, DefaultUsageWritesNoVoidRecords) {
   Options options = WALIndexOptions(PartitionWALUsage::kNone);
   DestroyAndReopen(options);

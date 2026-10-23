@@ -3678,6 +3678,74 @@ TEST_F(DBErrorHandlingFSTest,
   ASSERT_OK(Put("after", "value-after"));
 }
 
+TEST_F(DBErrorHandlingFSTest, IgnoredCompactionErrorStartsNoRecovery) {
+  // With paranoid_checks=false a compaction I/O error maps to kNoError: it
+  // is counted but never recorded, so it must not mark recovery in
+  // progress or set the WAL durability flag, and WaitForCompact() and
+  // Close() must not wait for a recovery that nothing runs.
+  Options options = GetDefaultOptions();
+  options.env = fault_env_.get();
+  options.create_if_missing = true;
+  options.paranoid_checks = false;
+  options.statistics = CreateDBStatistics();
+  DestroyAndReopen(options);
+  ASSERT_OK(Put(Key(0), "val0"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put(Key(1), "val1"));
+  ASSERT_OK(Flush());
+
+  int injected = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::Run():AfterVerifyOutputFiles", [&](void* arg) {
+        if (injected++ == 0) {
+          *static_cast<Status*>(arg) =
+              IOStatus::IOError("injected compaction error");
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  Status s = dbfull()->TEST_CompactRange(0, nullptr, nullptr, nullptr,
+                                         /*disallow_trivial_move=*/true);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_TRUE(s.IsIOError()) << s.ToString();
+  ASSERT_EQ(1, injected);
+  ASSERT_EQ(1,
+            options.statistics->getTickerCount(ERROR_HANDLER_BG_ERROR_COUNT));
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  ASSERT_FALSE(dbfull()->TEST_IsRecoveryInProgress());
+  ASSERT_FALSE(dbfull()->TEST_WalDurabilityBGError());
+  ASSERT_OK(dbfull()->WaitForCompact(WaitForCompactOptions()));
+  Close();
+}
+
+TEST_F(DBErrorHandlingFSTest, EqualSeverityRepeatStartsNoRecovery) {
+  // Auto-recovery is on by default. The listener declines it for the first
+  // soft error, which is recorded; a repeat at the same severity records
+  // nothing, so it must not start the recovery the first one declined.
+  std::shared_ptr<ErrorHandlerFSListener> listener =
+      std::make_shared<ErrorHandlerFSListener>();
+  Options options = GetDefaultOptions();
+  options.env = fault_env_.get();
+  options.create_if_missing = true;
+  options.listeners.emplace_back(listener);
+  DestroyAndReopen(options);
+
+  listener->EnableAutoRecovery(false);
+  dbfull()->TEST_SetBGError(IOStatus::Busy("first"),
+                            BackgroundErrorReason::kAsyncFileOpen);
+  const Status first = dbfull()->TEST_GetBGError();
+  ASSERT_EQ(Status::Severity::kSoftError, first.severity());
+  ASSERT_FALSE(dbfull()->TEST_IsRecoveryInProgress());
+
+  listener->EnableAutoRecovery(true);
+  dbfull()->TEST_SetBGError(IOStatus::Busy("repeat"),
+                            BackgroundErrorReason::kAsyncFileOpen);
+  EXPECT_EQ(first.ToString(), dbfull()->TEST_GetBGError().ToString());
+  EXPECT_FALSE(dbfull()->TEST_IsRecoveryInProgress());
+  Close();
+}
+
 TEST_F(DBErrorHandlingFSTest, FileScopedErrorReplacesEmptyCurrentWAL) {
   Options options = GetDefaultOptions();
   options.env = fault_env_.get();

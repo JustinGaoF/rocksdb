@@ -51,6 +51,53 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+namespace {
+// Forward-only view of a flush's input that hides entries at or above
+// `floor` and counts them, so the flush can still check that it read every
+// memtable entry.
+class SequenceFloorIterator : public InternalIterator {
+ public:
+  SequenceFloorIterator(InternalIterator* input, SequenceNumber floor)
+      : input_(input), floor_(floor) {}
+
+  bool Valid() const override { return input_->Valid(); }
+  void SeekToFirst() override {
+    input_->SeekToFirst();
+    SkipHidden();
+  }
+  void SeekToLast() override { assert(false); }
+  void Seek(const Slice& target) override {
+    input_->Seek(target);
+    SkipHidden();
+  }
+  void SeekForPrev(const Slice& /*target*/) override { assert(false); }
+  void Next() override {
+    input_->Next();
+    SkipHidden();
+  }
+  void Prev() override { assert(false); }
+  Slice key() const override { return input_->key(); }
+  Slice value() const override { return input_->value(); }
+  Status status() const override { return input_->status(); }
+  bool IsKeyPinned() const override { return input_->IsKeyPinned(); }
+  bool IsValuePinned() const override { return input_->IsValuePinned(); }
+
+  uint64_t num_hidden() const { return num_hidden_; }
+
+ private:
+  void SkipHidden() {
+    while (input_->Valid() && GetInternalKeySeqno(input_->key()) >= floor_) {
+      ++num_hidden_;
+      input_->Next();
+    }
+  }
+
+  InternalIterator* const input_;
+  const SequenceNumber floor_;
+  uint64_t num_hidden_ = 0;
+};
+}  // namespace
+
 const char* GetFlushReasonString(FlushReason flush_reason) {
   switch (flush_reason) {
     case FlushReason::kOthers:
@@ -433,12 +480,18 @@ Status FlushJob::MemPurge() {
   std::vector<InternalIterator*> memtables;
   std::vector<std::unique_ptr<FragmentedRangeTombstoneIterator>>
       range_del_iters;
+  // What a flush would drop, MemPurge drops too: entries at or above an
+  // unreleased fence.
+  const SequenceNumber range_del_read_seq =
+      drop_entries_at_or_above_ == kMaxSequenceNumber
+          ? kMaxSequenceNumber
+          : drop_entries_at_or_above_ - 1;
   for (ReadOnlyMemTable* m : mems_) {
     memtables.push_back(m->NewIterator(ro, /*seqno_to_time_mapping=*/nullptr,
                                        &arena, /*prefix_extractor=*/nullptr,
                                        /*for_flush=*/true));
     auto* range_del_iter = m->NewRangeTombstoneIterator(
-        ro, kMaxSequenceNumber, true /* immutable_memtable */);
+        ro, range_del_read_seq, true /* immutable_memtable */);
     if (range_del_iter != nullptr) {
       range_del_iters.emplace_back(range_del_iter);
     }
@@ -458,9 +511,16 @@ Status FlushJob::MemPurge() {
                          : earliest_seqno;
   }
 
-  ScopedArenaPtr<InternalIterator> iter(
+  ScopedArenaPtr<InternalIterator> merged(
       NewMergingIterator(&(cfd_->internal_comparator()), memtables.data(),
                          static_cast<int>(memtables.size()), &arena));
+  std::unique_ptr<SequenceFloorIterator> floor_iter;
+  InternalIterator* iter = merged.get();
+  if (drop_entries_at_or_above_ != kMaxSequenceNumber) {
+    floor_iter.reset(
+        new SequenceFloorIterator(merged.get(), drop_entries_at_or_above_));
+    iter = floor_iter.get();
+  }
 
   const auto& ioptions = cfd_->ioptions();
 
@@ -522,7 +582,7 @@ Status FlushJob::MemPurge() {
     assert(job_context_);
     const std::atomic<bool> kManualCompactionCanceledFalse{false};
     CompactionIterator c_iter(
-        iter.get(), (cfd_->internal_comparator()).user_comparator(), &merge,
+        iter, (cfd_->internal_comparator()).user_comparator(), &merge,
         kMaxSequenceNumber, &job_context_->snapshot_seqs, earliest_snapshot_,
         job_context_->earliest_write_conflict_snapshot,
         job_context_->GetJobSnapshotSequence(), job_context_->snapshot_checker,
@@ -958,11 +1018,15 @@ Status FlushJob::WriteLevel0Table() {
             m->NewIterator(ro, /*seqno_to_time_mapping=*/nullptr, &arena,
                            /*prefix_extractor=*/nullptr, /*for_flush=*/true));
       }
+      const SequenceNumber range_del_read_seq =
+          drop_entries_at_or_above_ == kMaxSequenceNumber
+              ? kMaxSequenceNumber
+              : drop_entries_at_or_above_ - 1;
       auto* range_del_iter =
           logical_strip_timestamp
               ? m->NewTimestampStrippingRangeTombstoneIterator(
-                    ro, kMaxSequenceNumber, ts_sz)
-              : m->NewRangeTombstoneIterator(ro, kMaxSequenceNumber,
+                    ro, range_del_read_seq, ts_sz)
+              : m->NewRangeTombstoneIterator(ro, range_del_read_seq,
                                              true /* immutable_memtable */);
       if (range_del_iter != nullptr) {
         range_del_iters.emplace_back(range_del_iter);
@@ -1003,6 +1067,18 @@ Status FlushJob::WriteLevel0Table() {
       ScopedArenaPtr<InternalIterator> iter(
           NewMergingIterator(&cfd_->internal_comparator(), memtables.data(),
                              static_cast<int>(memtables.size()), &arena));
+      std::unique_ptr<SequenceFloorIterator> floor_iter;
+      InternalIterator* input = iter.get();
+      if (drop_entries_at_or_above_ != kMaxSequenceNumber) {
+        ROCKS_LOG_WARN(db_options_.info_log,
+                       "[%s] [JOB %d] Flush drops entries at or above "
+                       "sequence %" PRIu64,
+                       cfd_->GetName().c_str(), job_context_->job_id,
+                       drop_entries_at_or_above_);
+        floor_iter.reset(
+            new SequenceFloorIterator(iter.get(), drop_entries_at_or_above_));
+        input = floor_iter.get();
+      }
       ROCKS_LOG_INFO(db_options_.info_log,
                      "[%s] [JOB %d] Level-0 flush table #%" PRIu64 ": started",
                      cfd_->GetName().c_str(), job_context_->job_id,
@@ -1058,7 +1134,7 @@ Status FlushJob::WriteLevel0Table() {
           dbname_ /*db_name*/);
       s = BuildTable(
           dbname_, versions_, db_options_, tboptions, file_options_,
-          cfd_->table_cache(), iter.get(), std::move(range_del_iters), &meta_,
+          cfd_->table_cache(), input, std::move(range_del_iters), &meta_,
           &blob_file_additions, job_context_->snapshot_seqs, earliest_snapshot_,
           job_context_->earliest_write_conflict_snapshot,
           job_context_->GetJobSnapshotSequence(),
@@ -1073,6 +1149,9 @@ Status FlushJob::WriteLevel0Table() {
       // TODO: Cleanup io_status in BuildTable and table builders
       assert(!s.ok() || io_s.ok());
       io_s.PermitUncheckedError();
+      if (floor_iter) {
+        total_num_input_entries -= floor_iter->num_hidden();
+      }
       if (s.ok() && total_num_input_entries != flush_stats.num_input_records) {
         std::string msg = "Expected " +
                           std::to_string(total_num_input_entries) +
