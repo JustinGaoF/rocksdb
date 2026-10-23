@@ -563,6 +563,7 @@ class WritePreparedTxnDB : public WritePreparedTxnDBBase {
   friend class
       WritePreparedTransactionTest_NonAtomicUpdateOfDelayedPrepared_Test;
   friend class WritePreparedTransactionTest_NonAtomicUpdateOfMaxEvictedSeq_Test;
+  friend class WritePreparedTransactionTest_OlderSnapshotListNeverWins_Test;
   friend class WritePreparedTransactionTest_OldCommitMapGC_Test;
   friend class WritePreparedTransactionTest_Rollback_Test;
   friend class WritePreparedTransactionTest_SmallestUnCommittedSeq_Test;
@@ -628,12 +629,16 @@ class WritePreparedTxnDB : public WritePreparedTxnDBBase {
     inline uint64_t top() { return heap_top_.load(std::memory_order_acquire); }
     inline void push(uint64_t v) {
       push_pop_mutex_.AssertHeld();
-      if (heap_.empty()) {
-        heap_top_.store(v, std::memory_order_release);
-      } else {
-        assert(heap_top_.load() < v);
+      // With wal_partitions > 1, prepares on different partitions arrive out
+      // of sequence order, so insert in place to keep heap_ sorted.
+      auto it = heap_.end();
+      while (it != heap_.begin() && *std::prev(it) > v) {
+        --it;
       }
-      heap_.push_back(v);
+      if (it == heap_.begin()) {
+        heap_top_.store(v, std::memory_order_release);
+      }
+      heap_.insert(it, v);
     }
     void pop(bool locked = false) {
       if (!locked) {
@@ -672,11 +677,14 @@ class WritePreparedTxnDB : public WritePreparedTxnDBBase {
         if (seq < top_seq) {
           // Already popped, ignore it.
         } else if (top_seq == seq) {
-          pop();
-#ifndef NDEBUG
           MutexLock ml(push_pop_mutex());
-          assert(heap_.empty() || heap_.front() != seq);
-#endif
+          // A smaller prepare pushed since top() was read now sits in front.
+          if (heap_.front() == seq) {
+            pop(/*locked=*/true);
+            assert(heap_.empty() || heap_.front() != seq);
+          } else {
+            erased_heap_.push(seq);
+          }
         } else {  // top() > seq
           // Down the heap, remember to pop it later
           erased_heap_.push(seq);
@@ -773,8 +781,9 @@ class WritePreparedTxnDB : public WritePreparedTxnDBBase {
   // max_evicted_seq_. Thread-safety: this function can be called concurrently.
   // The concurrent invocations of this function is equivalent to a serial
   // invocation in which the last invocation is the one with the largest
-  // version value.
-  void UpdateSnapshots(const std::vector<SequenceNumber>& snapshots,
+  // version value: a list older than the current one (a smaller version) is
+  // never stored, and false is returned for it.
+  bool UpdateSnapshots(const std::vector<SequenceNumber>& snapshots,
                        const SequenceNumber& version);
   // Check the new list of new snapshots against the old one to see  if any of
   // the snapshots are released and to do the cleanup for the released snapshot.
@@ -824,7 +833,10 @@ class WritePreparedTxnDB : public WritePreparedTxnDBBase {
   std::vector<SequenceNumber> snapshots_all_;
   // The version of the latest list of snapshots. This can be used to avoid
   // rewriting a list that is concurrently updated with a more recent version.
-  SequenceNumber snapshots_version_ = 0;
+  // Written under snapshots_mutex_; atomic for AdvanceMaxEvictedSeq's
+  // unlocked precheck, which leaders of different WAL partitions run
+  // concurrently.
+  std::atomic<SequenceNumber> snapshots_version_{0};
 
   // A heap of prepared transactions. Thread-safety is provided with
   // prepared_mutex_.

@@ -305,6 +305,14 @@ Status DBImpl::ValidateOptions(const DBOptions& db_options) {
         "More than four DB paths are not supported yet. ");
   }
 
+  if (db_options.wal_partitions > 1 && db_options.two_write_queues) {
+    // N>1 needs indexed WALs, which the check below rejects with two write
+    // queues.
+    return Status::NotSupported(
+        "wal_partitions > 1 is not supported with two_write_queues (for any "
+        "partition_wal_usage)");
+  }
+
   if (log::WALIndexEnabled(db_options.partition_wal_usage) &&
       db_options.two_write_queues) {
     return Status::NotSupported(
@@ -350,14 +358,48 @@ Status DBImpl::ValidateOptions(const DBOptions& db_options) {
                                    std::to_string(kMaxWalPartitions));
   }
 
-  if (db_options.wal_partitions > 1) {
-    // The option is plumbed so it can be configured, persisted and
-    // round-tripped, but no code reads it yet. Reject rather than silently
-    // accept a value that has no effect.
+  if (db_options.wal_partitions > 1 &&
+      !db_options.allow_concurrent_memtable_write) {
+    // Each partition has its own write group leader, and the leaders insert
+    // into the shared memtables concurrently.
     return Status::NotSupported(
-        "wal_partitions > 1 is not supported yet: the partitioned write path "
-        "and multi-WAL recovery are not implemented (for any "
-        "partition_wal_usage)");
+        "wal_partitions > 1 requires allow_concurrent_memtable_write");
+  }
+
+  if (db_options.wal_partitions > 1 && db_options.track_and_verify_wals) {
+    // The predecessor check compares each WAL with the one before it in file
+    // number order, which at N>1 belongs to another partition.
+    return Status::NotSupported(
+        "wal_partitions > 1 is not supported with track_and_verify_wals");
+  }
+
+  if (db_options.wal_partitions > 1 && db_options.unordered_write) {
+    // unordered_write publishes the sequence before the completion gate.
+    return Status::NotSupported(
+        "wal_partitions > 1 is not supported with unordered_write");
+  }
+
+  if (db_options.wal_partitions > 1 && db_options.recycle_log_file_num > 0) {
+    // Checked on the caller's options: SanitizeOptions may zero it later.
+    return Status::NotSupported(
+        "wal_partitions > 1 is not supported with recycle_log_file_num > 0");
+  }
+
+  if (db_options.wal_partitions > 1) {
+    // The partitioned write path exists, but the completion gate and
+    // multi-WAL recovery do not, so a crash could leave holes. Tests reach
+    // the write path through this sync point.
+    bool allow_wal_partitions =
+        db_options.experimental_allow_wal_partitions_for_testing &&
+        log::WALIndexEnabled(db_options.partition_wal_usage);
+    TEST_SYNC_POINT_CALLBACK("DBImpl::ValidateOptions:AllowWalPartitions",
+                             &allow_wal_partitions);
+    if (!allow_wal_partitions) {
+      return Status::NotSupported(
+          "wal_partitions > 1 is not supported yet: the partitioned write "
+          "path and multi-WAL recovery are not implemented (for any "
+          "partition_wal_usage)");
+    }
   }
 
   if (db_options.wal_partitions > 1 &&
@@ -366,6 +408,15 @@ Status DBImpl::ValidateOptions(const DBOptions& db_options) {
     // cannot be merged. Permanent, whatever the sync point above allows.
     return Status::NotSupported(
         "wal_partitions > 1 requires partition_wal_usage other than kNone");
+  }
+
+  if (db_options.wal_partitions > 1 &&
+      !db_options.track_and_verify_wals_in_manifest) {
+    // Recovery takes the WALs that must exist from the MANIFEST; without
+    // tracking, a missing partition WAL would read as the durability
+    // frontier.
+    return Status::NotSupported(
+        "wal_partitions > 1 requires track_and_verify_wals_in_manifest");
   }
 
   if (db_options.unordered_write &&
@@ -3879,6 +3930,24 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
       assert(impl->WalLogs(0).empty());
       impl->WalLogs(0).emplace_back(new_log_number, new_log);
     }
+    // One WAL per remaining partition, numbered above partition 0's so that
+    // cur_wal_number_ is the lowest live WAL number, as SwitchMemtable keeps
+    // it.
+    for (size_t p = 1; s.ok() && p < impl->NumWalPartitions(); ++p) {
+      const uint64_t partition_log_number = impl->versions_->NewFileNumber();
+      assert(impl->cur_wal_number_ == new_log_number);
+      assert(partition_log_number > impl->cur_wal_number_);
+      log::Writer* partition_log = nullptr;
+      s = impl->CreateWAL(db_options_snapshot, write_options,
+                          partition_log_number, 0 /*recycle_log_number*/,
+                          preallocate_block_size, PredecessorWALInfo(),
+                          &partition_log);
+      if (s.ok()) {
+        DBImpl::WalWriteMutexLock wl(&impl->WalWriteMutex(p));
+        impl->WalLogs(p).emplace_back(partition_log_number, partition_log);
+        impl->AliveWalFiles(p).emplace_back(partition_log_number);
+      }
+    }
 
     if (s.ok()) {
       impl->AliveWalFiles(0).emplace_back(impl->cur_wal_number_);
@@ -3922,7 +3991,8 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
           // above the burned index. The file is discarded with the failed
           // open rather than left holding an undeclared hole.
           s = impl->WriteToWAL(empty_batch, write_options, wal_context,
-                               &wal_used, &log_size, recovered_seq, wal_index);
+                               &wal_used, &log_size, recovered_seq, wal_index,
+                               /*sequence_count=*/0);
         }
         if (s.ok()) {
           // Need to fsync, otherwise it might get lost after a power reset.
