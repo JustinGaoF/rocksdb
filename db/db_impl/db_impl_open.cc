@@ -454,6 +454,14 @@ Status DBImpl::ValidateOptions(const DBOptions& db_options) {
         "wal_partitions > 1 requires track_and_verify_wals_in_manifest");
   }
 
+  if (db_options.wal_partitions > 1 && !db_options.paranoid_checks) {
+    // A failed WAL append must stop the DB (D-1): without a background error
+    // its range pins every partition's completion gates, and point-in-time
+    // recovery would apply records above the hole it leaves.
+    return Status::NotSupported(
+        "wal_partitions > 1 requires paranoid_checks=true");
+  }
+
   if (db_options.unordered_write &&
       !db_options.allow_concurrent_memtable_write) {
     return Status::InvalidArgument(

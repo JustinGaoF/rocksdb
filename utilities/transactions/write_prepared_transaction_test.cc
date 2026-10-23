@@ -4755,8 +4755,9 @@ TEST_F(WritePreparedPartitionedWalTest, ConcurrentRecoverableStateCaching) {
   // site (from D126602590) releases the parked leaders together once one per
   // partition is parked; while a flush runs it releases them at once
   // instead, since the flush's memtable switch waits for those leaders. The
-  // flusher starts after the first four-way release, so every run races.
-  // TSan reports any unguarded access to the cached state.
+  // flusher starts after 20 four-way releases (from D126813582), so every
+  // run forces at least 20 races. TSan reports any unguarded access to the
+  // cached state.
   constexpr size_t kPartitions = 4;
   constexpr int kCommitsPerThread = 100;
   Open(kPartitions);
@@ -4829,7 +4830,7 @@ TEST_F(WritePreparedPartitionedWalTest, ConcurrentRecoverableStateCaching) {
   {
     std::unique_lock<std::mutex> lock(mu);
     ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(30),
-                            [&] { return full_releases > 0; }));
+                            [&] { return full_releases >= 20; }));
   }
   port::Thread flusher([&] {
     Random rnd(301);
@@ -4853,7 +4854,7 @@ TEST_F(WritePreparedPartitionedWalTest, ConcurrentRecoverableStateCaching) {
   flusher.join();
   SyncPoint::GetInstance()->ClearCallBack(
       "DBImpl::WriteGroupToWAL:BeforeCacheRecoverableState");
-  ASSERT_GE(full_releases, 1);
+  ASSERT_GE(full_releases, 20);
 
   // The last commit has the highest sequence, so its state is the one
   // persisted and recovered.

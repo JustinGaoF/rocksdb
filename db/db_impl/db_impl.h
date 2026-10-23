@@ -1587,6 +1587,11 @@ class DBImpl : public DB
     return wal_durability_tracker_->DurableUpto(partition);
   }
 
+  // The inclusive WAL-number cutoff a file-scoped WAL failure quarantines.
+  uint64_t TEST_WalRecoveryCutoff() const {
+    return wal_recovery_cutoff_.load(std::memory_order_acquire);
+  }
+
   void TEST_DeleteObsoleteFiles();
 
   const std::unordered_set<uint64_t>& TEST_GetFilesGrabbedForPurge() const {
@@ -2544,6 +2549,9 @@ class DBImpl : public DB
     // WAL_SYNC_BARRIER_MICROS).
     uint32_t wal_sync_unsynced_partitions = 0;
     uint64_t wal_sync_micros = 0;
+    // Sync writes only. The WAL whose leadership-time fsync failed, which at
+    // N > 1 may belong to another partition; 0 if none failed.
+    uint64_t sync_failed_wal_number = 0;
   };
 
   // PurgeFileInfo is a structure to hold information of files to be deleted in
@@ -3008,6 +3016,14 @@ class DBImpl : public DB
   void PublishAppliedPrefix(size_t wal_partition, SequenceNumber first_sequence,
                             SequenceNumber last_sequence, bool wal_record);
 
+  // N>1, debug only. For code holding every write queue (or the closed
+  // memtable switch gate) before it assigns or stamps LastSequence() + 1:
+  // every group publishes before it leaves its queue, so no live write holds
+  // a sequence above LastSequence(). Only a range a failure pinned stays
+  // unpublished, and it comes with a background error.
+  // REQUIRES: mutex_ held.
+  void AssertLastSequenceCoversAllocated();
+
   Status ThrottleLowPriWritesIfNeeded(const WriteOptions& write_options,
                                       WriteBatch* my_batch);
 
@@ -3326,12 +3342,11 @@ class DBImpl : public DB
   // check and park. Safe with no waiters; takes no WAL or sync-mark mutex.
   void SignalWalDurabilityWaitersOnBGError();
 
-  // Clears the durability park predicate's background-error leg. Called only
-  // from ErrorHandler::ClearBGError with mutex_ held; the store itself is
-  // lock-free and needs no mutex.
-  void ClearWalDurabilityBGError() {
-    wal_durability_bg_error_.store(false, std::memory_order_release);
-  }
+  // Clears the durability park predicate's background-error leg, and
+  // releases every range whose append failed (failed_wal_ranges_) from both
+  // trackers: recovery succeeded, and those ranges hold no data. Called only
+  // from ErrorHandler::ClearBGError with mutex_ held.
+  void ClearWalDurabilityBGError();
 
   // Runs a write group's completion gate: wait until the durability frontier
   // covers `target`, then, for a sync write whose leadership-time fsync may
@@ -3354,9 +3369,15 @@ class DBImpl : public DB
 
   // Used by WriteImpl to update bg_error_ when IO error happens, e.g., write
   // WAL, sync WAL fails, if paranoid check is enabled.
+  // `pinned_wal_partition`, when not kNoPinnedWalRange, is the partition on
+  // which the failed group registered [failed_wal_sequence_start,
+  // failed_wal_sequence] for N>1 durability and publication; the range is
+  // kept in failed_wal_ranges_ until recovery clears the error.
+  static constexpr size_t kNoPinnedWalRange = SIZE_MAX;
   void WALIOStatusCheck(const IOStatus& status, uint64_t failed_wal_number = 0,
                         SequenceNumber failed_wal_sequence = 0,
-                        SequenceNumber failed_wal_sequence_start = 0);
+                        SequenceNumber failed_wal_sequence_start = 0,
+                        size_t pinned_wal_partition = kNoPinnedWalRange);
 
   // Extends the inclusive WAL-number cutoff that must not receive more I/O.
   // This is lock-free because a WAL error can race with public SyncWAL().
@@ -4335,12 +4356,14 @@ class DBImpl : public DB
       autovector<std::pair<log::Writer*, bool>, 1>* wals_to_sync);
   // Syncs every live WAL file on partition p for a leadership sync
   // (WriteToWAL): closed WALs need only manifest recording, so only open
-  // files are synced. Stops at the first error.
+  // files are synced. Stops at the first error, and sets *failed_wal_number
+  // to the WAL that failed.
   // REQUIRES: WalWriteMutex(partition) held, except the N==1 single-queue
   // leadership sync, which holds no WAL mutex (single writer; the
   // getting_synced marks exclude SyncWAL).
   IOStatus SyncWalPartitionFiles(size_t partition,
-                                 const WriteOptions& write_options);
+                                 const WriteOptions& write_options,
+                                 uint64_t* failed_wal_number);
   // Closes partition p's WAL writers and drops the deque (CloseHelper).
   // Warns per WAL and returns the first error.
   // REQUIRES: WalWriteMutex(partition) held (the driver holds all N).
@@ -4703,6 +4726,16 @@ class DBImpl : public DB
   // insert. Its safe point is the highest sequence N>1 may publish. Every
   // Register/Complete runs under sequence_wal_index_mutex_.
   std::unique_ptr<WalDurabilityTracker> applied_tracker_;
+  // N>1 ranges registered by groups whose WAL append or leadership sync
+  // failed. They stay registered in both trackers while the background error
+  // stands, holding every later gated write, and are released when recovery
+  // clears it. Guarded by mutex_.
+  struct FailedWalRange {
+    size_t partition;
+    SequenceNumber low;
+    SequenceNumber high;
+  };
+  std::vector<FailedWalRange> failed_wal_ranges_;
 
   // See CloseMemTableSwitchGate().
   std::atomic<size_t> leaders_past_switch_gate_{0};
