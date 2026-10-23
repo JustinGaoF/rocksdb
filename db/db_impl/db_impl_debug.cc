@@ -271,6 +271,24 @@ void DBImpl::TEST_SetBGError(const IOStatus& error,
   // SetBGError, exactly as in production; a suppressed error wakes nothing.
 }
 
+std::vector<std::pair<uint64_t, uint64_t>> DBImpl::TEST_AliveWalFiles(
+    size_t partition) {
+  InstrumentedMutexLock l(&mutex_);
+  WalWriteMutexLock wl(&WalWriteMutex(partition));
+  std::vector<std::pair<uint64_t, uint64_t>> files;
+  for (const WalFileNumberSize& file : AliveWalFiles(partition)) {
+    files.emplace_back(file.number, file.size);
+  }
+  return files;
+}
+
+uint64_t DBImpl::TEST_CurrentWalNumber(size_t partition) {
+  InstrumentedMutexLock l(&mutex_);
+  WalWriteMutexLock wl(&WalWriteMutex(partition));
+  assert(!WalLogs(partition).empty());
+  return WalLogs(partition).back().number;
+}
+
 std::vector<std::pair<uint64_t, bool>> DBImpl::TEST_WalSyncMarks(
     size_t partition) {
   WalWriteMutexLock wl(&WalWriteMutex(partition));

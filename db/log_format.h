@@ -53,10 +53,15 @@ enum RecordType : uint8_t {
   // The MANIFEST's WAL index guard (VersionEdit::SetWALIndexGuard) is what
   // makes such a binary fail to open the DB.
   //
-  // The marker carries no payload and no reader acts on its contents. Its
-  // value is positional: it is the first record in the file, so an older
+  // Its value is positional: it is the first record in the file, so an older
   // binary reports on record #1 rather than partway through replay, and the
   // report names the file rather than an arbitrary offset within it.
+  //
+  // The payload is empty, or a fixed32 WAL partition index. Empty means
+  // partition 0, and only partitions above 0 write one, so a single-partition
+  // WAL is unchanged. Readers that predate the payload never look at it, so
+  // they still read the file and place it in partition 0. Placement of a
+  // closed WAL affects only retirement order, never which records replay.
   kWALIndexMarkerType = 12,
   kRecyclableWALIndexMarkerType = 13,
 
@@ -199,6 +204,9 @@ constexpr uint32_t kWALIndexSupersessionPayloadSize = 2 * kWALIndexSize;
 // A progress record's payload is one fixed64: the bound below which nothing
 // is still coming from this file.
 constexpr uint32_t kWALIndexProgressPayloadSize = kWALIndexSize;
+
+// Size of the marker's WAL partition field, when present.
+constexpr uint32_t kWALIndexMarkerPartitionSize = 4;
 
 // A predecessor span record's payload is the predecessor WAL file number,
 // its first wal_index, and its last wal_index.

@@ -10375,6 +10375,102 @@ TEST_P(CommitBypassMemtableTest, WBWIOpCountMismatchWBCount) {
   }
 }
 
+// CDR-F017 with a WriteCommitted prepare: the prepare keeps a WAL written
+// before WAL indexing live across the upgrade to two partitions, so the next
+// recovery set is that unindexed WAL followed by partitioned indexed ones.
+// Recovery replays the unindexed prefix sequentially and merges the rest, so
+// the commit written after the upgrade finds its prepare.
+TEST(TransactionPartitionedWalTest, PreparedUnindexedWalSurvivesPartitioning) {
+  constexpr size_t kPartitions = 2;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::ValidateOptions:AllowWalPartitions",
+      [](void* arg) { *static_cast<bool*>(arg) = true; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  const std::string dbname =
+      test::PerThreadDBPath("transaction_prepare_across_partitioning");
+  Options options;
+  options.create_if_missing = true;
+  options.create_missing_column_families = true;
+  options.avoid_flush_during_recovery = true;
+  options.avoid_flush_during_shutdown = true;
+  options.track_and_verify_wals_in_manifest = true;
+  ASSERT_OK(DestroyDB(dbname, options));
+  // Column family ids follow descriptor order; add families until one routes
+  // to each partition at N = 2.
+  std::vector<ColumnFamilyDescriptor> cfs;
+  cfs.emplace_back(kDefaultColumnFamilyName, ColumnFamilyOptions(options));
+  std::vector<size_t> cf_for_partition(kPartitions, 0);
+  std::vector<bool> covered(kPartitions, false);
+  size_t num_covered = 0;
+  while (num_covered < kPartitions) {
+    const uint32_t cf_id = static_cast<uint32_t>(cfs.size());
+    cfs.emplace_back("cf" + std::to_string(cf_id),
+                     ColumnFamilyOptions(options));
+    WriteBatch batch;
+    ASSERT_OK(WriteBatchInternal::Put(&batch, cf_id, "key", "value"));
+    size_t partition = kPartitions;
+    ASSERT_OK(
+        DBImpl::TEST_WalPartitionForWrite(batch, kPartitions, &partition));
+    if (!covered[partition]) {
+      covered[partition] = true;
+      cf_for_partition[partition] = cf_id;
+      ++num_covered;
+    }
+  }
+  std::vector<ColumnFamilyHandle*> handles;
+  TransactionDB* db = nullptr;
+  auto open = [&](uint32_t partitions, PartitionWALUsage usage) {
+    options.wal_partitions = partitions;
+    options.partition_wal_usage = usage;
+    ASSERT_OK(TransactionDB::Open(options, TransactionDBOptions(), dbname, cfs,
+                                  &handles, &db));
+  };
+  auto close = [&] {
+    for (ColumnFamilyHandle* handle : handles) {
+      ASSERT_OK(db->DestroyColumnFamilyHandle(handle));
+    }
+    handles.clear();
+    delete db;
+    db = nullptr;
+  };
+
+  open(1, PartitionWALUsage::kNone);
+  Transaction* txn = db->BeginTransaction(WriteOptions());
+  ASSERT_OK(txn->SetName("xid"));
+  ASSERT_OK(txn->Put(handles[cf_for_partition[1]], "prepared", "value"));
+  ASSERT_OK(txn->Prepare());
+  ASSERT_OK(db->Put(WriteOptions(), handles[cf_for_partition[0]], "unindexed",
+                    "value"));
+  delete txn;
+  close();
+
+  open(kPartitions, PartitionWALUsage::kPartitionByColumnFamily);
+  txn = db->GetTransactionByName("xid");
+  ASSERT_NE(nullptr, txn);
+  ASSERT_OK(txn->Commit());
+  delete txn;
+  for (size_t p = 0; p < kPartitions; ++p) {
+    ASSERT_OK(db->Put(WriteOptions(), handles[cf_for_partition[p]],
+                      "indexed" + std::to_string(p), "value"));
+  }
+  close();
+
+  open(kPartitions, PartitionWALUsage::kPartitionByColumnFamily);
+  std::string value;
+  ASSERT_OK(
+      db->Get(ReadOptions(), handles[cf_for_partition[1]], "prepared", &value));
+  ASSERT_OK(db->Get(ReadOptions(), handles[cf_for_partition[0]], "unindexed",
+                    &value));
+  for (size_t p = 0; p < kPartitions; ++p) {
+    ASSERT_OK(db->Get(ReadOptions(), handles[cf_for_partition[p]],
+                      "indexed" + std::to_string(p), &value));
+  }
+  close();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_OK(DestroyDB(dbname, options));
+}
+
 // G-10: CommitAndTryCreateSnapshot's timestamped snapshot must not publish its
 // commit sequence above the N>1 applied prefix. With A, the lower sequence on
 // partition 0, held in its append, B's commit on partition 1 must leave B's

@@ -3065,7 +3065,8 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
   TEST_SYNC_POINT_CALLBACK("DBImpl::WriteToWAL:AfterAddRecord", &io_s);
 #ifndef NDEBUG
   WalAppendOutcome append_outcome{wal_context.wal_partition, sequence,
-                                  sequence_count, io_s.ok()};
+                                  sequence_count, io_s.ok(),
+                                  log_writer->get_log_number()};
   TEST_SYNC_POINT_CALLBACK("DBImpl::WriteToWAL:AppendOutcome", &append_outcome);
 #endif
 #ifndef NDEBUG
@@ -4662,7 +4663,28 @@ Status DBImpl::SwitchMemtableImpl(ColumnFamilyData* cfd, WriteContext* context,
       BuildDBOptions(immutable_db_options_, mutable_db_options_);
   const auto preallocate_block_size =
       GetWalPreallocateBlockSize(mutable_cf_options_copy.write_buffer_size);
+  // Every writer is excluded (the switch gate or all queues entered), so
+  // every index allocated so far is in a current WAL or an older one.
+  uint64_t wal_index_high = 0;
+  if (log::WALIndexEnabled(immutable_db_options_.partition_wal_usage)) {
+    InstrumentedMutexLock l(&sequence_wal_index_mutex_);
+    wal_index_high = next_wal_index_ - 1;
+  }
   mutex_.Unlock();
+  auto wal_index_predecessor = [this, wal_index_high](size_t partition) {
+    log::WALIndexPredecessorSpan span;
+    if (!log::WALIndexEnabled(immutable_db_options_.partition_wal_usage)) {
+      return span;
+    }
+    WalWriteMutexLock l(&WalWriteMutex(partition));
+    if (!WalLogs(partition).empty()) {
+      log::Writer* cur_log_writer = WalLogs(partition).back().writer;
+      span = log::MakeWALIndexPredecessorSpan(
+          cur_log_writer->get_log_number(),
+          cur_log_writer->first_wal_index_recorded(), wal_index_high);
+    }
+    return span;
+  };
   auto predecessor_wal_info = [this](size_t partition) {
     PredecessorWALInfo info;
     WalWriteMutexLock l(&WalWriteMutex(partition));
@@ -4678,15 +4700,16 @@ Status DBImpl::SwitchMemtableImpl(ColumnFamilyData* cfd, WriteContext* context,
     PredecessorWALInfo info = predecessor_wal_info(0);
     // TODO: Write buffer size passed in should be max of all CF's instead
     // of mutable_cf_options.write_buffer_size.
+    const log::WALIndexPredecessorSpan span = wal_index_predecessor(0);
     if (prepared_wal.writer) {
-      io_s = StartWALFile(write_options, info, prepared_wal.writer.get());
+      io_s = StartWALFile(write_options, info, span, prepared_wal.writer.get());
       if (io_s.ok()) {
         new_log = prepared_wal.writer.release();
       }
     } else {
-      io_s =
-          CreateWAL(db_options_snapshot, write_options, new_log_number,
-                    recycle_log_number, preallocate_block_size, info, &new_log);
+      io_s = CreateWAL(db_options_snapshot, write_options, new_log_number,
+                       recycle_log_number, preallocate_block_size, info, span,
+                       /*wal_partition=*/0, &new_log);
     }
     TEST_SYNC_POINT_CALLBACK("DBImpl::SwitchMemtable:AfterCreateWAL", &io_s);
     if (s.ok()) {
@@ -4696,7 +4719,8 @@ Status DBImpl::SwitchMemtableImpl(ColumnFamilyData* cfd, WriteContext* context,
       log::Writer* extra_wal = nullptr;
       io_s = CreateWAL(db_options_snapshot, write_options, extra_wal_numbers[i],
                        /*recycle_log_number=*/0, preallocate_block_size,
-                       predecessor_wal_info(i + 1), &extra_wal);
+                       predecessor_wal_info(i + 1),
+                       wal_index_predecessor(i + 1), i + 1, &extra_wal);
       s = io_s;
       if (s.ok()) {
         extra_wals.push_back(extra_wal);
@@ -4786,7 +4810,17 @@ Status DBImpl::SwitchMemtableImpl(ColumnFamilyData* cfd, WriteContext* context,
         cur_log_writer->file()->reset_seen_error();
       }
       if (!abandon_current_wal) {
-        io_s = cur_log_writer->WriteBuffer(write_options);
+        // Progress policy: with more than one partition, every retiring WAL
+        // asserts that nothing below the new generation's first index is
+        // still coming from it, so a live merge waiting on an idle partition
+        // advances at the next rotation.
+        io_s = NumWalPartitions() > 1
+                   ? cur_log_writer->AddWALIndexProgressRecord(
+                         write_options, wal_index_high + 1)
+                   : IOStatus::OK();
+        if (io_s.ok()) {
+          io_s = cur_log_writer->WriteBuffer(write_options);
+        }
         current_wal_write_buffer_failed = !io_s.ok();
         if (current_wal_write_buffer_failed) {
           failed_wal_number = cur_log_writer->get_log_number();
@@ -4852,7 +4886,10 @@ Status DBImpl::SwitchMemtableImpl(ColumnFamilyData* cfd, WriteContext* context,
     } else {
       error_handler_.SetBGError(s, BackgroundErrorReason::kMemTable);
     }
-    // Read back bg_error in order to get the right severity
+    // Read back bg_error in order to get the right severity. A WAL I/O
+    // failure while rotating wakes parked completion gates through the
+    // transition hook in the SetBGError above, the same path as every other
+    // background error; no explicit wake (and no mutex dance) here.
     s = error_handler_.GetBGError();
     UpdateWBMAccountingAfterMemtableSwitch(refresh_wbm_accounting);
     return s;

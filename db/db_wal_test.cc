@@ -8,6 +8,7 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #include <algorithm>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <numeric>
@@ -4920,8 +4921,6 @@ TEST_F(DBWALIndexTest, UncoveredWALIndexFailsSubsequentWrites) {
   Destroy(options);
 }
 
-// Indexing off means no void records, the same way it means no marker and no
-// indexed data types: the WAL stays byte-for-byte vanilla.
 // A sync that fails after the append burned nothing: the record is in the
 // file, so a void over its index would trail the reader's order mark and fail
 // every open that rejects corruption. The write still fails.
@@ -4988,6 +4987,8 @@ TEST_F(DBWALIndexTest, SyncFailureAfterAppendWritesNoCover) {
   }
 }
 
+// Indexing off means no void records, the same way it means no marker and no
+// indexed data types: the WAL stays byte-for-byte vanilla.
 TEST_F(DBWALIndexTest, DefaultUsageWritesNoVoidRecords) {
   Options options = WALIndexOptions(PartitionWALUsage::kNone);
   DestroyAndReopen(options);
@@ -5360,6 +5361,292 @@ TEST_F(DBWALIndexTest, LiveIndexAtOrAboveSeedFailsTheOpen) {
   Destroy(options);
 }
 
+// Runs `write` with its log entry corrupted after its WAL index is taken: the
+// write fails before any append, and the writer covers the index with a void.
+static Status WriteBurningWALIndex(const std::function<Status()>& write) {
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WriteToWAL:log_entry", [](void* arg) {
+        Slice* const log_entry = static_cast<Slice*>(arg);
+        char* const data = const_cast<char*>(log_entry->data());
+        data[log_entry->size() - 1] ^= 0xff;
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  const Status s = write();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  return s;
+}
+
+// A WAL holding only a burn cover opens in every mode: the cover declares
+// its index, the seed moves past it, and nothing is ever reissued under it.
+// Ported from D126149797.
+TEST_F(DBWALIndexTest, VoidOnlyWALOpensAndSeedsPastVoid) {
+  for (const WALRecoveryMode recovery_mode :
+       {WALRecoveryMode::kTolerateCorruptedTailRecords,
+        WALRecoveryMode::kAbsoluteConsistency,
+        WALRecoveryMode::kPointInTimeRecovery,
+        WALRecoveryMode::kSkipAnyCorruptedRecords}) {
+    SCOPED_TRACE(static_cast<int>(recovery_mode));
+    Options options =
+        WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+    options.wal_recovery_mode = recovery_mode;
+    DestroyAndReopen(options);
+    ASSERT_NOK(WriteBurningWALIndex(
+        [this] { return WriteProtectedBatch(Key(0), "value0"); }));
+    const uint64_t wal_number = LatestWALNumber();
+    const std::string wal_path = WALPath(wal_number);
+    EXPECT_TRUE(ReadWALIndices(wal_path, wal_number).empty());
+    const std::vector<std::pair<uint64_t, uint64_t>> expected_voids = {
+        {log::kWALIndexStartNumber, log::kWALIndexStartNumber}};
+    EXPECT_EQ(expected_voids, ReadWALVoidRanges(wal_path));
+    Close();
+
+    Reopen(options);
+    WriteKeyRange(0, 4);
+    const uint64_t new_wal = LatestWALNumber();
+    const std::vector<uint64_t> indices =
+        ReadWALIndices(WALPath(new_wal), new_wal);
+    ASSERT_FALSE(indices.empty());
+    EXPECT_EQ(log::kWALIndexStartNumber + 1, indices[0]);
+    Close();
+
+    Reopen(options);
+    for (int i = 0; i <= 3; ++i) {
+      EXPECT_EQ("value" + std::to_string(i), Get(Key(i))) << "key " << i;
+    }
+    Close();
+    Destroy(options);
+  }
+}
+
+// A filter stop at N=1 with a void above the last applied record: the seed
+// moves past the void, so the write after the stop takes a fresh index, and
+// the open after that finds no record over a void.
+TEST_F(DBWALIndexTest, BreakSeedsPastVoidAboveLastAppliedRecord) {
+  Options options =
+      WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+  DestroyAndReopen(options);
+  WriteKeyRange(0, 4);
+  Close();
+  Reopen(options);
+  WriteKeyRange(4, 1);
+  const uint64_t lone_wal = LatestWALNumber();
+  Close();
+  // A WAL holding only the cover of burned index 6. The burn stops the DB,
+  // so key 11 lands at index 7 in the next WAL.
+  Reopen(options);
+  ASSERT_NOK(WriteBurningWALIndex(
+      [this] { return WriteProtectedBatch(Key(10), "value10"); }));
+  const uint64_t void_wal = LatestWALNumber();
+  ASSERT_NE(lone_wal, void_wal);
+  Close();
+  Reopen(options);
+  ASSERT_OK(Put(Key(11), "value11"));
+  const uint64_t last_wal = LatestWALNumber();
+  ASSERT_NE(void_wal, last_wal);
+  Close();
+  const std::vector<std::pair<uint64_t, uint64_t>> expected_voids = {{6, 6}};
+  ASSERT_EQ(expected_voids, ReadWALVoidRanges(WALPath(void_wal)));
+  const std::vector<uint64_t> last_wal_indices = {7};
+  ASSERT_EQ(last_wal_indices, ReadWALIndices(WALPath(last_wal), last_wal));
+
+  // Ignores key 4 at index 5 and stops at key 11: index 4 is the last
+  // applied, and the void at 6, in a WAL the stop does not cut, sits above
+  // it.
+  IgnoreWALWalFilter filter(lone_wal, /*report_corrupted=*/false);
+  options.wal_filter = &filter;
+  Reopen(options);
+  ASSERT_OK(Put(Key(20), "value20"));
+  const uint64_t new_wal = LatestWALNumber();
+  const std::vector<uint64_t> new_indices = {7};
+  EXPECT_EQ(new_indices, ReadWALIndices(WALPath(new_wal), new_wal));
+  Close();
+
+  options.wal_filter = nullptr;
+  Reopen(options);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ("value" + std::to_string(i), Get(Key(i))) << "key " << i;
+  }
+  EXPECT_EQ("NOT_FOUND", Get(Key(4)));
+  EXPECT_EQ("NOT_FOUND", Get(Key(11)));
+  EXPECT_EQ("value20", Get(Key(20)));
+  Close();
+  Destroy(options);
+}
+
+// Reports the record after the first `ok_records` as corrupted, which arms a
+// point-in-time stop.
+class CorruptAfterRecordsWalFilter : public WalFilter {
+ public:
+  explicit CorruptAfterRecordsWalFilter(int ok_records)
+      : ok_records_(ok_records) {}
+
+  const char* Name() const override { return "CorruptAfterRecordsWalFilter"; }
+
+  WalProcessingOption LogRecordFound(unsigned long long /*log_number*/,
+                                     const std::string& /*log_file_name*/,
+                                     const WriteBatch& /*batch*/,
+                                     WriteBatch* /*new_batch*/,
+                                     bool* /*batch_changed*/) override {
+    return records_found_++ == ok_records_
+               ? WalProcessingOption::kCorruptedRecord
+               : WalProcessingOption::kContinueProcessing;
+  }
+
+ private:
+  const int ok_records_;
+  int records_found_ = 0;
+};
+
+// N-4-1 residual: a stop inside a WAL that ends in a void stops the drive
+// before the void is read. Recovery reads the unread tail for its voids, so
+// the write after the stop takes an index past the void instead of
+// reissuing it, and the next open does not fail with "bears records and a
+// void cover".
+TEST_F(DBWALIndexTest, UnreadVoidAfterStopIsNotReissued) {
+  struct Case {
+    WALRecoveryMode mode;
+    bool filter_reports_corruption;
+  };
+  for (const Case& c :
+       {Case{WALRecoveryMode::kPointInTimeRecovery, false},
+        Case{WALRecoveryMode::kTolerateCorruptedTailRecords, false},
+        Case{WALRecoveryMode::kAbsoluteConsistency, false},
+        Case{WALRecoveryMode::kSkipAnyCorruptedRecords, false},
+        Case{WALRecoveryMode::kPointInTimeRecovery, true}}) {
+    SCOPED_TRACE(std::to_string(static_cast<int>(c.mode)) + " " +
+                 std::to_string(c.filter_reports_corruption));
+    Options options =
+        WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+    options.wal_recovery_mode = c.mode;
+    DestroyAndReopen(options);
+    WriteKeyRange(0, 5);
+    ASSERT_NOK(WriteBurningWALIndex(
+        [this] { return WriteProtectedBatch(Key(10), "value10"); }));
+    const uint64_t void_wal = LatestWALNumber();
+    Close();
+    const std::vector<std::pair<uint64_t, uint64_t>> expected_voids = {{6, 6}};
+    ASSERT_EQ(expected_voids, ReadWALVoidRanges(WALPath(void_wal)));
+
+    StopReplayAfterRecordsWalFilter stop_filter(/*stop_after=*/2);
+    CorruptAfterRecordsWalFilter corrupt_filter(/*ok_records=*/2);
+    options.wal_filter = c.filter_reports_corruption
+                             ? static_cast<WalFilter*>(&corrupt_filter)
+                             : static_cast<WalFilter*>(&stop_filter);
+    Reopen(options);
+    WriteKeyRange(20, 4);
+    const uint64_t new_wal = LatestWALNumber();
+    // The point-in-time cut also writes a dummy record ahead of the keys.
+    const std::vector<uint64_t> new_indices =
+        ReadWALIndices(WALPath(new_wal), new_wal);
+    ASSERT_GE(new_indices.size(), 4U);
+    EXPECT_EQ(7U, new_indices.front());
+    Close();
+    options.wal_filter = nullptr;
+    ASSERT_OK(TryReopen(options));
+    for (int i = 0; i < 2; ++i) {
+      EXPECT_EQ("value" + std::to_string(i), Get(Key(i))) << "key " << i;
+    }
+    for (int i = 2; i < 5; ++i) {
+      EXPECT_EQ("NOT_FOUND", Get(Key(i))) << "key " << i;
+    }
+    for (int i = 20; i < 24; ++i) {
+      EXPECT_EQ("value" + std::to_string(i), Get(Key(i))) << "key " << i;
+    }
+    Close();
+    Destroy(options);
+  }
+}
+
+// Reading past the stop for voids ends silently at the first damage: a void
+// beyond it is not seeded past, so the open behaves as without the read,
+// keeps the same keys and logs no report.
+TEST_F(DBWALIndexTest, VoidReadAfterStopEndsAtDamage) {
+  Options options =
+      WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+  options.wal_recovery_mode = WALRecoveryMode::kTolerateCorruptedTailRecords;
+  DestroyAndReopen(options);
+  WriteKeyRange(0, 5);
+  ASSERT_NOK(WriteBurningWALIndex(
+      [this] { return WriteProtectedBatch(Key(10), "value10"); }));
+  const uint64_t void_wal = LatestWALNumber();
+  Close();
+  // Damage at index 5, between the stop and the void at 6, that the reader
+  // reports and reads past.
+  CorruptDataRecordTypeAt(WALPath(void_wal), /*ordinal=*/4);
+
+  StopReplayAfterRecordsWalFilter filter(/*stop_after=*/2);
+  options.wal_filter = &filter;
+  Reopen(options);
+  for (int i = 0; i < 2; ++i) {
+    EXPECT_EQ("value" + std::to_string(i), Get(Key(i))) << "key " << i;
+  }
+  for (int i = 2; i < 5; ++i) {
+    EXPECT_EQ("NOT_FOUND", Get(Key(i))) << "key " << i;
+  }
+  ASSERT_OK(Put(Key(20), "value20"));
+  const uint64_t new_wal = LatestWALNumber();
+  // As without the void read: the seed stays above the last applied index.
+  const std::vector<uint64_t> new_indices = {3};
+  EXPECT_EQ(new_indices, ReadWALIndices(WALPath(new_wal), new_wal));
+  Close();
+  std::string log_contents;
+  ASSERT_OK(ReadFileToString(env_, dbname_ + "/LOG", &log_contents));
+  EXPECT_EQ(std::string::npos, log_contents.find("dropping")) << log_contents;
+  options.wal_filter = nullptr;
+  Destroy(options);
+}
+
+// The end-of-recovery check covers voids: a live void at or above the seed
+// fails the open, cut or not, because a write would reissue its index and
+// the merge rejects a record over a void. A void below the seed opens.
+TEST_F(DBWALIndexTest, LiveVoidAtOrAboveSeedFailsTheOpen) {
+  for (const bool forged : {false, true}) {
+    SCOPED_TRACE(forged);
+    Options options =
+        WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+    DestroyAndReopen(options);
+    WriteKeyRange(0, 4);
+    ASSERT_NOK(WriteBurningWALIndex(
+        [this] { return WriteProtectedBatch(Key(10), "value10"); }));
+    const uint64_t wal_number = LatestWALNumber();
+    Close();
+    const std::string wal_path = WALPath(wal_number);
+    const std::vector<std::pair<uint64_t, uint64_t>> expected_voids = {{5, 5}};
+    ASSERT_EQ(expected_voids, ReadWALVoidRanges(wal_path));
+    if (forged) {
+      // The void moves to index 10, past the hole at 5 where a clean drive
+      // ends, so the seed stays at 5.
+      std::string contents = ReadWALContents(wal_path);
+      for (const PhysicalRecord& record : ScanPhysicalRecords(contents)) {
+        if (record.type == log::kWALIndexVoidType) {
+          char* const payload = &contents[record.payload_offset()];
+          EncodeFixed64(payload, 10);
+          EncodeFixed64(payload + log::kWALIndexSize, 10);
+          FixRecordChecksum(record, &contents);
+        }
+      }
+      WriteWALContents(wal_path, contents);
+      const Status status = TryReopen(options);
+      ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+      EXPECT_NE(std::string::npos,
+                status.ToString().find("WAL " + std::to_string(wal_number) +
+                                       " holds a void over wal_index 10"))
+          << status.ToString();
+    } else {
+      Reopen(options);
+      ASSERT_OK(Put(Key(20), "value20"));
+      Reopen(options);
+      for (int i = 0; i < 4; ++i) {
+        EXPECT_EQ("value" + std::to_string(i), Get(Key(i))) << "key " << i;
+      }
+      EXPECT_EQ("value20", Get(Key(20)));
+      Close();
+    }
+    Destroy(options);
+  }
+}
+
 TEST_F(DBWALIndexTest, UnopenableIndexedWALFailsRecovery) {
   Options options =
       WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
@@ -5565,8 +5852,11 @@ TEST_F(DBWALIndexTest, SwitchedWALCarriesWALIndexOnDisk) {
   const std::vector<uint8_t> types = ReadWALRecordTypes(wal_path);
   ASSERT_FALSE(types.empty());
   EXPECT_EQ(log::kWALIndexMarkerType, types.front());
+  // Then the span attesting the WAL it replaced.
+  ASSERT_GE(types.size(), 2U);
+  EXPECT_EQ(log::kWALIndexPredecessorSpanType, types[1]);
   int num_indexed = 0;
-  for (size_t i = 1; i < types.size(); i++) {
+  for (size_t i = 2; i < types.size(); i++) {
     EXPECT_TRUE(log::IsWALIndexRecordType(types[i]));
     num_indexed++;
   }
@@ -6075,6 +6365,75 @@ TEST_F(DBWALIndexTest, PristineHoleFailsExceptPointInTime) {
     EXPECT_NE(std::string::npos, status.ToString().find("unexplained hole"));
     Destroy(options);
   }
+}
+
+// G-20 at one WAL: the WAL after a rotation attests its predecessor, so
+// deleting the oldest live WAL is detected rather than read as a later lower
+// bound. Point-in-time keeps nothing at or above the lost file's first index;
+// tolerate and absolute fail naming it. Neuter: stop writing spans;
+// point-in-time opens with keys 2 and 3 and the loss is silent.
+TEST_F(DBWALIndexTest, DeletedOldestWALIsDetectedAtOneWAL) {
+  Options options =
+      WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+  DestroyAndReopen(options);
+  WriteKeyRange(0, 2);
+  const uint64_t oldest = LatestWALNumber();
+  ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+  WriteKeyRange(2, 2);
+  Close();
+  ASSERT_OK(env_->DeleteFile(WALPath(oldest)));
+  for (const WALRecoveryMode recovery_mode :
+       {WALRecoveryMode::kTolerateCorruptedTailRecords,
+        WALRecoveryMode::kAbsoluteConsistency}) {
+    SCOPED_TRACE(static_cast<int>(recovery_mode));
+    options.wal_recovery_mode = recovery_mode;
+    const Status status = TryReopen(options);
+    ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+    EXPECT_NE(std::string::npos,
+              status.ToString().find("WAL " + std::to_string(oldest) +
+                                     " is attested by its successor but "
+                                     "missing"))
+        << status.ToString();
+  }
+  options.wal_recovery_mode = WALRecoveryMode::kPointInTimeRecovery;
+  Reopen(options);
+  for (int i = 0; i < 4; ++i) {
+    std::string value;
+    EXPECT_TRUE(db_->Get(ReadOptions(), Key(i), &value).IsNotFound()) << i;
+  }
+  Destroy(options);
+}
+
+// WALs without a span (what the base writer and a new DB's first WAL write:
+// a marker and no span) recover as before, alone and with WALs that carry
+// spans, which then attest them.
+TEST_F(DBWALIndexTest, SpanlessWALsRecoverAloneAndWithNewOnes) {
+  Options options =
+      WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+  DestroyAndReopen(options);
+  WriteKeyRange(0, 2);
+  const uint64_t spanless = LatestWALNumber();
+  Close();
+  for (const uint8_t type : ReadWALRecordTypes(WALPath(spanless))) {
+    ASSERT_NE(log::kWALIndexPredecessorSpanType, type);
+  }
+  Reopen(options);
+  WriteKeyRange(2, 2);
+  const uint64_t spanned = LatestWALNumber();
+  ASSERT_GT(spanned, spanless);
+  Close();
+  std::vector<uint64_t> span_preds;
+  ForEachPhysicalRecord(WALPath(spanned), [&](uint8_t type, Slice payload) {
+    if (type == log::kWALIndexPredecessorSpanType) {
+      span_preds.push_back(DecodeFixed64(payload.data()));
+    }
+  });
+  EXPECT_EQ(std::vector<uint64_t>{spanless}, span_preds);
+  Reopen(options);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ("value" + std::to_string(i), Get(Key(i))) << i;
+  }
+  Destroy(options);
 }
 
 // Damage before a file's first readable record leaves the lower bound
