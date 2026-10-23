@@ -3170,7 +3170,7 @@ Status DBImpl::RestoreAliveLogFiles(const std::vector<uint64_t>& wal_numbers) {
   // Mark these as alive so they'll be considered for deletion later by
   // FindObsoleteFiles()
   wals_total_size_.StoreRelaxed(0);
-  wal_empty_ = false;
+  WalEmpty(0) = false;
   uint64_t min_wal_with_unflushed_data =
       versions_->MinLogNumberWithUnflushedData();
   const bool preallocation_supported = fs_->IsPreallocationSupported();
@@ -3873,7 +3873,7 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
       impl->min_wal_number_to_recycle_ = new_log_number;
     }
     if (s.ok()) {
-      InstrumentedMutexLock wl(&impl->wal_write_mutex_);
+      DBImpl::WalWriteMutexLock wl(&impl->WalWriteMutex(0));
       impl->cur_wal_number_ = new_log_number;
       assert(new_log != nullptr);
       assert(impl->WalLogs(0).empty());

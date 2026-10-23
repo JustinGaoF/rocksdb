@@ -73,6 +73,7 @@
 #include "util/autovector.h"
 #include "util/coro_utils.h"
 #include "util/hash.h"
+#include "util/mutexlock.h"
 #include "util/repeatable_thread.h"
 #include "util/stop_watch.h"
 #include "util/thread_local.h"
@@ -1716,7 +1717,7 @@ class DBImpl : public DB
 
   // State below is protected by mutex_
   // With two_write_queues enabled, some of the variables that accessed during
-  // WriteToWAL need different synchronization: wal_empty_, alive_wal_files_,
+  // WriteToWAL need different synchronization: wal_empties_, alive_wal_files_,
   // logs_, cur_wal_number_. Refer to the definition of each variable below for
   // more description.
   //
@@ -3075,8 +3076,11 @@ class DBImpl : public DB
   // partitioning a poisoned writer for partition p may want to fall back to a
   // healthy partition, so this signature needs revisiting then -- unless the
   // durability watermark rule above makes the fallback unnecessary.
+  // Takes WalWriteMutex(wal_partition) unless `wal_mutex_held`, whenever
+  // WriteToWAL would take it.
   IOStatus CoverBurnedWALIndex(const WriteOptions& write_options,
-                               log::Writer* log_writer, uint64_t wal_index);
+                               log::Writer* log_writer, uint64_t wal_index,
+                               size_t wal_partition, bool wal_mutex_held);
 
   // Binds `wal_context` to the WAL that writes should be appended to, and to
   // that WAL's file-number/size accounting.
@@ -3087,9 +3091,9 @@ class DBImpl : public DB
   // several WALs, and because the three callers were open-coding the same pair
   // of `.back()` calls plus the same consistency assertion.
   //
-  // REQUIRES: wal_write_mutex_ held, or called from Open() before the DB is
-  // visible to other threads. See the synchronization notes on logs_ and
-  // alive_wal_files_.
+  // REQUIRES: WalWriteMutex(WalPartitionForWrite()) held, or called from
+  // Open() before the DB is visible to other threads. See the synchronization
+  // notes on logs_ and alive_wal_files_.
   void SelectWalForWrite(WalContext* wal_context);
 
   // `wal_context` names the WAL these writes go to and carries the sync
@@ -3315,11 +3319,13 @@ class DBImpl : public DB
                        bool error_recovery_in_prog);
 
   // helper function to call after some of the logs_ were synced
+  // REQUIRES: all N WAL write mutexes held (see LockWalWriteMutexes()).
   void MarkLogsSynced(uint64_t up_to, bool synced_dir, VersionEdit* edit);
   Status ApplyWALToManifest(const ReadOptions& read_options,
                             const WriteOptions& write_options,
                             VersionEdit* edit);
   // WALs with log number up to up_to are not synced successfully.
+  // REQUIRES: all N WAL write mutexes held (see LockWalWriteMutexes()).
   void MarkLogsNotSynced(uint64_t up_to);
 
   SnapshotImpl* GetSnapshotImpl(bool is_write_conflict_boundary,
@@ -3670,13 +3676,97 @@ class DBImpl : public DB
   // Guards reads and writes to in-memory stats_history_.
   InstrumentedMutex stats_history_mutex_;
 
-  // In addition to mutex_, wal_write_mutex_ protects writes to logs_ and
-  // cur_wal_number_. With two_write_queues it also protects alive_wal_files_,
-  // and wal_empty_. Refer to the definition of each variable below for more
+  // WAL-write exclusion, one mutex per WAL partition: WalWriteMutex(p)
+  // serializes appends to, rotation of, and bookkeeping for partition p's
+  // WALs, and WalSyncCV(p) is the condition variable bound to it. In
+  // addition to mutex_, these protect writes to logs_ and cur_wal_number_.
+  // With two_write_queues they also protect alive_wal_files_ and
+  // wal_empties_. Refer to the definition of each variable below for more
   // details.
-  // Note: to avoid deadlock, if needed to acquire both wal_write_mutex_ and
-  // mutex_, the order should be first mutex_ and then wal_write_mutex_.
-  InstrumentedMutex wal_write_mutex_;
+  //
+  // LOCK ORDER (acyclic by construction):
+  //  1. mutex_ (the DB mutex) comes before every WAL write mutex.
+  //  2. WAL write mutexes are taken in ascending partition-index order, and
+  //     a thread holding more than one always took them in that order.
+  //  3. sequence_wal_index_mutex_ is a leaf below the WAL write mutexes: it
+  //     is only ever acquired alone or while already holding a WAL write
+  //     mutex, and nothing acquired under it takes a WAL write mutex.
+  // A write binds to and appends to exactly one partition, so the resolve
+  // step (SelectWalForWrite) and the append (WriteToWAL) hold exactly that
+  // partition's mutex and never a second. Operations that span partitions
+  // (sync, obsolete-file cleanup, close, the manual-flush API surface) hold
+  // all N, taken in index order. There is exactly one implementation of that
+  // order, LockWalWriteMutexes()/UnlockWalWriteMutexes() (and the
+  // AllWalWriteMutexesLock RAII wrapper); every multi-partition acquisition
+  // goes through it, and single-partition takes use WalWriteMutexLock on
+  // WalWriteMutex(p) directly. Debug builds check rule 2 on every Lock()
+  // (see WalWriteMutexType).
+  // A Wait() on WalSyncCV(p) holds WalWriteMutex(p) and no other partition
+  // mutex: pthread_cond_wait releases only the mutex the condvar is bound
+  // to, so waiting while holding others would keep them held while asleep,
+  // and the thread that signals (a sync completion holding all N) would
+  // block on them forever. Multi-partition waits are therefore sequential:
+  // take one partition's mutex, wait, mark, release, then move to the next.
+  //
+  // Private inheritance keeps InstrumentedMutexLock/InstrumentedMutexUnlock,
+  // which would bypass the check, from compiling against these mutexes.
+  // Cache-line aligned: every partition's leader takes its own on each
+  // append, so adjacent partitions' mutexes must not share a line.
+  class ALIGN_AS(CACHE_LINE_SIZE) WalWriteMutexType
+      : private InstrumentedMutex {
+   public:
+    // Debug builds assert the calling thread holds no WAL write mutex of the
+    // same DB at an equal or higher partition index (LOCK ORDER rule 2).
+    void Lock() {
+      AssertLockOrder();
+      InstrumentedMutex::Lock();
+      NoteHeld();
+    }
+    void Unlock() {
+      NoteReleased();
+      InstrumentedMutex::Unlock();
+    }
+    using InstrumentedMutex::AssertHeld;
+    using InstrumentedMutex::ConfigureSlowHoldLogging;
+
+    // Only for binding this partition's WalSyncCV.
+    InstrumentedMutex* CondVarMutex() { return this; }
+
+#ifndef NDEBUG
+    void SetPartition(const DBImpl* db, size_t partition) {
+      db_ = db;
+      partition_ = partition;
+    }
+
+   private:
+    void AssertLockOrder() const;
+    void NoteHeld();
+    void NoteReleased();
+    // WAL write mutexes the calling thread holds, across all DBs.
+    static std::vector<const WalWriteMutexType*>& HeldByThisThread();
+    const DBImpl* db_ = nullptr;
+    size_t partition_ = 0;
+#else
+    void SetPartition(const DBImpl* /*db*/, size_t /*partition*/) {}
+
+   private:
+    void AssertLockOrder() const {}
+    void NoteHeld() {}
+    void NoteReleased() {}
+#endif
+  };
+  static_assert(alignof(WalWriteMutexType) >= CACHE_LINE_SIZE);
+  static_assert(sizeof(WalWriteMutexType) % CACHE_LINE_SIZE == 0);
+  std::vector<WalWriteMutexType> wal_write_mutexes_ =
+      std::vector<WalWriteMutexType>(1);
+
+  // One sync condition variable per WAL partition, each bound to its own
+  // partition's mutex (see the LOCK ORDER note above for why a Wait() must
+  // never hold a second partition mutex). Signaled when getting_synced
+  // becomes false for some of that partition's logs_. Filled in the DBImpl
+  // constructor, once wal_write_mutexes_ exists to bind to; never resized
+  // after that, like every other partition vector.
+  std::vector<InstrumentedCondVar> wal_sync_cvs_;
 
   // Serializes sequence-block and WAL-index allocation across all WAL
   // partitions. It is never held across batch merging or I/O.
@@ -3731,10 +3821,12 @@ class DBImpl : public DB
 
   bool persistent_stats_cfd_exists_ = true;
 
-  // Writes are protected by locking both mutex_ and wal_write_mutex_, and reads
-  // must be under either mutex_ or wal_write_mutex_. Since after ::Open,
-  // cur_wal_number_ is currently updated only in write_thread_, it can be read
-  // from the same write_thread_ without any locks.
+  // Writes are protected by locking both mutex_ and the rotated partition's
+  // WalWriteMutex, and reads must be under either mutex_ or all N WAL write
+  // mutexes (a reader holding all N shares the rotated partition's mutex
+  // with any writer). Since after ::Open, cur_wal_number_ is currently
+  // updated only in write_thread_, it can be read from the same write_thread_
+  // without any locks.
   uint64_t cur_wal_number_ = 0;
 
   // Log files that we can recycle. Must be protected by db mutex_.
@@ -3746,16 +3838,28 @@ class DBImpl : public DB
   // were created in the recyclable format.
   uint64_t min_wal_number_to_recycle_ = 0;
 
-  // Protected by wal_write_mutex_.
+  // Written under mutex_ plus the rotated partition's WalWriteMutex (by
+  // rotation) or under all N WAL write mutexes (by sync completion); read
+  // under all N, so every reader shares a mutex with every writer.
   bool wal_dir_synced_ = false;
 
-  // Without two_write_queues, read and writes to wal_empty_ are protected by
-  // mutex_. Since it is currently updated/read only in write_thread_, it can be
-  // accessed from the same write_thread_ without any locks. With
+  // Whether partition p's current WAL has received no append since it was
+  // created. One entry per partition: SwitchMemtable()'s create-vs-reuse
+  // decision and WriteToWAL()'s mark-non-empty each concern one partition's
+  // WAL, and per-partition entries keep writers to different partitions on
+  // different cache lines: every leader writes its own entry on each append.
+  // Without two_write_queues, reads and writes to WalEmpty(p) are protected
+  // by mutex_. Since it is currently updated/read only in write_thread_, it
+  // can be accessed from the same write_thread_ without any locks. With
   // two_write_queues writes, where it can be updated in different threads,
-  // read and writes are protected by wal_write_mutex_ instead. This is to avoid
-  // expensive mutex_ lock during WAL write, which update wal_empty_.
-  bool wal_empty_ = true;
+  // reads and writes are protected by WalWriteMutex(p) instead. This is to
+  // avoid expensive mutex_ lock during WAL write, which updates WalEmpty(p).
+  // (uint8_t rather than bool: std::vector<bool> is bit-packed, so its
+  // elements are not independently addressable mutex-protected bytes.)
+  std::vector<CacheAlignedWrapper<uint8_t>> wal_empties_ =
+      std::vector<CacheAlignedWrapper<uint8_t>>(
+          1, CacheAlignedWrapper<uint8_t>{1});
+  static_assert(sizeof(CacheAlignedWrapper<uint8_t>) >= CACHE_LINE_SIZE);
 
   // The current WAL file and those that have not been found obsolete from
   // memtable flushes. A WAL not on this list might still be pending writer
@@ -3765,43 +3869,45 @@ class DBImpl : public DB
   //
   // Locking has two levels. The vector itself is sized at construction and
   // never resized, so it needs no lock. Each numbered case below is a
-  // statement about one partition's deque and holds per partition; the
-  // mutexes are not split by partition, so a cross-partition walk holds the
-  // same locks across all partitions, visiting them in ascending
-  // partition-index order. Each partition's deque owns its entries'
-  // lifetime bookkeeping independently, and removal stays per-entry, so a
-  // future reference-driven lifetime scheme can replace per-entry removal
-  // without reshaping the containers.
-  // alive_wal_files_ is protected by mutex_ and wal_write_mutex_ with details
-  // as follows (each case: partition p's deque):
+  // statement about one partition's deque and holds per partition under that
+  // partition's WalWriteMutex; a cross-partition walk holds all N in
+  // ascending partition-index order via LockWalWriteMutexes(). Each
+  // partition's deque owns its entries' lifetime bookkeeping independently,
+  // and removal stays per-entry, so a future reference-driven lifetime
+  // scheme can replace per-entry removal without reshaping the containers.
+  // alive_wal_files_ is protected by mutex_ and the WAL write mutexes with
+  // details as follows (each case: partition p's deque):
   // 1. read by FindObsoleteFiles() which can be called in either application
-  //    thread or RocksDB bg threads, both mutex_ and wal_write_mutex_ are
-  //    held.
-  // 2. pop_front() by FindObsoleteFiles(), both mutex_ and wal_write_mutex_
-  //    are held.
+  //    thread or RocksDB bg threads, both mutex_ and all N WAL write
+  //    mutexes are held.
+  // 2. pop_front() by FindObsoleteFiles(), both mutex_ and all N WAL write
+  //    mutexes are held.
   // 3. push_back() by DBImpl::Open() and DBImpl::RestoreAliveLogFiles()
   //    (actually called by Open()), only mutex_ is held because at this point,
   //    the DB::Open() call has not returned success to application, and the
   //    only other thread(s) that can conflict are bg threads calling
-  //    FindObsoleteFiles() which ensure that both mutex_ and wal_write_mutex_
-  //    are held when accessing alive_wal_files_.
+  //    FindObsoleteFiles() which ensure that both mutex_ and all N WAL write
+  //    mutexes are held when accessing alive_wal_files_.
   // 4. read by DBImpl::Open() is protected by mutex_.
-  // 5. push_back() by SwitchMemtable(). Both mutex_ and wal_write_mutex_ are
-  //    held. This is done by the write group leader. Note that in the case of
+  // 5. push_back() by SwitchMemtable(). Both mutex_ and the rotated
+  //    partition's WalWriteMutex (partition 0 today) are held. This is done
+  //    by the write group leader. Note that in the case of
   //    two-write-queues, another WAL-only write thread can be writing to the
   //    WAL concurrently. See 9.
-  // 6. read by SwitchWAL() with both mutex_ and wal_write_mutex_ held. This is
-  //    done by write group leader.
+  // 6. read by SwitchWAL() with only mutex_ held. This is done by the write
+  //    group leader. Every writer of this deque also holds mutex_ (cases 2,
+  //    3, 5), so no WAL write mutex is needed here.
   // 7. read by ConcurrentWriteToWAL() by the write group leader in the case of
-  //    two-write-queues. Only wal_write_mutex_ is held to protect concurrent
-  //    pop_front() by FindObsoleteFiles().
-  // 8. read by PreprocessWrite() by the write group leader. wal_write_mutex_
-  //    is held to protect the data structure from concurrent pop_front() by
-  //    FindObsoleteFiles().
+  //    two-write-queues. Only the selected partition's WalWriteMutex is held
+  //    to protect concurrent pop_front() by FindObsoleteFiles().
+  // 8. read by PreprocessWrite() by the write group leader. Only the
+  //    selected partition's WalWriteMutex is held to protect the data
+  //    structure from concurrent pop_front() by FindObsoleteFiles().
   // 9. read by ConcurrentWriteToWAL() by a WAL-only write thread in the case
-  //    of two-write-queues. Only wal_write_mutex_ is held. This suffices to
-  //    protect the data structure from concurrent push_back() by current
-  //    write group leader as well as pop_front() by FindObsoleteFiles().
+  //    of two-write-queues. Only the selected partition's WalWriteMutex is
+  //    held. This suffices to protect the data structure from concurrent
+  //    push_back() by current write group leader as well as pop_front() by
+  //    FindObsoleteFiles().
   std::vector<std::deque<WalFileNumberSize>> alive_wal_files_ =
       std::vector<std::deque<WalFileNumberSize>>(1);
 
@@ -3814,49 +3920,61 @@ class DBImpl : public DB
   // Synchronization (same two levels as alive_wal_files_ above: the vector
   // is sized at construction and never resized, so it needs no lock; each
   // numbered case below is a statement about one partition's deque and holds
-  // per partition under the same global mutexes; a cross-partition walk
-  // holds those locks across all partitions in ascending partition-index
-  // order):
+  // per partition under that partition's WalWriteMutex; a cross-partition
+  // walk holds all N in ascending partition-index order via
+  // LockWalWriteMutexes()):
   // 1. read by FindObsoleteFiles() which can be called either in application
-  //    thread or RocksDB bg threads. wal_write_mutex_ is always held, while
-  //    some reads are performed without mutex_.
-  // 2. pop_front() by FindObsoleteFiles() with only wal_write_mutex_ held.
-  // 3. read by DBImpl::Open() with both mutex_ and wal_write_mutex_.
-  // 4. emplace_back() by DBImpl::Open() with both mutex_ and wal_write_mutex.
+  //    thread or RocksDB bg threads. All N WAL write mutexes are held in the
+  //    first phase (with mutex_); the second phase visits partitions
+  //    sequentially holding one partition's WalWriteMutex at a time, without
+  //    mutex_.
+  // 2. pop_front() by FindObsoleteFiles() with only that partition's
+  //    WalWriteMutex held, visiting partitions sequentially.
+  // 3. read by DBImpl::Open() with both mutex_ and WalWriteMutex(0).
+  // 4. emplace_back() by DBImpl::Open() with both mutex_ and WalWriteMutex(0).
   //    Note that at this point, DB::Open() has not returned success to
   //    application, thus the only other thread(s) that can conflict are bg
   //    threads calling FindObsoleteFiles(). See 1.
-  // 5. iteration and clear() from CloseHelper() always hold wal_write_mutex
-  //    and mutex_.
-  // 6. back() called by APIs FlushWAL() and LockWAL() are protected by only
-  //    wal_write_mutex_. These two can be called by application threads after
-  //    DB::Open() returns success to applications.
-  // 7. read by SyncWAL(), another API, protected by only wal_write_mutex_.
+  // 5. iteration and clear() from CloseHelper() always hold all N WAL write
+  //    mutexes and mutex_.
+  // 6. back() called by APIs FlushWAL() and LockWAL() are protected by all N
+  //    WAL write mutexes (LockWAL transitively, through FlushWAL). These two
+  //    can be called by application threads after DB::Open() returns success
+  //    to applications.
+  // 7. read by SyncWAL(), another API, protected by all N WAL write mutexes.
   // 8. read by MarkLogsNotSynced() and MarkLogsSynced() are protected by
-  //    wal_write_mutex_.
-  // 9. erase() by MarkLogsSynced() protected by wal_write_mutex_.
-  // 10. read by SyncClosedWals() protected by only wal_write_mutex_. This can
-  //     happen in bg flush threads after DB::Open() returns success to
+  //    all N WAL write mutexes.
+  // 9. erase() by MarkLogsSynced() protected by all N WAL write mutexes.
+  // 10. read by SyncClosedWals() protected by all N WAL write mutexes. This
+  //     can happen in bg flush threads after DB::Open() returns success to
   //     applications.
   // 11. reads, e.g. front(), iteration, and back() called by PreprocessWrite()
-  //     holds only the wal_write_mutex_. This is done by the write group
-  //     leader. A bg thread calling FindObsoleteFiles() or MarkLogsSynced()
-  //     can happen concurrently. This is fine because wal_write_mutex_ is used
-  //     by all parties. See 2, 5, 9.
+  //     hold one partition's WalWriteMutex at a time: the sync-wait claim
+  //     visits partitions sequentially, and the bind holds only the selected
+  //     partition's mutex. This is done by the write group leader. A bg
+  //     thread calling FindObsoleteFiles() or MarkLogsSynced() can happen
+  //     concurrently. This is fine because every party holds the touched
+  //     partition's mutex. See 2, 5, 9.
   // 12. reads, empty(), back() called by SwitchMemtable() hold both mutex_ and
-  //     wal_write_mutex_. This happens in the write group leader.
-  // 13. emplace_back() by SwitchMemtable() hold both mutex_ and
-  //     wal_write_mutex_. This happens in the write group leader. Can conflict
-  //     with bg threads calling FindObsoleteFiles(), MarkLogsSynced(),
-  //     SyncClosedWals(), etc. as well as application threads calling
-  //     FlushWAL(), SyncWAL(), LockWAL(). This is fine because all parties
-  //     require at least wal_write_mutex_.
-  // 14. iteration called in WriteToWAL(write_group) protected by
-  //     wal_write_mutex_. This is done by write group leader when
-  //     two-write-queues is disabled and write needs to sync logs.
-  // 15. back() called in ConcurrentWriteToWAL() protected by wal_write_mutex_.
-  //     This can be done by the write group leader if two-write-queues is
-  //     enabled. It can also be done by another WAL-only write thread.
+  //     the rotated partition's WalWriteMutex (partition 0 today). This
+  //     happens in the write group leader.
+  // 13. emplace_back() by SwitchMemtable() hold both mutex_ and the rotated
+  //     partition's WalWriteMutex (partition 0 today). This happens in the
+  //     write group leader. Can conflict with bg threads calling
+  //     FindObsoleteFiles(), MarkLogsSynced(), SyncClosedWals(), etc. as well
+  //     as application threads calling FlushWAL(), SyncWAL(), LockWAL().
+  //     This is fine because all parties hold the touched partition's mutex:
+  //     single-partition operations hold exactly it, spanning operations hold
+  //     all N.
+  // 14. iteration called in WriteToWAL(write_group) protected by all N WAL
+  //     write mutexes when manual_wal_flush_ && !two_write_queues_, else by
+  //     none (same condition as before the split). This is done by the write
+  //     group leader when two-write-queues is disabled and write needs to
+  //     sync logs.
+  // 15. back() called in ConcurrentWriteToWAL() protected by the selected
+  //     partition's WalWriteMutex. This can be done by the write group
+  //     leader if two-write-queues is enabled. It can also be done by
+  //     another WAL-only write thread.
   //
   // Other observations (each about one partition's deque):
   //  - back() and items with getting_synced=true are not popped,
@@ -3881,7 +3999,7 @@ class DBImpl : public DB
   // Partition access. An interim chokepoint, not the container abstraction
   // (that gets extracted once real N-partition usage is known): every use
   // names its partition explicitly so a future change cannot silently mix
-  // partitions, and the asserts pin the layout (all three vectors always have
+  // partitions, and the asserts pin the layout (all seven vectors always have
   // one entry per partition). Do not touch the vectors directly; use these.
   // Element addresses are stable: deque elements never move, and none of the
   // vectors is ever resized, so references and pointers into a partition's
@@ -3906,12 +4024,84 @@ class DBImpl : public DB
     assert(partition < wal_merge_buffers_.size());
     return wal_merge_buffers_[partition];
   }
-  // Number of WAL partitions. All three vectors always have this many entries.
+  WalWriteMutexType& WalWriteMutex(size_t partition) {
+    assert(partition < wal_write_mutexes_.size());
+    return wal_write_mutexes_[partition];
+  }
+  InstrumentedCondVar& WalSyncCV(size_t partition) {
+    assert(partition < wal_sync_cvs_.size());
+    return wal_sync_cvs_[partition];
+  }
+  uint8_t& WalEmpty(size_t partition) {
+    assert(partition < wal_empties_.size());
+    return wal_empties_[partition].obj_;
+  }
+  autovector<log::Writer*>& WalsToFree(size_t partition) {
+    assert(partition < wals_to_free_.size());
+    return wals_to_free_[partition];
+  }
+  // Number of WAL partitions. All seven vectors always have this many
+  // entries.
   size_t NumWalPartitions() const {
     assert(logs_.size() == alive_wal_files_.size());
     assert(logs_.size() == wal_merge_buffers_.size());
+    assert(logs_.size() == wal_write_mutexes_.size());
+    assert(logs_.size() == wal_sync_cvs_.size());
+    assert(logs_.size() == wal_empties_.size());
+    assert(logs_.size() == wals_to_free_.size());
     return logs_.size();
   }
+
+  // The WAL partition the current write path binds to, chosen without holding
+  // any WAL write mutex so the caller can take exactly that partition's mutex
+  // before SelectWalForWrite() binds under it. Today every write targets
+  // partition 0; routing (a future change) computes this from the write
+  // instead. Single source of truth: SelectWalForWrite() binds this same
+  // value, so the mutex taken and the partition bound cannot diverge.
+  static size_t WalPartitionForWrite() { return 0; }
+
+  // Takes every WAL write mutex in ascending partition-index order. This and
+  // UnlockWalWriteMutexes() are the only implementation of the multi-take
+  // order; see the LOCK ORDER note above. Never wait on a WalSyncCV while
+  // holding the result (see the note).
+  void LockWalWriteMutexes() {
+    for (size_t p = 0; p < NumWalPartitions(); ++p) {
+      WalWriteMutex(p).Lock();
+    }
+  }
+  void UnlockWalWriteMutexes() {
+    for (size_t p = NumWalPartitions(); p > 0; --p) {
+      WalWriteMutex(p - 1).Unlock();
+    }
+  }
+
+  // RAII hold of a single partition's WAL write mutex.
+  class WalWriteMutexLock {
+   public:
+    explicit WalWriteMutexLock(WalWriteMutexType* mutex) : mutex_(mutex) {
+      mutex_->Lock();
+    }
+    ~WalWriteMutexLock() { mutex_->Unlock(); }
+    WalWriteMutexLock(const WalWriteMutexLock&) = delete;
+    WalWriteMutexLock& operator=(const WalWriteMutexLock&) = delete;
+
+   private:
+    WalWriteMutexType* const mutex_;
+  };
+
+  // RAII wrapper around LockWalWriteMutexes()/UnlockWalWriteMutexes().
+  class AllWalWriteMutexesLock {
+   public:
+    explicit AllWalWriteMutexesLock(DBImpl* db) : db_(db) {
+      db_->LockWalWriteMutexes();
+    }
+    ~AllWalWriteMutexesLock() { db_->UnlockWalWriteMutexes(); }
+    AllWalWriteMutexesLock(const AllWalWriteMutexesLock&) = delete;
+    AllWalWriteMutexesLock& operator=(const AllWalWriteMutexesLock&) = delete;
+
+   private:
+    DBImpl* db_;
+  };
 
   // The WAL currently being appended to -- the newest entry in partition 0's
   // deque.
@@ -3923,9 +4113,9 @@ class DBImpl : public DB
   // is reachable (which WAL to write to is selected by SelectWalForWrite,
   // not here).
   //
-  // REQUIRES: wal_write_mutex_ held, per the synchronization notes above. Note
-  // that back() itself is not safe to call unsynchronized: implementations may
-  // touch other deque members.
+  // REQUIRES: WalWriteMutex(0) held, per the synchronization notes above.
+  // Note that back() itself is not safe to call unsynchronized:
+  // implementations may touch other deque members.
   LogWriterNumber& CurrentWal() {
     assert(!WalLogs(0).empty());
     return WalLogs(0).back();
@@ -3935,21 +4125,24 @@ class DBImpl : public DB
     return WalLogs(0).back();
   }
 
-  // Signaled when getting_synced becomes false for some of the logs_.
-  InstrumentedCondVar wal_sync_cv_;
   // This is the app-level state that is written to the WAL but will be used
   // only during recovery. Using this feature enables not writing the state to
   // memtable on normal writes and hence improving the throughput. Each new
   // write of the state will replace the previous state entirely even if the
   // keys in the two consecutive states do not overlap.
-  // It is protected by wal_write_mutex_ when two_write_queues_ is enabled.
-  // Otherwise only the heaad of write_thread_ can access it.
+  // It is protected by the selected partition's WalWriteMutex when
+  // two_write_queues_ is enabled. Otherwise only the heaad of write_thread_
+  // can access it. Both write queues select partition 0 today, so concurrent
+  // WAL writers share that mutex; N-partition selection with two_write_queues
+  // (a future change) must keep a common mutex for this state.
   WriteBatch cached_recoverable_state_;
   std::atomic<bool> cached_recoverable_state_empty_ = {true};
 
-  // If this is non-empty, we need to delete these log files in background
-  // threads. Protected by wal_write_mutex_.
-  autovector<log::Writer*> wals_to_free_;
+  // If partition p's list is non-empty, we need to delete these log files in
+  // background threads. Appends hold WalWriteMutex(p); the takeover into a
+  // JobContext (FindObsoleteFiles) and the drain (CloseHelper) hold all N.
+  std::vector<autovector<log::Writer*>> wals_to_free_ =
+      std::vector<autovector<log::Writer*>>(1);
 
   bool is_snapshot_supported_ = true;
 
