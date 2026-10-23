@@ -4138,7 +4138,7 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
       if (s.ok()) {
         // Sync is needed otherwise WAL buffered data might get lost after a
         // power reset.
-        log::Writer* log_writer = impl->logs_.back().writer;
+        log::Writer* log_writer = impl->CurrentWal().writer;
         IOOptions opts;
         s = WritableFileWriter::PrepareIOOptions(write_options, opts);
         if (s.ok()) {
