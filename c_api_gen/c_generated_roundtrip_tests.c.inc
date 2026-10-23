@@ -745,6 +745,14 @@ static void rocksdb_roundtrip_test_rocksdb_options(void) {
   CheckCondition(
       rocksdb_options_get_enforce_write_buffer_manager_during_recovery(obj) ==
       0);
+  rocksdb_options_set_experimental_allow_wal_partitions_for_testing(obj, 1);
+  CheckCondition(
+      rocksdb_options_get_experimental_allow_wal_partitions_for_testing(obj) ==
+      1);
+  rocksdb_options_set_experimental_allow_wal_partitions_for_testing(obj, 0);
+  CheckCondition(
+      rocksdb_options_get_experimental_allow_wal_partitions_for_testing(obj) ==
+      0);
   rocksdb_options_set_fast_sst_open(obj, 1);
   CheckCondition(rocksdb_options_get_fast_sst_open(obj) == 1);
   rocksdb_options_set_fast_sst_open(obj, 0);
@@ -951,6 +959,10 @@ static void rocksdb_roundtrip_test_rocksdb_options(void) {
   rocksdb_options_set_verify_sst_unique_id_in_manifest(obj, 0);
   CheckCondition(rocksdb_options_get_verify_sst_unique_id_in_manifest(obj) ==
                  0);
+  rocksdb_options_set_wal_partitions(obj, 1);
+  CheckCondition(rocksdb_options_get_wal_partitions(obj) == 1);
+  rocksdb_options_set_wal_partitions(obj, 0);
+  CheckCondition(rocksdb_options_get_wal_partitions(obj) == 0);
   rocksdb_options_set_wal_write_temperature(obj, 1);
   CheckCondition(rocksdb_options_get_wal_write_temperature(obj) == 1);
   rocksdb_options_set_wal_write_temperature(obj, 0);

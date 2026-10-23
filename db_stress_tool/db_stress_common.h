@@ -399,6 +399,7 @@ DECLARE_bool(adaptive_readahead);
 DECLARE_bool(async_io);
 DECLARE_string(wal_compression);
 DECLARE_string(partition_wal_usage);
+DECLARE_uint32(wal_partitions);
 DECLARE_bool(verify_sst_unique_id_in_manifest);
 DECLARE_bool(fast_sst_open);
 

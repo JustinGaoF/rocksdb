@@ -18,7 +18,9 @@
 #include "db/db_impl/db_impl.h"
 #include "db/db_test_util.h"
 #include "env/mock_env.h"
+#include "file/filename.h"
 #include "options/options_helper.h"
+#include "options/options_parser.h"
 #include "port/stack_trace.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/convenience.h"
@@ -2045,6 +2047,93 @@ TEST_F(DBOptionsTest, OptimizeForCompactionTableReadUsesGlobalDirectReadsOnly) {
   }
 }
 
+TEST_F(DBOptionsTest, WalPartitionsValidation) {
+  Options options = CurrentOptions();
+  Destroy(options);
+
+  // Default is a single WAL and must open cleanly.
+  ASSERT_EQ(1U, options.wal_partitions);
+  ASSERT_OK(TryReopen(options));
+
+  // Zero partitions is meaningless.
+  options.wal_partitions = 0;
+  Status s = TryReopen(options);
+  ASSERT_TRUE(s.IsInvalidArgument());
+  ASSERT_TRUE(
+      std::strstr(s.getState(), "wal_partitions must be greater than 0"));
+
+  // More than one partition is configurable but not implemented yet, so it is
+  // rejected rather than silently ignored.
+  options.wal_partitions = 4;
+  s = TryReopen(options);
+  ASSERT_TRUE(s.IsNotSupported());
+  ASSERT_TRUE(
+      std::strstr(s.getState(), "wal_partitions > 1 is not supported yet"));
+
+  options.wal_partitions = 1;
+  ASSERT_OK(TryReopen(options));
+}
+
+TEST_F(DBOptionsTest, WalPartitionsRoundTrip) {
+  Options options = CurrentOptions();
+  Destroy(options);
+  ASSERT_OK(TryReopen(options));
+
+  // Survives the DBOptions -> ImmutableDBOptions -> DBOptions trip that
+  // GetDBOptions() performs.
+  ASSERT_EQ(1U, dbfull()->GetDBOptions().wal_partitions);
+
+  // And parses from the string form used by the OPTIONS file.
+  DBOptions parsed;
+  ConfigOptions config_options;
+  config_options.ignore_unknown_options = false;
+  ASSERT_OK(GetDBOptionsFromString(config_options, DBOptions(),
+                                   "wal_partitions=8", &parsed));
+  ASSERT_EQ(8U, parsed.wal_partitions);
+}
+
+static constexpr const char* kWalPartitionsRejection =
+    "wal_partitions > 1 is not supported yet: the partitioned write path "
+    "and multi-WAL recovery are not implemented (for any partition_wal_usage)";
+
+// Every (partition_wal_usage, wal_partitions) cell reachable without the test
+// hook: one partition opens under either usage, four are rejected under both.
+TEST_F(DBOptionsTest, WalPartitionsUsageMatrix) {
+  for (const PartitionWALUsage usage :
+       {PartitionWALUsage::kNone,
+        PartitionWALUsage::kPartitionByColumnFamily}) {
+    for (const uint32_t partitions : {1U, 4U}) {
+      SCOPED_TRACE(std::to_string(static_cast<int>(usage)) + " " +
+                   std::to_string(partitions));
+      Options options = CurrentOptions();
+      options.partition_wal_usage = usage;
+      options.wal_partitions = partitions;
+      Destroy(options);
+      const Status s = TryReopen(options);
+      if (partitions == 1) {
+        ASSERT_OK(s);
+        ASSERT_OK(Put("key", "value"));
+        Close();
+      } else {
+        ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+        ASSERT_STREQ(kWalPartitionsRejection, s.getState());
+      }
+    }
+  }
+}
+
+TEST_F(DBOptionsTest, SetDBOptionsRejectsWalPartitions) {
+  Options options = CurrentOptions();
+  Destroy(options);
+  ASSERT_OK(TryReopen(options));
+  const Status s = dbfull()->SetDBOptions({{"wal_partitions", "4"}});
+  // Immutable DB options are not in the mutable option table, so
+  // SetDBOptions cannot find them.
+  ASSERT_TRUE(s.IsNotFound()) << s.ToString();
+  ASSERT_STREQ("Unrecognized option: wal_partitions", s.getState());
+  ASSERT_EQ(1U, dbfull()->GetDBOptions().wal_partitions);
+}
+
 TEST_F(DBOptionsTest, SetDBOptionsRejectsPartitionWALUsage) {
   Options options = CurrentOptions();
   Destroy(options);
@@ -2057,6 +2146,45 @@ TEST_F(DBOptionsTest, SetDBOptionsRejectsPartitionWALUsage) {
   ASSERT_STREQ("Unrecognized option: partition_wal_usage", s.getState());
   ASSERT_EQ(PartitionWALUsage::kNone,
             dbfull()->GetDBOptions().partition_wal_usage);
+}
+
+// An OPTIONS file carrying an illegal pair loads unchanged, and opening with
+// what it loads fails with a message naming both options.
+TEST_F(DBOptionsTest, IllegalWalPartitionsPairInOptionsFileFailsOpen) {
+  for (const PartitionWALUsage usage :
+       {PartitionWALUsage::kNone,
+        PartitionWALUsage::kPartitionByColumnFamily}) {
+    SCOPED_TRACE(static_cast<int>(usage));
+    Options options = CurrentOptions();
+    Destroy(options);
+    ASSERT_OK(TryReopen(options));
+    Close();
+
+    DBOptions illegal(options);
+    illegal.partition_wal_usage = usage;
+    illegal.wal_partitions = 4;
+    ConfigOptions config_options;
+    config_options.env = env_;
+    ASSERT_OK(PersistRocksDBOptions(
+        WriteOptions(), config_options, illegal, {kDefaultColumnFamilyName},
+        {ColumnFamilyOptions(options)}, OptionsFileName(dbname_, 999999),
+        env_->GetFileSystem().get()));
+
+    DBOptions loaded;
+    std::vector<ColumnFamilyDescriptor> cf_descs;
+    ASSERT_OK(LoadLatestOptions(config_options, dbname_, &loaded, &cf_descs));
+    ASSERT_EQ(usage, loaded.partition_wal_usage);
+    ASSERT_EQ(4U, loaded.wal_partitions);
+
+    loaded.env = env_;
+    std::vector<ColumnFamilyHandle*> handles;
+    std::unique_ptr<DB> db;
+    const Status s = DB::Open(loaded, dbname_, cf_descs, &handles, &db);
+    ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+    ASSERT_NE(nullptr, std::strstr(s.getState(), "wal_partitions"));
+    ASSERT_NE(nullptr, std::strstr(s.getState(), "partition_wal_usage"));
+    ASSERT_STREQ(kWalPartitionsRejection, s.getState());
+  }
 }
 
 }  // namespace ROCKSDB_NAMESPACE
