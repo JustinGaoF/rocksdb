@@ -384,11 +384,11 @@ void DBImpl::FindObsoleteFiles(JobContext* job_context, bool force,
   // can't yet be any tracked obsolete logs
   LockWalWriteMutexes();
 
-  // Partitions are visited in ascending index order (see the locking notes on
-  // alive_wal_files_); a partition with nothing tracked is skipped.
+  // Partitions are visited in ascending index order (see the WAL deque
+  // accessors); a partition with nothing tracked is skipped.
   bool any_partition_has_wals = false;
   for (size_t p = 0; p < NumWalPartitions(); ++p) {
-    if (!AliveWalFiles(p).empty() && !WalLogs(p).empty()) {
+    if (WalPartitionHasTrackedWals(p)) {
       any_partition_has_wals = true;
       break;
     }
@@ -405,15 +405,15 @@ void DBImpl::FindObsoleteFiles(JobContext* job_context, bool force,
     uint64_t min_log_number = job_context->log_number;
     size_t num_alive_wal_files = 0;
     for (size_t p = 0; p < NumWalPartitions(); ++p) {
-      num_alive_wal_files += AliveWalFiles(p).size();
+      num_alive_wal_files += NumAliveWalFiles(p);
     }
     // find newly obsoleted log files
     for (size_t p = 0; p < NumWalPartitions(); ++p) {
-      if (AliveWalFiles(p).empty() || WalLogs(p).empty()) {
+      if (!WalPartitionHasTrackedWals(p)) {
         continue;
       }
-      while (AliveWalFiles(p).begin()->number < min_log_number) {
-        auto& earliest = *AliveWalFiles(p).begin();
+      WalFileNumberSize earliest;
+      while (TryPopObsoleteAliveWal(p, min_log_number, &earliest)) {
         if (immutable_db_options_.recycle_log_file_num >
                 wal_recycle_files_.size() &&
             earliest.number >= MinLogNumberToRecycle()) {
@@ -430,11 +430,6 @@ void DBImpl::FindObsoleteFiles(JobContext* job_context, bool force,
         }
         job_context->size_log_to_delete += earliest.size;
         wals_total_size_.FetchSubRelaxed(earliest.size);
-        AliveWalFiles(p).pop_front();
-
-        // Current log should always stay alive since it can't have
-        // number < MinLogNumber().
-        assert(AliveWalFiles(p).size());
       }
     }
     UnlockWalWriteMutexes();
@@ -445,25 +440,27 @@ void DBImpl::FindObsoleteFiles(JobContext* job_context, bool force,
     // mutex at a time: the wait below must never hold a second partition
     // mutex (see the LOCK ORDER note).
     for (size_t p = 0; p < NumWalPartitions(); ++p) {
-      // Only WalLogs(p) is consulted here: this phase holds only
-      // WalWriteMutex(p), and alive_wal_files_ reads require both mutexes.
+      // Only the writer deque is consulted here: this phase holds only
+      // WalWriteMutex(p), and live-file reads require both mutexes.
       WalWriteMutexLock wal_lock(&WalWriteMutex(p));
-      if (WalLogs(p).empty()) {
+      if (OldestWalOrNull(p) == nullptr) {
         continue;
       }
-      while (!WalLogs(p).empty() &&
-             WalLogs(p).front().number < min_log_number) {
-        auto& log = WalLogs(p).front();
+      while (true) {
+        LogWriterNumber* oldest = OldestWalOrNull(p);
+        if (oldest == nullptr || oldest->number >= min_log_number) {
+          break;
+        }
+        auto& log = *oldest;
         if (log.IsSyncing()) {
           WalSyncCV(p).Wait();
-          // WalLogs(p) could have changed while we were waiting.
+          // The deque could have changed while we were waiting.
           continue;
         }
         // This WAL file is not live, so it's OK if we never sync the rest of
         // it. If it's already closed, then it's been fully synced. If
         // !background_close_inactive_wals then we need to Close it before
-        // removing from WalLogs(p) but not blocking while holding
-        // WalWriteMutex(p).
+        // removing it, but not blocking while holding WalWriteMutex(p).
         if (!immutable_db_options_.background_close_inactive_wals &&
             log.writer->file()) {
           // We are taking ownership of and pinning the front entry, so we can
@@ -476,15 +473,15 @@ void DBImpl::FindObsoleteFiles(JobContext* job_context, bool force,
           s.PermitUncheckedError();
           WalWriteMutex(p).Lock();
           log.writer->PublishIfClosed();
-          assert(&log == &WalLogs(p).front());
+          assert(&log == OldestWalOrNull(p));
           log.FinishSync();
           WalSyncCV(p).SignalAll();
         }
         WalsToFree(p).push_back(log.ReleaseWriter());
-        WalLogs(p).pop_front();
+        PopOldestWal(p);
       }
       // Current log cannot be obsolete.
-      assert(!WalLogs(p).empty());
+      assert(OldestWalOrNull(p) != nullptr);
     }
   }
 
