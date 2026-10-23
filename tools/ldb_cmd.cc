@@ -354,6 +354,10 @@ LDBCommand* LDBCommand::SelectCommand(const ParsedParams& parsed_params) {
   } else if (parsed_params.cmd == WALDumperCommand::Name()) {
     return new WALDumperCommand(parsed_params.cmd_params,
                                 parsed_params.option_map, parsed_params.flags);
+  } else if (parsed_params.cmd == CheckWALIndexCommand::Name()) {
+    return new CheckWALIndexCommand(parsed_params.cmd_params,
+                                    parsed_params.option_map,
+                                    parsed_params.flags);
   } else if (parsed_params.cmd == ReduceDBLevelsCommand::Name()) {
     return new ReduceDBLevelsCommand(parsed_params.cmd_params,
                                      parsed_params.option_map,
@@ -3432,6 +3436,190 @@ void WALDumperCommand::DoCommand() {
   DumpWalFiles(options_, wal_file_, print_header_, print_values_,
                only_print_seqno_gaps_, is_write_committed_, ucmps_,
                &exec_state_);
+}
+
+// ----------------------------------------------------------------------------
+
+namespace {
+
+// "indexed" when any record in the WAL carries a WAL index, "unindexed" or
+// "empty" when its records were read without damage and none does. Damage
+// that may hide an index record, and a read failure, are reported as such.
+std::string ClassifyWALIndex(const Options& options, const std::string& path,
+                             uint64_t wal_number) {
+  std::unique_ptr<SequentialFileReader> file_reader;
+  Status s = SequentialFileReader::Create(
+      options.env->GetFileSystem(), path, FileOptions(options), &file_reader,
+      /*dbg=*/nullptr, /*rate_limiter=*/nullptr);
+  if (!s.ok()) {
+    return "unreadable: " + s.ToString();
+  }
+  class FirstErrorReporter : public log::Reader::Reporter {
+   public:
+    void Corruption(size_t /*bytes*/, const Status& status,
+                    uint64_t /*log_number*/) override {
+      if (first_error.empty()) {
+        first_error = status.ToString();
+      }
+    }
+    std::string first_error;
+  } reporter;
+  log::Reader reader(options.info_log, std::move(file_reader), &reporter,
+                     /*checksum=*/true, wal_number);
+  Slice record;
+  std::string scratch;
+  bool read_record = false;
+  // Point-in-time reads on after a checksum failure from the next block, so
+  // index records in later blocks still count, and stops at a truncated tail
+  // or at a recycled file's records from its earlier use. Index metadata
+  // records only follow the marker, so a file holding them without it has
+  // reported damage below.
+  while (reader.ReadRecord(&record, &scratch,
+                           WALRecoveryMode::kPointInTimeRecovery)) {
+    read_record = true;
+    if (reader.GetLastReadWALIndex() != 0) {
+      return "indexed";
+    }
+  }
+  if (reader.SawWALIndexMarker()) {
+    return "indexed";
+  }
+  if (reader.hasReadError()) {
+    return "unreadable: read error";
+  }
+  if (!reporter.first_error.empty()) {
+    return "damaged, may hide WAL index records: " + reporter.first_error;
+  }
+  return read_record ? "unindexed" : "empty";
+}
+
+}  // namespace
+
+const std::string CheckWALIndexCommand::ARG_WAL_DIR = "wal_dir";
+
+CheckWALIndexCommand::CheckWALIndexCommand(
+    const std::vector<std::string>& /*params*/,
+    const std::map<std::string, std::string>& options,
+    const std::vector<std::string>& flags)
+    : LDBCommand(options, flags, true /* is_read_only */,
+                 BuildCmdLineOptions({ARG_WAL_DIR})) {
+  auto itr = options.find(ARG_WAL_DIR);
+  if (itr != options.end()) {
+    wal_dir_ = itr->second;
+  }
+}
+
+void CheckWALIndexCommand::Help(std::string& ret) {
+  ret.append("  ");
+  ret.append(CheckWALIndexCommand::Name());
+  ret.append(" [--" + ARG_WAL_DIR + "=<wal_dir>]");
+  ret.append(
+      " : on a closed DB, lists live and archived WALs with WAL index records "
+      "(partition_wal_usage) and the MANIFEST guard against older binaries; "
+      "fails unless there are none. Scans --" +
+      ARG_WAL_DIR +
+      ", else the wal_dir in the OPTIONS file, or the DB directory when that "
+      "is empty. Without --" +
+      ARG_WAL_DIR +
+      " the check fails if the OPTIONS file cannot be read; with it an "
+      "unreadable OPTIONS file is ignored. It fails if the scanned "
+      "directory does not exist. Each WAL is read in "
+      "point-in-time mode, which resumes after a checksum failure at the "
+      "next block and stops at a truncated tail");
+  ret.append("\n");
+}
+
+void CheckWALIndexCommand::DoCommand() {
+  PrepareOptions();
+  if (GetExecuteState().IsFailed() && !wal_dir_.empty()) {
+    // The shared OPTIONS load failed, but an explicit --wal_dir is all the
+    // check needs from it (ported from D126568250).
+    exec_state_.Reset();
+  }
+  std::string wal_dir = wal_dir_;
+  if (wal_dir.empty()) {
+    // Without the OPTIONS file the WAL directory is unknown, and scanning the
+    // DB directory instead could pass a DB whose WALs live elsewhere.
+    // PrepareOptions also replaces a configured WAL directory that does not
+    // exist with the DB directory, so read the configured one here.
+    if (create_if_missing_ || !try_load_options_) {
+      exec_state_ = LDBCommandExecuteResult::Failed(
+          "OPTIONS loading is disabled, so the DB's wal_dir is unknown; pass "
+          "--" +
+          ARG_WAL_DIR);
+      return;
+    }
+    DBOptions configured;
+    std::vector<ColumnFamilyDescriptor> column_families;
+    Status s = LoadLatestOptions(config_options_, db_path_, &configured,
+                                 &column_families);
+    if (!s.ok()) {
+      exec_state_ = LDBCommandExecuteResult::Failed(
+          "Failed to load OPTIONS: " + s.ToString() +
+          "; the DB's wal_dir is unknown, pass --" + ARG_WAL_DIR);
+      return;
+    }
+    wal_dir = configured.wal_dir;
+    if (wal_dir.empty()) {
+      wal_dir = db_path_;
+    }
+  }
+  if (!options_.env->FileExists(wal_dir).ok()) {
+    exec_state_ = LDBCommandExecuteResult::Failed("WAL directory " + wal_dir +
+                                                  " does not exist");
+    return;
+  }
+  int blocking = 0;
+  for (const bool archived : {false, true}) {
+    const std::string dir = archived ? ArchivalDirectory(wal_dir) : wal_dir;
+    if (archived && options_.env->FileExists(dir).IsNotFound()) {
+      continue;
+    }
+    std::vector<std::string> files;
+    Status s = options_.env->GetChildren(dir, &files);
+    if (!s.ok()) {
+      exec_state_ = LDBCommandExecuteResult::Failed("Failed to list " + dir +
+                                                    ": " + s.ToString());
+      return;
+    }
+    std::sort(files.begin(), files.end());
+    for (const std::string& file : files) {
+      uint64_t number = 0;
+      FileType type = kWalFile;
+      if (!ParseFileName(file, &number, &type) || type != kWalFile) {
+        continue;
+      }
+      const std::string path = dir + "/" + file;
+      const std::string state = ClassifyWALIndex(options_, path, number);
+      if (state != "unindexed" && state != "empty") {
+        ++blocking;
+      }
+      fprintf(stdout, "%s WAL %s: %s\n", archived ? "archived" : "live",
+              path.c_str(), state.c_str());
+    }
+  }
+  uint64_t guard = 0;
+  Status s = VersionSet::ReadWALIndexGuard(
+      db_path_, options_.env->GetFileSystem().get(), &guard);
+  if (!s.ok()) {
+    exec_state_ = LDBCommandExecuteResult::Failed(
+        "Failed to read the MANIFEST: " + s.ToString());
+    return;
+  }
+  if (guard == 0) {
+    fprintf(stdout, "WAL index guard: clear\n");
+  } else if (guard == std::numeric_limits<uint64_t>::max()) {
+    fprintf(stdout, "WAL index guard: set, any WAL\n");
+  } else {
+    fprintf(stdout, "WAL index guard: set, WALs up to #%" PRIu64 "\n", guard);
+  }
+  if (blocking != 0 || guard != 0) {
+    exec_state_ = LDBCommandExecuteResult::Failed(
+        std::to_string(blocking) + " WAL(s) indexed or not provably unindexed" +
+        (guard != 0 ? ", WAL index guard set" : ""));
+    return;
+  }
+  fprintf(stdout, "No WAL index records and no WAL index guard\n");
 }
 
 // ----------------------------------------------------------------------------
