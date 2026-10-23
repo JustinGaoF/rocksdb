@@ -6,6 +6,7 @@
 // Copyright (c) 2011 The LevelDB Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
+#include <algorithm>
 #include <cinttypes>
 #include <optional>
 #include <unordered_map>
@@ -23,11 +24,55 @@
 #include "options/options_helper.h"
 #include "test_util/sync_point.h"
 #include "util/cast_util.h"
+#include "util/coding.h"
+#include "util/hash.h"
 #include "util/hash_containers.h"
+#include "util/write_batch_util.h"
 
 namespace ROCKSDB_NAMESPACE {
 
 namespace {
+
+constexpr uint64_t kWalColumnFamilyRoutingSeed = 0x6a09e667f3bcc909ULL;
+constexpr uint64_t kWalXidRoutingSeed = 0xbb67ae8584caa73bULL;
+
+class WalRoutingCollector final : public ColumnFamilyCollector {
+ public:
+  Status MarkEndPrepare(const Slice& xid) override {
+    AddXid(xid);
+    return Status::OK();
+  }
+
+  Status MarkRollback(const Slice& xid) override {
+    AddXid(xid);
+    return Status::OK();
+  }
+
+  Status MarkCommit(const Slice& xid) override {
+    AddXid(xid);
+    return Status::OK();
+  }
+
+  Status MarkCommitWithTimestamp(const Slice& xid,
+                                 const Slice& /*commit_ts*/) override {
+    AddXid(xid);
+    return Status::OK();
+  }
+
+  void AddXid(const Slice& xid) {
+    if (!has_xid_ || xid.compare(xid_) < 0) {
+      xid_ = xid;
+      has_xid_ = true;
+    }
+  }
+
+  bool has_xid() const { return has_xid_; }
+  const Slice& xid() const { return xid_; }
+
+ private:
+  bool has_xid_ = false;
+  Slice xid_;
+};
 
 class BlobWriteRollbackGuard {
  public:
@@ -82,6 +127,74 @@ class PutEntityFastPathWriteCallback final : public WriteCallback {
 };
 
 }  // namespace
+
+Status DBImpl::WalPartitionForWrite(
+    const WriteBatch& batch,
+    const DeferredPutEntityBatch* deferred_put_entities, size_t num_partitions,
+    size_t* wal_partition) {
+  if (num_partitions == 0 || wal_partition == nullptr) {
+    return Status::InvalidArgument("WAL routing requires a partition");
+  }
+
+  *wal_partition = 0;
+  // Performance shortcut, not a neuter: with one partition the route is 0
+  // whether or not this returns early (hash % 1 == 0), so removing it
+  // changes no route. It only skips the batch iteration and hash, keeping
+  // the N=1 write path byte- and cycle-identical.
+  if (num_partitions == 1) {
+    return Status::OK();
+  }
+
+  WalRoutingCollector collector;
+  Status status = batch.Iterate(&collector);
+  if (!status.ok()) {
+    return status;
+  }
+  std::optional<uint32_t> column_family_id;
+  for (uint32_t id : collector.column_families()) {
+    column_family_id = std::min(column_family_id.value_or(id), id);
+  }
+  if (deferred_put_entities != nullptr) {
+    for (const auto& op : deferred_put_entities->ops) {
+      column_family_id = std::min(
+          column_family_id.value_or(op.column_family_id), op.column_family_id);
+    }
+  }
+
+  uint64_t hash = 0;
+  if (column_family_id.has_value()) {
+    char encoded_id[sizeof(uint32_t)];
+    EncodeFixed32(encoded_id, column_family_id.value());
+    hash = Hash64(encoded_id, sizeof(encoded_id), kWalColumnFamilyRoutingSeed);
+  } else if (collector.has_xid()) {
+    hash = Hash64(collector.xid().data(), collector.xid().size(),
+                  kWalXidRoutingSeed);
+  } else {
+    return Status::OK();
+  }
+
+  *wal_partition = static_cast<size_t>(hash % num_partitions);
+  return Status::OK();
+}
+
+#ifndef NDEBUG
+Status DBImpl::TEST_WalPartitionForWrite(
+    const WriteBatch& batch, size_t num_partitions, size_t* wal_partition,
+    const std::vector<uint32_t>* deferred_cf_ids) {
+  DeferredPutEntityBatch deferred_storage;
+  const DeferredPutEntityBatch* deferred_put_entities = nullptr;
+  if (deferred_cf_ids != nullptr) {
+    for (uint32_t cf_id : *deferred_cf_ids) {
+      DeferredPutEntityBatch::Op op;
+      op.column_family_id = cf_id;
+      deferred_storage.ops.push_back(std::move(op));
+    }
+    deferred_put_entities = &deferred_storage;
+  }
+  return WalPartitionForWrite(batch, deferred_put_entities, num_partitions,
+                              wal_partition);
+}
+#endif
 
 // Convenience methods
 Status DBImpl::Put(const WriteOptions& o, ColumnFamilyHandle* column_family,
@@ -934,6 +1047,12 @@ Status DBImpl::WriteImpl(
         "WriteOptions::disableWAL option is not supported if "
         "DBOptions::recycle_log_file_num > 0");
   }
+  size_t wal_partition = 0;
+  Status routing_status = WalPartitionForWrite(
+      *my_batch, deferred_put_entities, NumWalPartitions(), &wal_partition);
+  if (!routing_status.ok()) {
+    return routing_status;
+  }
   WriteBatch* trace_batch =
       trace_batch_override != nullptr ? trace_batch_override : my_batch;
   // Non-preserved-order tracing runs before the write joins a group, so choose
@@ -1026,8 +1145,8 @@ Status DBImpl::WriteImpl(
     return WriteImplWALOnly(&nonmem_write_thread_, write_options, my_batch,
                             my_batch, callback, user_write_cb, wal_used,
                             log_ref, seq_used, batch_cnt, pre_release_callback,
-                            assign_order, kDontPublishLastSeq,
-                            disable_memtable);
+                            assign_order, kDontPublishLastSeq, disable_memtable,
+                            wal_partition);
   }
 
   const bool maybe_use_blob_direct_write = wbwi == nullptr &&
@@ -1081,7 +1200,7 @@ Status DBImpl::WriteImpl(
         WriteImplWALOnly(&write_thread_, write_options, my_batch, trace_batch,
                          callback, user_write_cb, wal_used, log_ref, &seq,
                          sub_batch_cnt, pre_release_callback, kDoAssignOrder,
-                         kDoPublishLastSeq, disable_memtable);
+                         kDoPublishLastSeq, disable_memtable, wal_partition);
     TEST_SYNC_POINT("DBImpl::WriteImpl:UnorderedWriteAfterWriteWAL");
     if (!status.ok()) {
       return status;
@@ -1099,8 +1218,8 @@ Status DBImpl::WriteImpl(
 
   if (immutable_db_options_.enable_pipelined_write) {
     return finish_write(PipelinedWriteImpl(
-        write_options, my_batch, trace_batch, callback, user_write_cb, wal_used,
-        log_ref, disable_memtable, seq_used));
+        write_options, my_batch, trace_batch, wal_partition, callback,
+        user_write_cb, wal_used, log_ref, disable_memtable, seq_used));
   }
 
   PERF_TIMER_GUARD(write_pre_and_post_process_time);
@@ -1108,6 +1227,7 @@ Status DBImpl::WriteImpl(
                         log_ref, disable_memtable, batch_cnt,
                         pre_release_callback, post_memtable_callback,
                         /*_ingest_wbwi=*/wbwi != nullptr, trace_batch);
+  w.wal_partition = wal_partition;
   StopWatch write_sw(immutable_db_options_.clock, stats_, DB_WRITE);
 
   {
@@ -1196,7 +1316,8 @@ Status DBImpl::WriteImpl(
     // PreprocessWrite does its own perf timing.
     PERF_TIMER_STOP(write_pre_and_post_process_time);
 
-    status = PreprocessWrite(write_options, &wal_context, &write_context);
+    status = PreprocessWrite(write_options, w.wal_partition, &wal_context,
+                             &write_context);
     if (!two_write_queues_) {
       // Assign it after ::PreprocessWrite since the sequence might advance
       // inside it by WriteRecoverableState
@@ -1627,7 +1748,7 @@ Status DBImpl::WriteImpl(
 
 Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
                                   WriteBatch* my_batch, WriteBatch* trace_batch,
-                                  WriteCallback* callback,
+                                  size_t wal_partition, WriteCallback* callback,
                                   UserWriteCallback* user_write_cb,
                                   uint64_t* wal_used, uint64_t log_ref,
                                   bool disable_memtable, uint64_t* seq_used) {
@@ -1641,6 +1762,7 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
                         /*_pre_release_callback=*/nullptr,
                         /*_post_memtable_callback=*/nullptr,
                         /*_ingest_wbwi=*/false, trace_batch);
+  w.wal_partition = wal_partition;
   {
     // Time blocked waiting to join a write batch group: the queueing that
     // write-partition routing could relieve.
@@ -1657,7 +1779,8 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
     WalContext wal_context(!write_options.disableWAL && write_options.sync);
     // PreprocessWrite does its own perf timing.
     PERF_TIMER_STOP(write_pre_and_post_process_time);
-    w.status = PreprocessWrite(write_options, &wal_context, &write_context);
+    w.status = PreprocessWrite(write_options, w.wal_partition, &wal_context,
+                               &write_context);
     PERF_TIMER_START(write_pre_and_post_process_time);
 
     // This can set non-OK status if callback fail.
@@ -1941,13 +2064,15 @@ Status DBImpl::WriteImplWALOnly(
     UserWriteCallback* user_write_cb, uint64_t* wal_used,
     const uint64_t log_ref, uint64_t* seq_used, const size_t sub_batch_cnt,
     PreReleaseCallback* pre_release_callback, const AssignOrder assign_order,
-    const PublishLastSeq publish_last_seq, const bool disable_memtable) {
+    const PublishLastSeq publish_last_seq, const bool disable_memtable,
+    size_t wal_partition) {
   PERF_TIMER_GUARD(write_pre_and_post_process_time);
   WriteThread::Writer w(write_options, my_batch, callback, user_write_cb,
                         log_ref, disable_memtable, sub_batch_cnt,
                         pre_release_callback,
                         /*_post_memtable_callback=*/nullptr,
                         /*_ingest_wbwi=*/false, trace_batch);
+  w.wal_partition = wal_partition;
   StopWatch write_sw(immutable_db_options_.clock, stats_, DB_WRITE);
 
   {
@@ -1978,8 +2103,8 @@ Status DBImpl::WriteImplWALOnly(
     // without paying the cost of obtaining the mutex.
     WalContext wal_context;
     WriteContext write_context;
-    Status status =
-        PreprocessWrite(write_options, &wal_context, &write_context);
+    Status status = PreprocessWrite(write_options, w.wal_partition,
+                                    &wal_context, &write_context);
     WriteStatusCheckOnLocked(status);
 
     if (!status.ok()) {
@@ -2266,7 +2391,7 @@ void DBImpl::HandleMemTableInsertFailure(const Status& status) {
 }
 
 Status DBImpl::PreprocessWrite(const WriteOptions& write_options,
-                               WalContext* wal_context,
+                               size_t wal_partition, WalContext* wal_context,
                                WriteContext* write_context) {
   assert(write_context != nullptr && wal_context != nullptr);
   Status status;
@@ -2345,7 +2470,6 @@ Status DBImpl::PreprocessWrite(const WriteOptions& write_options,
       status = WriteBufferManagerStallWrites(write_context);
     }
   }
-  const size_t wal_partition = WalPartitionForWrite();
   if (status.ok() && wal_context->need_wal_sync) {
     // Wait until the parallel syncs are finished. Any sync process has to sync
     // the front log too so it is enough to check the status of front()
@@ -2397,14 +2521,14 @@ Status DBImpl::PreprocessWrite(const WriteOptions& write_options,
         // we actually write to the WAL
         log.PrepareForSync();
       }
-      SelectWalForWrite(wal_context);
+      SelectWalForWrite(wal_partition, wal_context);
     }
   } else {
     wal_context->need_wal_sync = false;
     // Non-sync writes bind here holding exactly one partition's mutex, so
     // the resolve step no longer serializes across partitions.
     WalWriteMutexLock l(&WalWriteMutex(wal_partition));
-    SelectWalForWrite(wal_context);
+    SelectWalForWrite(wal_partition, wal_context);
   }
 
   return status;
@@ -2529,9 +2653,8 @@ IOStatus DBImpl::CoverBurnedWALIndex(const WriteOptions& write_options,
 // When two_write_queues_ is disabled, this function is called from the only
 // write thread. Otherwise this must be called holding the selected
 // partition's WalWriteMutex.
-void DBImpl::SelectWalForWrite(WalContext* wal_context) {
+void DBImpl::SelectWalForWrite(size_t wal_partition, WalContext* wal_context) {
   assert(wal_context != nullptr);
-  const size_t wal_partition = WalPartitionForWrite();
   assert(!WalLogs(wal_partition).empty());
   assert(!AliveWalFiles(wal_partition).empty());
 
@@ -2749,13 +2872,14 @@ IOStatus DBImpl::ConcurrentWriteGroupToWAL(
   }
 
   // We need to lock since logs_ and alive_wal_files might be pushed back
-  // concurrently. Exactly one partition's mutex: the whole group binds to
-  // the partition WalPartitionForWrite() selects.
-  WalWriteMutexType& wal_mutex = WalWriteMutex(WalPartitionForWrite());
+  // concurrently. Exactly one partition's mutex: the whole group carries the
+  // route its leader resolved before group formation.
+  const size_t wal_partition = write_group.leader->wal_partition;
+  WalWriteMutexType& wal_mutex = WalWriteMutex(wal_partition);
   wal_mutex.Lock();
 
   WalContext wal_context;
-  SelectWalForWrite(&wal_context);
+  SelectWalForWrite(wal_partition, &wal_context);
 
   WalFileNumberSize& wal_file_number_size = *wal_context.wal_file_number_size;
 

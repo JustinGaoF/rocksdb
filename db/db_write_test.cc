@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstdint>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -38,6 +39,279 @@ class DBWriteTestUnparameterized : public DBTestBase {
   explicit DBWriteTestUnparameterized()
       : DBTestBase("pipelined_write_test", /*env_do_fsync=*/false) {}
 };
+
+TEST(WalRoutingTest, RoutesOnlyByColumnFamily) {
+  constexpr size_t kNumPartitions = 4;
+  constexpr uint32_t kUnassigned = std::numeric_limits<uint32_t>::max();
+  std::vector<uint32_t> cf_for_partition(kNumPartitions, kUnassigned);
+
+  for (uint32_t cf_id = 0; cf_id < 10000; ++cf_id) {
+    WriteBatch batch;
+    ASSERT_OK(WriteBatchInternal::Put(&batch, cf_id, "key", "value"));
+    size_t partition = kNumPartitions;
+    ASSERT_OK(
+        DBImpl::TEST_WalPartitionForWrite(batch, kNumPartitions, &partition));
+    ASSERT_LT(partition, kNumPartitions);
+    cf_for_partition[partition] = cf_id;
+  }
+  for (size_t partition = 0; partition < kNumPartitions; ++partition) {
+    ASSERT_NE(cf_for_partition[partition], kUnassigned)
+        << "no CF id routed to partition " << partition;
+  }
+
+  const uint32_t first_cf = std::min(cf_for_partition[0], cf_for_partition[1]);
+  const uint32_t second_cf = std::max(cf_for_partition[0], cf_for_partition[1]);
+  WriteBatch first_cf_batch;
+  ASSERT_OK(WriteBatchInternal::Put(&first_cf_batch, first_cf, "a", "first"));
+  size_t expected_partition = kNumPartitions;
+  ASSERT_OK(DBImpl::TEST_WalPartitionForWrite(first_cf_batch, kNumPartitions,
+                                              &expected_partition));
+
+  WriteBatch forward;
+  ASSERT_OK(WriteBatchInternal::Put(&forward, first_cf, "a", "first"));
+  ASSERT_OK(WriteBatchInternal::Put(&forward, second_cf, "z", "second"));
+  WriteBatch reverse;
+  ASSERT_OK(WriteBatchInternal::Put(&reverse, second_cf, "different-key",
+                                    "different-value"));
+  ASSERT_OK(WriteBatchInternal::Put(&reverse, first_cf, "a", "first"));
+  size_t forward_partition = kNumPartitions;
+  size_t reverse_partition = kNumPartitions;
+  ASSERT_OK(DBImpl::TEST_WalPartitionForWrite(forward, kNumPartitions,
+                                              &forward_partition));
+  ASSERT_OK(DBImpl::TEST_WalPartitionForWrite(reverse, kNumPartitions,
+                                              &reverse_partition));
+  EXPECT_EQ(forward_partition, expected_partition);
+  EXPECT_EQ(reverse_partition, expected_partition);
+
+  WriteBatchInternal::SetSequence(&first_cf_batch, 1);
+  size_t low_sequence_partition = kNumPartitions;
+  ASSERT_OK(DBImpl::TEST_WalPartitionForWrite(first_cf_batch, kNumPartitions,
+                                              &low_sequence_partition));
+  WriteBatchInternal::SetSequence(&first_cf_batch, 1000000);
+  size_t high_sequence_partition = kNumPartitions;
+  ASSERT_OK(DBImpl::TEST_WalPartitionForWrite(first_cf_batch, kNumPartitions,
+                                              &high_sequence_partition));
+  EXPECT_EQ(low_sequence_partition, high_sequence_partition);
+}
+
+TEST(WalRoutingTest, HashesXidForZeroColumnFamilyBatches) {
+  constexpr size_t kNumPartitions = 4;
+  std::vector<bool> covered(kNumPartitions, false);
+  for (uint32_t i = 0; i < 10000; ++i) {
+    WriteBatch marker;
+    ASSERT_OK(WriteBatchInternal::MarkCommit(
+        &marker, "transaction-" + std::to_string(i)));
+    size_t partition = kNumPartitions;
+    ASSERT_OK(
+        DBImpl::TEST_WalPartitionForWrite(marker, kNumPartitions, &partition));
+    ASSERT_LT(partition, kNumPartitions);
+    covered[partition] = true;
+  }
+  for (size_t partition = 0; partition < kNumPartitions; ++partition) {
+    EXPECT_TRUE(covered[partition])
+        << "no XID routed to partition " << partition;
+  }
+
+  WriteBatch smallest_xid;
+  ASSERT_OK(WriteBatchInternal::MarkRollback(&smallest_xid, "a"));
+  size_t expected_partition = kNumPartitions;
+  ASSERT_OK(DBImpl::TEST_WalPartitionForWrite(smallest_xid, kNumPartitions,
+                                              &expected_partition));
+  WriteBatch two_xids;
+  ASSERT_OK(WriteBatchInternal::MarkCommit(&two_xids, "z"));
+  ASSERT_OK(WriteBatchInternal::MarkRollback(&two_xids, "a"));
+  size_t two_xid_partition = kNumPartitions;
+  ASSERT_OK(DBImpl::TEST_WalPartitionForWrite(two_xids, kNumPartitions,
+                                              &two_xid_partition));
+  EXPECT_EQ(two_xid_partition, expected_partition);
+
+  WriteBatch no_xid;
+  ASSERT_OK(WriteBatchInternal::InsertNoop(&no_xid));
+  size_t no_xid_partition = kNumPartitions;
+  ASSERT_OK(DBImpl::TEST_WalPartitionForWrite(no_xid, kNumPartitions,
+                                              &no_xid_partition));
+  EXPECT_EQ(no_xid_partition, 0);
+}
+
+TEST(WalRoutingTest, OnePartitionIsNeutered) {
+  WriteBatch cf_batch;
+  ASSERT_OK(WriteBatchInternal::Put(&cf_batch, 123, "key", "value"));
+  WriteBatch xid_batch;
+  ASSERT_OK(WriteBatchInternal::MarkCommit(&xid_batch, "transaction"));
+
+  for (const WriteBatch* batch : {&cf_batch, &xid_batch}) {
+    size_t partition = 1;
+    ASSERT_OK(DBImpl::TEST_WalPartitionForWrite(*batch, /*num_partitions=*/1,
+                                                &partition));
+    EXPECT_EQ(partition, 0);
+  }
+}
+
+TEST(WalRoutingTest, RoutesDeferredPutEntitiesByColumnFamily) {
+  // Q9 ([05-3]): deferred PutEntity ops contribute their column families to
+  // the route exactly like batch entries: the route hashes the minimum CF
+  // id across both. An XID-free batch with no CFs routes 0 on its own;
+  // with a deferred op it routes like a direct Put to that CF. Dropping
+  // the deferred contribution routes 0 and fails the nonzero assertions.
+  constexpr size_t kNumPartitions = 4;
+
+  // A CF id whose direct route is nonzero, so the equality below is not
+  // vacuous (a dropped contribution routes 0).
+  uint32_t routed_cf = 0;
+  size_t direct_partition = 0;
+  bool found = false;
+  for (uint32_t cf_id = 1; cf_id < 10000 && !found; ++cf_id) {
+    WriteBatch batch;
+    ASSERT_OK(WriteBatchInternal::Put(&batch, cf_id, "key", "value"));
+    size_t partition = kNumPartitions;
+    ASSERT_OK(
+        DBImpl::TEST_WalPartitionForWrite(batch, kNumPartitions, &partition));
+    if (partition != 0) {
+      routed_cf = cf_id;
+      direct_partition = partition;
+      found = true;
+    }
+  }
+  ASSERT_TRUE(found);
+
+  const std::vector<uint32_t> deferred_cf_ids{routed_cf};
+
+  WriteBatch empty;
+  ASSERT_OK(WriteBatchInternal::InsertNoop(&empty));
+  size_t deferred_partition = kNumPartitions;
+  ASSERT_OK(DBImpl::TEST_WalPartitionForWrite(
+      empty, kNumPartitions, &deferred_partition, &deferred_cf_ids));
+  EXPECT_EQ(deferred_partition, direct_partition);
+  EXPECT_NE(deferred_partition, 0);
+
+  // The deferred CF joins the minimum: a batch touching only a larger CF
+  // still routes by the smaller deferred CF.
+  WriteBatch larger_cf_batch;
+  ASSERT_OK(WriteBatchInternal::Put(&larger_cf_batch, routed_cf + 1000, "key",
+                                    "value"));
+  size_t joined_partition = kNumPartitions;
+  ASSERT_OK(DBImpl::TEST_WalPartitionForWrite(
+      larger_cf_batch, kNumPartitions, &joined_partition, &deferred_cf_ids));
+  EXPECT_EQ(joined_partition, direct_partition);
+}
+
+TEST(WalRoutingTest, HashesPrepareAndTimestampedCommitXids) {
+  // Q9 ([05-3]): MarkEndPrepare and MarkCommitWithTimestamp feed the same
+  // XID routing input as the other markers: the same XID routes the same
+  // through any of them. Dropping either marker's contribution routes 0
+  // and fails the nonzero assertion.
+  constexpr size_t kNumPartitions = 4;
+
+  std::string routed_xid;
+  size_t direct_partition = 0;
+  bool found = false;
+  for (uint32_t i = 0; i < 10000 && !found; ++i) {
+    WriteBatch marker;
+    std::string xid = "prepare-" + std::to_string(i);
+    // EndPrepare replaces the batch's leading noop.
+    ASSERT_OK(WriteBatchInternal::InsertNoop(&marker));
+    ASSERT_OK(WriteBatchInternal::MarkEndPrepare(&marker, xid));
+    size_t partition = kNumPartitions;
+    ASSERT_OK(
+        DBImpl::TEST_WalPartitionForWrite(marker, kNumPartitions, &partition));
+    if (partition != 0) {
+      routed_xid = xid;
+      direct_partition = partition;
+      found = true;
+    }
+  }
+  ASSERT_TRUE(found);
+
+  WriteBatch commit_ts;
+  ASSERT_OK(WriteBatchInternal::MarkCommitWithTimestamp(&commit_ts, routed_xid,
+                                                        "commit-ts"));
+  size_t commit_ts_partition = kNumPartitions;
+  ASSERT_OK(DBImpl::TEST_WalPartitionForWrite(commit_ts, kNumPartitions,
+                                              &commit_ts_partition));
+  EXPECT_EQ(commit_ts_partition, direct_partition);
+
+  WriteBatch commit;
+  ASSERT_OK(WriteBatchInternal::MarkCommit(&commit, routed_xid));
+  size_t commit_partition = kNumPartitions;
+  ASSERT_OK(DBImpl::TEST_WalPartitionForWrite(commit, kNumPartitions,
+                                              &commit_partition));
+  EXPECT_EQ(commit_partition, direct_partition);
+  EXPECT_NE(commit_partition, 0);
+}
+
+TEST(WriteThreadPartitionTest, DifferentPartitionsFormSeparateGroups) {
+  // Q8 ([05-1]): a write group becomes one WAL record and cannot span
+  // partitions, so group formation excludes a writer whose wal_partition
+  // differs from the leader's. Three writers join one WriteThread with
+  // partitions {0, 0, 1}; the leader's formation must group the two
+  // partition-0 writers and leave the partition-1 writer for the next
+  // group. Removing the clause groups all three and fails this test.
+  // (Through the DB this is unreachable: each partition has its own write
+  // thread, so cross-partition writers never meet in one formation.)
+  WriteThread write_thread{ImmutableDBOptions{}};
+
+  WriteBatch batch_a, batch_b, batch_c;
+  ASSERT_OK(batch_a.Put("a", "v"));
+  ASSERT_OK(batch_b.Put("b", "v"));
+  ASSERT_OK(batch_c.Put("c", "v"));
+  WriteThread::Writer wa(WriteOptions(), &batch_a, nullptr, nullptr, 0, false);
+  WriteThread::Writer wb(WriteOptions(), &batch_b, nullptr, nullptr, 0, false);
+  WriteThread::Writer wc(WriteOptions(), &batch_c, nullptr, nullptr, 0, false);
+  wa.wal_partition = 0;
+  wb.wal_partition = 0;
+  wc.wal_partition = 1;
+
+  // A links as leader and returns at once; B and C queue behind it and
+  // wait. Formation runs only once both followers are queued.
+  std::mutex mu;
+  std::condition_variable cv;
+  int waiting = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "WriteThread::JoinBatchGroup:BeganWaiting", [&](void*) {
+        std::lock_guard<std::mutex> lock(mu);
+        ++waiting;
+        cv.notify_all();
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  write_thread.JoinBatchGroup(&wa);
+  port::Thread thread_b([&] { write_thread.JoinBatchGroup(&wb); });
+  port::Thread thread_c([&] { write_thread.JoinBatchGroup(&wc); });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(10),
+                            [&] { return waiting == 2; }));
+  }
+
+  WriteThread::WriteGroup group;
+  write_thread.EnterAsBatchGroupLeader(&wa, &group);
+  ASSERT_EQ(2u, group.size);
+  ASSERT_EQ(0u, group.num_cap_excluded);
+  std::vector<WriteThread::Writer*> members;
+  for (auto* w : group) {
+    members.push_back(w);
+  }
+  ASSERT_EQ(2u, members.size());
+  EXPECT_EQ(&wa, members[0]);
+  EXPECT_EQ(&wb, members[1]);
+
+  // Exiting completes B and promotes C to the next group leader.
+  Status status;
+  write_thread.ExitAsBatchGroupLeader(group, status);
+  thread_b.join();
+  thread_c.join();
+  EXPECT_EQ(WriteThread::STATE_COMPLETED, wb.state.load());
+  EXPECT_EQ(WriteThread::STATE_GROUP_LEADER, wc.state.load());
+
+  // The excluded writer forms a group of its own.
+  WriteThread::WriteGroup group2;
+  write_thread.EnterAsBatchGroupLeader(&wc, &group2);
+  EXPECT_EQ(1u, group2.size);
+  write_thread.ExitAsBatchGroupLeader(group2, status);
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+}
 
 // It is invalid to do sync write while disabling WAL.
 TEST_P(DBWriteTest, SyncAndDisableWAL) {
