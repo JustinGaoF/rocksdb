@@ -1542,6 +1542,17 @@ class VersionSet {
   virtual void ApplyCommittedOptionsFileNumber(uint64_t number);
   void ApplyLegacyOptionsFileNumber(uint64_t number);
 
+  // Highest WAL number that may carry WAL index records, or zero when none
+  // may (see VersionEdit::SetWALIndexGuard). Every new MANIFEST carries it.
+  uint64_t wal_index_guard() const { return wal_index_guard_; }
+  // Only for a caller about to write a new MANIFEST without the guard: an
+  // edit cannot clear it from the current MANIFEST.
+  void ClearWALIndexGuard() { wal_index_guard_ = 0; }
+
+  // Reads the guard from the MANIFEST that CURRENT names in `dbname`.
+  static Status ReadWALIndexGuard(const std::string& dbname, FileSystem* fs,
+                                  uint64_t* guard);
+
   uint64_t pending_manifest_file_number() const {
     return pending_manifest_file_number_;
   }
@@ -1992,6 +2003,7 @@ class VersionSet {
   uint64_t options_file_number_;
   uint64_t options_file_size_;
   bool has_committed_options_file_number_;
+  uint64_t wal_index_guard_ = 0;
   uint64_t pending_manifest_file_number_;
   // The last seq visible to reads. It normally indicates the last sequence in
   // the memtable but when using two write queues it could also indicate the

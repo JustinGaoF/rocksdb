@@ -5771,6 +5771,7 @@ void VersionSet::Reset() {
   options_file_number_ = 0;
   options_file_size_ = 0;
   has_committed_options_file_number_ = false;
+  wal_index_guard_ = 0;
   pending_manifest_file_number_ = 0;
   last_sequence_.store(0);
   last_allocated_sequence_.store(0);
@@ -6230,6 +6231,9 @@ Status VersionSet::ProcessManifestWrites(
       wal_additions.AddWal(wal.first, wal.second);
     }
     options_manifest_state = options_file_manifest_state();
+    if (wal_index_guard_ != 0 && !batch_edits.back()->HasWALIndexGuard()) {
+      batch_edits.back()->SetWALIndexGuard(wal_index_guard_);
+    }
   }
 
   uint64_t new_manifest_file_size = 0;
@@ -6501,6 +6505,9 @@ Status VersionSet::ProcessManifestWrites(
         if (edit->HasCommittedOptionsFileNumber()) {
           ApplyCommittedOptionsFileNumber(
               edit->GetCommittedOptionsFileNumber());
+        }
+        if (edit->HasWALIndexGuard()) {
+          wal_index_guard_ = edit->GetWALIndexGuard();
         }
       }
       assert(max_last_sequence >= descriptor_last_sequence_);
@@ -7392,6 +7399,40 @@ Status VersionSet::ListColumnFamiliesFromManifest(
   }
 
   return handler.status();
+}
+
+Status VersionSet::ReadWALIndexGuard(const std::string& dbname, FileSystem* fs,
+                                     uint64_t* guard) {
+  assert(guard != nullptr);
+  *guard = 0;
+  std::string manifest_path;
+  uint64_t manifest_file_number = 0;
+  Status s = GetCurrentManifestPath(dbname, fs, /*is_retry=*/false,
+                                    &manifest_path, &manifest_file_number);
+  if (!s.ok()) {
+    return s;
+  }
+  std::unique_ptr<FSSequentialFile> file;
+  s = fs->NewSequentialFile(manifest_path, FileOptions(), &file, nullptr);
+  if (!s.ok()) {
+    return s;
+  }
+  LogReporter reporter;
+  reporter.status = &s;
+  log::Reader reader(nullptr,
+                     std::make_unique<SequentialFileReader>(
+                         std::move(file), manifest_path, /*io_tracer=*/nullptr),
+                     &reporter, /*checksum=*/true, /*log_number=*/0);
+  Slice record;
+  std::string scratch;
+  while (s.ok() && reader.ReadRecord(&record, &scratch)) {
+    VersionEdit edit;
+    s = edit.DecodeFrom(record);
+    if (s.ok() && edit.HasWALIndexGuard()) {
+      *guard = edit.GetWALIndexGuard();
+    }
+  }
+  return s;
 }
 
 Status VersionSet::GetOptionsFileManifestState(

@@ -475,6 +475,10 @@ enum class WALRecoveryMode : char {
 // kSkipAnyCorruptedRecords, or with paranoid_checks=false, it opens the DB and
 // discards the contents of those WALs, including acknowledged writes not yet
 // flushed.
+// So while a live WAL may be in the new format, the MANIFEST carries a record
+// that older versions reject, and their DB::Open fails in every recovery mode
+// instead. Backups and checkpoints taken in that state carry it too: restoring
+// them needs a version that supports this option.
 //
 // To roll back:
 //   1. Reopen with this option set to `kNone`.
@@ -482,7 +486,15 @@ enum class WALRecoveryMode : char {
 //   3. Wait for the WAL files written before step 1 to be deleted.
 //   4. If `WAL_ttl_seconds` or `WAL_size_limit_MB` keeps an archive, purge
 //      `archive/` or wait until those limits expire the same WAL files there.
-//   5. Downgrade the RocksDB binary.
+//   5. Close, reopen once more with `kNone`, and close. The MANIFEST record
+//      is cleared by the first open that finds none of those WALs live, which
+//      may already be step 1's (avoid_flush_during_recovery=false flushes at
+//      open).
+//   6. On the closed DB, run `ldb check_wal_index` and require that it reports
+//      no live or archived WAL in the new format.
+//   7. Require that it also reports `WAL index guard: clear`; it exits 0 only
+//      when 6 and 7 both hold.
+//   8. Downgrade the RocksDB binary.
 enum class PartitionWALUsage : char {
   // Disabled. The WAL keeps the vanilla on-disk format so that files stay
   // readable by (and are bit-for-bit compatible with) older RocksDB versions.
