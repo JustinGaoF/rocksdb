@@ -2501,8 +2501,7 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
     wal_write_mutex_.Unlock();
   }
   if (wal_used != nullptr) {
-    *wal_used = cur_wal_number_;
-    assert(*wal_used == wal_file_number_size.number);
+    *wal_used = wal_file_number_size.number;
   }
   wals_total_size_.FetchAddRelaxed(log_entry.size());
   wal_file_number_size.AddSize(*log_size);
@@ -2530,10 +2529,10 @@ IOStatus DBImpl::WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
   }
 
   if (merged_batch == write_group.leader->batch) {
-    write_group.leader->wal_used = cur_wal_number_;
+    write_group.leader->wal_used = wal_file_number_size.number;
   } else if (write_with_wal > 1) {
     for (auto writer : write_group) {
-      writer->wal_used = cur_wal_number_;
+      writer->wal_used = wal_file_number_size.number;
     }
   }
 
@@ -2650,11 +2649,17 @@ IOStatus DBImpl::ConcurrentWriteGroupToWAL(
   // We need to lock wal_write_mutex_ since logs_ and alive_wal_files might be
   // pushed back concurrently
   wal_write_mutex_.Lock();
+
+  log::Writer* log_writer = logs_.back().writer;
+  WalFileNumberSize& wal_file_number_size = alive_wal_files_.back();
+
+  assert(log_writer->get_log_number() == wal_file_number_size.number);
+
   if (merged_batch == write_group.leader->batch) {
-    write_group.leader->wal_used = cur_wal_number_;
+    write_group.leader->wal_used = wal_file_number_size.number;
   } else if (write_with_wal > 1) {
     for (auto writer : write_group) {
-      writer->wal_used = cur_wal_number_;
+      writer->wal_used = wal_file_number_size.number;
     }
   }
   uint64_t wal_index = 0;
@@ -2670,11 +2675,6 @@ IOStatus DBImpl::ConcurrentWriteGroupToWAL(
   }
   auto sequence = *last_sequence + 1;
   WriteBatchInternal::SetSequence(merged_batch, sequence);
-
-  log::Writer* log_writer = logs_.back().writer;
-  WalFileNumberSize& wal_file_number_size = alive_wal_files_.back();
-
-  assert(log_writer->get_log_number() == wal_file_number_size.number);
 
   uint64_t log_size;
 
