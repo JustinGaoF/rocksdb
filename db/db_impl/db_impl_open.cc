@@ -1246,17 +1246,96 @@ Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& wal_numbers,
                                RecoveryContext* recovery_ctx) {
   mutex_.AssertHeld();
 
+  std::vector<WALIndexSupersession> wal_index_supersessions;
+  if (log::WALIndexEnabled(immutable_db_options_.partition_wal_usage)) {
+    next_wal_index_ = log::kWALIndexStartNumber;
+  }
+
   std::unordered_map<int, VersionEdit> version_edits;
   int job_id = 0;
   uint64_t min_wal_number = 0;
   SetupLogFilesRecovery(wal_numbers, &version_edits, &job_id, &min_wal_number);
 
-  Status status = ProcessLogFiles(
-      wal_numbers, read_only, is_retry, min_wal_number, job_id, next_sequence,
-      &version_edits, corrupted_wal_found, recovery_ctx);
+  Status status =
+      ProcessLogFiles(wal_numbers, read_only, is_retry, min_wal_number, job_id,
+                      next_sequence, &version_edits, corrupted_wal_found,
+                      recovery_ctx, &wal_index_supersessions);
+
+  // A read-only or secondary open has no recovery context because it creates
+  // no WAL. It also allocates no wal_index and so reissues nothing, leaving
+  // the supersessions nothing to protect: drop them rather than fail an open
+  // over a tolerated tail, which is the normal state after a crash.
+  assert(!read_only || recovery_ctx == nullptr);
+  if (status.ok() && !wal_index_supersessions.empty() &&
+      recovery_ctx != nullptr) {
+    recovery_ctx->wal_index_supersessions_ = std::move(wal_index_supersessions);
+  }
 
   FinishLogFilesRecovery(job_id, status);
   return status;
+}
+
+// Scoped to the live recovery set. `WAL_ttl_seconds` and `WAL_size_limit_MB`
+// move retired WALs to `archive/` rather than deleting them; those files keep
+// the indices they were written with while sitting below
+// `min_log_number_to_keep` and outside `wal_numbers`, and scanning them would
+// mean reading the whole archive on every open. A consumer that merges
+// wal_index streams must therefore read the live set only: an archived WAL can
+// repeat an index the live set reissues.
+Status DBImpl::SetNextWALIndexAfterRecovery(uint64_t wal_index) {
+  if (wal_index == 0) {
+    return Status::OK();
+  }
+  if (wal_index == std::numeric_limits<uint64_t>::max()) {
+    return Status::Corruption(
+        "Recovered a wal_index at the type limit, which has no successor");
+  }
+  next_wal_index_ = wal_index + 1;
+  return Status::OK();
+}
+
+IOStatus DBImpl::WriteWALIndexSupersessions(
+    const WriteOptions& write_options, log::Writer* new_log,
+    const std::vector<WALIndexSupersession>& supersessions) {
+  // Recovery deliberately does not force a flush to retire the superseded
+  // files. The record here is the declaration, so it does not need those
+  // files gone, and avoid_flush_during_recovery stays honored. The cost is
+  // that a superseded WAL stays in the recovery set until an ordinary flush
+  // retires it, and every open until then re-reads it and redeclares the same
+  // cut. That repeat is idempotent: the declaration names one file and one
+  // lower bound, and a reader folds the minimum per file.
+  assert(new_log != nullptr);
+  // Recovery finds supersessions by reading WAL heads only, so they must
+  // precede this file's first data record.
+  assert(new_log->last_wal_index_recorded() == 0);
+  // The merge takes a void in a WAL numbered below the declaring WAL to
+  // predate the cut. That holds because the declaring WAL is partition 0's
+  // new WAL, the lowest-numbered WAL this open creates: every other
+  // partition's new WAL is numbered above it (asserted where Open creates
+  // them), and so is every later WAL.
+  assert(supersessions.empty() || new_log->get_log_number() == cur_wal_number_);
+  for (const WALIndexSupersession& supersession : supersessions) {
+    IOStatus io_s = new_log->AddWALIndexSupersessionRecord(
+        write_options, supersession.wal_number,
+        supersession.first_obsolete_wal_index);
+    TEST_SYNC_POINT_CALLBACK("DBImpl::WriteWALIndexSupersessions:io_s", &io_s);
+    if (!io_s.ok()) {
+      return io_s;
+    }
+  }
+  if (supersessions.empty()) {
+    return IOStatus::OK();
+  }
+  // Durable before Open returns, so before any index it makes reusable: with
+  // more than one partition, a reissued record lands in another partition's
+  // WAL, which could otherwise become durable first.
+  IOOptions opts;
+  IOStatus io_s = WritableFileWriter::PrepareIOOptions(write_options, opts);
+  if (io_s.ok()) {
+    io_s = immutable_db_options_.use_fsync ? new_log->file()->Fsync(opts)
+                                           : new_log->file()->Sync(opts);
+  }
+  return io_s;
 }
 
 void DBImpl::SetupLogFilesRecovery(
@@ -1301,7 +1380,9 @@ Status DBImpl::ProcessLogFiles(
     const std::vector<uint64_t>& wal_numbers, bool read_only, bool is_retry,
     uint64_t min_wal_number, int job_id, SequenceNumber* next_sequence,
     std::unordered_map<int, VersionEdit>* version_edits,
-    bool* corrupted_wal_found, RecoveryContext* recovery_ctx) {
+    bool* corrupted_wal_found, RecoveryContext* recovery_ctx,
+    std::vector<WALIndexSupersession>* supersessions) {
+  assert(supersessions != nullptr);
   Status status;
 
   bool stop_replay_by_wal_filter = false;
@@ -1319,11 +1400,12 @@ Status DBImpl::ProcessLogFiles(
     }
     SequenceNumber prev_next_sequence = *next_sequence;
     if (status.ok()) {
-      status = ProcessLogFile(
-          wal_number, min_wal_number, is_retry, read_only, job_id,
-          next_sequence, &stop_replay_for_corruption,
-          &stop_replay_by_wal_filter, &corrupted_wal_number,
-          corrupted_wal_found, version_edits, &flushed, predecessor_wal_info);
+      status =
+          ProcessLogFile(wal_number, min_wal_number, is_retry, read_only,
+                         job_id, next_sequence, &stop_replay_for_corruption,
+                         &stop_replay_by_wal_filter, &corrupted_wal_number,
+                         corrupted_wal_found, version_edits, &flushed,
+                         predecessor_wal_info, supersessions);
     }
     if (status.ok()) {
       status = CheckSeqnoNotSetBackDuringRecovery(prev_next_sequence,
@@ -1349,8 +1431,10 @@ Status DBImpl::ProcessLogFile(
     bool* stop_replay_by_wal_filter, uint64_t* corrupted_wal_number,
     bool* corrupted_wal_found,
     std::unordered_map<int, VersionEdit>* version_edits, bool* flushed,
-    PredecessorWALInfo& predecessor_wal_info) {
+    PredecessorWALInfo& predecessor_wal_info,
+    std::vector<WALIndexSupersession>* supersessions) {
   assert(stop_replay_by_wal_filter);
+  assert(supersessions != nullptr);
 
   // Variable initialization starts
   Status status;
@@ -1381,6 +1465,11 @@ Status DBImpl::ProcessLogFile(
   // `last_seqno_observed != *next_sequence` when there are multiple key-value
   // pairs in one WAL entry
   SequenceNumber last_seqno_observed = 0;
+  const bool wal_index_enabled =
+      log::WALIndexEnabled(immutable_db_options_.partition_wal_usage);
+  bool has_replayed_indexed_record = false;
+  uint64_t last_replayed_or_void_wal_index = 0;
+  uint64_t first_obsolete_wal_index = 0;
   // Variable initialization ends
 
   if (wal_number < min_wal_number) {
@@ -1396,6 +1485,9 @@ Status DBImpl::ProcessLogFile(
 
   if (*stop_replay_by_wal_filter) {
     logFileDropped();
+    if (wal_index_enabled) {
+      supersessions->push_back({wal_number, log::kWALIndexStartNumber});
+    }
     assert(status.ok());
     return status;
   }
@@ -1412,8 +1504,10 @@ Status DBImpl::ProcessLogFile(
   } else if (reader == nullptr) {
     // TODO(hx235): remove this case since it's confusing
     assert(status.ok());
-    // Fail initializing log reader for one log file with an ok status.
-    // Try next one.
+    if (wal_index_enabled) {
+      return Status::IOError("Indexed WAL reader was not initialized", fname);
+    }
+    // Fail initializing an unindexed log reader with an ok status. Try next.
     return status;
   }
 
@@ -1432,6 +1526,9 @@ Status DBImpl::ProcessLogFile(
     // when a corruption is encountered
     // FIXME(hx235): consolidate `read_record` and `status`
     if (!read_record || !status.ok()) {
+      if (wal_index_enabled && !status.ok()) {
+        first_obsolete_wal_index = next_wal_index_;
+      }
       break;
     }
 
@@ -1445,14 +1542,58 @@ Status DBImpl::ProcessLogFile(
 
     if (!process_status.ok()) {
       return process_status;
-    } else if (Status seqno_check_status = CheckSeqnoNotSetBackDuringRecovery(
-                   prev_next_sequence, *next_sequence);
-               !seqno_check_status.ok()) {
+    }
+    if (Status seqno_check_status = CheckSeqnoNotSetBackDuringRecovery(
+            prev_next_sequence, *next_sequence);
+        !seqno_check_status.ok()) {
       // Sequence number being set back indicates a serious software bug, the DB
       // should not be opened in this case.
       return seqno_check_status;
-    } else if (*stop_replay_for_corruption) {
+    }
+    if (!status.ok() || *stop_replay_for_corruption ||
+        *stop_replay_by_wal_filter) {
+      if (wal_index_enabled) {
+        first_obsolete_wal_index = reader->GetLastReadWALIndex();
+        if (first_obsolete_wal_index == 0) {
+          first_obsolete_wal_index = next_wal_index_;
+        }
+      }
       break;
+    }
+    if (wal_index_enabled) {
+      last_replayed_or_void_wal_index = std::max(
+          {last_replayed_or_void_wal_index, reader->GetLastReadWALIndex(),
+           reader->GetMaxVoidWALIndexHi()});
+      Status wal_index_status =
+          SetNextWALIndexAfterRecovery(last_replayed_or_void_wal_index);
+      if (!wal_index_status.ok()) {
+        return wal_index_status;
+      }
+      has_replayed_indexed_record |= reader->GetLastReadWALIndex() != 0;
+    }
+  }
+
+  if (wal_index_enabled) {
+    if (reader->hasReadError()) {
+      return Status::IOError("I/O error while recovering indexed WAL", fname);
+    }
+    last_replayed_or_void_wal_index = std::max(last_replayed_or_void_wal_index,
+                                               reader->GetMaxVoidWALIndexHi());
+    Status wal_index_status =
+        SetNextWALIndexAfterRecovery(last_replayed_or_void_wal_index);
+    if (!wal_index_status.ok()) {
+      return wal_index_status;
+    }
+    if (first_obsolete_wal_index != 0 ||
+        reader->WALRecoveryStoppedBeforeEndOfFile() || old_log_record ||
+        *stop_replay_for_corruption || *stop_replay_by_wal_filter ||
+        !status.ok()) {
+      if (first_obsolete_wal_index == 0) {
+        first_obsolete_wal_index = has_replayed_indexed_record
+                                       ? next_wal_index_
+                                       : log::kWALIndexStartNumber;
+      }
+      supersessions->push_back({wal_number, first_obsolete_wal_index});
     }
   }
 
@@ -1505,6 +1646,9 @@ Status DBImpl::InitializeLogReader(
     status = fs_->NewSequentialFile(
         fname, fs_->OptimizeForLogRead(file_options_), &file, nullptr);
     if (!status.ok()) {
+      if (log::WALIndexEnabled(immutable_db_options_.partition_wal_usage)) {
+        return status;
+      }
       MaybeIgnoreError(&status);
       return status;
     }
@@ -2820,6 +2964,10 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
 
     if (s.ok()) {
       impl->alive_wal_files_.emplace_back(impl->cur_wal_number_);
+      s = impl->WriteWALIndexSupersessions(
+          write_options, new_log, recovery_ctx.wal_index_supersessions_);
+    }
+    if (s.ok()) {
       // In WritePrepared there could be gap in sequence numbers. This breaks
       // the trick we use in kPointInTimeRecovery which assumes the first seq in
       // the log right after the corrupted log is one larger than the last seq
