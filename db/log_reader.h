@@ -133,6 +133,18 @@ class Reader {
     return !first_record_read_ && compression_type_record_read_;
   }
 
+  // Returns true once a record in the recyclable format has been read.
+  bool IsRecycled() const { return recycled_; }
+
+  // Returns true when ReadRecord stopped at a record from a previous use of
+  // the log, in any mode that stops there.
+  bool StoppedAtOldRecord() const { return stopped_at_old_record_; }
+
+  // Returns true when a report may have dropped a record of this log: every
+  // report except a dropped block remainder that holds no recyclable header
+  // naming this log past its first byte.
+  bool MayHaveDroppedOwnRecord() const { return may_have_dropped_own_record_; }
+
   // Returns true when ReadRecord stopped at bytes that were not a clean EOF,
   // such as a truncated record or a stale recycled-file tail.
   bool WALRecoveryStoppedBeforeEndOfFile() const {
@@ -238,6 +250,11 @@ class Reader {
   // Whether the first record has been read or not.
   bool first_record_read_;
   bool wal_recovery_stopped_before_end_of_file_ = false;
+  bool stopped_at_old_record_ = false;
+  // Set by ReadPhysicalRecord when the bytes it just dropped hold no header of
+  // this log; consumed by the report of that drop.
+  bool drop_holds_no_own_header_ = false;
+  bool may_have_dropped_own_record_ = false;
   // Type of compression used
   CompressionType compression_type_;
   // Track whether the compression type record has been read or not.
@@ -318,6 +335,8 @@ class Reader {
   void ReportDrop(size_t bytes, const Status& reason,
                   uint64_t log_number = kMaxSequenceNumber);
   void ReportOldLogRecord(size_t bytes);
+  // Whether `bytes` holds a recyclable record header naming this log.
+  bool HoldsOwnRecyclableHeader(const Slice& bytes) const;
 
   void InitCompression(const CompressionTypeRecord& compression_record);
 
