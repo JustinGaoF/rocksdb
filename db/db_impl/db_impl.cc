@@ -272,6 +272,12 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
     nonmem_write_threads_.emplace_back(
         std::make_unique<WriteThread>(immutable_db_options_));
   }
+  wal_durability_tracker_ =
+      std::make_unique<WalDurabilityTracker>(num_wal_partitions);
+  // The oracle's safe point self-test shifts the durability watermark only;
+  // shifting this one too would claim an unapplied range applied.
+  applied_tracker_ = std::make_unique<WalDurabilityTracker>(
+      num_wal_partitions, /*safe_point_test_hook=*/false);
 
   // Bind one sync condvar to each WAL partition's mutex. This is the only
   // partition vector filled here rather than at declaration: a condvar needs
@@ -7945,6 +7951,25 @@ Status DBImpl::CommitFileIngestionHandles(
     TEST_SYNC_POINT_CALLBACK("DBImpl::IngestExternalFile:NeedFlush",
                              &at_least_one_cf_need_flush);
 
+    // With every queue held no write registers or completes a durability
+    // range, so a range still pending is a failed WAL append's, which stays
+    // pinned and never completes. Ingesting would publish sequences above
+    // that hole.
+    if (status.ok() && NumWalPartitions() > 1) {
+      for (size_t p = 0; p < NumWalPartitions(); ++p) {
+        if (wal_durability_tracker_->PendingLow(p) !=
+            WalDurabilityTracker::kIdle) {
+          status = error_handler_.GetBGError();
+          if (status.ok()) {
+            status = Status::Aborted(
+                "IngestExternalFile: a failed WAL append left WAL partition " +
+                std::to_string(p) + "'s sequence range pending");
+          }
+          break;
+        }
+      }
+    }
+
     if (status.ok() && at_least_one_cf_need_flush) {
       FlushOptions flush_opts;
       flush_opts.allow_write_stall = true;
@@ -8052,6 +8077,17 @@ Status DBImpl::CommitFileIngestionHandles(
       if (max_assigned_seqno > 0) {
         const SequenceNumber last_seqno = versions_->LastSequence();
         if (max_assigned_seqno > last_seqno) {
+#ifndef NDEBUG
+          // Jumping allocated forward is safe only with no range pending. The
+          // safe point alone is no witness: it stays below allocated after a
+          // disableWAL write, which registers nothing.
+          if (NumWalPartitions() > 1) {
+            for (size_t p = 0; p < NumWalPartitions(); ++p) {
+              assert(wal_durability_tracker_->PendingLow(p) ==
+                     WalDurabilityTracker::kIdle);
+            }
+          }
+#endif  // NDEBUG
           versions_->SetLastAllocatedSequence(max_assigned_seqno);
           versions_->SetLastPublishedSequence(max_assigned_seqno);
           versions_->SetLastSequence(max_assigned_seqno);

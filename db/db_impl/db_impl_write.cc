@@ -1303,7 +1303,8 @@ Status DBImpl::WriteImpl(
         }
       }
       if (w.status.ok()) {  // Don't publish a partial batch write
-        PublishLastSequence(last_sequence);
+        PublishLastSequence(w.wal_partition, w.write_group->first_sequence,
+                            last_sequence, !w.disable_wal);
       } else {
         HandleMemTableInsertFailure(w.status);
       }
@@ -1336,6 +1337,10 @@ Status DBImpl::WriteImpl(
   WriteThread::WriteGroup write_group;
   bool in_parallel_group = false;
   uint64_t last_sequence = kMaxSequenceNumber;
+  // The group's range is registered for N>1 publication, and a step after
+  // its WAL append failed before anything was inserted (see the exit).
+  bool registered_applied_range = false;
+  bool release_unapplied_range = false;
 
   assert(!two_write_queues_ || !disable_memtable);
   {
@@ -1561,17 +1566,29 @@ Status DBImpl::WriteImpl(
         // read still serves the kNone path, which never reaches the allocator.
         // The two agree because the allocator catches last_allocated_sequence_
         // up to LastSequence() before reserving.
-        io_s = AllocateSequenceAndWALIndex(seq_inc, !write_options.disableWAL,
-                                           &last_sequence, &wal_index);
+        // Register only above one partition: at N==1 nothing consumes
+        // the tracker (the gate and its snapshots are all N>1-gated), so
+        // an indexed N=1 write allocates its index without entering it.
+        io_s = AllocateSequenceAndWALIndex(
+            seq_inc, !write_options.disableWAL, &last_sequence, &wal_index,
+            wal_context.wal_partition,
+            /*register_durability=*/NumWalPartitions() > 1);
         status = io_s;
+        registered_applied_range = io_s.ok() && NumWalPartitions() > 1 &&
+                                   (!write_options.disableWAL || seq_inc > 0);
       }
       if (status.ok() && !write_options.disableWAL) {
         assert(wal_context.wal_file_number_size);
         wal_write_number = wal_context.wal_file_number_size->number;
         wal_context.prev_size = wal_context.writer->file()->GetFileSize();
         PERF_TIMER_GUARD(write_wal_time);
+        // Paired with the Allocate above: only complete what was
+        // registered. At N==1 this skips the completion's mutex
+        // acquisition: nothing at N==1 reads the tracker's answer.
+        const bool complete_durability = NumWalPartitions() > 1;
         io_s = WriteGroupToWAL(write_group, wal_context, wal_used,
-                               last_sequence + 1, wal_index, seq_inc);
+                               last_sequence + 1, wal_index, seq_inc,
+                               complete_durability);
         if (!io_s.ok()) {
           // The index was consumed; if its record never landed, cover it
           // before the error escapes, so the hole is declared rather than
@@ -1662,6 +1679,9 @@ Status DBImpl::WriteImpl(
       }
     }
 
+    release_unapplied_range =
+        registered_applied_range && io_s.ok() && !status.ok();
+
     if (status.ok()) {
       PERF_TIMER_FOR_WAIT_GUARD(write_memtable_time);
 
@@ -1673,6 +1693,7 @@ Status DBImpl::WriteImpl(
             write_options.ignore_missing_column_families,
             0 /*recovery_log_number*/, this, seq_per_batch_, batch_per_txn_);
       } else {
+        write_group.first_sequence = current_sequence;
         write_group.last_sequence = last_sequence;
         if (NumWalPartitions() > 1) {
           // A failed insert is recorded under the leader's state mutex
@@ -1778,8 +1799,17 @@ Status DBImpl::WriteImpl(
             "DBImpl::WriteImpl:AfterWBWIIngestBeforeSetLastSequence:pause");
         TEST_SYNC_POINT(
             "DBImpl::WriteImpl:AfterWBWIIngestBeforeSetLastSequence:resume");
-        PublishLastSequence(last_sequence);
+        PublishLastSequence(w.wal_partition, last_sequence + 1 - seq_inc,
+                            last_sequence, !write_options.disableWAL);
       }
+    } else if (release_unapplied_range) {
+      // The record landed but a later step failed (recording the sync in the
+      // MANIFEST), so the group inserted nothing. Mark its range applied, as
+      // one partition does when the next group publishes past it: left
+      // pending, it would hold every higher range on every partition, and
+      // their completion gates, for good. It publishes no data.
+      PublishLastSequence(w.wal_partition, last_sequence + 1 - seq_inc,
+                          last_sequence, !write_options.disableWAL);
     }
     if (!w.status.ok()) {
       if (wal_context.prev_size < SIZE_MAX) {
@@ -1848,6 +1878,9 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
         write_thread.EnterAsBatchGroupLeader(&w, &wal_write_group));
     const bool wal_index_enabled =
         log::WALIndexEnabled(immutable_db_options_.partition_wal_usage);
+    // At N==1 nothing consumes the tracker, so neither the registration
+    // nor its paired completion below enters it.
+    const bool track_durability = wal_index_enabled && NumWalPartitions() > 1;
     // With WAL index the sequence block is reserved jointly with the index,
     // which needs total_count -- not known until the loop below has run. So
     // that loop numbers writers from zero and they are shifted onto the
@@ -1877,9 +1910,10 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
       }
       if (wal_index_enabled) {
         SequenceNumber last_sequence_before = 0;
-        w.status =
-            AllocateSequenceAndWALIndex(total_count, !write_options.disableWAL,
-                                        &last_sequence_before, &wal_index);
+        w.status = AllocateSequenceAndWALIndex(
+            total_count, !write_options.disableWAL, &last_sequence_before,
+            &wal_index, w.wal_partition,
+            /*register_durability=*/track_durability);
         if (w.status.ok()) {
           current_sequence = last_sequence_before + 1;
           for (auto* writer : wal_write_group) {
@@ -1955,8 +1989,10 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
         RecordTick(stats_, WRITE_DONE_BY_OTHER, wal_write_group.size - 1);
       }
       assert(wal_context.wal_file_number_size);
+      // Paired with the registration above.
       io_s = WriteGroupToWAL(wal_write_group, wal_context, wal_used,
-                             current_sequence, wal_index, total_count);
+                             current_sequence, wal_index, total_count,
+                             /*complete_durability=*/track_durability);
       if (!io_s.ok()) {
         // As in WriteImpl: declare the burned index before the error escapes.
         const IOStatus cover_io_s = CoverBurnedWALIndex(
@@ -2287,8 +2323,9 @@ Status DBImpl::WriteImplWALOnly(
     }
   } else if (log::WALIndexEnabled(immutable_db_options_.partition_wal_usage)) {
     uint64_t wal_index = 0;
-    IOStatus io_s = AllocateSequenceAndWALIndex(seq_inc, /*write_wal=*/false,
-                                                &last_sequence, &wal_index);
+    IOStatus io_s = AllocateSequenceAndWALIndex(
+        seq_inc, /*write_wal=*/false, &last_sequence, &wal_index, wal_partition,
+        /*register_durability=*/true);
     // write_wal=false, so no index is consumed and there is nothing that could
     // burn -- no cover is needed on this path.
     assert(wal_index == 0);
@@ -2352,7 +2389,8 @@ Status DBImpl::WriteImplWALOnly(
     }
   }
   if (publish_last_seq == kDoPublishLastSeq) {
-    PublishLastSequence(last_sequence + seq_inc);
+    PublishLastSequence(wal_partition, last_sequence + 1,
+                        last_sequence + seq_inc, !write_options.disableWAL);
     // Currently we only use kDoPublishLastSeq in unordered_write
     assert(immutable_db_options_.unordered_write);
   }
@@ -2671,7 +2709,9 @@ Status DBImpl::MergeBatch(const WriteThread::WriteGroup& write_group,
 
 IOStatus DBImpl::AllocateSequenceAndWALIndex(
     size_t sequence_count, bool write_wal, SequenceNumber* last_sequence_before,
-    uint64_t* wal_index) {
+    uint64_t* wal_index, size_t wal_partition, bool register_durability,
+    size_t leading_sequence_count) {
+  assert(leading_sequence_count <= sequence_count);
   const bool wal_index_enabled =
       log::WALIndexEnabled(immutable_db_options_.partition_wal_usage);
   assert(wal_index_enabled || NumWalPartitions() > 1);
@@ -2696,7 +2736,58 @@ IOStatus DBImpl::AllocateSequenceAndWALIndex(
   *last_sequence_before =
       versions_->FetchAddLastAllocatedSequence(sequence_count);
   *wal_index = wal_index_enabled && write_wal ? next_wal_index_++ : 0;
+  if (register_durability && write_wal) {
+    // A WAL-only marker with count 0 is stamped with last_allocated + 1
+    // without consuming it; it shares its value with the next real write and
+    // both entries pin the minimum until both are durable. Its range is
+    // empty (high == low - 1), so completing it advances nothing past the
+    // last allocated sequence.
+    const SequenceNumber low = *last_sequence_before + 1;
+    const SequenceNumber high = *last_sequence_before + sequence_count;
+    assert(wal_partition < NumWalPartitions());
+    wal_durability_tracker_->Register(wal_partition, low, high);
+  }
+  // Every N>1 range PublishLastSequence will publish: the ranges registered
+  // above, plus disableWAL ranges, which have no record but must not become
+  // visible above a range still being inserted. Same section as the
+  // allocation, so no frontier scan can miss an allocated range.
+  if (register_durability && NumWalPartitions() > 1 &&
+      (write_wal || sequence_count > 0)) {
+    const SequenceNumber low = *last_sequence_before + 1;
+    const SequenceNumber high = *last_sequence_before + sequence_count;
+    if (leading_sequence_count > 0) {
+      applied_tracker_->Register(wal_partition, low,
+                                 low + leading_sequence_count - 1);
+    }
+    applied_tracker_->Register(wal_partition, low + leading_sequence_count,
+                               high);
+  }
   return IOStatus::OK();
+}
+
+void DBImpl::PublishAppliedPrefix(size_t wal_partition,
+                                  SequenceNumber first_sequence,
+                                  SequenceNumber last_sequence,
+                                  bool wal_record) {
+  assert(NumWalPartitions() > 1);
+  if (!wal_record && first_sequence > last_sequence) {
+    // Consumed no sequence and wrote no record: never registered.
+    return;
+  }
+  InstrumentedMutexLock l(&sequence_wal_index_mutex_);
+  applied_tracker_->Complete(wal_partition, first_sequence, last_sequence);
+  // A record that consumes no sequence completes an empty range, so the
+  // safe point never passes what was allocated.
+  SequenceNumber frontier = applied_tracker_->SafePoint();
+  assert(frontier <= versions_->LastAllocatedSequence());
+#ifndef NDEBUG
+  // The applied prefix is WAL-durable: no range with a record at or below
+  // it is still pending its append.
+  for (size_t p = 0; p < NumWalPartitions(); ++p) {
+    assert(wal_durability_tracker_->PendingLow(p) > frontier);
+  }
+#endif
+  versions_->SetLastSequenceAtLeast(frontier);
 }
 
 void DBImpl::AssertLastSequenceCoversAllocated() {
@@ -2850,7 +2941,8 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
 IOStatus DBImpl::WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
                                  WalContext& wal_context, uint64_t* wal_used,
                                  SequenceNumber sequence, uint64_t wal_index,
-                                 size_t sequence_count) {
+                                 size_t sequence_count,
+                                 bool complete_durability) {
   IOStatus io_s;
   assert(!two_write_queues_);
   assert(!write_group.leader->disable_wal);
@@ -2887,8 +2979,21 @@ IOStatus DBImpl::WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
   WriteOptions write_options;
   write_options.rate_limiter_priority =
       write_group.leader->rate_limiter_priority;
+  const uint64_t append_start = WalPartitionTimerStart();
   io_s = WriteToWAL(*merged_batch, write_options, wal_context, wal_used,
                     &log_size, sequence, wal_index, sequence_count);
+  if (io_s.ok() && complete_durability) {
+    // write() completed (not fsync): the range is durable at sync=false.
+    // A failed append stays pinned per the burned-index rule.
+    const SequenceNumber high = sequence + sequence_count - 1;
+    InstrumentedMutexLock seq_lock(&sequence_wal_index_mutex_);
+    wal_durability_tracker_->Complete(wal_context.wal_partition, sequence,
+                                      high);
+    if (append_start != 0) {
+      RecordTimeToHistogram(stats_, WAL_PARTITION_COMPLETION_MICROS,
+                            WalPartitionTimerElapsed(append_start));
+    }
+  }
   if (to_be_cached_state) {
     TEST_SYNC_POINT("DBImpl::WriteGroupToWAL:BeforeCacheRecoverableState");
     // Leaders of different partitions get here concurrently and in no
@@ -3029,13 +3134,26 @@ IOStatus DBImpl::ConcurrentWriteGroupToWAL(
     }
   }
   uint64_t wal_index = 0;
+  // At N==1 nothing consumes the tracker, so neither path below enters
+  // it; the mutex acquisitions go away with the registration.
+  const bool track_durability = NumWalPartitions() > 1;
   if (log::WALIndexEnabled(immutable_db_options_.partition_wal_usage)) {
-    io_s = AllocateSequenceAndWALIndex(seq_inc, /*write_wal=*/true,
-                                       last_sequence, &wal_index);
+    io_s = AllocateSequenceAndWALIndex(
+        seq_inc, /*write_wal=*/true, last_sequence, &wal_index, wal_partition,
+        /*register_durability=*/track_durability);
     if (!io_s.ok()) {
       wal_mutex.Unlock();
       return io_s;
     }
+  } else if (track_durability) {
+    // No-index path: bracket the allocation with durability registration so
+    // no later scan can miss the outstanding range. sequence_wal_index_mutex_
+    // is a leaf below the WAL write mutex already held here.
+    InstrumentedMutexLock seq_lock(&sequence_wal_index_mutex_);
+    *last_sequence = versions_->FetchAddLastAllocatedSequence(seq_inc);
+    const SequenceNumber low = *last_sequence + 1;
+    const SequenceNumber high = *last_sequence + seq_inc;
+    wal_durability_tracker_->Register(wal_partition, low, high);
   } else {
     *last_sequence = versions_->FetchAddLastAllocatedSequence(seq_inc);
   }
@@ -3061,6 +3179,14 @@ IOStatus DBImpl::ConcurrentWriteGroupToWAL(
         CoverBurnedWALIndex(write_options, wal_context.writer, wal_index,
                             wal_partition, /*wal_mutex_held=*/true);
     cover_io_s.PermitUncheckedError();
+  } else if (track_durability) {
+    // write() completed (not fsync). Still under the partition's WAL write
+    // mutex; sequence_wal_index_mutex_ is a leaf below it. Paired with the
+    // registration above: only complete what was registered, so at N==1
+    // this completion (and its mutex acquisition) goes away with it.
+    const SequenceNumber high = sequence + seq_inc - 1;
+    InstrumentedMutexLock seq_lock(&sequence_wal_index_mutex_);
+    wal_durability_tracker_->Complete(wal_partition, sequence, high);
   }
   if (to_be_cached_state) {
     cached_recoverable_state_ = *to_be_cached_state;
