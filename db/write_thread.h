@@ -91,6 +91,10 @@ class WriteThread {
     Status status;
     std::atomic<size_t> running;
     size_t size = 0;
+    // Writers excluded from this group by max_write_batch_group_size_bytes:
+    // writers compatible with the leader in every way except that adding them
+    // would exceed the cap. Set by EnterAsBatchGroupLeader only.
+    size_t num_cap_excluded = 0;
 
     struct Iterator {
       Writer* writer;

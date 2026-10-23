@@ -459,6 +459,244 @@ TEST_F(DBWriteTestUnparameterized, PartitionMergeBufferLifecycle) {
   }
 }
 
+TEST_F(DBWriteTestUnparameterized, WriteGroupHistograms) {
+  // One leader plus two followers gated so all three land in a single write
+  // group, across the three write paths that form WAL-side groups. Each path
+  // must record one writers-per-group sample, one cap-exclusion sample, and
+  // one join-wait sample per write.
+  const std::vector<std::string> modes = {"default", "pipelined_write",
+                                          "unordered_write"};
+  for (const auto& mode : modes) {
+    SCOPED_TRACE("mode=" + mode);
+    Options options = CurrentOptions();
+    options.create_if_missing = true;
+    options.statistics = ROCKSDB_NAMESPACE::CreateDBStatistics();
+    options.enable_pipelined_write = (mode == "pipelined_write");
+    options.unordered_write = (mode == "unordered_write");
+    DestroyAndReopen(options);
+
+    constexpr int kFollowers = 2;
+    std::atomic<bool> group_started{false};
+    std::atomic<int> followers_joined{0};
+    std::vector<port::Thread> follower_threads;
+    std::vector<Status> follower_statuses(kFollowers);
+    SyncPoint::GetInstance()->SetCallBack(
+        "WriteThread::JoinBatchGroup:Wait2", [&](void* arg) {
+          auto* writer = static_cast<WriteThread::Writer*>(arg);
+          if (writer->state != WriteThread::STATE_GROUP_LEADER ||
+              group_started.exchange(true)) {
+            return;
+          }
+          SyncPoint::GetInstance()->SetCallBack(
+              "WriteThread::JoinBatchGroup:Wait", [&](void* follower_arg) {
+                auto* follower =
+                    static_cast<WriteThread::Writer*>(follower_arg);
+                if (follower->state != WriteThread::STATE_GROUP_LEADER) {
+                  ++followers_joined;
+                }
+              });
+          for (int i = 0; i < kFollowers; ++i) {
+            follower_threads.emplace_back(
+                [&](int index) {
+                  follower_statuses[index] =
+                      Put("follower" + std::to_string(index), "value");
+                },
+                i);
+          }
+          while (followers_joined.load() < kFollowers) {
+          }
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+
+    const Status leader_status = Put("leader", "value");
+    for (auto& t : follower_threads) {
+      t.join();
+    }
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+
+    ASSERT_OK(leader_status);
+    for (const auto& s : follower_statuses) {
+      ASSERT_OK(s);
+    }
+    ASSERT_EQ("value", Get("leader"));
+    ASSERT_EQ("value", Get("follower0"));
+    ASSERT_EQ("value", Get("follower1"));
+
+    HistogramData writers_per_group;
+    options.statistics->histogramData(WRITERS_PER_WRITE_GROUP,
+                                      &writers_per_group);
+    ASSERT_EQ(1u, writers_per_group.count);
+    ASSERT_EQ(3u, writers_per_group.sum);
+    ASSERT_EQ(3, writers_per_group.max);
+
+    HistogramData cap_excluded;
+    options.statistics->histogramData(WRITE_GROUP_CAP_EXCLUDED, &cap_excluded);
+    ASSERT_EQ(1u, cap_excluded.count);
+    ASSERT_EQ(0u, cap_excluded.sum);
+
+    HistogramData join_wait;
+    options.statistics->histogramData(JOIN_BATCH_GROUP_WAIT_MICROS, &join_wait);
+    ASSERT_EQ(3u, join_wait.count);
+    ASSERT_GT(join_wait.sum, 0u);
+  }
+}
+
+TEST_F(DBWriteTestUnparameterized, WriteGroupCapExcludedHistogram) {
+  // A group-size cap smaller than two batches: the follower cannot join the
+  // leader's group and forms a second group alone. The cap-exclusion
+  // histogram must show the one turned-away writer.
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.statistics = ROCKSDB_NAMESPACE::CreateDBStatistics();
+  options.max_write_batch_group_size_bytes = 1024;
+  DestroyAndReopen(options);
+
+  const std::string big_value(1500, 'v');
+  std::atomic<bool> group_started{false};
+  std::atomic<bool> follower_joined{false};
+  Status follower_status;
+  port::Thread follower_thread;
+  SyncPoint::GetInstance()->SetCallBack(
+      "WriteThread::JoinBatchGroup:Wait2", [&](void* arg) {
+        auto* writer = static_cast<WriteThread::Writer*>(arg);
+        if (writer->state != WriteThread::STATE_GROUP_LEADER ||
+            group_started.exchange(true)) {
+          return;
+        }
+        SyncPoint::GetInstance()->SetCallBack(
+            "WriteThread::JoinBatchGroup:Wait", [&](void* follower_arg) {
+              auto* follower = static_cast<WriteThread::Writer*>(follower_arg);
+              if (follower->state != WriteThread::STATE_GROUP_LEADER) {
+                follower_joined = true;
+              }
+            });
+        follower_thread = port::Thread(
+            [&]() { follower_status = Put("follower", big_value); });
+        while (!follower_joined.load()) {
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  const Status leader_status = Put("leader", big_value);
+  follower_thread.join();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_OK(leader_status);
+  ASSERT_OK(follower_status);
+  ASSERT_EQ(big_value, Get("leader"));
+  ASSERT_EQ(big_value, Get("follower"));
+
+  HistogramData writers_per_group;
+  options.statistics->histogramData(WRITERS_PER_WRITE_GROUP,
+                                    &writers_per_group);
+  ASSERT_EQ(2u, writers_per_group.count);
+  ASSERT_EQ(2u, writers_per_group.sum);
+  ASSERT_EQ(1, writers_per_group.max);
+
+  HistogramData cap_excluded;
+  options.statistics->histogramData(WRITE_GROUP_CAP_EXCLUDED, &cap_excluded);
+  ASSERT_EQ(2u, cap_excluded.count);
+  ASSERT_EQ(1u, cap_excluded.sum);
+  ASSERT_EQ(1, cap_excluded.max);
+
+  HistogramData join_wait;
+  options.statistics->histogramData(JOIN_BATCH_GROUP_WAIT_MICROS, &join_wait);
+  ASSERT_EQ(2u, join_wait.count);
+}
+
+TEST_F(DBWriteTestUnparameterized, WriteGroupCapExcludedAttribution) {
+  // One cap exclusion and one compatibility exclusion in the same group
+  // formation: only the cap exclusion must be counted. The leader is a
+  // non-sync write whose batch alone exceeds the cap; behind it queue a sync
+  // write (incompatible with a non-sync leader) and a compatible non-sync
+  // write that cannot fit under the cap. Sync mismatch is the non-cap
+  // exclusion because it is the simplest to force -- one WriteOptions flag,
+  // no helper class -- and it exercises the first incompatible clause.
+  //
+  // Followers spawn sequentially: the Wait sync point fires after LinkOne, so
+  // a counted follower is already queued, and waiting for each before starting
+  // the next fixes the queue order deterministically. Group 1 is the leader
+  // alone (cap sample 1); group 2 is the sync follower leading with the small
+  // compatible follower joining (cap sample 0), since both small batches fit
+  // under the small-leader effective cap.
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.statistics = ROCKSDB_NAMESPACE::CreateDBStatistics();
+  options.max_write_batch_group_size_bytes = 1024;
+  DestroyAndReopen(options);
+
+  const std::string big_value(1500, 'v');
+  std::atomic<bool> group_started{false};
+  std::atomic<int> followers_joined{0};
+  Status sync_status;
+  Status compat_status;
+  port::Thread sync_thread;
+  port::Thread compat_thread;
+  SyncPoint::GetInstance()->SetCallBack(
+      "WriteThread::JoinBatchGroup:Wait2", [&](void* arg) {
+        auto* writer = static_cast<WriteThread::Writer*>(arg);
+        if (writer->state != WriteThread::STATE_GROUP_LEADER ||
+            group_started.exchange(true)) {
+          return;
+        }
+        SyncPoint::GetInstance()->SetCallBack(
+            "WriteThread::JoinBatchGroup:Wait", [&](void* follower_arg) {
+              auto* follower = static_cast<WriteThread::Writer*>(follower_arg);
+              if (follower->state != WriteThread::STATE_GROUP_LEADER) {
+                ++followers_joined;
+              }
+            });
+        sync_thread = port::Thread([&]() {
+          WriteOptions sync_options;
+          sync_options.sync = true;
+          sync_status = Put("sync_follower", "v", sync_options);
+        });
+        while (followers_joined.load() < 1) {
+        }
+        compat_thread = port::Thread(
+            [&]() { compat_status = Put("compat_follower", "v"); });
+        while (followers_joined.load() < 2) {
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  const Status leader_status = Put("leader", big_value);
+  sync_thread.join();
+  compat_thread.join();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_OK(leader_status);
+  ASSERT_OK(sync_status);
+  ASSERT_OK(compat_status);
+  ASSERT_EQ(big_value, Get("leader"));
+  ASSERT_EQ("v", Get("sync_follower"));
+  ASSERT_EQ("v", Get("compat_follower"));
+
+  HistogramData writers_per_group;
+  options.statistics->histogramData(WRITERS_PER_WRITE_GROUP,
+                                    &writers_per_group);
+  ASSERT_EQ(2u, writers_per_group.count);
+  ASSERT_EQ(3u, writers_per_group.sum);
+  ASSERT_EQ(2, writers_per_group.max);
+
+  // Exactly one cap exclusion across both groups. Incrementing
+  // num_cap_excluded on every exclusion would record 2 in group 1 and fail
+  // the sum and max assertions below.
+  HistogramData cap_excluded;
+  options.statistics->histogramData(WRITE_GROUP_CAP_EXCLUDED, &cap_excluded);
+  ASSERT_EQ(2u, cap_excluded.count);
+  ASSERT_EQ(1u, cap_excluded.sum);
+  ASSERT_EQ(1, cap_excluded.max);
+
+  HistogramData join_wait;
+  options.statistics->histogramData(JOIN_BATCH_GROUP_WAIT_MICROS, &join_wait);
+  ASSERT_EQ(3u, join_wait.count);
+  ASSERT_GT(join_wait.sum, 0u);
+}
+
 TEST_F(DBWriteTestUnparameterized, PipelinedWriteRace) {
   // This test was written to trigger a race in ExitAsBatchGroupLeader in case
   // enable_pipelined_write_ was true.
