@@ -10,6 +10,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <type_traits>
 #include <vector>
@@ -99,6 +100,19 @@ class WriteThread {
     // writers compatible with the leader in every way except that adding them
     // would exceed the cap. Set by EnterAsBatchGroupLeader only.
     size_t num_cap_excluded = 0;
+    // Optional completion gate, installed by DBImpl on write groups whose WAL
+    // record participates in the cross-partition durability frontier, and on
+    // disableWAL groups that must wait for publication. Runs
+    // inside ExitAsBatchGroupLeader after the next leader is promoted and
+    // before followers complete, so the wait costs acknowledgment latency and
+    // never blocks the next append. Empty for groups that need no gate (any
+    // single-WAL group, groups that consume no sequence without a record,
+    // ingestion), which exit exactly as before.
+    std::function<Status()> completion_gate;
+    // Outcome of completion_gate, set by ExitAsBatchGroupLeader when it runs
+    // the gate. Lets ExitAsBatchGroupFollower hand the gate outcome to the
+    // leader, whose own status is otherwise untouched by the exit.
+    Status gate_status;
 
     struct Iterator {
       Writer* writer;

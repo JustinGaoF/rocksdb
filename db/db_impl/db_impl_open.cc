@@ -366,6 +366,17 @@ Status DBImpl::ValidateOptions(const DBOptions& db_options) {
         "wal_partitions > 1 requires allow_concurrent_memtable_write");
   }
 
+  if (db_options.wal_partitions > 1 && db_options.enable_pipelined_write) {
+    // The completion gate runs between promotion and follower completion in
+    // the single-queue exit. The pipelined exit completes WAL-only followers
+    // before promoting and hands memtable followers to the memtable queue, so
+    // it has nowhere to run the gate; reject rather than complete ungated.
+    // Unconditional: pipelined writes over N WALs are unsafe even for tests.
+    return Status::NotSupported(
+        "wal_partitions > 1 is not supported with enable_pipelined_write: "
+        "the completion gate does not cover the split WAL/memtable queues");
+  }
+
   if (db_options.wal_partitions > 1 && db_options.track_and_verify_wals) {
     // The predecessor check compares each WAL with the one before it in file
     // number order, which at N>1 belongs to another partition.
@@ -386,9 +397,10 @@ Status DBImpl::ValidateOptions(const DBOptions& db_options) {
   }
 
   if (db_options.wal_partitions > 1) {
-    // The partitioned write path exists, but the completion gate and
-    // multi-WAL recovery do not, so a crash could leave holes. Tests reach
-    // the write path through this sync point.
+    // The partitioned write path and its completion gate exist, but
+    // unindexed multi-WAL recovery, WAL rotation, and stalled-partition
+    // handling do not, so production opens stay rejected. Tests reach the
+    // write path through this sync point.
     bool allow_wal_partitions =
         db_options.experimental_allow_wal_partitions_for_testing &&
         log::WALIndexEnabled(db_options.partition_wal_usage);
@@ -396,8 +408,9 @@ Status DBImpl::ValidateOptions(const DBOptions& db_options) {
                              &allow_wal_partitions);
     if (!allow_wal_partitions) {
       return Status::NotSupported(
-          "wal_partitions > 1 is not supported yet: the partitioned write "
-          "path and multi-WAL recovery are not implemented (for any "
+          "wal_partitions > 1 is not supported yet: unindexed multi-WAL "
+          "recovery, WAL rotation, and stalled-partition handling are not "
+          "implemented (for any "
           "partition_wal_usage)");
     }
   }
@@ -3947,7 +3960,8 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
           // open rather than left holding an undeclared hole.
           s = impl->WriteToWAL(empty_batch, write_options, wal_context,
                                &wal_used, &log_size, recovered_seq, wal_index,
-                               /*sequence_count=*/0);
+                               /*sequence_count=*/0,
+                               /*wal_mutex_held=*/false);
         }
         if (s.ok()) {
           // Need to fsync, otherwise it might get lost after a power reset.
