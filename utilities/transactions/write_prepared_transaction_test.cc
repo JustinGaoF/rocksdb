@@ -4944,10 +4944,13 @@ TEST_F(WritePreparedPartitionedWalTest, ConcurrentRecoverableStateCaching) {
 
 TEST_F(WritePreparedPartitionedWalTest, HigherSequenceRecoverableStateWins) {
   // G-18 / F010: A takes the lower sequence on partition 0 but caches its
-  // state only after B, on partition 1, has committed with a higher
-  // sequence. The state persisted at the flush, and recovered, is B's.
+  // state only after B, on partition 1, has cached its own with a higher
+  // sequence. The state persisted at the flush, and recovered, is B's. B is
+  // not published (and its commit does not return) until A is, so A waits
+  // for B to park in its completion gate, which B reaches after caching.
   constexpr size_t kPartitions = 2;
   Open(kPartitions);
+  DBImpl* db_impl = static_cast_with_check<DBImpl>(db_->GetRootDB());
 
   static thread_local bool is_a = false;
   std::mutex mu;
@@ -4975,13 +4978,22 @@ TEST_F(WritePreparedPartitionedWalTest, HigherSequenceRecoverableStateWins) {
     ASSERT_TRUE(
         cv.wait_for(lock, std::chrono::seconds(30), [&] { return a_parked; }));
   }
-  ASSERT_OK(CommitWithState(CfOnPartition(1), "b", "high"));
+  port::Thread b(
+      [&] { ASSERT_OK(CommitWithState(CfOnPartition(1), "b", "high")); });
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while (db_impl->TEST_WalDurabilityWaiters() == 0 &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_EQ(1U, db_impl->TEST_WalDurabilityWaiters());
   {
     std::lock_guard<std::mutex> lock(mu);
     b_committed = true;
     cv.notify_all();
   }
   a.join();
+  b.join();
   SyncPoint::GetInstance()->ClearCallBack(
       "DBImpl::WriteGroupToWAL:BeforeCacheRecoverableState");
 

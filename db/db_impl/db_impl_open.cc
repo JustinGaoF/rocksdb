@@ -397,10 +397,11 @@ Status DBImpl::ValidateOptions(const DBOptions& db_options) {
   }
 
   if (db_options.wal_partitions > 1) {
-    // The partitioned write path and its completion gate exist, but
-    // unindexed multi-WAL recovery, WAL rotation, and stalled-partition
-    // handling do not, so production opens stay rejected. Tests reach the
-    // write path through this sync point.
+    // The partitioned write path, its completion gate, and stalled-partition
+    // handling exist, but unindexed multi-WAL recovery and WAL rotation do
+    // not, so production opens stay rejected. Tests reach the write path
+    // through this sync point; test tools through the experimental opt-in,
+    // which admits indexed WALs only.
     bool allow_wal_partitions =
         db_options.experimental_allow_wal_partitions_for_testing &&
         log::WALIndexEnabled(db_options.partition_wal_usage);
@@ -409,8 +410,7 @@ Status DBImpl::ValidateOptions(const DBOptions& db_options) {
     if (!allow_wal_partitions) {
       return Status::NotSupported(
           "wal_partitions > 1 is not supported yet: unindexed multi-WAL "
-          "recovery, WAL rotation, and stalled-partition handling are not "
-          "implemented (for any "
+          "recovery and WAL rotation are not implemented (for any "
           "partition_wal_usage)");
     }
   }
@@ -430,6 +430,14 @@ Status DBImpl::ValidateOptions(const DBOptions& db_options) {
     // frontier.
     return Status::NotSupported(
         "wal_partitions > 1 requires track_and_verify_wals_in_manifest");
+  }
+
+  if (db_options.wal_partitions > 1 && !db_options.paranoid_checks) {
+    // A failed WAL append must stop the DB (D-1): without a background error
+    // its range pins every partition's completion gates, and point-in-time
+    // recovery would apply records above the hole it leaves.
+    return Status::NotSupported(
+        "wal_partitions > 1 requires paranoid_checks=true");
   }
 
   if (db_options.unordered_write &&

@@ -468,6 +468,7 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
     WaitForPendingWrites();
 
     versions_->SyncLastSequenceWithAllocated();
+    TEST_SYNC_POINT("DBImpl::ResumeImpl:SyncLastSequenceWithAllocated");
 
     nonmem_w.ExitUnbatched();
     w.ExitUnbatched();

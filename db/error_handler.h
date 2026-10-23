@@ -181,7 +181,7 @@ class ErrorHandler {
                       bool wal_related, DBRecoverContext context,
                       bool allow_auto_recovery);
   void HandleKnownErrors(const Status& bg_err, BackgroundErrorReason reason,
-                         const DBRecoverContext& context,
+                         const DBRecoverContext& context, bool wal_related,
                          bool allow_auto_recovery);
   // REQUIRES: db_mutex_ held. When replacing the general recovery context,
   // retain WAL facts accumulated from concurrent errors independently.

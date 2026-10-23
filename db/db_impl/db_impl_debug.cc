@@ -267,6 +267,8 @@ void DBImpl::TEST_SetBGError(const IOStatus& error,
                              BackgroundErrorReason reason) {
   InstrumentedMutexLock l(&mutex_);
   error_handler_.SetBGError(error, reason);
+  // The wake, if the error lands, comes from the transition hook inside
+  // SetBGError, exactly as in production; a suppressed error wakes nothing.
 }
 
 std::vector<std::pair<uint64_t, bool>> DBImpl::TEST_WalSyncMarks(

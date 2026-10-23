@@ -10374,6 +10374,98 @@ TEST_P(CommitBypassMemtableTest, WBWIOpCountMismatchWBCount) {
     delete txn;
   }
 }
+
+// G-10: CommitAndTryCreateSnapshot's timestamped snapshot must not publish its
+// commit sequence above the N>1 applied prefix. With A, the lower sequence on
+// partition 0, held in its append, B's commit on partition 1 must leave B's
+// sequence invisible until A is released.
+TEST(TransactionPartitionedWalTest,
+     SnapshotCommitPublishesAboveHeldLowerWrite) {
+  constexpr size_t kPartitions = 2;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::ValidateOptions:AllowWalPartitions",
+      [](void* arg) { *static_cast<bool*>(arg) = true; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  const std::string dbname =
+      test::PerThreadDBPath("transaction_partitioned_wal_snapshot_commit");
+  Options options;
+  options.create_if_missing = true;
+  options.wal_partitions = kPartitions;
+  options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  options.track_and_verify_wals_in_manifest = true;
+  ASSERT_OK(DestroyDB(dbname, options));
+  TransactionDB* db = nullptr;
+  ASSERT_OK(TransactionDB::Open(options, TransactionDBOptions(), dbname, &db));
+  std::vector<ColumnFamilyHandle*> handles;
+  std::vector<ColumnFamilyHandle*> cf_for_partition(kPartitions, nullptr);
+  size_t num_covered = 0;
+  while (num_covered < kPartitions) {
+    ColumnFamilyHandle* handle = nullptr;
+    ASSERT_OK(db->CreateColumnFamily(ColumnFamilyOptions(options),
+                                     "cf" + std::to_string(handles.size() + 1),
+                                     &handle));
+    handles.push_back(handle);
+    WriteBatch batch;
+    ASSERT_OK(WriteBatchInternal::Put(&batch, handle->GetID(), "key", "value"));
+    size_t partition = kPartitions;
+    ASSERT_OK(
+        DBImpl::TEST_WalPartitionForWrite(batch, kPartitions, &partition));
+    if (cf_for_partition[partition] == nullptr) {
+      cf_for_partition[partition] = handle;
+      ++num_covered;
+    }
+  }
+  const SequenceNumber seq_a = db->GetLatestSequenceNumber() + 1;
+
+  std::mutex mu;
+  std::condition_variable cv;
+  bool a_held = false;
+  bool release_a = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WriteToWAL:log_entry", [&](void*) {
+        std::unique_lock<std::mutex> lock(mu);
+        if (a_held) {
+          return;
+        }
+        a_held = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return release_a; });
+      });
+  port::Thread a([&] {
+    ASSERT_OK(db->Put(WriteOptions(), cf_for_partition[0], "a", "v"));
+  });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    cv.wait(lock, [&] { return a_held; });
+  }
+  port::Thread b([&] {
+    std::unique_ptr<Transaction> txn(db->BeginTransaction(WriteOptions()));
+    ASSERT_OK(txn->SetName("b"));
+    ASSERT_OK(txn->Put(cf_for_partition[1], "b", "v"));
+    std::shared_ptr<const Snapshot> snapshot;
+    ASSERT_OK(txn->CommitAndTryCreateSnapshot(nullptr, 10, &snapshot));
+  });
+  DBImpl* db_impl = static_cast_with_check<DBImpl>(db->GetRootDB());
+  while (db_impl->TEST_WalDurabilityWaiters() == 0) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_LT(db->GetLatestSequenceNumber(), seq_a);
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    release_a = true;
+    cv.notify_all();
+  }
+  a.join();
+  b.join();
+  for (ColumnFamilyHandle* handle : handles) {
+    ASSERT_OK(db->DestroyColumnFamilyHandle(handle));
+  }
+  delete db;
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_OK(DestroyDB(dbname, options));
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
