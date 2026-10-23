@@ -1510,6 +1510,12 @@ class DBImpl : public DB
 
   size_t TEST_NumWalPartitions() const { return NumWalPartitions(); }
 
+  // As WalPartitionForWrite, with deferred PutEntity ops given by column
+  // family id (the only field routing reads). Null means no deferred ops.
+  static Status TEST_WalPartitionForWrite(
+      const WriteBatch& batch, size_t num_partitions, size_t* wal_partition,
+      const std::vector<uint32_t>* deferred_cf_ids = nullptr);
+
   // Returns the reusable merge buffer for a WAL partition.
   const WriteBatch* TEST_GetWalMergeBuffer(size_t partition) {
     return &WalMergeBuffer(partition);
@@ -2095,7 +2101,7 @@ class DBImpl : public DB
       const BlobDirectWriteContext& blob_direct_write_ctx);
 
   Status PipelinedWriteImpl(const WriteOptions& options, WriteBatch* updates,
-                            WriteBatch* trace_batch,
+                            WriteBatch* trace_batch, size_t wal_partition,
                             WriteCallback* callback = nullptr,
                             UserWriteCallback* user_write_cb = nullptr,
                             uint64_t* wal_used = nullptr, uint64_t log_ref = 0,
@@ -2122,13 +2128,16 @@ class DBImpl : public DB
   // of the write batch that does not have duplicate keys. When seq_per_batch is
   // not set, each key is a separate sub_batch. Otherwise each duplicate key
   // marks start of a new sub-batch.
-  Status WriteImplWALOnly(
-      WriteThread* write_thread, const WriteOptions& options,
-      WriteBatch* updates, WriteBatch* trace_batch, WriteCallback* callback,
-      UserWriteCallback* user_write_cb, uint64_t* wal_used,
-      const uint64_t log_ref, uint64_t* seq_used, const size_t sub_batch_cnt,
-      PreReleaseCallback* pre_release_callback, const AssignOrder assign_order,
-      const PublishLastSeq publish_last_seq, const bool disable_memtable);
+  Status WriteImplWALOnly(WriteThread* write_thread,
+                          const WriteOptions& options, WriteBatch* updates,
+                          WriteBatch* trace_batch, WriteCallback* callback,
+                          UserWriteCallback* user_write_cb, uint64_t* wal_used,
+                          const uint64_t log_ref, uint64_t* seq_used,
+                          const size_t sub_batch_cnt,
+                          PreReleaseCallback* pre_release_callback,
+                          const AssignOrder assign_order,
+                          const PublishLastSeq publish_last_seq,
+                          const bool disable_memtable, size_t wal_partition);
 
   // write cached_recoverable_state_ to memtable if it is not empty
   // The writer must be the leader in write_thread_ and holding mutex_
@@ -3037,7 +3046,8 @@ class DBImpl : public DB
 
   // REQUIRES: mutex locked
   Status PreprocessWrite(const WriteOptions& write_options,
-                         WalContext* log_context, WriteContext* write_context);
+                         size_t wal_partition, WalContext* log_context,
+                         WriteContext* write_context);
 
   // Merge write batches in the write group into merged_batch.
   // Returns OK if merge is successful.
@@ -3082,16 +3092,14 @@ class DBImpl : public DB
   // Binds `wal_context` to the WAL that writes should be appended to, and to
   // that WAL's file-number/size accounting.
   //
-  // There is exactly one WAL, so this unconditionally selects the newest. It
-  // exists as a named seam rather than an inline `CurrentWal()` because it is
-  // the single point at which a future `wal_partitions > 1` would choose among
-  // several WALs, and because the three callers were open-coding the same pair
-  // of `.back()` calls plus the same consistency assertion.
+  // This remains the single seam that binds a resolved route to a WAL. The
+  // route is resolved once, before group formation, and carried here by the
+  // group leader.
   //
-  // REQUIRES: WalWriteMutex(WalPartitionForWrite()) held, or called from
+  // REQUIRES: WalWriteMutex(wal_partition) held, or called from
   // Open() before the DB is visible to other threads. See the synchronization
   // notes on logs_ and alive_wal_files_.
-  void SelectWalForWrite(WalContext* wal_context);
+  void SelectWalForWrite(size_t wal_partition, WalContext* wal_context);
 
   // `wal_context` names the WAL these writes go to and carries the sync
   // requirements for it. It is populated by PreprocessWrite().
@@ -4069,13 +4077,18 @@ class DBImpl : public DB
     return start == 0 ? 0 : immutable_db_options_.clock->NowMicros() - start;
   }
 
-  // The WAL partition the current write path binds to, chosen without holding
-  // any WAL write mutex so the caller can take exactly that partition's mutex
-  // before SelectWalForWrite() binds under it. Today every write targets
-  // partition 0; routing (a future change) computes this from the write
-  // instead. Single source of truth: SelectWalForWrite() binds this same
-  // value, so the mutex taken and the partition bound cannot diverge.
-  static size_t WalPartitionForWrite() { return 0; }
+  // Resolves a write's partition before group formation. Data-bearing batches
+  // use a stable hash of their smallest column-family id. This explicit
+  // smallest-id rule makes multi-CF routing independent of record order.
+  // CF-less transaction markers hash their smallest XID so commits do not all
+  // become partition-0 stragglers; genuinely XID-less batches use partition 0.
+  // Sequence numbers, keys, values, and caller threads are not inputs.
+  // Never fails: a malformed batch still routes deterministically, and the
+  // write path reports it. REQUIRES: num_partitions > 0.
+  static size_t WalPartitionForWrite(
+      const WriteBatch& batch,
+      const DeferredPutEntityBatch* deferred_put_entities,
+      size_t num_partitions);
 
   // Takes every WAL write mutex in ascending partition-index order. This and
   // UnlockWalWriteMutexes() are the only implementation of the multi-take
