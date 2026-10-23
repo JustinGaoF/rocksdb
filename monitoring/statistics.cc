@@ -440,6 +440,20 @@ const std::vector<std::pair<Histograms, std::string>> HistogramsNameMap = {
      "rocksdb.flush.write_buffer_manager.memtable.memory.bytes"},
     {OPEN_AND_COMPACT_DB_OPEN_MICROS,
      "rocksdb.open.and.compact.db.open.micros"},
+    {WRITERS_PER_WRITE_GROUP, "rocksdb.writers.per.write.group"},
+    {WRITE_GROUP_CAP_EXCLUDED, "rocksdb.write.group.cap.excluded"},
+    {JOIN_BATCH_GROUP_WAIT_MICROS, "rocksdb.join.batch.group.wait.micros"},
+    {WAL_DURABILITY_WAIT_MICROS, "rocksdb.wal.durability.wait.micros"},
+    {WAL_PARTITION_COMPLETION_MICROS,
+     "rocksdb.wal.partition.completion.micros"},
+    {WAL_SYNC_FSYNCED_PARTITIONS, "rocksdb.wal.sync.fsynced.partitions"},
+    {WAL_SYNC_UNSYNCED_PARTITIONS, "rocksdb.wal.sync.unsynced.partitions"},
+    {WAL_SYNC_BARRIER_MICROS, "rocksdb.wal.sync.barrier.micros"},
+    {WAL_PARTITION_INGESTION_STALL_MICROS,
+     "rocksdb.wal.partition.ingestion.stall.micros"},
+    {WAL_WRITE_MUTEX_WAIT_MICROS, "rocksdb.wal.write.mutex.wait.micros"},
+    {WAL_WRITE_MUTEX_ALL_WAIT_MICROS,
+     "rocksdb.wal.write.mutex.all.wait.micros"},
 };
 
 std::shared_ptr<Statistics> CreateDBStatistics() {
