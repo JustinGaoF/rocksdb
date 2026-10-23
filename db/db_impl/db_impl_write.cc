@@ -2315,16 +2315,18 @@ Status DBImpl::PreprocessWrite(const WriteOptions& write_options,
     // Note: there does not seem to be a reason to wait for parallel sync at
     // this early step but it is not important since parallel sync (SyncWAL) and
     // need_wal_sync are usually not used together.
-    while (logs_.front().IsSyncing()) {
-      wal_sync_cv_.Wait();
-    }
-    for (auto& log : logs_) {
-      // This is just to prevent the logs to be synced by a parallel SyncWAL
-      // call. We will do the actual syncing later after we will write to the
-      // WAL.
-      // Note: there does not seem to be a reason to set this early before we
-      // actually write to the WAL
-      log.PrepareForSync();
+    for (size_t p = 0; p < NumWalPartitions(); ++p) {
+      while (WalLogs(p).front().IsSyncing()) {
+        wal_sync_cv_.Wait();
+      }
+      for (auto& log : WalLogs(p)) {
+        // This is just to prevent the logs to be synced by a parallel SyncWAL
+        // call. We will do the actual syncing later after we will write to
+        // the WAL.
+        // Note: there does not seem to be a reason to set this early before
+        // we actually write to the WAL
+        log.PrepareForSync();
+      }
     }
   } else {
     wal_context->need_wal_sync = false;
@@ -2456,11 +2458,11 @@ IOStatus DBImpl::CoverBurnedWALIndex(const WriteOptions& write_options,
 // write thread. Otherwise this must be called holding wal_write_mutex_.
 void DBImpl::SelectWalForWrite(WalContext* wal_context) {
   assert(wal_context != nullptr);
-  assert(!logs_.empty());
-  assert(!alive_wal_files_.empty());
+  assert(!WalLogs(0).empty());
+  assert(!AliveWalFiles(0).empty());
 
   wal_context->writer = CurrentWal().writer;
-  wal_context->wal_file_number_size = std::addressof(alive_wal_files_.back());
+  wal_context->wal_file_number_size = std::addressof(AliveWalFiles(0).back());
 
   assert(wal_context->writer->get_log_number() ==
          wal_context->wal_file_number_size->number);
@@ -2565,11 +2567,11 @@ IOStatus DBImpl::WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
 
   if (io_s.ok() && need_wal_sync) {
     StopWatch sw(immutable_db_options_.clock, stats_, WAL_FILE_SYNC_MICROS);
-    // It's safe to access logs_ with unlocked mutex_ here because:
+    // It's safe to access WalLogs(p) with unlocked mutex_ here because:
     //  - we've set getting_synced=true for all logs,
-    //    so other threads won't pop from logs_ while we're here,
-    //  - only writer thread can push to logs_, and we're in
-    //    writer thread, so no one will push to logs_,
+    //    so other threads won't pop from WalLogs(p) while we're here,
+    //  - only writer thread can push to WalLogs(p), and we're in
+    //    writer thread, so no one will push to WalLogs(p),
     //  - as long as other threads don't modify it, it's safe to read
     //    from std::deque from multiple threads concurrently.
     //
@@ -2585,21 +2587,26 @@ IOStatus DBImpl::WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
     }
 
     if (io_s.ok()) {
-      for (auto& log : logs_) {
-        IOOptions opts;
-        io_s = WritableFileWriter::PrepareIOOptions(write_options, opts);
-        if (!io_s.ok()) {
-          break;
-        }
-        // If last sync failed on a later WAL, this could be a fully synced
-        // and closed WAL that just needs to be recorded as synced in the
-        // manifest.
-        if (auto* f = log.writer->file()) {
-          io_s =
-              immutable_db_options_.use_fsync ? f->Fsync(opts) : f->Sync(opts);
+      for (size_t p = 0; p < NumWalPartitions(); ++p) {
+        for (auto& log : WalLogs(p)) {
+          IOOptions opts;
+          io_s = WritableFileWriter::PrepareIOOptions(write_options, opts);
           if (!io_s.ok()) {
             break;
           }
+          // If last sync failed on a later WAL, this could be a fully synced
+          // and closed WAL that just needs to be recorded as synced in the
+          // manifest.
+          if (auto* f = log.writer->file()) {
+            io_s = immutable_db_options_.use_fsync ? f->Fsync(opts)
+                                                   : f->Sync(opts);
+            if (!io_s.ok()) {
+              break;
+            }
+          }
+        }
+        if (!io_s.ok()) {
+          break;
         }
       }
     }
@@ -2846,11 +2853,11 @@ Status DBImpl::SwitchWAL(WriteContext* write_context) {
   assert(write_context != nullptr);
   Status status;
 
-  if (alive_wal_files_.begin()->getting_flushed) {
+  if (AliveWalFiles(0).begin()->getting_flushed) {
     return status;
   }
 
-  auto oldest_alive_log = alive_wal_files_.begin()->number;
+  auto oldest_alive_log = AliveWalFiles(0).begin()->number;
   bool flush_wont_release_oldest_log = false;
   if (allow_2pc()) {
     auto oldest_log_with_uncommitted_prep =
@@ -2880,7 +2887,7 @@ Status DBImpl::SwitchWAL(WriteContext* write_context) {
     // transactions then we cannot flush this log until those transactions are
     // commited.
     unable_to_release_oldest_log_ = false;
-    alive_wal_files_.begin()->getting_flushed = true;
+    AliveWalFiles(0).begin()->getting_flushed = true;
   }
 
   ROCKS_LOG_INFO(
@@ -3517,7 +3524,7 @@ Status DBImpl::SwitchMemtableImpl(ColumnFamilyData* cfd, WriteContext* context,
   if (creating_new_log) {
     PredecessorWALInfo info;
     wal_write_mutex_.Lock();
-    if (!logs_.empty()) {
+    if (!WalLogs(0).empty()) {
       log::Writer* cur_log_writer = CurrentWal().writer;
       info = PredecessorWALInfo(cur_log_writer->get_log_number(),
                                 cur_log_writer->file()->GetFileSize(),
@@ -3598,7 +3605,7 @@ Status DBImpl::SwitchMemtableImpl(ColumnFamilyData* cfd, WriteContext* context,
   if (s.ok() && creating_new_log) {
     InstrumentedMutexLock l(&wal_write_mutex_);
     assert(new_log != nullptr);
-    if (!logs_.empty()) {
+    if (!WalLogs(0).empty()) {
       // Always flush the buffer of the last log before switching to a new one,
       // except when recovery is replacing a file-scoped failed WAL. Its
       // accepted contents are persisted by the atomic recovery flush.
@@ -3636,8 +3643,8 @@ Status DBImpl::SwitchMemtableImpl(ColumnFamilyData* cfd, WriteContext* context,
       cur_wal_number_ = new_log_number;
       wal_empty_ = true;
       wal_dir_synced_ = false;
-      logs_.emplace_back(cur_wal_number_, new_log);
-      alive_wal_files_.emplace_back(cur_wal_number_);
+      WalLogs(0).emplace_back(cur_wal_number_, new_log);
+      AliveWalFiles(0).emplace_back(cur_wal_number_);
     }
   }
 

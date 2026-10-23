@@ -627,22 +627,28 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
     {
       InstrumentedMutexLock wal_lock(&wal_write_mutex_);
       size_t retired_wal_count = 0;
-      if (logs_.empty() || CurrentWal().number <= context.failed_wal_number) {
+      // The replacement WAL is installed by rotation, which targets
+      // partition 0.
+      if (WalLogs(0).empty() ||
+          CurrentWal().number <= context.failed_wal_number) {
         s = Status::Corruption(
             "WAL write error recovery did not install a replacement WAL "
             "after WAL " +
             std::to_string(context.failed_wal_number));
       } else {
-        for (auto it = logs_.begin();
-             it != logs_.end() && it->number <= context.failed_wal_number;) {
-          if (it->IsSyncing()) {
-            wal_sync_cv_.Wait();
-            it = logs_.begin();
-            continue;
+        for (size_t p = 0; p < NumWalPartitions(); ++p) {
+          for (auto it = WalLogs(p).begin();
+               it != WalLogs(p).end() &&
+               it->number <= context.failed_wal_number;) {
+            if (it->IsSyncing()) {
+              wal_sync_cv_.Wait();
+              it = WalLogs(p).begin();
+              continue;
+            }
+            wals_to_free_.push_back(it->ReleaseWriter());
+            it = WalLogs(p).erase(it);
+            ++retired_wal_count;
           }
-          wals_to_free_.push_back(it->ReleaseWriter());
-          it = logs_.erase(it);
-          ++retired_wal_count;
         }
         uint64_t expected_cutoff = context.failed_wal_number;
         // A failed compare-exchange means a concurrent WAL failure extended the
@@ -963,7 +969,7 @@ Status DBImpl::MaybeWriteWalMarkersToManifestOnClose() {
   mutex_.AssertHeld();
   if (!mutable_db_options_.optimize_manifest_for_recovery ||
       !opened_successfully_ || read_only_ || versions_ == nullptr ||
-      logs_.empty()) {
+      WalLogs(0).empty()) {
     return Status::OK();
   }
 
@@ -1213,10 +1219,11 @@ Status DBImpl::CloseHelper() {
     mutex_.Lock();
   }
   // Best-effort warm-reopen optimization: after obsolete-file cleanup and
-  // before logs_.clear(), persist close-time WAL markers that can reduce
-  // recovery work on the next open. This matters most when some CFs have no
-  // unflushed writes and/or the newest WAL is empty, since recovery would
-  // otherwise append marker-only MANIFEST edits on reopen.
+  // before clearing WalLogs for each partition, persist close-time WAL
+  // markers that can reduce recovery work on the next open. This matters
+  // most when some CFs have no unflushed writes and/or the newest WAL is
+  // empty, since recovery would otherwise append marker-only MANIFEST edits
+  // on reopen.
   Status manifest_s = MaybeWriteWalMarkersToManifestOnClose();
   if (!manifest_s.ok()) {
     ROCKS_LOG_WARN(immutable_db_options_.info_log,
@@ -1228,22 +1235,25 @@ Status DBImpl::CloseHelper() {
     for (auto l : wals_to_free_) {
       delete l;
     }
-    for (auto& log : logs_) {
-      uint64_t log_number = log.writer->get_log_number();
-      Status s = log.ClearWriter();
-      if (!s.ok()) {
-        ROCKS_LOG_WARN(
-            immutable_db_options_.info_log,
-            "Unable to clear writer for WAL %s with error -- %s",
-            LogFileName(immutable_db_options_.GetWalDir(), log_number).c_str(),
-            s.ToString().c_str());
-        // Retain the first error
-        if (ret.ok()) {
-          ret = s;
+    for (size_t p = 0; p < NumWalPartitions(); ++p) {
+      for (auto& log : WalLogs(p)) {
+        uint64_t log_number = log.writer->get_log_number();
+        Status s = log.ClearWriter();
+        if (!s.ok()) {
+          ROCKS_LOG_WARN(
+              immutable_db_options_.info_log,
+              "Unable to clear writer for WAL %s with error -- %s",
+              LogFileName(immutable_db_options_.GetWalDir(), log_number)
+                  .c_str(),
+              s.ToString().c_str());
+          // Retain the first error
+          if (ret.ok()) {
+            ret = s;
+          }
         }
       }
+      WalLogs(p).clear();
     }
-    logs_.clear();
   }
 
   for (auto& txn_entry : recovered_transactions_) {
@@ -2333,10 +2343,12 @@ bool DBImpl::WALBufferIsEmpty() {
 Status DBImpl::GetOpenWalSizes(std::map<uint64_t, uint64_t>& number_to_size) {
   assert(number_to_size.empty());
   InstrumentedMutexLock l(&wal_write_mutex_);
-  for (auto& log : logs_) {
-    auto* open_file = log.writer->file();
-    if (open_file) {
-      number_to_size[log.number] = open_file->GetFlushedSize();
+  for (size_t p = 0; p < NumWalPartitions(); ++p) {
+    for (auto& log : WalLogs(p)) {
+      auto* open_file = log.writer->file();
+      if (open_file) {
+        number_to_size[log.number] = open_file->GetFlushedSize();
+      }
     }
   }
   return Status::OK();
@@ -2383,45 +2395,55 @@ IOStatus DBImpl::SyncWalImpl(bool include_current_wal,
 
   {
     InstrumentedMutexLock l(&wal_write_mutex_);
-    assert(!logs_.empty());
 
     maybe_active_number = cur_wal_number_;
     up_to_number =
         include_current_wal ? maybe_active_number : maybe_active_number - 1;
 
-    while (logs_.front().number <= up_to_number && logs_.front().IsSyncing()) {
-      wal_sync_cv_.Wait();
-    }
-    // First check that logs are safe to sync in background.
-    if (include_current_wal &&
-        !CurrentWal().writer->file()->writable_file()->IsSyncThreadSafe()) {
-      return IOStatus::NotSupported(
-          "SyncWAL() is not supported for this implementation of WAL file",
-          immutable_db_options_.allow_mmap_writes
-              ? "try setting Options::allow_mmap_writes to false"
-              : Slice());
-    }
-    for (auto it = logs_.begin();
-         it != logs_.end() && it->number <= up_to_number; ++it) {
-      auto& log = *it;
-      // Ensure the head of logs_ is marked as getting_synced if any is.
-      log.PrepareForSync();
-      if (log.number <= wal_recovery_cutoff_.load(std::memory_order_acquire)) {
-        // The failed file handle is permanently unusable. Recovery will make
-        // this WAL obsolete only after atomically persisting all accepted
-        // memtable contents, so do not retry any operation on the handle.
-        // PrepareForSync() pins the entry until MarkLogsSynced() or
-        // MarkLogsNotSynced() calls FinishSync(), which prevents recovery from
-        // clearing the cutoff while this call still relies on it.
-        TEST_SYNC_POINT_CALLBACK("DBImpl::SyncWalImpl:SkipFailedWAL",
-                                 &log.number);
-        continue;
+    // Wait for and safety-check every partition before marking any: an early
+    // return must not leave some partitions marked getting_synced with no
+    // sync to follow.
+    for (size_t p = 0; p < NumWalPartitions(); ++p) {
+      assert(!WalLogs(p).empty());
+      while (WalLogs(p).front().number <= up_to_number &&
+             WalLogs(p).front().IsSyncing()) {
+        wal_sync_cv_.Wait();
       }
-      // If last sync failed on a later WAL, this could be a fully synced
-      // and closed WAL that just needs to be recorded as synced in the
-      // manifest.
-      if (log.writer->file()) {
-        wals_to_sync.push_back(log.writer);
+      // First check that logs are safe to sync in background.
+      log::Writer* cur_log_writer = WalLogs(p).back().writer;
+      if (include_current_wal &&
+          !cur_log_writer->file()->writable_file()->IsSyncThreadSafe()) {
+        return IOStatus::NotSupported(
+            "SyncWAL() is not supported for this implementation of WAL file",
+            immutable_db_options_.allow_mmap_writes
+                ? "try setting Options::allow_mmap_writes to false"
+                : Slice());
+      }
+    }
+    for (size_t p = 0; p < NumWalPartitions(); ++p) {
+      for (auto it = WalLogs(p).begin();
+           it != WalLogs(p).end() && it->number <= up_to_number; ++it) {
+        auto& log = *it;
+        // Ensure the head of WalLogs(p) is marked as getting_synced if any is.
+        log.PrepareForSync();
+        if (log.number <=
+            wal_recovery_cutoff_.load(std::memory_order_acquire)) {
+          // The failed file handle is permanently unusable. Recovery will make
+          // this WAL obsolete only after atomically persisting all accepted
+          // memtable contents, so do not retry any operation on the handle.
+          // PrepareForSync() pins the entry until MarkLogsSynced() or
+          // MarkLogsNotSynced() calls FinishSync(), which prevents recovery
+          // from clearing the cutoff while this call still relies on it.
+          TEST_SYNC_POINT_CALLBACK("DBImpl::SyncWalImpl:SkipFailedWAL",
+                                   &log.number);
+          continue;
+        }
+        // If last sync failed on a later WAL, this could be a fully synced
+        // and closed WAL that just needs to be recorded as synced in the
+        // manifest.
+        if (log.writer->file()) {
+          wals_to_sync.push_back(log.writer);
+        }
       }
     }
 
@@ -2647,43 +2669,46 @@ void DBImpl::MarkLogsSynced(uint64_t up_to, bool synced_dir,
   if (synced_dir && cur_wal_number_ == up_to) {
     wal_dir_synced_ = true;
   }
-  for (auto it = logs_.begin(); it != logs_.end() && it->number <= up_to;) {
-    auto& wal = *it;
-    assert(wal.IsSyncing());
+  for (size_t p = 0; p < NumWalPartitions(); ++p) {
+    for (auto it = WalLogs(p).begin();
+         it != WalLogs(p).end() && it->number <= up_to;) {
+      auto& wal = *it;
+      assert(wal.IsSyncing());
 
-    if (wal.number <= wal_recovery_cutoff_.load(std::memory_order_acquire)) {
-      wal.FinishSync();
-      ++it;
-      continue;
-    }
-
-    if (wal.number < CurrentWal().number) {
-      // Inactive WAL
-      if (immutable_db_options_.track_and_verify_wals_in_manifest &&
-          wal.GetPreSyncSize() > 0) {
-        synced_wals->AddWal(wal.number, WalMetadata(wal.GetPreSyncSize()));
+      if (wal.number <= wal_recovery_cutoff_.load(std::memory_order_acquire)) {
+        wal.FinishSync();
+        ++it;
+        continue;
       }
-      // Reclaim closed WALs (wal.writer->file() == nullptr), and if we don't
-      // need to close before that (background_close_inactive_wals) we can
-      // opportunistically reclaim WALs that happen to be fully synced.
-      // (Probably not worth extra code and mutex release to opportunistically
-      // close WALs that became eligible since last holding the mutex.
-      // FindObsoleteFiles can take care of it.)
-      if (wal.writer->file() == nullptr ||
-          (immutable_db_options_.background_close_inactive_wals &&
-           wal.GetPreSyncSize() == wal.writer->file()->GetFlushedSize())) {
-        // Fully synced
-        wals_to_free_.push_back(wal.ReleaseWriter());
-        it = logs_.erase(it);
+
+      if (wal.number < WalLogs(p).back().number) {
+        // Inactive WAL
+        if (immutable_db_options_.track_and_verify_wals_in_manifest &&
+            wal.GetPreSyncSize() > 0) {
+          synced_wals->AddWal(wal.number, WalMetadata(wal.GetPreSyncSize()));
+        }
+        // Reclaim closed WALs (wal.writer->file() == nullptr), and if we
+        // don't need to close before that (background_close_inactive_wals)
+        // we can opportunistically reclaim WALs that happen to be fully
+        // synced. (Probably not worth extra code and mutex release to
+        // opportunistically close WALs that became eligible since last
+        // holding the mutex. FindObsoleteFiles can take care of it.)
+        if (wal.writer->file() == nullptr ||
+            (immutable_db_options_.background_close_inactive_wals &&
+             wal.GetPreSyncSize() == wal.writer->file()->GetFlushedSize())) {
+          // Fully synced
+          wals_to_free_.push_back(wal.ReleaseWriter());
+          it = WalLogs(p).erase(it);
+        } else {
+          wal.FinishSync();
+          ++it;
+        }
       } else {
+        assert(wal.number == WalLogs(p).back().number);
+        // Active WAL
         wal.FinishSync();
         ++it;
       }
-    } else {
-      assert(wal.number == CurrentWal().number);
-      // Active WAL
-      wal.FinishSync();
-      ++it;
     }
   }
   wal_sync_cv_.SignalAll();
@@ -2691,10 +2716,12 @@ void DBImpl::MarkLogsSynced(uint64_t up_to, bool synced_dir,
 
 void DBImpl::MarkLogsNotSynced(uint64_t up_to) {
   wal_write_mutex_.AssertHeld();
-  for (auto it = logs_.begin(); it != logs_.end() && it->number <= up_to;
-       ++it) {
-    auto& wal = *it;
-    wal.FinishSync();
+  for (size_t p = 0; p < NumWalPartitions(); ++p) {
+    for (auto it = WalLogs(p).begin();
+         it != WalLogs(p).end() && it->number <= up_to; ++it) {
+      auto& wal = *it;
+      wal.FinishSync();
+    }
   }
   wal_sync_cv_.SignalAll();
 }

@@ -380,11 +380,20 @@ void DBImpl::FindObsoleteFiles(JobContext* job_context, bool force,
     }
   });
 
-  // logs_ is empty when called during recovery, in which case there can't yet
-  // be any tracked obsolete logs
+  // The deques are empty when called during recovery, in which case there
+  // can't yet be any tracked obsolete logs
   wal_write_mutex_.Lock();
 
-  if (alive_wal_files_.empty() || logs_.empty()) {
+  // Partitions are visited in ascending index order (see the locking notes on
+  // alive_wal_files_); a partition with nothing tracked is skipped.
+  bool any_partition_has_wals = false;
+  for (size_t p = 0; p < NumWalPartitions(); ++p) {
+    if (!AliveWalFiles(p).empty() && !WalLogs(p).empty()) {
+      any_partition_has_wals = true;
+      break;
+    }
+  }
+  if (!any_partition_has_wals) {
     mutex_.AssertHeld();
     // We may reach here if the db is DBImplSecondary
     wal_write_mutex_.Unlock();
@@ -392,71 +401,88 @@ void DBImpl::FindObsoleteFiles(JobContext* job_context, bool force,
   }
 
   bool mutex_unlocked = false;
-  if (!alive_wal_files_.empty() && !logs_.empty()) {
+  if (any_partition_has_wals) {
     uint64_t min_log_number = job_context->log_number;
-    size_t num_alive_wal_files = alive_wal_files_.size();
+    size_t num_alive_wal_files = 0;
+    for (size_t p = 0; p < NumWalPartitions(); ++p) {
+      num_alive_wal_files += AliveWalFiles(p).size();
+    }
     // find newly obsoleted log files
-    while (alive_wal_files_.begin()->number < min_log_number) {
-      auto& earliest = *alive_wal_files_.begin();
-      if (immutable_db_options_.recycle_log_file_num >
-              wal_recycle_files_.size() &&
-          earliest.number >= MinLogNumberToRecycle()) {
-        ROCKS_LOG_INFO(immutable_db_options_.info_log,
-                       "adding log %" PRIu64 " to recycle list\n",
-                       earliest.number);
-        wal_recycle_files_.push_back(earliest.number);
-      } else {
-        job_context->log_delete_files.push_back(earliest.number);
+    for (size_t p = 0; p < NumWalPartitions(); ++p) {
+      if (AliveWalFiles(p).empty() || WalLogs(p).empty()) {
+        continue;
       }
-      if (job_context->size_log_to_delete == 0) {
-        job_context->prev_wals_total_size = wals_total_size_.LoadRelaxed();
-        job_context->num_alive_wal_files = num_alive_wal_files;
-      }
-      job_context->size_log_to_delete += earliest.size;
-      wals_total_size_.FetchSubRelaxed(earliest.size);
-      alive_wal_files_.pop_front();
+      while (AliveWalFiles(p).begin()->number < min_log_number) {
+        auto& earliest = *AliveWalFiles(p).begin();
+        if (immutable_db_options_.recycle_log_file_num >
+                wal_recycle_files_.size() &&
+            earliest.number >= MinLogNumberToRecycle()) {
+          ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                         "adding log %" PRIu64 " to recycle list\n",
+                         earliest.number);
+          wal_recycle_files_.push_back(earliest.number);
+        } else {
+          job_context->log_delete_files.push_back(earliest.number);
+        }
+        if (job_context->size_log_to_delete == 0) {
+          job_context->prev_wals_total_size = wals_total_size_.LoadRelaxed();
+          job_context->num_alive_wal_files = num_alive_wal_files;
+        }
+        job_context->size_log_to_delete += earliest.size;
+        wals_total_size_.FetchSubRelaxed(earliest.size);
+        AliveWalFiles(p).pop_front();
 
-      // Current log should always stay alive since it can't have
-      // number < MinLogNumber().
-      assert(alive_wal_files_.size());
+        // Current log should always stay alive since it can't have
+        // number < MinLogNumber().
+        assert(AliveWalFiles(p).size());
+      }
     }
     wal_write_mutex_.Unlock();
     mutex_.Unlock();
     mutex_unlocked = true;
     TEST_SYNC_POINT_CALLBACK("FindObsoleteFiles::PostMutexUnlock", nullptr);
     wal_write_mutex_.Lock();
-    while (!logs_.empty() && logs_.front().number < min_log_number) {
-      auto& log = logs_.front();
-      if (log.IsSyncing()) {
-        wal_sync_cv_.Wait();
-        // logs_ could have changed while we were waiting.
+    for (size_t p = 0; p < NumWalPartitions(); ++p) {
+      // Only WalLogs(p) is consulted here: this phase holds only
+      // wal_write_mutex_, and alive_wal_files_ reads require both mutexes.
+      if (WalLogs(p).empty()) {
         continue;
       }
-      // This WAL file is not live, so it's OK if we never sync the rest of it.
-      // If it's already closed, then it's been fully synced. If
-      // !background_close_inactive_wals then we need to Close it before
-      // removing from logs_ but not blocking while holding wal_write_mutex_.
-      if (!immutable_db_options_.background_close_inactive_wals &&
-          log.writer->file()) {
-        // We are taking ownership of and pinning the front entry, so we can
-        // expect it to be the same after releasing and re-acquiring the lock
-        log.PrepareForSync();
-        wal_write_mutex_.Unlock();
-        // TODO: maybe check the return value of Close.
-        // TODO: plumb Env::IOActivity, Env::IOPriority
-        auto s = log.writer->file()->Close({});
-        s.PermitUncheckedError();
-        wal_write_mutex_.Lock();
-        log.writer->PublishIfClosed();
-        assert(&log == &logs_.front());
-        log.FinishSync();
-        wal_sync_cv_.SignalAll();
+      while (!WalLogs(p).empty() &&
+             WalLogs(p).front().number < min_log_number) {
+        auto& log = WalLogs(p).front();
+        if (log.IsSyncing()) {
+          wal_sync_cv_.Wait();
+          // WalLogs(p) could have changed while we were waiting.
+          continue;
+        }
+        // This WAL file is not live, so it's OK if we never sync the rest of
+        // it. If it's already closed, then it's been fully synced. If
+        // !background_close_inactive_wals then we need to Close it before
+        // removing from WalLogs(p) but not blocking while holding
+        // wal_write_mutex_.
+        if (!immutable_db_options_.background_close_inactive_wals &&
+            log.writer->file()) {
+          // We are taking ownership of and pinning the front entry, so we can
+          // expect it to be the same after releasing and re-acquiring the lock
+          log.PrepareForSync();
+          wal_write_mutex_.Unlock();
+          // TODO: maybe check the return value of Close.
+          // TODO: plumb Env::IOActivity, Env::IOPriority
+          auto s = log.writer->file()->Close({});
+          s.PermitUncheckedError();
+          wal_write_mutex_.Lock();
+          log.writer->PublishIfClosed();
+          assert(&log == &WalLogs(p).front());
+          log.FinishSync();
+          wal_sync_cv_.SignalAll();
+        }
+        wals_to_free_.push_back(log.ReleaseWriter());
+        WalLogs(p).pop_front();
       }
-      wals_to_free_.push_back(log.ReleaseWriter());
-      logs_.pop_front();
+      // Current log cannot be obsolete.
+      assert(!WalLogs(p).empty());
     }
-    // Current log cannot be obsolete.
-    assert(!logs_.empty());
   }
 
   // We're just cleaning up for DB::Write().
