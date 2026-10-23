@@ -1504,8 +1504,7 @@ class DBImpl : public DB
 
   uint64_t TEST_GetCurrentLogNumber() const {
     InstrumentedMutexLock l(mutex());
-    assert(!logs_.empty());
-    return logs_.back().number;
+    return CurrentWal().number;
   }
 
   void TEST_DeleteObsoleteFiles();
@@ -3075,7 +3074,7 @@ class DBImpl : public DB
   // that WAL's file-number/size accounting.
   //
   // There is exactly one WAL, so this unconditionally selects the newest. It
-  // exists as a named seam rather than an inline `logs_.back()` because it is
+  // exists as a named seam rather than an inline `CurrentWal()` because it is
   // the single point at which a future `wal_partitions > 1` would choose among
   // several WALs, and because the three callers were open-coding the same pair
   // of `.back()` calls plus the same consistency assertion.
@@ -3841,6 +3840,25 @@ class DBImpl : public DB
   //  - it follows that the items with getting_synced=true can be safely read
   //  from the same thread that has set getting_synced=true
   std::deque<LogWriterNumber> logs_;
+
+  // The WAL currently being appended to -- the newest entry in logs_.
+  //
+  // There is exactly one. Named rather than spelled `logs_.back()` at each use
+  // because "the current WAL" is the concept the callers actually want, and
+  // because it is the set of accesses that becomes per-partition if
+  // wal_partitions > 1 is ever implemented.
+  //
+  // REQUIRES: wal_write_mutex_ held, per the synchronization notes above. Note
+  // that back() itself is not safe to call unsynchronized: implementations may
+  // touch other deque members.
+  LogWriterNumber& CurrentWal() {
+    assert(!logs_.empty());
+    return logs_.back();
+  }
+  const LogWriterNumber& CurrentWal() const {
+    assert(!logs_.empty());
+    return logs_.back();
+  }
 
   // Signaled when getting_synced becomes false for some of the logs_.
   InstrumentedCondVar wal_sync_cv_;

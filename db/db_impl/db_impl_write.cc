@@ -1593,8 +1593,8 @@ Status DBImpl::WriteImpl(
     if (!w.status.ok()) {
       if (wal_context.prev_size < SIZE_MAX) {
         InstrumentedMutexLock l(&wal_write_mutex_);
-        if (logs_.back().number == wal_context.wal_file_number_size->number) {
-          logs_.back().SetAttemptTruncateSize(wal_context.prev_size);
+        if (CurrentWal().number == wal_context.wal_file_number_size->number) {
+          CurrentWal().SetAttemptTruncateSize(wal_context.prev_size);
         }
       }
       HandleMemTableInsertFailure(w.status);
@@ -2200,7 +2200,7 @@ void DBImpl::WALIOStatusCheck(const IOStatus& io_status,
     mutex_.Unlock();
   } else {
     // Force writable file to be continue writable.
-    logs_.back().writer->file()->reset_seen_error();
+    CurrentWal().writer->file()->reset_seen_error();
   }
 }
 
@@ -2459,7 +2459,7 @@ void DBImpl::SelectWalForWrite(WalContext* wal_context) {
   assert(!logs_.empty());
   assert(!alive_wal_files_.empty());
 
-  wal_context->writer = logs_.back().writer;
+  wal_context->writer = CurrentWal().writer;
   wal_context->wal_file_number_size = std::addressof(alive_wal_files_.back());
 
   assert(wal_context->writer->get_log_number() ==
@@ -3518,7 +3518,7 @@ Status DBImpl::SwitchMemtableImpl(ColumnFamilyData* cfd, WriteContext* context,
     PredecessorWALInfo info;
     wal_write_mutex_.Lock();
     if (!logs_.empty()) {
-      log::Writer* cur_log_writer = logs_.back().writer;
+      log::Writer* cur_log_writer = CurrentWal().writer;
       info = PredecessorWALInfo(cur_log_writer->get_log_number(),
                                 cur_log_writer->file()->GetFileSize(),
                                 cur_log_writer->GetLastSeqnoRecorded());
@@ -3602,7 +3602,7 @@ Status DBImpl::SwitchMemtableImpl(ColumnFamilyData* cfd, WriteContext* context,
       // Always flush the buffer of the last log before switching to a new one,
       // except when recovery is replacing a file-scoped failed WAL. Its
       // accepted contents are persisted by the atomic recovery flush.
-      log::Writer* cur_log_writer = logs_.back().writer;
+      log::Writer* cur_log_writer = CurrentWal().writer;
       const bool abandon_current_wal =
           recovering_from_wal_write_error_ &&
           cur_log_writer->get_log_number() <= recover_wal_through_number_;
