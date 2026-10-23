@@ -224,20 +224,32 @@ Status ValidateOptionsByTable(
   return Status::OK();
 }
 
-// Counts head corruption during the pre-replay WAL index peek. The peek
-// reports nothing outward: the chosen recovery path re-reads each file and
-// reports for itself.
-class WALIndexPeekReporter : public log::Reader::Reporter {
- public:
-  void Corruption(size_t /*bytes*/, const Status& /*status*/,
-                  uint64_t /*log_number*/) override {
-    saw_corruption_ = true;
-  }
-  bool saw_corruption() const { return saw_corruption_; }
-
- private:
-  bool saw_corruption_ = false;
-};
+// Classification and merged replay both enter the logical WAL reader here,
+// so their parsing options cannot drift apart.
+std::unique_ptr<log::WALIndexMerger::ReaderMember> NewWALIndexRecoveryMember(
+    uint64_t wal_number, uint64_t min_wal_number,
+    std::unique_ptr<SequentialFileReader> file_reader,
+    const ImmutableDBOptions& db_options, log::Reader::Reporter* reporter,
+    bool stop_on_report) {
+  log::WALIndexMerger::ReaderMemberOptions options;
+  options.wal_number = wal_number;
+  options.file = std::move(file_reader);
+  options.checksum = true;
+  // Plain readers only: recovery never uses fragment-buffered readers,
+  // whose tailing semantic reports torn tails as clean ends.
+  options.fragment_buffered = false;
+  options.wal_recovery_mode = db_options.wal_recovery_mode;
+  options.track_and_verify_wals = false;
+  // No running stop flag: merged recovery has no previous file. The flag
+  // only gates predecessor verification, which is off here.
+  options.stop_replay_for_corruption = false;
+  options.min_wal_number_to_keep = min_wal_number;
+  options.info_log = db_options.info_log;
+  options.outer_reporter = reporter;
+  options.stop_on_report = stop_on_report;
+  return std::make_unique<log::WALIndexMerger::ReaderMember>(
+      std::move(options));
+}
 }  // namespace
 
 Status DBImpl::ValidateOptions(
@@ -1321,36 +1333,46 @@ Status DBImpl::CheckWALFilesCarryWALIndex(
     if (wal_number < min_wal_number) {
       continue;
     }
+    TEST_SYNC_POINT_CALLBACK("DBImpl::CheckWALFilesCarryWALIndex:PerFile",
+                             &wal_number);
     const std::string fname =
         LogFileName(immutable_db_options_.GetWalDir(), wal_number);
-    std::unique_ptr<FSSequentialFile> file;
-    Status open_status = fs_->NewSequentialFile(
-        fname, fs_->OptimizeForLogRead(file_options_), &file, nullptr);
+    std::unique_ptr<SequentialFileReader> file_reader;
+    Status open_status = OpenWALForRecovery(fname, is_retry, &file_reader);
     if (!open_status.ok()) {
       // Same as the merged path: indexed recovery fails on an unopenable WAL.
       return open_status;
     }
-    std::unique_ptr<SequentialFileReader> file_reader(new SequentialFileReader(
-        std::move(file), fname, immutable_db_options_.log_readahead_size,
-        io_tracer_, /*listeners=*/{},
-        /*rate_limiter=*/nullptr,
-        /*verify_and_reconstruct_read=*/is_retry));
-    WALIndexPeekReporter reporter;
-    log::Reader reader(immutable_db_options_.info_log, std::move(file_reader),
-                       &reporter, /*checksum=*/true, wal_number);
-    Slice record;
-    std::string scratch;
-    if (!reader.ReadRecord(&record, &scratch,
-                           immutable_db_options_.wal_recovery_mode)) {
+    std::unique_ptr<log::WALIndexMerger::ReaderMember> reader =
+        NewWALIndexRecoveryMember(wal_number, min_wal_number,
+                                  std::move(file_reader), immutable_db_options_,
+                                  /*reporter=*/nullptr,
+                                  /*stop_on_report=*/false);
+
+    // This is the classification pass's only pull from this WAL. Therefore,
+    // any corruption the member has observed occurred at or before the first
+    // returned data record and is head damage. Both marker-less decisions
+    // below rely on that bound.
+    const log::WALIndexMerger::Member::PulledRecord pulled = reader->PullNext();
+    if (pulled.kind != log::WALIndexMerger::Member::Pull::kRecord &&
+        pulled.kind != log::WALIndexMerger::Member::Pull::kUnindexed) {
       // No data: an empty or metadata-only file contributes nothing either
       // way. A read error surfaces when the chosen path reads the file.
+      //
+      // kIdle cannot arrive here, which is why this treats "not a data
+      // record" as "no data" rather than retrying: idling is a merge-side
+      // concept for waiting on a member that may yet produce a record, and
+      // the plain recovery member this pass builds reads its file straight
+      // through -- it either yields a record or finishes. The merge re-pulls
+      // its own idles, so the case never crosses into classification.
       continue;
     }
-    if (reader.SawWALIndexMarker()) {
+    if (reader->SawWALIndexMarker()) {
       continue;
     }
-    if (reader.GetLastReadWALIndex() != 0) {
-      if (reporter.saw_corruption()) {
+    const bool head_intact = reader->HeadIntact();
+    if (pulled.kind == log::WALIndexMerger::Member::Pull::kRecord) {
+      if (!head_intact) {
         // The head is damaged, so the marker may have been lost to the
         // damage: the merge's attestation path owns that question.
         ROCKS_LOG_INFO(immutable_db_options_.info_log,
@@ -1368,13 +1390,22 @@ Status DBImpl::CheckWALFilesCarryWALIndex(
     }
     // No marker and an unindexed first record: the file has no position in
     // the merged order, so the set replays sequentially instead.
-    ROCKS_LOG_INFO(immutable_db_options_.info_log,
-                   "WAL #%" PRIu64 " carries no WAL index (%s)", wal_number,
-                   reporter.saw_corruption()
-                       ? "head damaged, a lost marker cannot be ruled out"
-                       : "predates partition_wal_usage");
+    if (head_intact) {
+      ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                     "WAL #%" PRIu64
+                     " carries no WAL index (predates partition_wal_usage)",
+                     wal_number);
+    } else {
+      ROCKS_LOG_WARN(immutable_db_options_.info_log,
+                     "WAL #%" PRIu64
+                     " has a damaged head with no marker or wal_index; "
+                     "cannot distinguish a pre-option WAL from a lost "
+                     "marker, recovering sequentially",
+                     wal_number);
+    }
     *all_indexed = false;
   }
+  TEST_SYNC_POINT("DBImpl::CheckWALFilesCarryWALIndex:AfterClassification");
   return Status::OK();
 }
 
@@ -1662,18 +1693,12 @@ Status DBImpl::ProcessLogFilesMerged(
     SetupLogFileProcessing(wal_number);
     const std::string fname =
         LogFileName(immutable_db_options_.GetWalDir(), wal_number);
-    std::unique_ptr<FSSequentialFile> file;
-    Status open_status = fs_->NewSequentialFile(
-        fname, fs_->OptimizeForLogRead(file_options_), &file, nullptr);
+    std::unique_ptr<SequentialFileReader> file_reader;
+    Status open_status = OpenWALForRecovery(fname, is_retry, &file_reader);
     if (!open_status.ok()) {
       // Indexed recovery fails on an unopenable WAL.
       return open_status;
     }
-    std::unique_ptr<SequentialFileReader> file_reader(new SequentialFileReader(
-        std::move(file), fname, immutable_db_options_.log_readahead_size,
-        io_tracer_, /*listeners=*/{},
-        /*rate_limiter=*/nullptr,
-        /*verify_and_reconstruct_read=*/is_retry));
     reporter_fnames.push_back(fname);
     reporters.emplace_back();
     DBOpenLogRecordReadReporter& reporter = reporters.back();
@@ -1683,24 +1708,9 @@ Status DBImpl::ProcessLogFilesMerged(
     reporter.status = stop_on_report ? &status : nullptr;
     reporter.old_log_record = &old_log_record;
     reporter_of.emplace(wal_number, &reporter);
-    log::WALIndexMerger::ReaderMemberOptions options;
-    options.wal_number = wal_number;
-    options.file = std::move(file_reader);
-    options.checksum = true;
-    // Plain readers only: recovery never uses fragment-buffered readers,
-    // whose tailing semantic reports torn tails as clean ends.
-    options.fragment_buffered = false;
-    options.wal_recovery_mode = immutable_db_options_.wal_recovery_mode;
-    options.track_and_verify_wals = false;
-    // No running stop flag: the single merged pass has no previous file.
-    // (The flag only gates predecessor verification, which is off here.)
-    options.stop_replay_for_corruption = false;
-    options.min_wal_number_to_keep = min_wal_number;
-    options.info_log = immutable_db_options_.info_log;
-    options.outer_reporter = &reporter;
-    options.stop_on_report = stop_on_report;
-    auto member = std::unique_ptr<log::WALIndexMerger::Member>(
-        new log::WALIndexMerger::ReaderMember(std::move(options)));
+    auto member = NewWALIndexRecoveryMember(
+        wal_number, min_wal_number, std::move(file_reader),
+        immutable_db_options_, &reporter, stop_on_report);
     readers.push_back(
         static_cast<const log::WALIndexMerger::ReaderMember*>(member.get()));
     members.push_back(std::move(member));
@@ -2478,6 +2488,23 @@ void DBImpl::SetupLogFileProcessing(uint64_t wal_number) {
                  static_cast<int>(immutable_db_options_.wal_recovery_mode));
 }
 
+Status DBImpl::OpenWALForRecovery(
+    const std::string& fname, bool is_retry,
+    std::unique_ptr<SequentialFileReader>* file_reader) {
+  assert(file_reader != nullptr);
+  std::unique_ptr<FSSequentialFile> file;
+  Status status = fs_->NewSequentialFile(
+      fname, fs_->OptimizeForLogRead(file_options_), &file, nullptr);
+  if (!status.ok()) {
+    return status;
+  }
+  file_reader->reset(new SequentialFileReader(
+      std::move(file), fname, immutable_db_options_.log_readahead_size,
+      io_tracer_, /*listeners=*/{}, /*rate_limiter=*/nullptr,
+      /*verify_and_reconstruct_read=*/is_retry));
+  return status;
+}
+
 Status DBImpl::InitializeLogReader(
     uint64_t wal_number, bool is_retry, std::string& fname,
     bool stop_replay_for_corruption, uint64_t min_wal_number,
@@ -2491,21 +2518,13 @@ Status DBImpl::InitializeLogReader(
   Status status;
 
   std::unique_ptr<SequentialFileReader> file_reader;
-  {
-    std::unique_ptr<FSSequentialFile> file;
-    status = fs_->NewSequentialFile(
-        fname, fs_->OptimizeForLogRead(file_options_), &file, nullptr);
-    if (!status.ok()) {
-      if (log::WALIndexEnabled(immutable_db_options_.partition_wal_usage)) {
-        return status;
-      }
-      MaybeIgnoreError(&status);
+  status = OpenWALForRecovery(fname, is_retry, &file_reader);
+  if (!status.ok()) {
+    if (log::WALIndexEnabled(immutable_db_options_.partition_wal_usage)) {
       return status;
     }
-    file_reader.reset(new SequentialFileReader(
-        std::move(file), fname, immutable_db_options_.log_readahead_size,
-        io_tracer_, /*listeners=*/{}, /*rate_limiter=*/nullptr,
-        /*verify_and_reconstruct_read=*/is_retry));
+    MaybeIgnoreError(&status);
+    return status;
   }
 
   // Create the log reader.

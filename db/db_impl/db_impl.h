@@ -2713,6 +2713,10 @@ class DBImpl : public DB
 
   void SetupLogFileProcessing(uint64_t wal_number);
 
+  // Opens the physical stream shared by every recovery-time WAL reader.
+  Status OpenWALForRecovery(const std::string& fname, bool is_retry,
+                            std::unique_ptr<SequentialFileReader>* file_reader);
+
   Status InitializeLogReader(uint64_t wal_number, bool is_retry,
                              std::string& fname,
 
