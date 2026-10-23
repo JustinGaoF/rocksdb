@@ -1856,6 +1856,9 @@ db_universal_compaction_test: $(OBJ_DIR)/db/db_universal_compaction_test.o $(TES
 db_wal_test: $(OBJ_DIR)/db/db_wal_test.o $(TOOLS_LIBRARY) $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
+db_wal_oracle_test: $(OBJ_DIR)/db/db_wal_oracle_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
 db_io_failure_test: $(OBJ_DIR)/db/db_io_failure_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
@@ -1974,6 +1977,9 @@ fault_injection_test: $(OBJ_DIR)/db/fault_injection_test.o $(TEST_LIBRARY) $(LIB
 	$(AM_LINK)
 
 fault_injection_fs_test: $(OBJ_DIR)/utilities/fault_injection_fs_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
+latency_injection_fs_test: $(OBJ_DIR)/utilities/latency_injection_fs_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
 rate_limiter_test: $(OBJ_DIR)/util/rate_limiter_test.o $(TEST_LIBRARY) $(LIBRARY)
