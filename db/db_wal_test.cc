@@ -6218,6 +6218,148 @@ TEST_F(DBWALIndexTest, MixedVoidAndHoleMapsPerMode) {
     Destroy(options);
   }
 }
+
+// Enabling the option leaves every pre-existing WAL unindexed. The first
+// reopen meets an all-unindexed set; after more writes the second meets a
+// true mixed set. Both route sequential and replay every key.
+TEST_F(DBWALIndexTest, MixedRecoverySetOpensAfterEnablingWALIndex) {
+  Options none = WALIndexOptions(PartitionWALUsage::kNone);
+  DestroyAndReopen(none);
+  WriteKeyRange(0, 4);
+  const uint64_t legacy_wal = LatestWALNumber();
+  Close();
+  for (const uint8_t type : ReadWALRecordTypes(WALPath(legacy_wal))) {
+    EXPECT_FALSE(log::IsWALIndexRecordType(type));
+    EXPECT_NE(log::kWALIndexMarkerType, type);
+  }
+
+  Options options =
+      WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+  Reopen(options);
+  for (int i = 0; i <= 3; ++i) {
+    EXPECT_EQ("value" + std::to_string(i), Get(Key(i))) << "key " << i;
+  }
+  WriteKeyRange(4, 4);
+  const uint64_t indexed_wal = LatestWALNumber();
+  ASSERT_NE(legacy_wal, indexed_wal);
+  Close();
+
+  Reopen(options);
+  for (int i = 0; i <= 7; ++i) {
+    EXPECT_EQ("value" + std::to_string(i), Get(Key(i))) << "key " << i;
+  }
+  for (const uint64_t wal_index :
+       ReadWALIndices(WALPath(indexed_wal), indexed_wal)) {
+    EXPECT_NE(0U, wal_index);
+  }
+  Destroy(options);
+}
+
+// The documented rollback: opening with kNone while indexed WALs survive.
+// The pre-pass is skipped and the sequential path replays the survivors;
+// new writes are byte-identical legacy records.
+TEST_F(DBWALIndexTest, IndexedWALsOpenAfterDisablingWALIndex) {
+  Options indexed =
+      WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+  DestroyAndReopen(indexed);
+  WriteKeyRange(0, 4);
+  Close();
+
+  Options none = WALIndexOptions(PartitionWALUsage::kNone);
+  Reopen(none);
+  for (int i = 0; i <= 3; ++i) {
+    EXPECT_EQ("value" + std::to_string(i), Get(Key(i))) << "key " << i;
+  }
+  WriteKeyRange(4, 4);
+  const uint64_t new_wal = LatestWALNumber();
+  Close();
+  const std::vector<uint8_t> types = ReadWALRecordTypes(WALPath(new_wal));
+  ASSERT_FALSE(types.empty());
+  for (const uint8_t type : types) {
+    EXPECT_FALSE(log::IsWALIndexRecordType(type));
+    EXPECT_NE(log::kWALIndexMarkerType, type);
+    EXPECT_NE(log::kRecyclableWALIndexMarkerType, type);
+  }
+  Destroy(none);
+}
+
+// A marker prepended to a legacy WAL promises indices the file never
+// carries. The batches stay valid, so nothing masks the contradiction and
+// recovery fails on the marker in every mode.
+TEST_F(DBWALIndexTest, MarkerWithoutIndicesFailsRecovery) {
+  const std::vector<WALRecoveryMode> recovery_modes = {
+      WALRecoveryMode::kTolerateCorruptedTailRecords,
+      WALRecoveryMode::kAbsoluteConsistency,
+      WALRecoveryMode::kPointInTimeRecovery,
+      WALRecoveryMode::kSkipAnyCorruptedRecords,
+  };
+  for (const WALRecoveryMode recovery_mode : recovery_modes) {
+    SCOPED_TRACE(static_cast<int>(recovery_mode));
+    Options none = WALIndexOptions(PartitionWALUsage::kNone);
+    DestroyAndReopen(none);
+    WriteKeyRange(0, 4);
+    const uint64_t wal_number = LatestWALNumber();
+    Close();
+
+    std::string marker(log::kHeaderSize, '\0');
+    marker[6] = static_cast<char>(log::kWALIndexMarkerType);
+    const uint32_t crc = crc32c::Mask(crc32c::Value(&marker[6], 1));
+    EncodeFixed32(&marker[0], crc);
+    WriteWALContents(WALPath(wal_number),
+                     marker + ReadWALContents(WALPath(wal_number)));
+
+    Options options =
+        WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+    options.wal_recovery_mode = recovery_mode;
+    const Status status = TryReopen(options);
+    ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+    EXPECT_NE(std::string::npos, status.ToString().find("carry no wal_index"));
+    Destroy(options);
+  }
+}
+
+// Excising the marker from an indexed WAL leaves indexed data with no marker
+// over an intact head. The pre-pass fails the open before replay in every
+// mode, naming the file.
+TEST_F(DBWALIndexTest, IndexedDataWithoutMarkerFailsRecovery) {
+  const std::vector<WALRecoveryMode> recovery_modes = {
+      WALRecoveryMode::kTolerateCorruptedTailRecords,
+      WALRecoveryMode::kAbsoluteConsistency,
+      WALRecoveryMode::kPointInTimeRecovery,
+      WALRecoveryMode::kSkipAnyCorruptedRecords,
+  };
+  for (const WALRecoveryMode recovery_mode : recovery_modes) {
+    SCOPED_TRACE(static_cast<int>(recovery_mode));
+    Options options =
+        WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+    options.wal_recovery_mode = recovery_mode;
+    DestroyAndReopen(options);
+    WriteKeyRange(0, 4);
+    const uint64_t wal_number = LatestWALNumber();
+    Close();
+
+    std::string contents = ReadWALContents(WALPath(wal_number));
+    bool excised = false;
+    for (const PhysicalRecord& record : ScanPhysicalRecords(contents)) {
+      if (record.type == log::kWALIndexMarkerType ||
+          record.type == log::kRecyclableWALIndexMarkerType) {
+        contents.erase(record.header_offset,
+                       record.header_size + record.payload_size);
+        excised = true;
+        break;
+      }
+    }
+    ASSERT_TRUE(excised);
+    WriteWALContents(WALPath(wal_number), contents);
+
+    const Status status = TryReopen(options);
+    ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+    EXPECT_NE(std::string::npos, status.ToString().find("before replay"));
+    EXPECT_NE(std::string::npos,
+              status.ToString().find(std::to_string(wal_number)));
+    Destroy(options);
+  }
+}
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

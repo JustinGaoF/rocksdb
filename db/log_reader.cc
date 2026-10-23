@@ -346,6 +346,7 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch,
       case kRecyclableWALIndexMarkerType: {
         // Identifies the file as carrying per-record wal_index values. The
         // marker itself does not consume a wal_index.
+        saw_wal_index_marker_ = true;
         if (first_record_read_) {
           // The writer emits it when the file is started, so a marker after a
           // data record means the file is not what it claims to be.
@@ -1282,6 +1283,7 @@ bool FragmentBufferedReader::ReadRecord(Slice* record, std::string* scratch,
 
       case kWALIndexMarkerType:
       case kRecyclableWALIndexMarkerType: {
+        saw_wal_index_marker_ = true;
         if (first_record_read_) {
           // The writer emits it when the file is started, so a marker after a
           // data record means the file is not what it claims to be.
