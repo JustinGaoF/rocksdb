@@ -3770,6 +3770,22 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
     return s;
   }
 
+  // WritePrepared/WriteUnprepared (seq_per_batch) with two_write_queues keeps
+  // a contiguous published prefix via callbacks that assume a single write
+  // queue ("once a seq is published all the seq prior to that are also
+  // publishable"). With N partitions publishing out of order the premise is
+  // gone and a CAS-max would only silence the assert while leaving
+  // non-repeatable reads. Without two_write_queues reads use LastSequence()
+  // (last_seq_same_as_publish_seq_), which N partitions publish only up to
+  // the contiguous applied, WAL-durable prefix (PublishAppliedPrefix).
+  if (db_options.wal_partitions > 1 && seq_per_batch &&
+      db_options.two_write_queues) {
+    return Status::NotSupported(
+        "wal_partitions > 1 is not supported with seq_per_batch and "
+        "two_write_queues (WritePrepared/WriteUnprepared with two write "
+        "queues publish a contiguous prefix that N queues would break)");
+  }
+
   *dbptr = nullptr;
   assert(handles);
   handles->clear();
@@ -3922,7 +3938,7 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
           SequenceNumber last_sequence_before = 0;
           s = impl->AllocateSequenceAndWALIndex(
               /*sequence_count=*/0, /*write_wal=*/true, &last_sequence_before,
-              &wal_index);
+              &wal_index, wal_partition, /*register_durability=*/false);
         }
         if (s.ok()) {
           // No cover on this path, deliberately: a failure here fails Open(),

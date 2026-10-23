@@ -271,6 +271,12 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
     nonmem_write_threads_.emplace_back(
         std::make_unique<WriteThread>(immutable_db_options_));
   }
+  wal_durability_tracker_ =
+      std::make_unique<WalDurabilityTracker>(num_wal_partitions);
+  // The oracle's safe point self-test shifts the durability watermark only;
+  // shifting this one too would claim an unapplied range applied.
+  applied_tracker_ = std::make_unique<WalDurabilityTracker>(
+      num_wal_partitions, /*safe_point_test_hook=*/false);
 
   // Bind one sync condvar to each WAL partition's mutex. This is the only
   // partition vector filled here rather than at declaration: a condvar needs
