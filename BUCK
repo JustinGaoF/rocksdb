@@ -321,6 +321,7 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "utilities/fault_injection_env.cc",
         "utilities/fault_injection_fs.cc",
         "utilities/fault_injection_secondary_cache.cc",
+        "utilities/latency_injection_fs.cc",
         "utilities/leveldb_options/leveldb_options.cc",
         "utilities/memory/memory_util.cc",
         "utilities/merge_operators.cc",
@@ -5125,6 +5126,12 @@ cpp_unittest_wrapper(name="db_universal_compaction_test",
             extra_compiler_flags=[])
 
 
+cpp_unittest_wrapper(name="db_wal_oracle_test",
+            srcs=["db/db_wal_oracle_test.cc"],
+            deps=[":rocksdb_test_lib"],
+            extra_compiler_flags=[])
+
+
 cpp_unittest_wrapper(name="db_wal_test",
             srcs=["db/db_wal_test.cc"],
             deps=[":rocksdb_test_lib"],
@@ -5369,6 +5376,12 @@ cpp_unittest_wrapper(name="io_tracer_test",
 
 cpp_unittest_wrapper(name="iostats_context_test",
             srcs=["monitoring/iostats_context_test.cc"],
+            deps=[":rocksdb_test_lib"],
+            extra_compiler_flags=[])
+
+
+cpp_unittest_wrapper(name="latency_injection_fs_test",
+            srcs=["utilities/latency_injection_fs_test.cc"],
             deps=[":rocksdb_test_lib"],
             extra_compiler_flags=[])
 
