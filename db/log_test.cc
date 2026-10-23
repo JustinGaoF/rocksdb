@@ -959,6 +959,35 @@ TEST_P(LogTest, WALIndexMarkerRecordIsEmpty) {
   ASSERT_EQ(0U, length);
 }
 
+// The marker precedes all data, so indexed-ness is known after the first
+// record is read, before the file's data records are consumed: no re-scan.
+TEST_P(LogTest, WALIndexMarkerKnownAfterFirstRecord) {
+  EnableWALIndex();
+  Write("one");
+  Write("two");
+
+  ASSERT_EQ("one", Read());
+  EXPECT_TRUE(reader_->SawWALIndexMarker());
+  ASSERT_EQ("two", Read());
+  EXPECT_TRUE(reader_->SawWALIndexMarker());
+  ASSERT_EQ("EOF", Read());
+  EXPECT_TRUE(reader_->SawWALIndexMarker());
+}
+
+// A legacy file never sets the marker flag: the negative answer is just as
+// cheap as the positive one above.
+TEST_P(LogTest, WALIndexMarkerAbsentAfterFirstRecordInLegacyFile) {
+  Write("one");
+  Write("two");
+
+  ASSERT_EQ("one", Read());
+  EXPECT_FALSE(reader_->SawWALIndexMarker());
+  ASSERT_EQ("two", Read());
+  EXPECT_FALSE(reader_->SawWALIndexMarker());
+  ASSERT_EQ("EOF", Read());
+  EXPECT_FALSE(reader_->SawWALIndexMarker());
+}
+
 // The marker is written when the file is started, so one appearing after a
 // data record is reported, the same way kSetCompressionType is.
 TEST_P(LogTest, WALIndexMarkerAfterDataRecordReportsCorruption) {

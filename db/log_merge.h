@@ -126,6 +126,14 @@ class WALIndexMerger {
     // True when the tail impurity was reported through the member's reporter
     // (as opposed to a silent torn stop). Only meaningful when TailImpure().
     virtual bool TailReported() const = 0;
+    // Whether the member's file claims to carry indices: its reader consumed
+    // the WAL index marker. A file may legally mix indexed and unindexed
+    // data records, but only a real file can contradict its own marker, so
+    // scripted members satisfy this by default.
+    virtual bool SawWALIndexMarker() const { return true; }
+    // Data records pulled so far, by kind. Zero both until the first pull.
+    virtual uint64_t IndexedDataPulled() const { return 0; }
+    virtual uint64_t UnindexedDataPulled() const { return 0; }
     // True once the member's reader saw a record from a previous use of the
     // log (a recycled log number). Recovery attributes point-in-time cuts
     // to the latest WAL that saw one.
@@ -184,6 +192,11 @@ class WALIndexMerger {
     bool SwallowedCovers(uint64_t index) const override;
     bool TailImpure() const override;
     bool TailReported() const override;
+    bool SawWALIndexMarker() const override {
+      return reader_->SawWALIndexMarker();
+    }
+    uint64_t IndexedDataPulled() const override { return indexed_pulled_; }
+    uint64_t UnindexedDataPulled() const override { return unindexed_pulled_; }
     bool SawOldLogRecord() const override { return reporter_.saw_old(); }
     uint64_t LastRecordChecksum() const override { return checksum_; }
     const UnorderedMap<uint32_t, size_t>& LastTimestampSizes() const override {
@@ -245,6 +258,8 @@ class WALIndexMerger {
     bool seen_first_ = false;
     bool corrupt_before_first_ = false;
     uint64_t head_floor_ = 0;
+    uint64_t indexed_pulled_ = 0;
+    uint64_t unindexed_pulled_ = 0;
     bool progress_noted_ = false;
     bool corrupt_before_progress_ = false;
     uint64_t first_indexed_ = 0;
@@ -437,6 +452,12 @@ class WALIndexMerger {
   // `threshold`, buffering unindexed records. Records below `threshold` or
   // below their member's progress bound fail the merge.
   Status PullMembers(uint64_t threshold, PullOutcome* outcome);
+
+  // Fails a member that contradicts its own index marker, or that carries no
+  // index at all. Runs after every pull, so a fully unindexed file fails
+  // before its records are emitted; indexed data without a marker waits for
+  // the attestation checks when the lower bound is not set yet.
+  Status CheckMemberCoherence(const MemberState& state);
 
   // Derives the lower bound from first indices and attested spans, enforcing
   // the head-integrity gates. Sets kCleanEnd when nothing is indexed
