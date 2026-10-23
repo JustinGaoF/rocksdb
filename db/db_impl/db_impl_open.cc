@@ -1831,8 +1831,7 @@ IOStatus DBImpl::WriteWALIndexHeadFloors(const WriteOptions& write_options,
       continue;
     }
     WalWriteMutexLock l(&WalWriteMutex(p));
-    const LogWriterNumber* current_wal =
-        WalLogs(p).empty() ? nullptr : &WalLogs(p).back();
+    const LogWriterNumber* current_wal = CurrentWalOrNull(p);
     assert(current_wal != nullptr);
     assert(current_wal->writer->last_wal_index_recorded() == 0);
     IOStatus io_s =
@@ -3735,7 +3734,7 @@ Status DBImpl::RestoreAliveLogFiles(const std::vector<uint64_t>& wal_numbers) {
   for (auto wal_number : wal_numbers) {
     if (!allow_2pc() && wal_number < min_wal_with_unflushed_data) {
       // In non-2pc mode, the WAL files not backing unflushed data are not
-      // alive, thus should not be added to the alive_wal_files_.
+      // alive, thus should not be added to the live-file deques.
       continue;
     }
     // We preallocate space for wals, but then after a crash and restart, those
@@ -3762,7 +3761,7 @@ Status DBImpl::RestoreAliveLogFiles(const std::vector<uint64_t>& wal_numbers) {
     }
     // Accounted to the partition whose deque retires it.
     WalsTotalSizeCounter(wal_partition).FetchAddRelaxed(log.size);
-    AliveWalFiles(wal_partition).push_back(log);
+    AddRecoveredAliveWal(wal_partition, log);
   }
   return s;
 }
@@ -4548,8 +4547,9 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
       DBImpl::WalWriteMutexLock wl(&impl->WalWriteMutex(0));
       impl->cur_wal_number_ = new_log_number;
       assert(new_log != nullptr);
-      assert(impl->WalLogs(0).empty());
-      impl->WalLogs(0).emplace_back(new_log_number, new_log);
+      assert(impl->CurrentWalOrNull(0) == nullptr);
+      // Installs the live-file entry too (InstallCurrentWal covers both).
+      impl->InstallCurrentWal(0, new_log_number, new_log);
     }
     // One WAL per remaining partition, numbered above partition 0's so that
     // cur_wal_number_ is the lowest live WAL number, as SwitchMemtable keeps
@@ -4566,13 +4566,11 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
                           &partition_log);
       if (s.ok()) {
         DBImpl::WalWriteMutexLock wl(&impl->WalWriteMutex(p));
-        impl->WalLogs(p).emplace_back(partition_log_number, partition_log);
-        impl->AliveWalFiles(p).emplace_back(partition_log_number);
+        impl->InstallCurrentWal(p, partition_log_number, partition_log);
       }
     }
 
     if (s.ok()) {
-      impl->AliveWalFiles(0).emplace_back(impl->cur_wal_number_);
       s = impl->WriteWALIndexSupersessions(
           write_options, new_log, recovery_ctx.wal_index_supersessions_);
     }
@@ -4600,6 +4598,10 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
             empty_batch, /*deferred_put_entities=*/nullptr,
             impl->NumWalPartitions());
         {
+          // SelectWalForWrite requires the partition's WAL write mutex;
+          // Open holds mutex_ and nothing else runs yet, so taking it here
+          // cannot deadlock or violate the lock order.
+          DBImpl::WalWriteMutexLock wl(&impl->WalWriteMutex(wal_partition));
           impl->SelectWalForWrite(wal_partition, &wal_context);
         }
         impl->mutex_.AssertHeld();
@@ -4839,11 +4841,17 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
       s = impl->FlushWAL(write_options, false);
       if (s.ok()) {
         // Sync is needed otherwise WAL buffered data might get lost after a
-        // power reset.
-        log::Writer* log_writer = impl->CurrentWal().writer;
+        // power reset. FlushWAL flushed every partition's current WAL.
         IOOptions opts;
         s = WritableFileWriter::PrepareIOOptions(write_options, opts);
-        if (s.ok()) {
+        for (size_t p = 0; s.ok() && p < impl->NumWalPartitions(); ++p) {
+          log::Writer* log_writer;
+          {
+            // Open holds no WAL write mutex here; take partition p's for the
+            // current-WAL lookup.
+            DBImpl::WalWriteMutexLock wl(&impl->WalWriteMutex(p));
+            log_writer = impl->CurrentWal(p).writer;
+          }
           s = impl->immutable_db_options_.use_fsync
                   ? log_writer->file()->Fsync(opts)
                   : log_writer->file()->Sync(opts);
