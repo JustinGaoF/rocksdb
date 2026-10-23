@@ -2095,8 +2095,8 @@ TEST_F(DBOptionsTest, WalPartitionsRoundTrip) {
 
 static constexpr const char* kWalPartitionsRejection =
     "wal_partitions > 1 is not supported yet: unindexed multi-WAL "
-    "recovery, WAL rotation, and stalled-partition handling are not "
-    "implemented (for any partition_wal_usage)";
+    "recovery and WAL rotation are not implemented (for any "
+    "partition_wal_usage)";
 
 // Every (partition_wal_usage, wal_partitions) cell reachable without the test
 // hook: one partition opens under either usage, four are rejected under both.
