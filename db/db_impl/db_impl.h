@@ -3071,18 +3071,17 @@ class DBImpl : public DB
   IOStatus CoverBurnedWALIndex(const WriteOptions& write_options,
                                log::Writer* log_writer, uint64_t wal_index);
 
+  // `wal_context` names the WAL these writes go to and carries the sync
+  // requirements for it. It is populated by PreprocessWrite().
   IOStatus WriteToWAL(const WriteBatch& merged_batch,
                       const WriteOptions& write_options,
-                      log::Writer* log_writer, uint64_t* wal_used,
-                      uint64_t* log_size,
-                      WalFileNumberSize& wal_file_number_size,
-                      SequenceNumber sequence, uint64_t wal_index);
+                      WalContext& wal_context, uint64_t* wal_used,
+                      uint64_t* log_size, SequenceNumber sequence,
+                      uint64_t wal_index);
 
   IOStatus WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
-                           log::Writer* log_writer, uint64_t* wal_used,
-                           bool need_wal_sync, bool need_wal_dir_sync,
-                           SequenceNumber sequence, uint64_t wal_index,
-                           WalFileNumberSize& wal_file_number_size);
+                           WalContext& wal_context, uint64_t* wal_used,
+                           SequenceNumber sequence, uint64_t wal_index);
 
   IOStatus ConcurrentWriteGroupToWAL(const WriteThread::WriteGroup& write_group,
                                      uint64_t* wal_used,

@@ -1391,10 +1391,8 @@ Status DBImpl::WriteImpl(
         wal_write_number = wal_context.wal_file_number_size->number;
         wal_context.prev_size = wal_context.writer->file()->GetFileSize();
         PERF_TIMER_GUARD(write_wal_time);
-        io_s = WriteGroupToWAL(write_group, wal_context.writer, wal_used,
-                               wal_context.need_wal_sync,
-                               wal_context.need_wal_dir_sync, last_sequence + 1,
-                               wal_index, *wal_context.wal_file_number_size);
+        io_s = WriteGroupToWAL(write_group, wal_context, wal_used,
+                               last_sequence + 1, wal_index);
         if (!io_s.ok()) {
           // The index was consumed; if its record never landed, cover it
           // before the error escapes, so the hole is declared rather than
@@ -1746,12 +1744,8 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
         RecordTick(stats_, WRITE_DONE_BY_OTHER, wal_write_group.size - 1);
       }
       assert(wal_context.wal_file_number_size);
-      WalFileNumberSize& wal_file_number_size =
-          *(wal_context.wal_file_number_size);
-      io_s = WriteGroupToWAL(wal_write_group, wal_context.writer, wal_used,
-                             wal_context.need_wal_sync,
-                             wal_context.need_wal_dir_sync, current_sequence,
-                             wal_index, wal_file_number_size);
+      io_s = WriteGroupToWAL(wal_write_group, wal_context, wal_used,
+                             current_sequence, wal_index);
       if (!io_s.ok()) {
         // As in WriteImpl: declare the burned index before the error escapes.
         const IOStatus cover_io_s =
@@ -2463,11 +2457,15 @@ IOStatus DBImpl::CoverBurnedWALIndex(const WriteOptions& write_options,
 // write thread. Otherwise this must be called holding wal_write_mutex_.
 IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
                             const WriteOptions& write_options,
-                            log::Writer* log_writer, uint64_t* wal_used,
-                            uint64_t* log_size,
-                            WalFileNumberSize& wal_file_number_size,
-                            SequenceNumber sequence, uint64_t wal_index) {
+                            WalContext& wal_context, uint64_t* wal_used,
+                            uint64_t* log_size, SequenceNumber sequence,
+                            uint64_t wal_index) {
   assert(log_size != nullptr);
+  assert(wal_context.writer != nullptr);
+  assert(wal_context.wal_file_number_size != nullptr);
+
+  log::Writer* log_writer = wal_context.writer;
+  WalFileNumberSize& wal_file_number_size = *wal_context.wal_file_number_size;
 
   Slice log_entry = WriteBatchInternal::Contents(&merged_batch);
   TEST_SYNC_POINT_CALLBACK("DBImpl::WriteToWAL:log_entry", &log_entry);
@@ -2511,13 +2509,16 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
 }
 
 IOStatus DBImpl::WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
-                                 log::Writer* log_writer, uint64_t* wal_used,
-                                 bool need_wal_sync, bool need_wal_dir_sync,
-                                 SequenceNumber sequence, uint64_t wal_index,
-                                 WalFileNumberSize& wal_file_number_size) {
+                                 WalContext& wal_context, uint64_t* wal_used,
+                                 SequenceNumber sequence, uint64_t wal_index) {
   IOStatus io_s;
   assert(!two_write_queues_);
   assert(!write_group.leader->disable_wal);
+  assert(wal_context.wal_file_number_size != nullptr);
+
+  WalFileNumberSize& wal_file_number_size = *wal_context.wal_file_number_size;
+  const bool need_wal_sync = wal_context.need_wal_sync;
+  const bool need_wal_dir_sync = wal_context.need_wal_dir_sync;
   // Same holds for all in the batch group
   size_t write_with_wal = 0;
   WriteBatch* to_be_cached_state = nullptr;
@@ -2544,8 +2545,8 @@ IOStatus DBImpl::WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
   WriteOptions write_options;
   write_options.rate_limiter_priority =
       write_group.leader->rate_limiter_priority;
-  io_s = WriteToWAL(*merged_batch, write_options, log_writer, wal_used,
-                    &log_size, wal_file_number_size, sequence, wal_index);
+  io_s = WriteToWAL(*merged_batch, write_options, wal_context, wal_used,
+                    &log_size, sequence, wal_index);
   if (to_be_cached_state) {
     cached_recoverable_state_ = *to_be_cached_state;
     cached_recoverable_state_empty_ = false;
@@ -2650,10 +2651,13 @@ IOStatus DBImpl::ConcurrentWriteGroupToWAL(
   // pushed back concurrently
   wal_write_mutex_.Lock();
 
-  log::Writer* log_writer = logs_.back().writer;
-  WalFileNumberSize& wal_file_number_size = alive_wal_files_.back();
+  WalContext wal_context;
+  wal_context.writer = logs_.back().writer;
+  wal_context.wal_file_number_size = std::addressof(alive_wal_files_.back());
 
-  assert(log_writer->get_log_number() == wal_file_number_size.number);
+  WalFileNumberSize& wal_file_number_size = *wal_context.wal_file_number_size;
+
+  assert(wal_context.writer->get_log_number() == wal_file_number_size.number);
 
   if (merged_batch == write_group.leader->batch) {
     write_group.leader->wal_used = wal_file_number_size.number;
@@ -2682,8 +2686,8 @@ IOStatus DBImpl::ConcurrentWriteGroupToWAL(
   WriteOptions write_options;
   write_options.rate_limiter_priority =
       write_group.leader->rate_limiter_priority;
-  io_s = WriteToWAL(*merged_batch, write_options, log_writer, wal_used,
-                    &log_size, wal_file_number_size, sequence, wal_index);
+  io_s = WriteToWAL(*merged_batch, write_options, wal_context, wal_used,
+                    &log_size, sequence, wal_index);
   if (!io_s.ok()) {
     // Not reachable today: this path needs two_write_queues or
     // unordered_write, and Open() rejects the first alongside WAL indexing.
@@ -2691,7 +2695,7 @@ IOStatus DBImpl::ConcurrentWriteGroupToWAL(
     // later cannot silently reintroduce an uncovered hole. Still under
     // wal_write_mutex_, which is where WAL appends on this path belong.
     const IOStatus cover_io_s =
-        CoverBurnedWALIndex(write_options, log_writer, wal_index);
+        CoverBurnedWALIndex(write_options, wal_context.writer, wal_index);
     cover_io_s.PermitUncheckedError();
   }
   if (to_be_cached_state) {
