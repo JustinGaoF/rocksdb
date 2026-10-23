@@ -254,8 +254,8 @@ Status DBImpl::FlushMemTableToOutputFile(
   bool need_cancel = false;
   IOStatus log_io_s = IOStatus::OK();
   if (needs_to_sync_closed_wals) {
-    // SyncClosedWals() may unlock and re-lock the wal_write_mutex multiple
-    // times.
+    // SyncClosedWals() may release and re-acquire the WAL write mutexes
+    // multiple times.
     VersionEdit synced_wals;
     bool error_recovery_in_prog = error_handler_.IsRecoveryInProgress();
     mutex_.Unlock();
