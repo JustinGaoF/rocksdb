@@ -847,7 +847,11 @@ Status SnapshotCreationCallback::operator()(SequenceNumber seq,
 #endif
 
   const bool seq_per_batch = db_impl_->seq_per_batch();
-  if (!seq_per_batch) {
+  if (db_impl_->immutable_db_options().wal_partitions > 1) {
+    // Runs from the completion gate, once seq is published; other
+    // partitions may have published past it.
+    assert(db_impl_->GetLastPublishedSequence() >= seq);
+  } else if (!seq_per_batch) {
     assert(db_impl_->GetLastPublishedSequence() <= seq);
   } else {
     assert(db_impl_->GetLastPublishedSequence() < seq);

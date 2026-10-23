@@ -906,6 +906,12 @@ void DBImpl::CancelAllBackgroundWork(bool wait) {
   }
   shutting_down_.store(true, std::memory_order_release);
   bg_cv_.SignalAll();
+  if (NumWalPartitions() > 1) {
+    // Writes parked in their completion gate return ShutdownInProgress
+    // unless already covered, as a stalled write does.
+    InstrumentedMutexLock seq_lock(&sequence_wal_index_mutex_);
+    wal_durability_cv_.SignalAll();
+  }
   env_->UnSchedule(&bg_async_file_open_state_, Env::Priority::HIGH);
   if (!wait) {
     return;
@@ -1156,6 +1162,18 @@ Status DBImpl::CloseHelper() {
   // marker. After this we do a variant of the waiting and unschedule work
   // (to consider: moving all the waiting into CancelAllBackgroundWork(true))
   CancelAllBackgroundWork(false);
+
+  if (NumWalPartitions() > 1) {
+    // The shutdown marker woke every write parked in its completion gate;
+    // the gate's mutex and cv are freed with this DB, so wait for them to
+    // leave. A write reaching its gate after this point is a write
+    // concurrent with Close(), which is unsupported.
+    InstrumentedMutexLock seq_lock(&sequence_wal_index_mutex_);
+    while (wal_durability_waiters_.load(std::memory_order_relaxed) > 0) {
+      wal_durability_cv_.Wait();
+    }
+  }
+  TEST_SYNC_POINT("DBImpl::CloseHelper:WalDurabilityWaitersLeft");
 
   // Cancel manual compaction if there's any
   if (HasPendingManualCompaction()) {
@@ -2484,13 +2502,23 @@ IOStatus DBImpl::SyncWalImpl(bool include_current_wal,
                              const WriteOptions& write_options,
                              JobContext* job_context, VersionEdit* synced_wals,
                              bool error_recovery_in_prog) {
-  autovector<log::Writer*, 1> wals_to_sync;
+  // The claimed logs and whether each was its partition's current WAL when
+  // claimed. Currency selects SyncWithoutFlush (active WAL, whose user-space
+  // buffers a manual-flush SyncWAL must not sync) versus Sync; it cannot be
+  // recovered from the log number because at N > 1 every partition numbers
+  // its WALs above cur_wal_number_, the lowest live number.
+  autovector<std::pair<log::Writer*, bool>, 1> wals_to_sync;
   bool need_wal_dir_sync;
   // Number of a WAL that was active at the start of call and maybe is by
   // the end of the call.
   uint64_t maybe_active_number;
-  // Sync WALs up to this number
+  // Manifest-recording horizon only (see MarkLogsSynced): the sync itself
+  // claims every live log, since a leadership sync marks every live log and
+  // any marked log must be finished.
   uint64_t up_to_number;
+  // Which partitions this call marked. Only those are finished or cancelled
+  // below: a partition it skipped may be marked by a concurrent sync.
+  autovector<uint8_t, 1> claimed;
 
   {
     // Snapshot the sync horizon under all N: cur_wal_number_ is only ever
@@ -2508,11 +2536,12 @@ IOStatus DBImpl::SyncWalImpl(bool include_current_wal,
     // maybe_active_number and need_wal_dir_sync are consumed after the claim
     // loop with every WAL write mutex released in between, a deliberately
     // wider window than one continuous hold (the claims must be sequential).
-    // A rotation in it only adds WALs past up_to_number, so the assert at the
-    // SyncWithoutFlush call still holds and is the tripwire if that bound is
-    // ever broken. A stale need_wal_dir_sync costs at most a redundant
-    // directory fsync: MarkLogsSynced() records the directory as synced only
-    // if cur_wal_number_ is still up_to_number.
+    // A rotation in it only adds a WAL the claim loop then syncs harmlessly
+    // or misses (it holds only post-call appends, which this sync does not
+    // owe). A stale need_wal_dir_sync costs at most a redundant directory
+    // fsync:
+    // MarkLogsSynced() records the directory as synced only if
+    // cur_wal_number_ is still up_to_number.
     maybe_active_number = cur_wal_number_;
     up_to_number =
         include_current_wal ? maybe_active_number : maybe_active_number - 1;
@@ -2540,40 +2569,69 @@ IOStatus DBImpl::SyncWalImpl(bool include_current_wal,
   }
 
   // Claim each partition sequentially: the wait on WalSyncCV(p) holds only
-  // WalWriteMutex(p) (see the LOCK ORDER note). A rotation landing between
-  // the claims of two partitions only adds a WAL numbered past up_to_number,
-  // which the horizon bound below excludes from this sync.
-  for (size_t p = 0; p < NumWalPartitions(); ++p) {
-    WalWriteMutexLock l(&WalWriteMutex(p));
-    if (WalLogs(p).empty()) {
-      continue;
+  // WalWriteMutex(p) (see the LOCK ORDER note). Every live log is claimed no
+  // matter its number: with cur_wal_number_ the lowest live number, a number
+  // bound would skip every other partition's WAL. Marking is serialized
+  // across all syncs under wal_sync_mark_mutex_: this claim runs ascending
+  // while leadership marking runs others-then-own, so head waits alone
+  // cannot exclude an interleaved marker.
+  {
+    // The mark mutex serializes markers across partitions; with one
+    // partition there is nothing to interleave, so the N=1 path takes
+    // nothing here, exactly as before the mutex existed.
+    std::optional<InstrumentedMutexLock> mark_lock;
+    if (NumWalPartitions() > 1) {
+      TEST_SYNC_POINT("DBImpl::SyncWalImpl:TakesSyncMarkMutex");
+      mark_lock.emplace(&wal_sync_mark_mutex_);
     }
-    while (WalLogs(p).front().number <= up_to_number &&
-           WalLogs(p).front().IsSyncing()) {
-      WalSyncCV(p).Wait();
-    }
-    for (auto it = WalLogs(p).begin();
-         it != WalLogs(p).end() && it->number <= up_to_number; ++it) {
-      auto& log = *it;
-      // Ensure the head of WalLogs(p) is marked as getting_synced if any is.
-      log.PrepareForSync();
-      if (log.number <= wal_recovery_cutoff_.load(std::memory_order_acquire)) {
-        // The failed file handle is permanently unusable. Recovery will make
-        // this WAL obsolete only after atomically persisting all accepted
-        // memtable contents, so do not retry any operation on the handle.
-        // PrepareForSync() pins the entry until MarkLogsSynced() or
-        // MarkLogsNotSynced() calls FinishSync(), which prevents recovery from
-        // clearing the cutoff while this call still relies on it.
-        TEST_SYNC_POINT_CALLBACK("DBImpl::SyncWalImpl:SkipFailedWAL",
-                                 &log.number);
+    for (size_t p = 0; p < NumWalPartitions(); ++p) {
+      WalWriteMutexLock l(&WalWriteMutex(p));
+      if (WalLogs(p).empty()) {
+        claimed.push_back(false);
         continue;
       }
-      // If last sync failed on a later WAL, this could be a fully synced
-      // and closed WAL that just needs to be recorded as synced in the
-      // manifest.
-      if (log.writer->file()) {
-        wals_to_sync.push_back(log.writer);
+      // Whether this partition contributes anything: without the current WAL, a
+      // partition holding only its current WAL contributes nothing and must not
+      // wait for an in-progress sync of it.
+      const bool claim_front =
+          include_current_wal ||
+          WalLogs(p).front().number != WalLogs(p).back().number;
+      while (claim_front && WalLogs(p).front().IsSyncing()) {
+        TEST_SYNC_POINT("DBImpl::ClaimWalPartitionForSyncWalImpl:Wait");
+        WalSyncCV(p).Wait();
       }
+      const uint64_t back_number = WalLogs(p).back().number;
+      // The wait can retire every log but the current WAL, leaving nothing to
+      // mark; anything marked includes the front.
+      bool marked = false;
+      for (auto it = WalLogs(p).begin(); it != WalLogs(p).end(); ++it) {
+        auto& log = *it;
+        if (!include_current_wal && log.number == back_number) {
+          continue;
+        }
+        // Ensure the head of WalLogs(p) is marked as getting_synced if any is.
+        log.PrepareForSync();
+        marked = true;
+        if (log.number <=
+            wal_recovery_cutoff_.load(std::memory_order_acquire)) {
+          // The failed file handle is permanently unusable. Recovery will make
+          // this WAL obsolete only after atomically persisting all accepted
+          // memtable contents, so do not retry any operation on the handle.
+          // PrepareForSync() pins the entry until MarkLogsSynced() or
+          // MarkLogsNotSynced() calls FinishSync(), which prevents recovery
+          // from clearing the cutoff while this call still relies on it.
+          TEST_SYNC_POINT_CALLBACK("DBImpl::SyncWalImpl:SkipFailedWAL",
+                                   &log.number);
+          continue;
+        }
+        // If last sync failed on a later WAL, this could be a fully synced
+        // and closed WAL that just needs to be recorded as synced in the
+        // manifest.
+        if (log.writer->file()) {
+          wals_to_sync.emplace_back(log.writer, log.number == back_number);
+        }
+      }
+      claimed.push_back(marked);
     }
   }
 
@@ -2587,7 +2645,9 @@ IOStatus DBImpl::SyncWalImpl(bool include_current_wal,
   uint64_t failed_wal_number = 0;
   bool failed_with_previous_error = false;
   if (io_s.ok()) {
-    for (log::Writer* log : wals_to_sync) {
+    for (const auto& wal_to_sync : wals_to_sync) {
+      log::Writer* log = wal_to_sync.first;
+      const bool is_current = wal_to_sync.second;
       if (log->get_log_number() <=
           wal_recovery_cutoff_.load(std::memory_order_acquire)) {
         continue;
@@ -2601,8 +2661,7 @@ IOStatus DBImpl::SyncWalImpl(bool include_current_wal,
       if (error_recovery_in_prog) {
         log->file()->reset_seen_error();
       }
-      if (log->get_log_number() >= maybe_active_number) {
-        assert(log->get_log_number() == maybe_active_number);
+      if (is_current) {
         io_s = log->file()->SyncWithoutFlush(
             opts, immutable_db_options_.use_fsync, &failed_with_previous_error);
       } else {
@@ -2677,9 +2736,9 @@ IOStatus DBImpl::SyncWalImpl(bool include_current_wal,
       (void)was_closed;
     }
     if (io_s.ok()) {
-      MarkLogsSynced(up_to_number, need_wal_dir_sync, synced_wals);
+      MarkLogsSynced(up_to_number, need_wal_dir_sync, synced_wals, claimed);
     } else {
-      MarkLogsNotSynced(up_to_number);
+      MarkLogsNotSynced(up_to_number, claimed);
     }
   }
   return io_s;
@@ -2798,7 +2857,8 @@ Status DBImpl::UnlockWAL() {
 }
 
 void DBImpl::MarkLogsSynced(uint64_t up_to, bool synced_dir,
-                            VersionEdit* synced_wals) {
+                            VersionEdit* synced_wals,
+                            const autovector<uint8_t, 1>& claimed) {
   for (size_t p = 0; p < NumWalPartitions(); ++p) {
     WalWriteMutex(p).AssertHeld();
   }
@@ -2806,44 +2866,60 @@ void DBImpl::MarkLogsSynced(uint64_t up_to, bool synced_dir,
     wal_dir_synced_ = true;
   }
   for (size_t p = 0; p < NumWalPartitions(); ++p) {
-    for (auto it = WalLogs(p).begin();
-         it != WalLogs(p).end() && it->number <= up_to;) {
-      auto& wal = *it;
-      assert(wal.IsSyncing());
-
-      if (wal.number <= wal_recovery_cutoff_.load(std::memory_order_acquire)) {
-        wal.FinishSync();
-        ++it;
-        continue;
-      }
-
-      if (wal.number < WalLogs(p).back().number) {
-        // Inactive WAL
-        if (immutable_db_options_.track_and_verify_wals_in_manifest &&
-            wal.GetPreSyncSize() > 0) {
-          synced_wals->AddWal(wal.number, WalMetadata(wal.GetPreSyncSize()));
+    if (claimed[p]) {
+      for (auto it = WalLogs(p).begin(); it != WalLogs(p).end();) {
+        auto& wal = *it;
+        if (wal.number > up_to) {
+          // Beyond the sync horizon: another partition's WAL, numbered above
+          // cur_wal_number_ (the lowest live number at N > 1), or a WAL that
+          // rotated in between the horizon snapshot and the claim. Never
+          // recorded or reclaimed here, but if marked it is this sync's (the
+          // claimed partition's front mark excludes every other marker), so it
+          // must still be finished: leaving it marked hangs the next sync's
+          // PreprocessWrite on WalSyncCV.
+          if (wal.IsSyncing()) {
+            wal.FinishSync();
+          }
+          ++it;
+          continue;
         }
-        // Reclaim closed WALs (wal.writer->file() == nullptr), and if we
-        // don't need to close before that (background_close_inactive_wals)
-        // we can opportunistically reclaim WALs that happen to be fully
-        // synced. (Probably not worth extra code and mutex release to
-        // opportunistically close WALs that became eligible since last
-        // holding the mutex. FindObsoleteFiles can take care of it.)
-        if (wal.writer->file() == nullptr ||
-            (immutable_db_options_.background_close_inactive_wals &&
-             wal.GetPreSyncSize() == wal.writer->file()->GetFlushedSize())) {
-          // Fully synced
-          WalsToFree(p).push_back(wal.ReleaseWriter());
-          it = WalLogs(p).erase(it);
+        assert(wal.IsSyncing());
+
+        if (wal.number <=
+            wal_recovery_cutoff_.load(std::memory_order_acquire)) {
+          wal.FinishSync();
+          ++it;
+          continue;
+        }
+
+        if (wal.number < WalLogs(p).back().number) {
+          // Inactive WAL
+          if (immutable_db_options_.track_and_verify_wals_in_manifest &&
+              wal.GetPreSyncSize() > 0) {
+            synced_wals->AddWal(wal.number, WalMetadata(wal.GetPreSyncSize()));
+          }
+          // Reclaim closed WALs (wal.writer->file() == nullptr), and if we
+          // don't need to close before that (background_close_inactive_wals)
+          // we can opportunistically reclaim WALs that happen to be fully
+          // synced. (Probably not worth extra code and mutex release to
+          // opportunistically close WALs that became eligible since last
+          // holding the mutex. FindObsoleteFiles can take care of it.)
+          if (wal.writer->file() == nullptr ||
+              (immutable_db_options_.background_close_inactive_wals &&
+               wal.GetPreSyncSize() == wal.writer->file()->GetFlushedSize())) {
+            // Fully synced
+            WalsToFree(p).push_back(wal.ReleaseWriter());
+            it = WalLogs(p).erase(it);
+          } else {
+            wal.FinishSync();
+            ++it;
+          }
         } else {
+          assert(wal.number == WalLogs(p).back().number);
+          // Active WAL
           wal.FinishSync();
           ++it;
         }
-      } else {
-        assert(wal.number == WalLogs(p).back().number);
-        // Active WAL
-        wal.FinishSync();
-        ++it;
       }
     }
   }
@@ -2852,15 +2928,25 @@ void DBImpl::MarkLogsSynced(uint64_t up_to, bool synced_dir,
   }
 }
 
-void DBImpl::MarkLogsNotSynced(uint64_t up_to) {
+void DBImpl::MarkLogsNotSynced(uint64_t up_to,
+                               const autovector<uint8_t, 1>& claimed) {
   for (size_t p = 0; p < NumWalPartitions(); ++p) {
     WalWriteMutex(p).AssertHeld();
   }
   for (size_t p = 0; p < NumWalPartitions(); ++p) {
-    for (auto it = WalLogs(p).begin();
-         it != WalLogs(p).end() && it->number <= up_to; ++it) {
-      auto& wal = *it;
-      wal.FinishSync();
+    if (claimed[p]) {
+      for (auto it = WalLogs(p).begin(); it != WalLogs(p).end(); ++it) {
+        auto& wal = *it;
+        // As in MarkLogsSynced: logs past the horizon are never the failure's,
+        // but a mark left on them hangs the next sync all the same.
+        if (wal.number > up_to) {
+          if (wal.IsSyncing()) {
+            wal.FinishSync();
+          }
+          continue;
+        }
+        wal.FinishSync();
+      }
     }
   }
   for (size_t p = 0; p < NumWalPartitions(); ++p) {
@@ -5720,6 +5806,27 @@ DBImpl::CreateTimestampedSnapshotImpl(SequenceNumber snapshot_seq, uint64_t ts,
   std::shared_ptr<const SnapshotImpl> latest =
       timestamped_snapshots_.GetSnapshot(std::numeric_limits<uint64_t>::max());
 
+  if (NumWalPartitions() > 1 && latest &&
+      latest->GetSequenceNumber() > snapshot_seq) {
+    // Write groups on different partitions create these out of sequence
+    // order. Check against the latest at or below snapshot_seq as below; the
+    // next one above must have a larger timestamp.
+    std::shared_ptr<const SnapshotImpl> above;
+    latest = timestamped_snapshots_.GetLatestAtOrBelow(snapshot_seq, &above);
+    assert(above);
+    if (above->GetTimestamp() <= ts) {
+      if (lock) {
+        mutex_.Unlock();
+      }
+      delete s;
+      std::ostringstream oss;
+      oss << "snapshot exists with larger seq " << above->GetSequenceNumber()
+          << " > " << snapshot_seq << " but timestamp " << above->GetTimestamp()
+          << " <= " << ts;
+      return std::make_pair(Status::InvalidArgument(oss.str()), nullptr);
+    }
+  }
+
   // If there is already a latest timestamped snapshot, then we need to do
   // some checks.
   if (latest) {
@@ -5780,7 +5887,12 @@ DBImpl::CreateTimestampedSnapshotImpl(SequenceNumber snapshot_seq, uint64_t ts,
   // number.
   if (need_update_seq) {
     assert(versions_);
-    if (last_seq_same_as_publish_seq_) {
+    if (NumWalPartitions() > 1) {
+      // The write group's completion gate published everything at or below
+      // snapshot_seq before running this; other partitions may have
+      // published past it since.
+      assert(versions_->LastSequence() >= snapshot_seq);
+    } else if (last_seq_same_as_publish_seq_) {
       versions_->SetLastSequence(snapshot_seq);
     } else {
       // TODO: support write-prepared/write-unprepared transactions with two
