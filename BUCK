@@ -85,6 +85,7 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "db/forward_iterator.cc",
         "db/import_column_family_job.cc",
         "db/internal_stats.cc",
+        "db/log_merge.cc",
         "db/log_reader.cc",
         "db/log_writer.cc",
         "db/logs_with_prep_tracker.cc",
@@ -5380,6 +5381,12 @@ cpp_unittest_wrapper(name="ldb_cmd_test",
 
 cpp_unittest_wrapper(name="listener_test",
             srcs=["db/listener_test.cc"],
+            deps=[":rocksdb_test_lib"],
+            extra_compiler_flags=[])
+
+
+cpp_unittest_wrapper(name="log_merge_test",
+            srcs=["db/log_merge_test.cc"],
             deps=[":rocksdb_test_lib"],
             extra_compiler_flags=[])
 

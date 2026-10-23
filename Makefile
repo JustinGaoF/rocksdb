@@ -2000,6 +2000,9 @@ full_filter_block_test: $(OBJ_DIR)/table/block_based/full_filter_block_test.o $(
 partitioned_filter_block_test: $(OBJ_DIR)/table/block_based/partitioned_filter_block_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
+log_merge_test: $(OBJ_DIR)/db/log_merge_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
 log_test: $(OBJ_DIR)/db/log_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
