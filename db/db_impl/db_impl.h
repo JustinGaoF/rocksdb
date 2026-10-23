@@ -1537,6 +1537,10 @@ class DBImpl : public DB
 
   size_t TEST_NumWalPartitions() const { return NumWalPartitions(); }
 
+  uint64_t TEST_WalRecoveryCutoff() const {
+    return wal_recovery_cutoff_.load(std::memory_order_relaxed);
+  }
+
   // As WalPartitionForWrite, with deferred PutEntity ops given by column
   // family id (the only field routing reads). Null means no deferred ops.
   static Status TEST_WalPartitionForWrite(
@@ -3333,6 +3337,18 @@ class DBImpl : public DB
     wal_durability_bg_error_.store(false, std::memory_order_release);
   }
 
+  // Records a failed append/insert range for release at the recovery fence.
+  // No-op at N=1 (nothing is registered there) and for low == 0 (callers
+  // without a range). A record consuming no sequence is tracked at the next
+  // unallocated one, so high < low is normalized to high = low.
+  // REQUIRES: mutex_ held.
+  void RecordFailedDurabilityRange(size_t wal_partition, SequenceNumber low,
+                                   SequenceNumber high, bool wal_range_pinned);
+  // Abandons every recorded range in the tracker(s) still pinning it and
+  // clears the list. Called only from ErrorHandler::ClearBGError with
+  // mutex_ held, after successful recovery.
+  void ReleaseFailedDurabilityRanges();
+
   // Runs a write group's completion gate: wait until the durability frontier
   // covers `target`, then, for a sync write whose leadership-time fsync may
   // not cover it (`pre_sync_safe_point` < `target`), sync again so the sync
@@ -3354,9 +3370,13 @@ class DBImpl : public DB
 
   // Used by WriteImpl to update bg_error_ when IO error happens, e.g., write
   // WAL, sync WAL fails, if paranoid check is enabled.
+  // failed_wal_partition locates the pinned tracker range for the N>1
+  // recovery-fence release; callers without a pinned range leave it 0 along
+  // with the sequence bounds.
   void WALIOStatusCheck(const IOStatus& status, uint64_t failed_wal_number = 0,
                         SequenceNumber failed_wal_sequence = 0,
-                        SequenceNumber failed_wal_sequence_start = 0);
+                        SequenceNumber failed_wal_sequence_start = 0,
+                        size_t failed_wal_partition = 0);
 
   // Extends the inclusive WAL-number cutoff that must not receive more I/O.
   // This is lock-free because a WAL error can race with public SyncWAL().
@@ -4703,6 +4723,26 @@ class DBImpl : public DB
   // insert. Its safe point is the highest sequence N>1 may publish. Every
   // Register/Complete runs under sequence_wal_index_mutex_.
   std::unique_ptr<WalDurabilityTracker> applied_tracker_;
+
+  // A sequence range whose WAL append or memtable insert failed at N>1. The
+  // failed group never completes it, so it stays pinned in the tracker(s)
+  // below, keeping every completion gate at or above it failing (through
+  // the background-error leg) instead of succeeding while the error is set.
+  // Recorded under mutex_ when the error is published; released once, at
+  // the recovery fence, after ResumeImpl has fenced and retired the failed
+  // WALs (ReleaseFailedDurabilityRanges).
+  struct FailedDurabilityRange {
+    size_t wal_partition;
+    SequenceNumber low;
+    SequenceNumber high;
+    // True when the WAL append itself failed, pinning the range in both the
+    // durability and the applied tracker; false when only the memtable
+    // insert failed, pinning the applied tracker alone (the append already
+    // completed).
+    bool wal_range_pinned;
+  };
+  // GUARDED_BY(mutex_).
+  std::vector<FailedDurabilityRange> failed_durability_ranges_;
 
   // See CloseMemTableSwitchGate().
   std::atomic<size_t> leaders_past_switch_gate_{0};

@@ -680,6 +680,10 @@ Status ErrorHandler::ClearBGError() {
     // The background error is OK again; parked durability waits (if any
     // remained) must observe that instead of a stale error leg.
     db_->ClearWalDurabilityBGError();
+    // Recovery succeeded: ResumeImpl has fenced and retired the failed WALs,
+    // so ranges pinned by failed appends/inserts stop blocking later writes.
+    // A failed recovery skips this whole branch and leaves them in place.
+    db_->ReleaseFailedDurabilityRanges();
     recovery_error_ = IOStatus::OK();
     // Recovery facts belong to one background-error episode. Keeping a
     // retired WAL cutoff or reserved sequence here would attach it to a later,

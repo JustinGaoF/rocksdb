@@ -157,6 +157,50 @@ class WalDurabilityTracker {
     Recompute(partition, new_pending);
   }
 
+  // Drops one occurrence of [low, high] on partition p without marking it
+  // durable: the range's append (or insert) failed, and live recovery has
+  // fenced the failed WALs off, so later ranges must unblock without the
+  // frontier claiming the failed range itself is durable. Unlike Complete,
+  // this leaves durable_upto_ alone, so an all-idle safe point never
+  // reports a failed high. Recovery (which replays the WAL prefix below the
+  // failed sequence) and the indeterminate-write fence still treat the range
+  // as a hole; only the completion gate stops waiting on it. Callers must
+  // guarantee the range is still registered: DBImpl records each failed
+  // range exactly once and releases it once, at the recovery fence.
+  void Release(size_t partition, uint64_t low, uint64_t high) {
+    assert(partition < inflight_.size());
+    std::vector<Range>& fifo = inflight_[partition];
+    size_t found = fifo.size();
+    for (size_t i = 0; i < fifo.size(); ++i) {
+      if (fifo[i].low == low && fifo[i].high == high) {
+        found = i;
+        break;
+      }
+    }
+    if (found == fifo.size()) {
+      // Unpaired release: a bug in the caller. Assert in debug; tolerate
+      // in release rather than corrupting the frontier.
+      assert(false);
+      return;
+    }
+    const uint64_t old_pending =
+        pending_low_[partition].load(std::memory_order_relaxed);
+    fifo[found] = fifo.back();
+    fifo.pop_back();
+    // Deliberately not durable_upto_: the range failed.
+    uint64_t new_pending = kIdle;
+    for (const Range& r : fifo) {
+      if (r.low < new_pending) {
+        new_pending = r.low;
+      }
+    }
+    pending_low_[partition].store(new_pending, std::memory_order_release);
+    if (new_pending == old_pending) {
+      return;
+    }
+    Recompute(partition, new_pending);
+  }
+
   // Current durability frontier: every sequence at or below it is durable.
   // Monotonic; 0 before anything completes.
   uint64_t SafePoint() const {

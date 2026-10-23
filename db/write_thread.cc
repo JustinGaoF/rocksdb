@@ -738,8 +738,15 @@ static WriteThread::AdaptationContext cpmtw_ctx(
 bool WriteThread::CompleteParallelMemTableWriter(Writer* w) {
   auto* write_group = w->write_group;
   if (!w->status.ok()) {
-    std::lock_guard<std::mutex> guard(write_group->leader->StateMutex());
-    write_group->status = w->status;
+    if (write_group->size == 1) {
+      // Sole worker: an N>1 single-writer group takes the parallel path
+      // too, but with no follower the leader's StateMutex was never made
+      // waitable, and no one else can touch write_group->status.
+      write_group->status = w->status;
+    } else {
+      std::lock_guard<std::mutex> guard(write_group->leader->StateMutex());
+      write_group->status = w->status;
+    }
   }
 
   if (write_group->running-- > 1) {

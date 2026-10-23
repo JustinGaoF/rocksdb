@@ -419,6 +419,15 @@ Status DBImpl::ValidateOptions(const DBOptions& db_options) {
         "wal_partitions > 1 is not supported with recycle_log_file_num > 0");
   }
 
+  if (db_options.wal_partitions > 1 && !db_options.paranoid_checks) {
+    // D-1: a failed WAL append stops the whole DB. Reset-and-continue would
+    // either pin the durability frontier forever or punch a permanent hole,
+    // so the configuration that allows it cannot open.
+    return Status::NotSupported(
+        "wal_partitions > 1 is not supported with paranoid_checks=false: a "
+        "failed WAL append must stop the whole DB");
+  }
+
   if (db_options.wal_partitions > 1) {
     // The partitioned write path, its completion gate, stalled-partition
     // handling, and WAL rotation exist, but production opens stay rejected

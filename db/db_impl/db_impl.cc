@@ -485,6 +485,12 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
   if (s.ok() && context.IsWALWriteErrorRecovery()) {
     const bool has_blob_direct_write =
         HasAnyBlobDirectWriteColumnFamilyWithLockHeld();
+    // N>1 requires MANIFEST WAL tracking at Open, so file-scoped recovery
+    // must work with it there; N=1 keeps the existing rejection.
+    const bool wal_tracking_unsupported =
+        NumWalPartitions() == 1 &&
+        (immutable_db_options_.track_and_verify_wals_in_manifest ||
+         immutable_db_options_.track_and_verify_wals);
     if (immutable_db_options_.manual_wal_flush ||
         immutable_db_options_.allow_2pc || two_write_queues_ ||
         immutable_db_options_.enable_pipelined_write ||
@@ -492,8 +498,7 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
         immutable_db_options_.recycle_log_file_num != 0 ||
         immutable_db_options_.WAL_ttl_seconds != 0 ||
         immutable_db_options_.WAL_size_limit_MB != 0 ||
-        immutable_db_options_.track_and_verify_wals_in_manifest ||
-        immutable_db_options_.track_and_verify_wals || has_blob_direct_write) {
+        wal_tracking_unsupported || has_blob_direct_write) {
       ROCKS_LOG_WARN(
           immutable_db_options_.info_log,
           "[WAL recovery] Unsupported configuration; DB remains write-stopped: "
@@ -2365,6 +2370,7 @@ Status DBImpl::FlushWAL(const FlushWALOptions& options) {
 Status DBImpl::FlushWAL(const WriteOptions& write_options, bool sync) {
   if (manual_wal_flush_) {
     IOStatus io_s;
+    uint64_t failed_wal_number = 0;
     {
       // We need to lock since the WAL writers might change concurrently.
       // Every partition's current WAL is flushed: the application-visible
@@ -2379,6 +2385,9 @@ Status DBImpl::FlushWAL(const WriteOptions& write_options, bool sync) {
         }
         io_s = current_wal->writer->WriteBuffer(write_options);
         if (!io_s.ok()) {
+          // Attribute the failure to the WAL that failed, not partition
+          // 0's: at N>1 the cutoff must quarantine this file.
+          failed_wal_number = current_wal->number;
           break;
         }
       }
@@ -2388,7 +2397,7 @@ Status DBImpl::FlushWAL(const WriteOptions& write_options, bool sync) {
                       io_s.ToString().c_str());
       // In case there is a fs error we should set it globally to prevent the
       // future writes
-      WALIOStatusCheck(io_s);
+      WALIOStatusCheck(io_s, NumWalPartitions() > 1 ? failed_wal_number : 0);
       // whether sync or not, we should abort the rest of function upon error
       return static_cast<Status>(io_s);
     }
@@ -5973,7 +5982,11 @@ DBImpl::CreateTimestampedSnapshotImpl(SequenceNumber snapshot_seq, uint64_t ts,
   // number.
   if (need_update_seq) {
     assert(versions_);
-    if (last_seq_same_as_publish_seq_) {
+    if (NumWalPartitions() > 1) {
+      // The commit's group publishes boundedly at its write-queue exit; a
+      // direct jump here could publish above a lower write held on another
+      // partition. The snapshot itself is still created above.
+    } else if (last_seq_same_as_publish_seq_) {
       versions_->SetLastSequence(snapshot_seq);
     } else {
       // TODO: support write-prepared/write-unprepared transactions with two
@@ -8174,6 +8187,13 @@ Status DBImpl::CommitFileIngestionHandles(
         }
       }
     }
+    // Every write queue is held above, so every allocated range was
+    // published before its group exited: a lower LastSequence() would let a
+    // job assign sequences live writes still hold. Failed ranges recorded
+    // for the recovery fence are the only pinned-but-unpublished exception.
+    assert(NumWalPartitions() == 1 ||
+           versions_->LastSequence() >= versions_->LastAllocatedSequence() ||
+           !failed_durability_ranges_.empty());
     // Run ingestion jobs.
     if (status.ok()) {
       for (size_t i = 0; i != num_jobs; ++i) {
