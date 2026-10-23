@@ -40,9 +40,11 @@
 #include <thread>
 
 #include "db/db_impl/db_impl.h"
+#include "db/log_format.h"
 #include "db/malloc_stats.h"
 #include "db/version_set.h"
 #include "env/composite_env_wrapper.h"
+#include "file/filename.h"
 #include "monitoring/histogram.h"
 #include "monitoring/iostats_context_imp.h"
 #include "monitoring/statistics_impl.h"
@@ -88,6 +90,7 @@
 #include "tools/simulated_hybrid_file_system.h"
 #include "util/atomic.h"
 #include "util/cast_util.h"
+#include "util/coding.h"
 #include "util/compression.h"
 #include "util/crc32c.h"
 #include "util/file_checksum_helper.h"
@@ -1769,6 +1772,19 @@ DEFINE_uint64(wal_latency_jitter_us, 0,
               "deterministic extra delay in [0, this] derived from "
               "--wal_latency_seed, the WAL number and the operation index.");
 DEFINE_uint64(wal_latency_seed, 0, "Seed of the WAL latency jitter.");
+DEFINE_int32(sync_write_one_in, 0,
+             "In the fill/write benchmarks, make every Nth write batch "
+             "sync=true (1 syncs every batch). 0 disables, leaving --sync in "
+             "control. Counted per benchmark thread, so a fixed --seed "
+             "reproduces the sync pattern. Benchmark-only.");
+DEFINE_int32(wal_slow_partition, -1,
+             "With --inject_wal_latency and --wal_partitions N > 1, run "
+             "partition P's WALs at 10x the default append/sync/jitter "
+             "latency, to show the straggler cost the durability watermark "
+             "imposes. -1 disables. Each WAL's partition is read from its WAL "
+             "index marker on the first append, so the override follows the "
+             "partition across rotations. Needs --wal_compression=none. "
+             "Benchmark-only.");
 
 DEFINE_int64(
     preclude_last_level_data_seconds, 0,
@@ -2280,6 +2296,96 @@ DEFINE_uint32(openandcompact_cancel_after_millseconds, 1,
 
 namespace ROCKSDB_NAMESPACE {
 namespace {
+// Sets a LatencyInjectionFileSystem latency on every WAL of one WAL
+// partition. A WAL's partition is read from its WAL index marker, which
+// StartWALFile writes first, so the override follows the partition across
+// rotations. A WAL without the marker (no WAL index, or a recycled WAL) keeps
+// the default latency.
+class SlowWalPartitionFileSystem : public FileSystemWrapper {
+ public:
+  SlowWalPartitionFileSystem(
+      const std::shared_ptr<LatencyInjectionFileSystem>& latency_fs,
+      uint32_t partition, const LatencyInjectionFileSystem::Latency& latency)
+      : FileSystemWrapper(latency_fs),
+        latency_fs_(latency_fs),
+        partition_(partition),
+        latency_(latency) {}
+
+  static const char* kClassName() { return "SlowWalPartitionFileSystem"; }
+  const char* Name() const override { return kClassName(); }
+
+  IOStatus NewWritableFile(const std::string& fname,
+                           const FileOptions& file_opts,
+                           std::unique_ptr<FSWritableFile>* result,
+                           IODebugContext* dbg) override {
+    IOStatus s = target()->NewWritableFile(fname, file_opts, result, dbg);
+    uint64_t number = 0;
+    FileType type;
+    if (s.ok() &&
+        ParseFileName(fname.substr(fname.find_last_of('/') + 1), &number,
+                      &type) &&
+        type == kWalFile) {
+      result->reset(new WalFile(std::move(*result), this, number));
+    }
+    return s;
+  }
+
+ private:
+  class WalFile : public FSWritableFileOwnerWrapper {
+   public:
+    WalFile(std::unique_ptr<FSWritableFile>&& file,
+            SlowWalPartitionFileSystem* fs, uint64_t number)
+        : FSWritableFileOwnerWrapper(std::move(file)),
+          fs_(fs),
+          number_(number) {}
+
+    IOStatus Append(const Slice& data, const IOOptions& options,
+                    IODebugContext* dbg) override {
+      MaybeSlowDown(data);
+      return target()->Append(data, options, dbg);
+    }
+    IOStatus Append(const Slice& data, const IOOptions& options,
+                    const DataVerificationInfo& verification_info,
+                    IODebugContext* dbg) override {
+      MaybeSlowDown(data);
+      return target()->Append(data, options, verification_info, dbg);
+    }
+
+   private:
+    // The first append starts with the marker: a log header, then the
+    // partition as a fixed32 when it is not 0.
+    void MaybeSlowDown(const Slice& data) {
+      if (first_append_done_) {
+        return;
+      }
+      first_append_done_ = true;
+      if (data.size() < log::kHeaderSize ||
+          static_cast<uint8_t>(data[6]) != log::kWALIndexMarkerType) {
+        return;
+      }
+      const uint16_t length = DecodeFixed16(data.data() + 4);
+      uint32_t partition = 0;
+      if (length == log::kWALIndexMarkerPartitionSize &&
+          data.size() >= log::kHeaderSize + log::kWALIndexMarkerPartitionSize) {
+        partition = DecodeFixed32(data.data() + log::kHeaderSize);
+      } else if (length != 0) {
+        return;
+      }
+      if (partition == fs_->partition_) {
+        fs_->latency_fs_->SetWalLatency(number_, fs_->latency_);
+      }
+    }
+
+    SlowWalPartitionFileSystem* const fs_;
+    const uint64_t number_;
+    bool first_append_done_ = false;
+  };
+
+  const std::shared_ptr<LatencyInjectionFileSystem> latency_fs_;
+  const uint32_t partition_;
+  const LatencyInjectionFileSystem::Latency latency_;
+};
+
 static Status CreateMemTableRepFactory(
     const ConfigOptions& config_options,
     std::shared_ptr<MemTableRepFactory>* factory) {
@@ -7176,6 +7282,8 @@ class Benchmark {
 
     int64_t stage = 0;
     int64_t num_written = 0;
+    // DB::Write calls this thread issued, for --sync_write_one_in.
+    uint64_t num_batches = 0;
     int64_t next_seq_db_at = num_ops;
     size_t id = 0;
     int64_t num_range_deletions = 0;
@@ -7430,7 +7538,13 @@ class Benchmark {
       }
       if (!use_blob_db_) {
         // Not stacked BlobDB
-        s = db_with_cfh->db->Write(write_options_, &batch);
+        ++num_batches;
+        WriteOptions batch_options = write_options_;
+        if (FLAGS_sync_write_one_in > 0 &&
+            num_batches % static_cast<uint64_t>(FLAGS_sync_write_one_in) == 0) {
+          batch_options.sync = true;
+        }
+        s = db_with_cfh->db->Write(batch_options, &batch);
       }
       thread->stats.FinishedOps(db_with_cfh, db_with_cfh->db,
                                 entries_per_batch_, kWrite);
@@ -12002,6 +12116,27 @@ int db_bench_tool(int argc, char** argv, ToolHooks& hooks) {
   // outlives all DB usage; the FileSystem is kept to print its counters.
   static std::shared_ptr<ROCKSDB_NAMESPACE::LatencyInjectionFileSystem>
       wal_latency_fs;
+  if (FLAGS_wal_slow_partition >= 0) {
+    if (!FLAGS_inject_wal_latency) {
+      fprintf(stderr, "--wal_slow_partition needs --inject_wal_latency\n");
+      db_bench_exit(1);
+    }
+    if (FLAGS_wal_partitions <= 1 ||
+        static_cast<uint32_t>(FLAGS_wal_slow_partition) >=
+            FLAGS_wal_partitions) {
+      fprintf(stderr,
+              "--wal_slow_partition=%d needs --wal_partitions N > 1 with the "
+              "partition below N\n",
+              FLAGS_wal_slow_partition);
+      db_bench_exit(1);
+    }
+    // A compressed WAL starts with its compression record, so the marker
+    // that names the partition is not the first append.
+    if (FLAGS_wal_compression_e != ROCKSDB_NAMESPACE::kNoCompression) {
+      fprintf(stderr, "--wal_slow_partition needs --wal_compression=none\n");
+      db_bench_exit(1);
+    }
+  }
   if (FLAGS_inject_wal_latency) {
     ROCKSDB_NAMESPACE::LatencyInjectionFileSystem::Latency latency;
     latency.append_micros = FLAGS_wal_append_latency_us;
@@ -12010,8 +12145,18 @@ int db_bench_tool(int argc, char** argv, ToolHooks& hooks) {
     wal_latency_fs =
         std::make_shared<ROCKSDB_NAMESPACE::LatencyInjectionFileSystem>(
             FLAGS_env->GetFileSystem(), latency, FLAGS_wal_latency_seed);
+    std::shared_ptr<ROCKSDB_NAMESPACE::FileSystem> fs = wal_latency_fs;
+    if (FLAGS_wal_slow_partition >= 0) {
+      ROCKSDB_NAMESPACE::LatencyInjectionFileSystem::Latency slow;
+      slow.append_micros = 10 * FLAGS_wal_append_latency_us;
+      slow.sync_micros = 10 * FLAGS_wal_sync_latency_us;
+      slow.jitter_micros = 10 * FLAGS_wal_latency_jitter_us;
+      fs = std::make_shared<ROCKSDB_NAMESPACE::SlowWalPartitionFileSystem>(
+          wal_latency_fs, static_cast<uint32_t>(FLAGS_wal_slow_partition),
+          slow);
+    }
     static std::shared_ptr<ROCKSDB_NAMESPACE::Env> wal_latency_env =
-        NewCompositeEnv(wal_latency_fs);
+        NewCompositeEnv(fs);
     FLAGS_env = wal_latency_env.get();
   }
 
