@@ -86,6 +86,14 @@ class ErrorHandler {
   void SetBGErrorNoAutoRecovery(const Status& bg_err,
                                 BackgroundErrorReason reason);
 
+  // For an error whose write then installs a WAL gate fence (a memtable
+  // insert, or a sync group's gate, failing after insert). Above one WAL
+  // partition the fence pins every later write on every partition until
+  // recovery from this error, so listeners are told but cannot suppress or
+  // soften it, as with a failed WAL write.
+  void SetBGErrorBeforeFence(const Status& bg_err,
+                             BackgroundErrorReason reason);
+
   Status GetBGError() const { return bg_error_; }
 
   Status GetRecoveryError() const { return recovery_error_; }
@@ -179,10 +187,10 @@ class ErrorHandler {
 
   void SetBGErrorImpl(const Status& bg_err, BackgroundErrorReason reason,
                       bool wal_related, DBRecoverContext context,
-                      bool allow_auto_recovery);
+                      bool allow_auto_recovery, bool fences_writes);
   void HandleKnownErrors(const Status& bg_err, BackgroundErrorReason reason,
-                         const DBRecoverContext& context,
-                         bool allow_auto_recovery);
+                         const DBRecoverContext& context, bool wal_related,
+                         bool allow_auto_recovery, bool fences_writes);
   // REQUIRES: db_mutex_ held. When replacing the general recovery context,
   // retain WAL facts accumulated from concurrent errors independently.
   void UpdateRecoveryContext(const DBRecoverContext& context,

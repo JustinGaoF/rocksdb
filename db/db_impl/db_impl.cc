@@ -407,12 +407,25 @@ Status DBImpl::Resume() {
 // 1. Keep every WAL through failed_wal_number quarantined from concurrent sync.
 // 2. Fence WAL iterators at the failed sequence range and persist its end so a
 //    possibly complete record is neither exposed nor allowed to collide with a
-//    later write after recovery.
-// 3. Replace the failed WAL and atomically flush all live column families.
-// 4. Verify every column family advanced beyond the failed WAL.
+//    later write after recovery. Above one partition, persist the last
+//    sequence allocated instead: the top of every gate fence.
+// 3. Replace the failed WAL (above one partition, every partition's WAL) and
+//    atomically flush all live column families.
+// 4. Verify every column family advanced beyond the failed WAL, and every
+//    partition's current WAL lies above it.
 // 5. Detach the quarantined handles, then clear the cutoff only if a concurrent
 //    failure did not extend it. Any failure before completion leaves the hard
 //    background error and quarantine in place.
+// 6. Above one partition, explain the burned WAL indices. One burned in a WAL
+//    the flush retired needs no I/O: the predecessor spans of the WALs after
+//    it put it below every recovery's lower bound. A failure here leaves the
+//    hard background error but not the quarantine: step 5 already detached
+//    every WAL the cutoff covered and cleared it.
+// 7. Above one partition, persist the last allocated sequence again: a
+//    straggler that passed its stopped-DB check before the error can allocate
+//    above the step 2 reservation, and fails at its fence. Hold allocation
+//    back until the release closes the fences, so no sequence a fenced write
+//    allocated is issued again, after a reopen either.
 Status DBImpl::ResumeImpl(DBRecoverContext context,
                           Env::IOActivity io_activity) {
   mutex_.AssertHeld();
@@ -474,6 +487,7 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
     WaitForPendingWrites();
 
     versions_->SyncLastSequenceWithAllocated();
+    TEST_SYNC_POINT("DBImpl::ResumeImpl:SyncLastSequenceWithAllocated");
 
     nonmem_w.ExitUnbatched();
     w.ExitUnbatched();
@@ -498,7 +512,11 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
         immutable_db_options_.recycle_log_file_num != 0 ||
         immutable_db_options_.WAL_ttl_seconds != 0 ||
         immutable_db_options_.WAL_size_limit_MB != 0 ||
-        immutable_db_options_.track_and_verify_wals_in_manifest ||
+        // Above one partition, which requires the tracking, the atomic flush
+        // retires every WAL through the failed one from the MANIFEST WAL set
+        // in the commit that advances every log number past it.
+        (immutable_db_options_.track_and_verify_wals_in_manifest &&
+         NumWalPartitions() == 1) ||
         immutable_db_options_.track_and_verify_wals || has_blob_direct_write) {
       ROCKS_LOG_WARN(
           immutable_db_options_.info_log,
@@ -566,8 +584,10 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
     }
   }
 
+  // Above one partition, the sequence the reservation below persisted.
+  SequenceNumber persisted_reservation = 0;
   if (s.ok() && context.IsWALWriteErrorRecovery() &&
-      context.failed_wal_sequence > 0) {
+      (context.failed_wal_sequence > 0 || NumWalPartitions() > 1)) {
     // A WAL error can be reported after the whole record reached storage but
     // before its sequence range was published. Persist the reservation before
     // admitting later writes so they cannot reuse an ambiguous sequence. This
@@ -575,22 +595,35 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
     // every column family past the failed WAL before retiring it. Unsupported
     // configurations fail the check above and remain write-stopped.
     assert(context.IsWALWriteErrorRecovery());
-    assert(context.failed_wal_sequence_start != 0);
-    assert(context.failed_wal_sequence_start <= context.failed_wal_sequence);
-    wal_manager_.RecordIndeterminateWriteSequence(
-        context.failed_wal_number, context.failed_wal_sequence_start,
-        context.failed_wal_sequence);
-    if (context.failed_wal_sequence > versions_->LastAllocatedSequence()) {
-      versions_->SetLastAllocatedSequence(context.failed_wal_sequence);
-    }
-    if (context.failed_wal_sequence > versions_->LastPublishedSequence()) {
-      versions_->SetLastPublishedSequence(context.failed_wal_sequence);
-    }
-    if (context.failed_wal_sequence > versions_->LastSequence()) {
-      versions_->SetLastSequence(context.failed_wal_sequence);
+    SequenceNumber reserved_sequence = context.failed_wal_sequence;
+    if (NumWalPartitions() > 1) {
+      // Every sequence allocated above a failed range belongs to a write that
+      // failed or fails at its gate, whose record may lie in a WAL another
+      // partition keeps: ClearWalDurabilityBGError closes the fences at the
+      // last allocated sequence, and records their gap for the WAL iterator.
+      // Reserve through it, a failed gate sync's range included (its context
+      // carries none). In the MANIFEST only: the release publishes these
+      // ranges once the flush dropped them.
+      reserved_sequence =
+          std::max(reserved_sequence, versions_->LastAllocatedSequence());
+    } else {
+      assert(context.failed_wal_sequence_start != 0);
+      assert(context.failed_wal_sequence_start <= context.failed_wal_sequence);
+      wal_manager_.RecordIndeterminateWriteSequence(
+          context.failed_wal_number, context.failed_wal_sequence_start,
+          context.failed_wal_sequence);
+      if (context.failed_wal_sequence > versions_->LastAllocatedSequence()) {
+        versions_->SetLastAllocatedSequence(context.failed_wal_sequence);
+      }
+      if (context.failed_wal_sequence > versions_->LastPublishedSequence()) {
+        versions_->SetLastPublishedSequence(context.failed_wal_sequence);
+      }
+      if (context.failed_wal_sequence > versions_->LastSequence()) {
+        versions_->SetLastSequence(context.failed_wal_sequence);
+      }
     }
     VersionEdit edit;
-    edit.SetLastSequence(context.failed_wal_sequence);
+    edit.SetLastSequence(reserved_sequence);
     auto cfh =
         static_cast_with_check<ColumnFamilyHandleImpl>(default_cf_handle_);
     assert(cfh);
@@ -601,15 +634,16 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
                                 BackgroundErrorReason::kManifestWrite);
     }
     if (s.ok()) {
+      persisted_reservation = reserved_sequence;
       ROCKS_LOG_INFO(immutable_db_options_.info_log,
                      "[WAL recovery] Persisted sequence reservation through "
                      "#%" PRIu64,
-                     context.failed_wal_sequence);
+                     reserved_sequence);
     } else {
       ROCKS_LOG_WARN(immutable_db_options_.info_log,
                      "[WAL recovery] Failed to persist sequence reservation "
                      "through #%" PRIu64 ": %s",
-                     context.failed_wal_sequence, s.ToString().c_str());
+                     reserved_sequence, s.ToString().c_str());
     }
   }
 
@@ -652,6 +686,7 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
     }
   }
 
+  TEST_SYNC_POINT("DBImpl::ResumeImpl:AfterFlush");
   if (s.ok() && context.IsWALWriteErrorRecovery()) {
     for (auto* cfd : *versions_->GetColumnFamilySet()) {
       if (!cfd->IsDropped() &&
@@ -744,6 +779,13 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
   job_context.Clean();
   mutex_.Lock();
 
+  if (s.ok() && context.IsWALWriteErrorRecovery() && NumWalPartitions() > 1) {
+    // Step 7: a straggler may have allocated above the reservation since.
+    // From here until ClearBGError closes the fences, allocation waits.
+    s = HoldSequencesForWalRecoveryRelease(persisted_reservation, read_options,
+                                           write_options);
+  }
+  TEST_SYNC_POINT("DBImpl::ResumeImpl:BeforeClearBGError");
   if (s.ok()) {
     // Will notify and unblock threads waiting for error recovery to finish.
     s = error_handler_.ClearBGError();
@@ -768,6 +810,8 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
     // See https://github.com/facebook/rocksdb/pull/7715#issuecomment-754947952
     error_handler_.GetRecoveryError().PermitUncheckedError();
   }
+  // ClearBGError ended the hold, unless it failed before closing the fences.
+  ReleaseSequenceReservation();
 
   // Check for shutdown again before scheduling further compactions,
   // since we released and re-acquired the lock above
@@ -917,7 +961,7 @@ void DBImpl::CancelAllBackgroundWork(bool wait) {
     // covered, as a stalled write does, except those whose range is already
     // applied: they publish with the ranges below them, so they keep waiting
     // until covered or fenced (WaitForWalDurability).
-    InstrumentedMutexLock seq_lock(&sequence_wal_index_mutex_);
+    InstrumentedMutexLock seq_lock(&wal_durability_wait_mutex_);
     wal_durability_cv_.SignalAll();
   }
   env_->UnSchedule(&bg_async_file_open_state_, Env::Priority::HIGH);
@@ -1178,7 +1222,7 @@ Status DBImpl::CloseHelper() {
     // fence, which takes only those writes' appends and gate syncs. A write
     // reaching its gate after this point is a write concurrent with Close(),
     // which is unsupported.
-    InstrumentedMutexLock seq_lock(&sequence_wal_index_mutex_);
+    InstrumentedMutexLock seq_lock(&wal_durability_wait_mutex_);
     while (wal_durability_waiters_.load(std::memory_order_relaxed) > 0) {
       wal_durability_cv_.Wait();
     }
