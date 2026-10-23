@@ -236,6 +236,12 @@ class DBImpl : public DB
 
   ~DBImpl() override;
 
+  // Largest DBOptions::wal_partitions Open() accepts. Each partition owns a
+  // write thread, a WAL file and a merge buffer, sized at construction, and
+  // appends gain nothing once partitions outnumber the device's queue depth;
+  // 64 is four times the most any test or the crash test runs.
+  static constexpr uint32_t kMaxWalPartitions = 64;
+
   // ---- Implementations of the DB interface ----
 
   using DB::Resume;
