@@ -159,6 +159,11 @@ class Reader {
   // hold both indexed and non-indexed records.
   uint64_t GetLastReadWALIndex() const { return last_read_wal_index_; }
 
+  // Whether a WAL index marker record has been consumed so far. The writer
+  // emits it first, so after the first ReadRecord returns this already tells
+  // whether the file claims to carry indices, before its data is consumed.
+  bool SawWALIndexMarker() const { return saw_wal_index_marker_; }
+
   // Highest wal_index covered by any valid void record read so far, or zero
   // if no void record has been read.
   uint64_t GetMaxVoidWALIndexHi() const { return max_void_wal_index_hi_; }
@@ -216,6 +221,13 @@ class Reader {
   uint64_t GetFirstSupersededWALIndex(uint64_t wal_number) const {
     const auto it = first_superseded_wal_indices_.find(wal_number);
     return it == first_superseded_wal_indices_.end() ? 0 : it->second;
+  }
+
+  // Whether a supersession record was read after a data or progress record.
+  // Such a record is reported and dropped, so it supersedes nothing, and a
+  // replay that already applied the records it names cannot honor it.
+  bool SawMisplacedWALIndexSupersession() const {
+    return saw_misplaced_supersession_;
   }
 
  protected:
@@ -283,31 +295,43 @@ class Reader {
   UnorderedMap<uint32_t, size_t> recorded_cf_to_ts_sz_;
 
   // WAL index (LSN) state. See db/log_writer.h.
+  //
+  // Declaration order here is deliberate: the word-sized members are grouped
+  // ahead of the flags so the flags pack together instead of each one forcing
+  // seven bytes of padding between two uint64_ts.
+  //
   // wal_index extracted from the most recent logical record.
   uint64_t last_read_wal_index_ = 0;
   // Highest `hi` of any valid void range read so far. Tracked separately
   // because a void record deliberately leaves last_read_wal_index_ alone.
   uint64_t max_void_wal_index_hi_ = 0;
-  // Valid void ranges read so far, in file order. Covers are order-constrained
-  // (see log_format.h), so ranges arrive lo-ordered in a well-formed file.
-  std::vector<std::pair<uint64_t, uint64_t>> wal_index_void_ranges_;
   // Highest data index or void lower bound read so far. A void range may not
   // start at or below this mark: it would trail behind data the merge has
   // already passed, hence be invisible when the merge decides the hole.
   uint64_t wal_index_order_mark_ = 0;
-  // Lowest open-ended supersession boundary declared for each older WAL.
-  UnorderedMap<uint64_t, uint64_t> first_superseded_wal_indices_;
   // Highest progress bound asserted so far, or zero when no valid progress
   // record has been read. A nonzero bound also proves the head is complete:
   // supersessions and spans must precede the first progress record.
   uint64_t last_progress_bound_read_ = 0;
-  // Predecessor span attested by this file's head, if one was read.
-  bool has_predecessor_span_ = false;
+  // Predecessor span attested by this file's head, if one was read. Valid
+  // only when has_predecessor_span_ below is set.
   uint64_t predecessor_span_wal_ = 0;
   uint64_t predecessor_span_first_ = 0;
   uint64_t predecessor_span_last_ = 0;
   // Spans read after the first; see GetFurtherWALIndexPredecessorSpans().
   std::vector<std::array<uint64_t, 3>> further_predecessor_spans_;
+  // Valid void ranges read so far, in file order. Covers are order-constrained
+  // (see log_format.h), so ranges arrive lo-ordered in a well-formed file.
+  std::vector<std::pair<uint64_t, uint64_t>> wal_index_void_ranges_;
+  // Lowest open-ended supersession boundary declared for each older WAL.
+  UnorderedMap<uint64_t, uint64_t> first_superseded_wal_indices_;
+  // Whether a WAL index marker record has been consumed. Set by both
+  // logical-reader implementations; never cleared.
+  bool saw_wal_index_marker_ = false;
+  // Whether this file's head attested a predecessor span.
+  bool has_predecessor_span_ = false;
+  // Whether a supersession record followed a data or progress record.
+  bool saw_misplaced_supersession_ = false;
 
   // Extend record types with the following special values
   enum : uint8_t {

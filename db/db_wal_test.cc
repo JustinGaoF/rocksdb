@@ -3989,6 +3989,36 @@ class DBWALIndexTest : public DBWALTestBase {
     return ranges;
   }
 
+  // Ported from GC23's losing candidate (Muse), for GC24 Q9.
+  // Moves every WAL index supersession record in `wal_path` past the last
+  // physical record, leaving all other bytes in place. Each physical record
+  // carries its own header and checksum, so every record still parses; only
+  // the declarations' position changes, from the head to after the data.
+  // Single-block files only: nothing here crosses a block boundary.
+  void MoveWALSupersessionsLast(const std::string& wal_path) {
+    std::string contents = ReadWALContents(wal_path);
+    ASSERT_LT(contents.size(), log::kBlockSize);
+    std::string kept;
+    std::string moved;
+    size_t pos = 0;
+    size_t supersessions = 0;
+    for (const PhysicalRecord& record : ScanPhysicalRecords(contents)) {
+      const size_t begin = record.header_offset;
+      const size_t end = record.payload_offset() + record.payload_size;
+      if (record.type == log::kWALIndexSupersessionType ||
+          record.type == log::kRecyclableWALIndexSupersessionType) {
+        moved += contents.substr(begin, end - begin);
+        ++supersessions;
+      } else {
+        kept += contents.substr(begin, end - begin);
+      }
+      pos = end;
+    }
+    ASSERT_GT(supersessions, 0U);
+    ASSERT_EQ(contents.size(), pos);
+    WriteWALContents(wal_path, kept + moved);
+  }
+
   std::vector<std::pair<uint64_t, uint64_t>> ReadWALSupersessions(
       const std::string& wal_path) {
     std::vector<std::pair<uint64_t, uint64_t>> supersessions;
@@ -4892,6 +4922,158 @@ TEST_F(DBWALIndexTest, WalFilterStopWritesSupersessionAtReplayCut) {
   const std::vector<std::pair<uint64_t, uint64_t>> supersessions = {
       {second_wal, 9}};
   EXPECT_EQ(supersessions, ReadWALSupersessions(WALPath(new_wal)));
+  Destroy(options);
+}
+
+// Ported from GC23's losing candidate (Muse), for GC24 Q9.
+// GC23 Q1: the writer's head-position guarantee, enforced at recovery. A
+// filter stop declares a supersession for the cut WAL; moving that
+// declaration past the declaring WAL's data hides it from the head
+// classification, so a kNone open routes sequentially. Sequential replay
+// cannot honor it, so every mode fails closed naming the misplacement
+// instead of resurrecting the dropped keys. Neuter: drop the
+// misplaced-supersession guard after ProcessLogFile's read loop; every mode
+// opens with keys 4 and 5 present.
+TEST_F(DBWALIndexTest, GC23MisplacedSupersessionFailsSequentialReplay) {
+  Options options =
+      WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+  DestroyAndReopen(options);
+  WriteKeyRange(0, 3);
+  Close();
+  Reopen(options);
+  WriteKeyRange(3, 3);
+  const uint64_t cut_wal = LatestWALNumber();
+  Close();
+
+  StopReplayAfterRecordsWalFilter filter(/*stop_after=*/4);
+  options.wal_filter = &filter;
+  Reopen(options);
+  ASSERT_EQ("value0", Get(Key(0)));
+  ASSERT_EQ("NOT_FOUND", Get(Key(5)));
+  options.wal_filter = nullptr;
+  // A three-key batch after the stop: it lands a data record in the declaring
+  // WAL (so the moved declarations below genuinely follow data) whose count
+  // covers the two dropped sequences (so no backwards-sequence trip hides the
+  // guard; a single-key reissue would fail before the guard instead).
+  {
+    WriteBatch batch;
+    ASSERT_OK(batch.Put(Key(20), "value20"));
+    ASSERT_OK(batch.Put(Key(21), "value21"));
+    ASSERT_OK(batch.Put(Key(22), "value22"));
+    ASSERT_OK(db_->Write(WriteOptions(), &batch));
+  }
+  const uint64_t declaring_wal = LatestWALNumber();
+  Close();
+  ASSERT_NE(cut_wal, declaring_wal);
+  const std::vector<std::pair<uint64_t, uint64_t>> before =
+      ReadWALSupersessions(WALPath(declaring_wal));
+  ASSERT_TRUE(
+      std::any_of(before.begin(), before.end(),
+                  [&](const std::pair<uint64_t, uint64_t>& supersession) {
+                    return supersession.first == cut_wal;
+                  }));
+
+  MoveWALSupersessionsLast(WALPath(declaring_wal));
+  // The declarations moved, not vanished: a whole-file scan still finds them.
+  EXPECT_EQ(before, ReadWALSupersessions(WALPath(declaring_wal)));
+
+  Options none = WALIndexOptions(PartitionWALUsage::kNone);
+  for (const WALRecoveryMode mode :
+       {WALRecoveryMode::kTolerateCorruptedTailRecords,
+        WALRecoveryMode::kAbsoluteConsistency,
+        WALRecoveryMode::kPointInTimeRecovery,
+        WALRecoveryMode::kSkipAnyCorruptedRecords}) {
+    SCOPED_TRACE(static_cast<int>(mode));
+    none.wal_recovery_mode = mode;
+    const Status s = TryReopen(none);
+    if (s.ok()) {
+      // Without the guard the dropped keys silently come back.
+      EXPECT_EQ("value4", Get(Key(4)));
+      EXPECT_EQ("value5", Get(Key(5)));
+      FAIL() << "expected Corruption naming the misplaced supersession";
+    }
+    ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+    EXPECT_NE(std::string::npos,
+              s.ToString().find("supersession after a data record"))
+        << s.ToString();
+  }
+  Destroy(none);
+}
+
+// GC23 Q1: a supersession record after data. Supersessions are written only
+// into a new WAL's head, and routing finds them by reading heads, so one
+// after data is never honored. Here the newer WAL declares the older WAL's
+// last three records obsolete after its own data. Every open, sequential
+// (kNone) or merged (indexed), in every mode fails closed naming the WAL
+// instead of replaying the superseded records. Neuter: drop the guards in
+// ProcessLogFile and ProcessLogFilesMerged; point-in-time and skip open with
+// keys 3-5 present.
+TEST_F(DBWALIndexTest, SupersessionAfterDataFailsClosed) {
+  Options options =
+      WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+  DestroyAndReopen(options);
+  WriteKeyRange(0, 6);
+  const uint64_t old_wal = LatestWALNumber();
+  Close();
+  Reopen(options);
+  WriteKeyRange(6, 2);
+  const uint64_t new_wal = LatestWALNumber();
+  ASSERT_NE(old_wal, new_wal);
+  Close();
+
+  const std::vector<uint64_t> old_indices =
+      ReadWALIndices(WALPath(old_wal), old_wal);
+  ASSERT_GE(old_indices.size(), 6U);
+  const uint64_t first_superseded = old_indices[old_indices.size() - 3];
+  std::string contents = ReadWALContents(WALPath(new_wal));
+  const std::vector<PhysicalRecord> records = ScanPhysicalRecords(contents);
+  ASSERT_FALSE(records.empty());
+  ASSERT_FALSE(log::IsRecyclableRecordType(records.back().type));
+  ASSERT_TRUE(log::IsWALIndexRecordType(records.back().type));
+  // A whole supersession record appended after the last data record.
+  std::string record(log::kHeaderSize, '\0');
+  PutFixed64(&record, old_wal);
+  PutFixed64(&record, first_superseded);
+  record[4] = static_cast<char>(log::kWALIndexSupersessionPayloadSize);
+  record[5] = 0;
+  record[6] = static_cast<char>(log::kWALIndexSupersessionType);
+  EncodeFixed32(&record[0],
+                crc32c::Mask(crc32c::Value(
+                    &record[6], 1 + log::kWALIndexSupersessionPayloadSize)));
+  ASSERT_LE(contents.size() % log::kBlockSize + record.size(),
+            static_cast<size_t>(log::kBlockSize));
+  contents += record;
+  WriteWALContents(WALPath(new_wal), contents);
+  const std::vector<std::pair<uint64_t, uint64_t>> appended = {
+      {old_wal, first_superseded}};
+  ASSERT_EQ(appended, ReadWALSupersessions(WALPath(new_wal)));
+
+  const std::string expected = "WAL " + std::to_string(new_wal) +
+                               " declares a WAL index supersession after a "
+                               "data record";
+  for (const PartitionWALUsage usage :
+       {PartitionWALUsage::kNone,
+        PartitionWALUsage::kPartitionByColumnFamily}) {
+    for (const WALRecoveryMode mode :
+         {WALRecoveryMode::kTolerateCorruptedTailRecords,
+          WALRecoveryMode::kAbsoluteConsistency,
+          WALRecoveryMode::kPointInTimeRecovery,
+          WALRecoveryMode::kSkipAnyCorruptedRecords}) {
+      SCOPED_TRACE("usage=" + std::to_string(static_cast<int>(usage)) +
+                   " mode=" + std::to_string(static_cast<int>(mode)));
+      Options reopen = WALIndexOptions(usage);
+      reopen.wal_recovery_mode = mode;
+      const Status s = TryReopen(reopen);
+      if (s.ok()) {
+        for (int i = 3; i < 6; ++i) {
+          EXPECT_EQ("NOT_FOUND", Get(Key(i))) << "superseded key " << i;
+        }
+        Close();
+      }
+      ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+      EXPECT_NE(std::string::npos, s.ToString().find(expected)) << s.ToString();
+    }
+  }
   Destroy(options);
 }
 
@@ -6279,6 +6461,148 @@ TEST_F(DBWALIndexTest, MixedVoidAndHoleMapsPerMode) {
     const Status status = TryReopen(options);
     ASSERT_TRUE(status.IsCorruption()) << status.ToString();
     EXPECT_NE(std::string::npos, status.ToString().find("unexplained hole"));
+    Destroy(options);
+  }
+}
+
+// Enabling the option leaves every pre-existing WAL unindexed. The first
+// reopen meets an all-unindexed set; after more writes the second meets a
+// true mixed set. Both route sequential and replay every key.
+TEST_F(DBWALIndexTest, MixedRecoverySetOpensAfterEnablingWALIndex) {
+  Options none = WALIndexOptions(PartitionWALUsage::kNone);
+  DestroyAndReopen(none);
+  WriteKeyRange(0, 4);
+  const uint64_t legacy_wal = LatestWALNumber();
+  Close();
+  for (const uint8_t type : ReadWALRecordTypes(WALPath(legacy_wal))) {
+    EXPECT_FALSE(log::IsWALIndexRecordType(type));
+    EXPECT_NE(log::kWALIndexMarkerType, type);
+  }
+
+  Options options =
+      WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+  Reopen(options);
+  for (int i = 0; i <= 3; ++i) {
+    EXPECT_EQ("value" + std::to_string(i), Get(Key(i))) << "key " << i;
+  }
+  WriteKeyRange(4, 4);
+  const uint64_t indexed_wal = LatestWALNumber();
+  ASSERT_NE(legacy_wal, indexed_wal);
+  Close();
+
+  Reopen(options);
+  for (int i = 0; i <= 7; ++i) {
+    EXPECT_EQ("value" + std::to_string(i), Get(Key(i))) << "key " << i;
+  }
+  for (const uint64_t wal_index :
+       ReadWALIndices(WALPath(indexed_wal), indexed_wal)) {
+    EXPECT_NE(0U, wal_index);
+  }
+  Destroy(options);
+}
+
+// The documented rollback: opening with kNone while indexed WALs survive.
+// The pre-pass is skipped and the sequential path replays the survivors;
+// new writes are byte-identical legacy records.
+TEST_F(DBWALIndexTest, IndexedWALsOpenAfterDisablingWALIndex) {
+  Options indexed =
+      WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+  DestroyAndReopen(indexed);
+  WriteKeyRange(0, 4);
+  Close();
+
+  Options none = WALIndexOptions(PartitionWALUsage::kNone);
+  Reopen(none);
+  for (int i = 0; i <= 3; ++i) {
+    EXPECT_EQ("value" + std::to_string(i), Get(Key(i))) << "key " << i;
+  }
+  WriteKeyRange(4, 4);
+  const uint64_t new_wal = LatestWALNumber();
+  Close();
+  const std::vector<uint8_t> types = ReadWALRecordTypes(WALPath(new_wal));
+  ASSERT_FALSE(types.empty());
+  for (const uint8_t type : types) {
+    EXPECT_FALSE(log::IsWALIndexRecordType(type));
+    EXPECT_NE(log::kWALIndexMarkerType, type);
+    EXPECT_NE(log::kRecyclableWALIndexMarkerType, type);
+  }
+  Destroy(none);
+}
+
+// A marker prepended to a legacy WAL promises indices the file never
+// carries. The batches stay valid, so nothing masks the contradiction and
+// recovery fails on the marker in every mode.
+TEST_F(DBWALIndexTest, MarkerWithoutIndicesFailsRecovery) {
+  const std::vector<WALRecoveryMode> recovery_modes = {
+      WALRecoveryMode::kTolerateCorruptedTailRecords,
+      WALRecoveryMode::kAbsoluteConsistency,
+      WALRecoveryMode::kPointInTimeRecovery,
+      WALRecoveryMode::kSkipAnyCorruptedRecords,
+  };
+  for (const WALRecoveryMode recovery_mode : recovery_modes) {
+    SCOPED_TRACE(static_cast<int>(recovery_mode));
+    Options none = WALIndexOptions(PartitionWALUsage::kNone);
+    DestroyAndReopen(none);
+    WriteKeyRange(0, 4);
+    const uint64_t wal_number = LatestWALNumber();
+    Close();
+
+    std::string marker(log::kHeaderSize, '\0');
+    marker[6] = static_cast<char>(log::kWALIndexMarkerType);
+    const uint32_t crc = crc32c::Mask(crc32c::Value(&marker[6], 1));
+    EncodeFixed32(&marker[0], crc);
+    WriteWALContents(WALPath(wal_number),
+                     marker + ReadWALContents(WALPath(wal_number)));
+
+    Options options =
+        WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+    options.wal_recovery_mode = recovery_mode;
+    const Status status = TryReopen(options);
+    ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+    EXPECT_NE(std::string::npos, status.ToString().find("carry no wal_index"));
+    Destroy(options);
+  }
+}
+
+// Excising the marker from an indexed WAL leaves indexed data with no marker
+// over an intact head. The pre-pass fails the open before replay in every
+// mode, naming the file.
+TEST_F(DBWALIndexTest, IndexedDataWithoutMarkerFailsRecovery) {
+  const std::vector<WALRecoveryMode> recovery_modes = {
+      WALRecoveryMode::kTolerateCorruptedTailRecords,
+      WALRecoveryMode::kAbsoluteConsistency,
+      WALRecoveryMode::kPointInTimeRecovery,
+      WALRecoveryMode::kSkipAnyCorruptedRecords,
+  };
+  for (const WALRecoveryMode recovery_mode : recovery_modes) {
+    SCOPED_TRACE(static_cast<int>(recovery_mode));
+    Options options =
+        WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+    options.wal_recovery_mode = recovery_mode;
+    DestroyAndReopen(options);
+    WriteKeyRange(0, 4);
+    const uint64_t wal_number = LatestWALNumber();
+    Close();
+
+    std::string contents = ReadWALContents(WALPath(wal_number));
+    bool excised = false;
+    for (const PhysicalRecord& record : ScanPhysicalRecords(contents)) {
+      if (record.type == log::kWALIndexMarkerType ||
+          record.type == log::kRecyclableWALIndexMarkerType) {
+        contents.erase(record.header_offset,
+                       record.header_size + record.payload_size);
+        excised = true;
+        break;
+      }
+    }
+    ASSERT_TRUE(excised);
+    WriteWALContents(WALPath(wal_number), contents);
+
+    const Status status = TryReopen(options);
+    ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+    EXPECT_NE(std::string::npos, status.ToString().find("before replay"));
+    EXPECT_NE(std::string::npos,
+              status.ToString().find(std::to_string(wal_number)));
     Destroy(options);
   }
 }
