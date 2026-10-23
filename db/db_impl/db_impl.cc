@@ -627,7 +627,7 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
     {
       InstrumentedMutexLock wal_lock(&wal_write_mutex_);
       size_t retired_wal_count = 0;
-      if (logs_.empty() || logs_.back().number <= context.failed_wal_number) {
+      if (logs_.empty() || CurrentWal().number <= context.failed_wal_number) {
         s = Status::Corruption(
             "WAL write error recovery did not install a replacement WAL "
             "after WAL " +
@@ -970,7 +970,7 @@ Status DBImpl::MaybeWriteWalMarkersToManifestOnClose() {
   TEST_SYNC_POINT("DBImpl::CloseHelper:WriteWalMarkersOnCloseEntered");
   const ReadOptions read_options(Env::IOActivity::kUnknown);
   const WriteOptions write_options(Env::IOActivity::kUnknown);
-  uint64_t max_wal_number = logs_.back().number;
+  uint64_t max_wal_number = CurrentWal().number;
   TEST_SYNC_POINT_CALLBACK("DBImpl::CloseHelper:CapturedMaxWal",
                            &max_wal_number);
   const uint64_t new_log_num = max_wal_number + 1;
@@ -2298,7 +2298,7 @@ Status DBImpl::FlushWAL(const WriteOptions& write_options, bool sync) {
     {
       // We need to lock wal_write_mutex_ since logs_ might change concurrently
       InstrumentedMutexLock wl(&wal_write_mutex_);
-      log::Writer* cur_log_writer = logs_.back().writer;
+      log::Writer* cur_log_writer = CurrentWal().writer;
       io_s = cur_log_writer->WriteBuffer(write_options);
     }
     if (!io_s.ok()) {
@@ -2325,7 +2325,7 @@ Status DBImpl::FlushWAL(const WriteOptions& write_options, bool sync) {
 
 bool DBImpl::WALBufferIsEmpty() {
   InstrumentedMutexLock l(&wal_write_mutex_);
-  log::Writer* cur_log_writer = logs_.back().writer;
+  log::Writer* cur_log_writer = CurrentWal().writer;
   auto res = cur_log_writer->BufferIsEmpty();
   return res;
 }
@@ -2394,7 +2394,7 @@ IOStatus DBImpl::SyncWalImpl(bool include_current_wal,
     }
     // First check that logs are safe to sync in background.
     if (include_current_wal &&
-        !logs_.back().writer->file()->writable_file()->IsSyncThreadSafe()) {
+        !CurrentWal().writer->file()->writable_file()->IsSyncThreadSafe()) {
       return IOStatus::NotSupported(
           "SyncWAL() is not supported for this implementation of WAL file",
           immutable_db_options_.allow_mmap_writes
@@ -2657,7 +2657,7 @@ void DBImpl::MarkLogsSynced(uint64_t up_to, bool synced_dir,
       continue;
     }
 
-    if (wal.number < logs_.back().number) {
+    if (wal.number < CurrentWal().number) {
       // Inactive WAL
       if (immutable_db_options_.track_and_verify_wals_in_manifest &&
           wal.GetPreSyncSize() > 0) {
@@ -2680,7 +2680,7 @@ void DBImpl::MarkLogsSynced(uint64_t up_to, bool synced_dir,
         ++it;
       }
     } else {
-      assert(wal.number == logs_.back().number);
+      assert(wal.number == CurrentWal().number);
       // Active WAL
       wal.FinishSync();
       ++it;
