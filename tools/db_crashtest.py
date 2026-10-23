@@ -521,6 +521,9 @@ default_params = {
     "partition_wal_usage": lambda: random.choice(
         ["none", "partition_by_column_family"]
     ),
+    # Fixed for the whole invocation, so every run reopens the same layout.
+    "wal_partitions": random.choice([1] * 6 + [2, 8, 16]),
+    "sync_write_one_in": lambda: random.choice([0, 0, 10, 100]),
     "verify_sst_unique_id_in_manifest": 1,  # always do unique_id verification
     "fast_sst_open": lambda: random.choice([0, 1]),
     "secondary_cache_uri": lambda: random.choice(
@@ -1294,6 +1297,18 @@ multiops_txn_params = {
 def finalize_and_sanitize(src_params):
     dest_params = {k: v() if callable(v) else v for (k, v) in src_params.items()}
     apply_cache_and_write_buffer_size_multiplier(dest_params)
+    if dest_params.get("wal_partitions", 1) > 1:
+        # Open admits wal_partitions > 1 only with an indexed WAL and rejects
+        # these; a profile that forces one back on falls back to one partition
+        # at the end. Writes mix sync levels rather than syncing all or none.
+        dest_params["partition_wal_usage"] = "partition_by_column_family"
+        dest_params["disable_wal"] = 0
+        dest_params["enable_pipelined_write"] = 0
+        dest_params["allow_concurrent_memtable_write"] = 1
+        dest_params["memtablerep"] = "skip_list"
+        dest_params["sync"] = 0
+        if dest_params.get("sync_write_one_in", 0) == 0:
+            dest_params["sync_write_one_in"] = 10
     if is_release_mode():
         dest_params["read_fault_one_in"] = 0
     if dest_params.get("compression_max_dict_bytes") == 0:
@@ -2043,6 +2058,37 @@ def finalize_and_sanitize(src_params):
         dest_params["readahead_size"] = 4096
         dest_params["cache_size"] = 65536
         dest_params["use_write_buffer_manager"] = 0
+
+    if dest_params.get("wal_partitions", 1) > 1:
+        if (
+            dest_params.get("disable_wal", 0) == 1
+            or dest_params.get("partition_wal_usage") == "none"
+            or dest_params.get("two_write_queues", 0) == 1
+            or dest_params.get("enable_pipelined_write", 0) == 1
+            or dest_params.get("allow_concurrent_memtable_write", 0) == 0
+            or dest_params.get("memtablerep") != "skip_list"
+            or dest_params.get("inplace_update_support", 0) == 1
+            or dest_params.get("unordered_write", 0) == 1
+            or dest_params.get("enable_blob_direct_write", 0) == 1
+            or dest_params.get("recycle_log_file_num", 0) > 0
+            or dest_params.get("track_and_verify_wals", 0) == 1
+            # db_stress turns track_and_verify_wals_in_manifest off for this
+            # mode, and N > 1 requires it.
+            or dest_params.get("file_scope_wal_write_faults", 0) == 1
+            or (
+                dest_params.get("use_optimistic_txn", 0) == 1
+                and dest_params.get("occ_validation_policy", 1) == 0
+            )
+        ):
+            dest_params["wal_partitions"] = 1
+        else:
+            # Both ingest a WriteBatchWithIndex, which fails at N > 1.
+            dest_params["ingest_wbwi_one_in"] = 0
+            dest_params["commit_bypass_memtable_one_in"] = 0
+            # A secondary instance refuses partitioned WALs, and continuous
+            # verification reads through one.
+            dest_params["test_secondary"] = 0
+            dest_params["continuous_verification_interval"] = 0
 
     # `db_stress` rejects either verification knob when `skip_verifydb` is set.
     # Must stay last: sanitization above can turn a verification knob back on

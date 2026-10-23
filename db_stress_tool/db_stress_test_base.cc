@@ -1680,7 +1680,7 @@ bool StressTest::BuildOptionsTable() {
             std::to_string(options_.level0_file_num_compaction_trigger + 4),
         });
   }
-  if (FLAGS_unordered_write) {
+  if (FLAGS_unordered_write || FLAGS_wal_partitions > 1) {
     options_tbl.emplace("max_successive_merges", std::vector<std::string>{"0"});
   } else {
     options_tbl.emplace("max_successive_merges",
@@ -2566,6 +2566,9 @@ void StressTest::OperateDb(ThreadState* thread) {
     for (uint64_t i = 0; i < ops_per_open; i++) {
       if (thread->shared->HasVerificationFailedYet()) {
         break;
+      }
+      if (!FLAGS_sync && !FLAGS_disable_wal && FLAGS_sync_write_one_in > 0) {
+        write_opts.sync = thread->rand.OneIn(FLAGS_sync_write_one_in);
       }
       // Change Options
       if (thread->rand.OneInOpt(FLAGS_set_options_one_in)) {
