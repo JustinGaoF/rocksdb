@@ -1523,6 +1523,18 @@ Status ColumnFamilyData::ValidateOptions(
     const DBOptions& db_options, const ColumnFamilyOptions& cf_options) {
   Status s;
   s = CheckCompressionSupported(cf_options);
+  // Ahead of the concurrent-write checks, which reject these too but without
+  // naming wal_partitions.
+  if (s.ok() && db_options.wal_partitions > 1 &&
+      cf_options.inplace_update_support) {
+    s = Status::NotSupported(
+        "wal_partitions > 1 is not supported with inplace_update_support");
+  }
+  if (s.ok() && db_options.wal_partitions > 1 &&
+      cf_options.enable_blob_direct_write) {
+    s = Status::NotSupported(
+        "wal_partitions > 1 is not supported with enable_blob_direct_write");
+  }
   if (s.ok() && db_options.allow_concurrent_memtable_write) {
     s = CheckConcurrentWritesSupported(cf_options);
   }

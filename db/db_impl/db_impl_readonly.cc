@@ -293,6 +293,14 @@ Status DBImplReadOnly::OpenForReadOnlyWithoutCheck(
   *dbptr = nullptr;
   handles->clear();
 
+  if (db_options.wal_partitions != 1) {
+    // The same wal_partitions checks a read-write open applies.
+    Status s = ValidateOptions(db_options);
+    if (!s.ok()) {
+      return s;
+    }
+  }
+
   SuperVersionContext sv_context(/* create_superversion */ true);
   DBImplReadOnly* impl = new DBImplReadOnly(db_options, dbname);
   impl->mutex_.Lock();
