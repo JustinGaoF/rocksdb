@@ -3901,11 +3901,16 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
         uint64_t wal_used;
         uint64_t log_size;
         WalContext wal_context;
-        impl->SelectWalForWrite(&wal_context);
+        const size_t wal_partition = impl->WalPartitionForWrite(
+            empty_batch, /*deferred_put_entities=*/nullptr,
+            impl->NumWalPartitions());
+        {
+          impl->SelectWalForWrite(wal_partition, &wal_context);
+        }
         impl->mutex_.AssertHeld();
         uint64_t wal_index = 0;
-        if (log::WALIndexEnabled(
-                impl->immutable_db_options_.partition_wal_usage)) {
+        if (s.ok() && log::WALIndexEnabled(
+                          impl->immutable_db_options_.partition_wal_usage)) {
           SequenceNumber last_sequence_before = 0;
           s = impl->AllocateSequenceAndWALIndex(
               /*sequence_count=*/0, /*write_wal=*/true, &last_sequence_before,
