@@ -355,6 +355,55 @@ IOStatus Writer::AddWALIndexSupersessionRecord(
                                    payload);
 }
 
+IOStatus Writer::AddWALIndexProgressRecord(const WriteOptions& write_options,
+                                           uint64_t bound) {
+  if (!WALIndexEnabled()) {
+    return IOStatus::OK();
+  }
+  assert(bound != 0);
+  if (bound < last_progress_bound_recorded_) {
+    return IOStatus::Corruption(
+        "WAL index progress bound moves backward: " + std::to_string(bound) +
+        " follows " + std::to_string(last_progress_bound_recorded_));
+  }
+
+  std::string payload;
+  payload.reserve(kWALIndexProgressPayloadSize);
+  PutFixed64(&payload, bound);
+  IOStatus s = EmitWALIndexControlRecord(write_options,
+                                         recycle_log_files_
+                                             ? kRecyclableWALIndexProgressType
+                                             : kWALIndexProgressType,
+                                         payload);
+  if (s.ok()) {
+    last_progress_bound_recorded_ = bound;
+  }
+  return s;
+}
+
+IOStatus Writer::AddWALIndexPredecessorSpanRecord(
+    const WriteOptions& write_options, uint64_t predecessor_wal_number,
+    uint64_t first_wal_index, uint64_t last_wal_index) {
+  if (!WALIndexEnabled()) {
+    return IOStatus::OK();
+  }
+  assert(predecessor_wal_number != 0);
+  assert(predecessor_wal_number < log_number_);
+  assert((first_wal_index == 0) == (last_wal_index == 0));
+  assert(first_wal_index <= last_wal_index);
+
+  std::string payload;
+  payload.reserve(kWALIndexPredecessorSpanPayloadSize);
+  PutFixed64(&payload, predecessor_wal_number);
+  PutFixed64(&payload, first_wal_index);
+  PutFixed64(&payload, last_wal_index);
+  return EmitWALIndexControlRecord(write_options,
+                                   recycle_log_files_
+                                       ? kRecyclableWALIndexPredecessorSpanType
+                                       : kWALIndexPredecessorSpanType,
+                                   payload);
+}
+
 IOStatus Writer::EmitWALIndexControlRecord(const WriteOptions& write_options,
                                            RecordType type,
                                            const std::string& payload) {
