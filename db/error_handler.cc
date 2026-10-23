@@ -297,7 +297,8 @@ void ErrorHandler::CancelErrorRecoveryForShutDown() {
 void ErrorHandler::HandleKnownErrors(const Status& bg_err,
                                      BackgroundErrorReason reason,
                                      const DBRecoverContext& context,
-                                     bool allow_auto_recovery) {
+                                     bool allow_auto_recovery,
+                                     bool is_wal_append_failure) {
   db_mutex_->AssertHeld();
   if (bg_err.ok()) {
     return;
@@ -356,6 +357,14 @@ void ErrorHandler::HandleKnownErrors(const Status& bg_err,
     Status s = new_bg_err;
     EventHelpers::NotifyOnBackgroundError(db_options_.listeners, reason, &s,
                                           db_mutex_, &auto_recovery);
+    if (s.ok() && is_wal_append_failure) {
+      // Above one partition a failed WAL append always stops the DB (D-1):
+      // its range stays pinned below every later gate, so honouring the
+      // listener's suppression would park those gates forever with no error
+      // to fail them. The listener was still notified; only its override is
+      // ignored. Any other error keeps its suppression.
+      s = new_bg_err;
+    }
     if (!s.ok() && (s.severity() > bg_error_.severity())) {
       // Same store as the severity paths in SetBGError, including the
       // durability wake.
@@ -427,16 +436,18 @@ void ErrorHandler::HandleKnownErrors(const Status& bg_err,
 //    BackgroundErrorReason reason) will be called to handle other error cases
 //    such as delegating to SstFileManager to handle no space error.
 void ErrorHandler::SetBGError(const Status& bg_status,
-                              BackgroundErrorReason reason, bool wal_related) {
+                              BackgroundErrorReason reason, bool wal_related,
+                              bool is_wal_append_failure) {
   SetBGErrorImpl(bg_status, reason, wal_related, DBRecoverContext(),
-                 /*allow_auto_recovery=*/true);
+                 /*allow_auto_recovery=*/true, is_wal_append_failure);
 }
 
 void ErrorHandler::SetBGError(const Status& bg_status,
                               BackgroundErrorReason reason, bool wal_related,
-                              DBRecoverContext context) {
+                              DBRecoverContext context,
+                              bool is_wal_append_failure) {
   SetBGErrorImpl(bg_status, reason, wal_related, std::move(context),
-                 /*allow_auto_recovery=*/true);
+                 /*allow_auto_recovery=*/true, is_wal_append_failure);
 }
 
 void ErrorHandler::SetBGErrorNoAutoRecovery(const Status& bg_status,
@@ -448,7 +459,8 @@ void ErrorHandler::SetBGErrorNoAutoRecovery(const Status& bg_status,
 void ErrorHandler::SetBGErrorImpl(const Status& bg_status,
                                   BackgroundErrorReason reason,
                                   bool wal_related, DBRecoverContext context,
-                                  bool allow_auto_recovery) {
+                                  bool allow_auto_recovery,
+                                  bool is_wal_append_failure) {
   db_mutex_->AssertHeld();
   Status tmp_status = bg_status;
   IOStatus bg_io_err = status_to_io_status(std::move(tmp_status));
@@ -593,7 +605,8 @@ void ErrorHandler::SetBGErrorImpl(const Status& bg_status,
     StartRecoverFromRetryableBGIOError(bg_io_err);
     return;
   }
-  HandleKnownErrors(new_bg_io_err, reason, context, allow_auto_recovery);
+  HandleKnownErrors(new_bg_io_err, reason, context, allow_auto_recovery,
+                    is_wal_append_failure);
 }
 
 void ErrorHandler::AddFilesToQuarantine(

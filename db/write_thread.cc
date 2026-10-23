@@ -913,6 +913,7 @@ void WriteThread::ExitAsBatchGroupLeader(WriteGroup& write_group,
       // group's acknowledgment, never the next append. Skipped when the group
       // already failed; followers are failing either way, and a failed append
       // stays pinned, so waiting on it could never succeed.
+      TEST_SYNC_POINT("WriteThread::ExitAsBatchGroupLeader:BeforeGate");
       write_group.gate_status = write_group.completion_gate();
       if (!write_group.gate_status.ok()) {
         status = write_group.gate_status;

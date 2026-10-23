@@ -79,9 +79,10 @@ class ErrorHandler {
                                     Status::Code code, Status::SubCode subcode);
 
   void SetBGError(const Status& bg_err, BackgroundErrorReason reason,
-                  bool wal_related = false);
+                  bool wal_related = false, bool is_wal_append_failure = false);
   void SetBGError(const Status& bg_err, BackgroundErrorReason reason,
-                  bool wal_related, DBRecoverContext context);
+                  bool wal_related, DBRecoverContext context,
+                  bool is_wal_append_failure = false);
 
   void SetBGErrorNoAutoRecovery(const Status& bg_err,
                                 BackgroundErrorReason reason);
@@ -179,10 +180,12 @@ class ErrorHandler {
 
   void SetBGErrorImpl(const Status& bg_err, BackgroundErrorReason reason,
                       bool wal_related, DBRecoverContext context,
-                      bool allow_auto_recovery);
+                      bool allow_auto_recovery,
+                      bool is_wal_append_failure = false);
   void HandleKnownErrors(const Status& bg_err, BackgroundErrorReason reason,
                          const DBRecoverContext& context,
-                         bool allow_auto_recovery);
+                         bool allow_auto_recovery,
+                         bool is_wal_append_failure = false);
   // REQUIRES: db_mutex_ held. When replacing the general recovery context,
   // retain WAL facts accumulated from concurrent errors independently.
   void UpdateRecoveryContext(const DBRecoverContext& context,

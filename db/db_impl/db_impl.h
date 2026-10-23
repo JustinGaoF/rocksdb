@@ -3315,11 +3315,14 @@ class DBImpl : public DB
 
   // Blocks until LastSequence() covers `target` and, for a group with a WAL
   // record (`wal_record`), the durability frontier covers it too, i.e. every
-  // WAL record at or below it completed. Returns a background error instead
-  // if one arrives while still uncovered: the group must not report OK on a
-  // write the DB has since decided it cannot honour. Called without holding
-  // any mutex; takes sequence_wal_index_mutex_ only to park, never together
-  // with mutex_.
+  // WAL record at or below it completed. A stored background error fails the
+  // wait only when the waiter's target can never be reached: a failed WAL
+  // range sits at or below it, or its sequences were allocated above a failed
+  // range that recovery already released. Every other background error leaves
+  // it parked until covered, as at N=1. Shutdown fails it with
+  // ShutdownInProgress unless already covered. Called without holding any
+  // mutex; takes sequence_wal_index_mutex_ only to park, never together with
+  // mutex_.
   Status WaitForWalDurability(SequenceNumber target, bool wal_record);
 
   // Wakes durability waiters after the frontier advanced. Call with
@@ -3335,18 +3338,37 @@ class DBImpl : public DB
   // publication that stores an error or repeats the recorded severity.
   // Called only from ErrorHandler (CheckAndSetRecoveryAndBGError, and
   // HandleKnownErrors for a repeat) with mutex_ held, never while bg_error_
-  // is OK. Sets the predicate flag first so a waiter checking after the
-  // store observes the error without needing the signal, then always
-  // signals under sequence_wal_index_mutex_ so a waiter already parked is
-  // woken. Either way no waiter can miss the error between its predicate
-  // check and park. Safe with no waiters; takes no WAL or sync-mark mutex.
+  // is OK. Sets the predicate flag and bumps the wake epoch first so a waiter
+  // checking after the store observes the error without needing the signal,
+  // then always signals under sequence_wal_index_mutex_ so a waiter already
+  // parked is woken. Either way no waiter can miss the error between its
+  // predicate check and park. Safe with no waiters; takes no WAL or sync-mark
+  // mutex.
   void SignalWalDurabilityWaitersOnBGError();
+
+  // Wakes durability waiters for shutdown: sets the shutdown leg and the wake
+  // epoch, then signals under sequence_wal_index_mutex_. Takes no other
+  // mutex, so it can run from any teardown path.
+  void SignalWalDurabilityWaitersOnShutdown();
 
   // Clears the durability park predicate's background-error leg, and
   // releases every range whose append failed (failed_wal_ranges_) from both
-  // trackers: recovery succeeded, and those ranges hold no data. Called only
+  // trackers: recovery succeeded, and those ranges hold no data. Before
+  // releasing, taints every sequence allocated above each failed range so a
+  // group that appended above the hole but reaches its gate only after this
+  // release still fails instead of seeing its target covered. Called only
   // from ErrorHandler::ClearBGError with mutex_ held.
   void ClearWalDurabilityBGError();
+
+  // Records a failed WAL range (append or memtable-insert failure) in
+  // failed_wal_ranges_, skipping exact duplicates: the serial and parallel
+  // insert-failure sites can fire for the same group. REQUIRES: mutex_ held.
+  void RecordFailedWalRange(size_t partition, SequenceNumber low,
+                            SequenceNumber high);
+  // Whether `target` was allocated above a failed WAL range recovery
+  // already released, setting *error to the failure then. REQUIRES:
+  // mutex_ held.
+  bool TaintedTargetError(SequenceNumber target, Status* error);
 
   // Runs a write group's completion gate: wait until the durability frontier
   // covers `target`, then, for a sync write whose leadership-time fsync may
@@ -3384,7 +3406,15 @@ class DBImpl : public DB
   void ExtendWALRecoveryCutoff(uint64_t failed_wal_number);
 
   // Used by WriteImpl to update bg_error_ in case of memtable insert error.
-  void HandleMemTableInsertFailure(const Status& nonok_memtable_insert_status);
+  // At N>1 the failed group's registered range never publishes, so it pins
+  // the applied frontier exactly like a failed append pins the durability
+  // one: callers pass it via `wal_partition`/`low`/`high` (kNoPinnedWalRange
+  // when nothing was registered) so it is recorded in failed_wal_ranges_
+  // under the same mutex_ hold as the error and released with it.
+  void HandleMemTableInsertFailure(const Status& nonok_memtable_insert_status,
+                                   size_t wal_partition = kNoPinnedWalRange,
+                                   SequenceNumber low = 0,
+                                   SequenceNumber high = 0);
 
   Status CompactFilesImpl(const CompactionOptions& compact_options,
                           ColumnFamilyData* cfd, Version* version,
@@ -4124,6 +4154,17 @@ class DBImpl : public DB
   // ErrorHandler::ClearBGError, the single transition of the background
   // error back to OK.
   std::atomic<bool> wal_durability_bg_error_{false};
+  // Monotonic wake generation for durability waiters, bumped under mutex_
+  // on every background-error publication and on the shutdown signal. The
+  // flag above stays set across publications, so it cannot tell a waiter
+  // that rechecked and reparks whether a newer publication arrived since;
+  // the epoch can, which is what keeps an unaffected waiter parked instead
+  // of spinning.
+  std::atomic<uint64_t> wal_durability_wake_epoch_{0};
+  // Shutdown leg of the durability park predicate. Set (release) before the
+  // shutdown signal in teardown; a waiter that observes it returns
+  // ShutdownInProgress unless already covered.
+  std::atomic<bool> wal_durability_shutdown_{false};
   uint64_t next_wal_index_ = log::kWALIndexStartNumber;
 
   // If zero, manual compactions are allowed to proceed. If non-zero, manual
@@ -4736,6 +4777,21 @@ class DBImpl : public DB
     SequenceNumber high;
   };
   std::vector<FailedWalRange> failed_wal_ranges_;
+
+  // Sequences allocated above a failed WAL range that recovery already
+  // released: their WAL records sit above a hole, so a group gating on one
+  // must fail even though the frontier covers it. Each entry covers
+  // (failed_high, max_allocated_at_release]. Kept for the DB lifetime: fresh
+  // sequences always exceed every recorded bound, so later writes never
+  // match. Guarded by mutex_.
+  struct TaintedSeqInterval {
+    size_t failed_partition;
+    SequenceNumber failed_low;
+    SequenceNumber failed_high;
+    SequenceNumber taint_low;
+    SequenceNumber taint_high;
+  };
+  std::vector<TaintedSeqInterval> tainted_seq_intervals_;
 
   // See CloseMemTableSwitchGate().
   std::atomic<size_t> leaders_past_switch_gate_{0};

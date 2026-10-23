@@ -885,6 +885,69 @@ bool FlushJob::MemPurgeDecider(double threshold) {
           threshold);
 }
 
+// Hides memtable entries above a sequence cutoff from a flush: entries a
+// failed write left behind (gate-failed above a failed WAL range) never
+// reach the SST, and the dropped immutable memtable purges them. Only moves
+// forward in practice (BuildTable iterates forward); backward moves filter
+// symmetrically for safety. Counts hidden entries so the input-count check
+// below can account for them.
+class SeqnoCutoffIterator : public InternalIterator {
+ public:
+  SeqnoCutoffIterator(InternalIterator* child, SequenceNumber cutoff)
+      : child_(child), cutoff_(cutoff) {}
+
+  bool Valid() const override { return child_->Valid(); }
+  void SeekToFirst() override {
+    child_->SeekToFirst();
+    SkipForward();
+  }
+  void SeekToLast() override {
+    child_->SeekToLast();
+    SkipBackward();
+  }
+  void Seek(const Slice& target) override {
+    child_->Seek(target);
+    SkipForward();
+  }
+  void SeekForPrev(const Slice& target) override {
+    child_->SeekForPrev(target);
+    SkipBackward();
+  }
+  void Next() override {
+    assert(Valid());
+    child_->Next();
+    SkipForward();
+  }
+  void Prev() override {
+    assert(Valid());
+    child_->Prev();
+    SkipBackward();
+  }
+  Slice key() const override { return child_->key(); }
+  Slice value() const override { return child_->value(); }
+  Status status() const override { return child_->status(); }
+
+  uint64_t NumHidden() const { return num_hidden_; }
+
+ private:
+  void SkipForward() {
+    while (child_->Valid() && GetInternalKeySeqno(child_->key()) > cutoff_) {
+      ++num_hidden_;
+      child_->Next();
+    }
+  }
+  void SkipBackward() {
+    while (child_->Valid() && GetInternalKeySeqno(child_->key()) > cutoff_) {
+      ++num_hidden_;
+      child_->Prev();
+    }
+  }
+
+  InternalIterator* const child_;
+  const SequenceNumber cutoff_;
+  uint64_t num_hidden_ = 0;
+};
+
 Status FlushJob::WriteLevel0Table() {
   AutoThreadOperationStageUpdater stage_updater(
       ThreadStatus::STAGE_FLUSH_WRITE_L0);
@@ -931,6 +994,9 @@ Status FlushJob::WriteLevel0Table() {
     ro.total_order_seek = true;
     ro.io_activity = Env::IOActivity::kFlush;
     Arena arena;
+    // Error recovery above one WAL partition bounds the flush below its
+    // failed ranges; otherwise kMaxSequenceNumber and nothing is hidden.
+    const SequenceNumber flush_seqno_cutoff = cfd_->GetFlushSeqnoCutoff();
     uint64_t total_num_input_entries = 0;
     uint64_t total_num_deletes = 0;
     uint64_t total_data_size = 0;
@@ -961,8 +1027,8 @@ Status FlushJob::WriteLevel0Table() {
       auto* range_del_iter =
           logical_strip_timestamp
               ? m->NewTimestampStrippingRangeTombstoneIterator(
-                    ro, kMaxSequenceNumber, ts_sz)
-              : m->NewRangeTombstoneIterator(ro, kMaxSequenceNumber,
+                    ro, flush_seqno_cutoff, ts_sz)
+              : m->NewRangeTombstoneIterator(ro, flush_seqno_cutoff,
                                              true /* immutable_memtable */);
       if (range_del_iter != nullptr) {
         range_del_iters.emplace_back(range_del_iter);
@@ -1003,6 +1069,9 @@ Status FlushJob::WriteLevel0Table() {
       ScopedArenaPtr<InternalIterator> iter(
           NewMergingIterator(&cfd_->internal_comparator(), memtables.data(),
                              static_cast<int>(memtables.size()), &arena));
+      SeqnoCutoffIterator cutoff_iter(iter.get(), flush_seqno_cutoff);
+      InternalIterator* build_iter =
+          flush_seqno_cutoff == kMaxSequenceNumber ? iter.get() : &cutoff_iter;
       ROCKS_LOG_INFO(db_options_.info_log,
                      "[%s] [JOB %d] Level-0 flush table #%" PRIu64 ": started",
                      cfd_->GetName().c_str(), job_context_->job_id,
@@ -1058,7 +1127,7 @@ Status FlushJob::WriteLevel0Table() {
           dbname_ /*db_name*/);
       s = BuildTable(
           dbname_, versions_, db_options_, tboptions, file_options_,
-          cfd_->table_cache(), iter.get(), std::move(range_del_iters), &meta_,
+          cfd_->table_cache(), build_iter, std::move(range_del_iters), &meta_,
           &blob_file_additions, job_context_->snapshot_seqs, earliest_snapshot_,
           job_context_->earliest_write_conflict_snapshot,
           job_context_->GetJobSnapshotSequence(),
@@ -1073,7 +1142,10 @@ Status FlushJob::WriteLevel0Table() {
       // TODO: Cleanup io_status in BuildTable and table builders
       assert(!s.ok() || io_s.ok());
       io_s.PermitUncheckedError();
-      if (s.ok() && total_num_input_entries != flush_stats.num_input_records) {
+      const uint64_t num_hidden =
+          build_iter == &cutoff_iter ? cutoff_iter.NumHidden() : 0;
+      if (s.ok() && total_num_input_entries !=
+                        flush_stats.num_input_records + num_hidden) {
         std::string msg = "Expected " +
                           std::to_string(total_num_input_entries) +
                           " entries in memtables, but read " +

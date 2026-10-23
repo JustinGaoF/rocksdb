@@ -1300,6 +1300,13 @@ Status DBImpl::WriteImpl(
       if (w.status.ok()) {  // Don't publish a partial batch write
         PublishLastSequence(w.wal_partition, w.write_group->first_sequence,
                             last_sequence, !w.disable_wal);
+      } else if (NumWalPartitions() > 1 && w.write_group->last_sequence >=
+                                               w.write_group->first_sequence) {
+        // The last worker out of a parallel group: the range never
+        // publishes, so record it for the gates parked above it.
+        HandleMemTableInsertFailure(w.status, w.wal_partition,
+                                    w.write_group->first_sequence,
+                                    w.write_group->last_sequence);
       } else {
         HandleMemTableInsertFailure(w.status);
       }
@@ -1884,7 +1891,16 @@ Status DBImpl::WriteImpl(
           current_wal.SetAttemptTruncateSize(wal_context.prev_size);
         }
       }
-      HandleMemTableInsertFailure(w.status);
+      if (registered_applied_range) {
+        // The range never publishes, so record it for the gates parked
+        // above it; recovery releases it with the failed appends.
+        const SequenceNumber range_low = last_sequence + 1 - seq_inc;
+        HandleMemTableInsertFailure(w.status, wal_context.wal_partition,
+                                    range_low,
+                                    std::max(range_low, last_sequence));
+      } else {
+        HandleMemTableInsertFailure(w.status);
+      }
     }
     ExitMemTableSwitchGate();
     write_thread.ExitAsBatchGroupLeader(write_group, status);
@@ -2539,9 +2555,9 @@ void DBImpl::WALIOStatusCheck(const IOStatus& io_status,
       // Under the same mutex_ hold as the error below, so recovery from an
       // earlier error cannot release this range before the error is set.
       assert(NumWalPartitions() > 1);
-      failed_wal_ranges_.push_back(
-          {pinned_wal_partition, failed_wal_sequence_start,
-           std::max(failed_wal_sequence_start, failed_wal_sequence)});
+      RecordFailedWalRange(
+          pinned_wal_partition, failed_wal_sequence_start,
+          std::max(failed_wal_sequence_start, failed_wal_sequence));
     }
     // Maybe change the return status to void?
     if (io_status.IsIOError() && !io_status.IsIOFenced()) {
@@ -2571,6 +2587,43 @@ void DBImpl::WALIOStatusCheck(const IOStatus& io_status,
                                 BackgroundErrorReason::kWriteCallback,
                                 /*wal_related=*/true);
     }
+    if (pinned_wal_partition != kNoPinnedWalRange && NumWalPartitions() > 1 &&
+        error_handler_.GetBGError().ok()) {
+      // A listener suppressed the publication, so no background error is
+      // stored. That is final unless the WAL record never landed: then the
+      // range stays outstanding and pins every later gate, so at N>1 the
+      // failure is re-published with the suppression overridden (the
+      // listener was still notified). A failure after the append landed
+      // (sync) leaves nothing pinned, so its suppression stands. This check
+      // runs only when suppressed, after the first publication, so the
+      // sequence mutex below cannot delay the flag a parked waiter holds
+      // the park mutex for.
+      const SequenceNumber range_low = failed_wal_sequence_start;
+      const SequenceNumber range_high =
+          std::max(failed_wal_sequence_start, failed_wal_sequence);
+      bool record_missing;
+      {
+        InstrumentedMutexLock seq_l(&sequence_wal_index_mutex_);
+        record_missing = wal_durability_tracker_->IsOutstanding(
+            pinned_wal_partition, range_low, range_high);
+      }
+      if (record_missing) {
+        if (io_status.IsIOError() && !io_status.IsIOFenced()) {
+          DBRecoverContext context;
+          context.failed_wal_sequence = failed_wal_sequence;
+          context.failed_wal_sequence_start = failed_wal_sequence_start;
+          error_handler_.SetBGError(io_status,
+                                    BackgroundErrorReason::kWriteCallback,
+                                    /*wal_related=*/true, context,
+                                    /*is_wal_append_failure=*/true);
+        } else {
+          error_handler_.SetBGError(io_status,
+                                    BackgroundErrorReason::kWriteCallback,
+                                    /*wal_related=*/true,
+                                    /*is_wal_append_failure=*/true);
+        }
+      }
+    }
     // The background error is published; parked completion gates fail on
     // it through the transition hook in SetBGError above.
     mutex_.Unlock();
@@ -2596,7 +2649,10 @@ void DBImpl::ExtendWALRecoveryCutoff(uint64_t failed_wal_number) {
   }
 }
 
-void DBImpl::HandleMemTableInsertFailure(const Status& status) {
+void DBImpl::HandleMemTableInsertFailure(const Status& status,
+                                         size_t wal_partition,
+                                         SequenceNumber low,
+                                         SequenceNumber high) {
   assert(!status.ok());
   // A non-OK status on memtable insert indicates that the state implied by the
   // WAL has diverged from the in-memory state.  This could be because of a
@@ -2604,6 +2660,12 @@ void DBImpl::HandleMemTableInsertFailure(const Status& status) {
   // column family and didn't specify ignore_missing_column_families.
   mutex_.Lock();
   assert(!error_handler_.IsBGWorkStopped());
+  if (wal_partition != kNoPinnedWalRange) {
+    // Same hold as the error below: the group's applied range never
+    // publishes, so gates at or above it fail on this error and recovery
+    // releases it with the failed appends.
+    RecordFailedWalRange(wal_partition, low, high);
+  }
   error_handler_.SetBGError(status, BackgroundErrorReason::kMemTable);
   mutex_.Unlock();
 }
@@ -3059,10 +3121,33 @@ Status DBImpl::WaitForWalDurability(SequenceNumber target, bool wal_record) {
     return versions_->LastSequence() >= target &&
            (!wal_record || wal_durability_tracker_->SafePoint() >= target);
   };
+  // Every OK below confirms under mutex_ with taint first: a target above
+  // a released failed range fails even when covered, and the mutex_ orders
+  // this gate after any concurrent release. The peek stays lock-free, so
+  // uncovered gates pay nothing.
+  Status s;
+  bool decided = false;
+  auto confirm_covered = [&](bool peek_covered) -> bool {
+    if (!peek_covered) {
+      return false;
+    }
+    InstrumentedMutexLock l(&mutex_);
+    if (TaintedTargetError(target, &s)) {
+      decided = true;
+      return true;
+    }
+    if (covered()) {
+      s = Status::OK();
+      decided = true;
+      return true;
+    }
+    // A sequence reservation moved the frontier back; keep waiting.
+    return false;
+  };
   // Fast path: atomic loads, no blocking. On the partitioned path this is
   // the whole gate whenever predecessors already landed.
-  if (covered()) {
-    return Status::OK();
+  if (confirm_covered(covered())) {
+    return s;
   }
 
   // Below the fast path: spin, then block, mirroring
@@ -3071,8 +3156,8 @@ Status DBImpl::WaitForWalDurability(SequenceNumber target, bool wal_record) {
   PERF_TIMER_FOR_WAIT_GUARD(write_thread_wait_nanos);
 
   for (uint32_t tries = 0; tries < 200; ++tries) {
-    if (covered()) {
-      return Status::OK();
+    if (covered() && confirm_covered(true)) {
+      return s;
     }
     port::AsmVolatilePause();
   }
@@ -3121,37 +3206,87 @@ Status DBImpl::WaitForWalDurability(SequenceNumber target, bool wal_record) {
     }
   }
 
-  Status s;
-  if (!covered()) {
-    // Park until a completion advances the frontier, checking for a
-    // background error on every wakeup. The pre-park check runs under the
-    // mutex both signalers hold, so no advance or error publication can
-    // slip between the check and the park; mutex_ is never held together
-    // with it (leaf rule). The background-error leg reads the predicate
-    // flag instead of the ErrorHandler, because that check needs mutex_
-    // and the park needs this mutex: the flag (set before the error wake)
-    // keeps the whole predicate under one mutex. The wait has no timeout:
-    // a missed wake would hang, loudly, instead of hiding behind a poll.
+  if (!decided) {
+    confirm_covered(covered());
+  }
+  if (!decided) {
+    // Park until a completion advances the frontier, rechecking the error
+    // state under mutex_ on every wakeup. The pre-park check runs under the
+    // mutex every signaler holds, so no advance, error publication, or
+    // shutdown signal can slip between the check and the park; mutex_ is
+    // never held together with it (leaf rule). A stored background error
+    // fails the wait only when the target can never be reached: a failed
+    // WAL range sits at or below it. Any other error leaves the waiter
+    // parked until covered, as at N=1, and the wake epoch (not the sticky
+    // predicate flag) tells it whether a newer publication arrived since
+    // its last check, so an unaffected wake reparks instead of spinning.
+    // Shutdown fails it unless already covered. Every covered outcome
+    // confirms under mutex_ with taint first (see above). The wait has no
+    // timeout: a missed wake would hang, loudly, instead of hiding behind
+    // a poll.
     wal_durability_waiters_.fetch_add(1, std::memory_order_relaxed);
-    while (!covered()) {
+    uint64_t seen_epoch =
+        wal_durability_wake_epoch_.load(std::memory_order_acquire);
+    // Always check once: an already-standing error must fail us even though
+    // no newer publication will arrive.
+    bool check_error = true;
+    while (!decided) {
       {
         InstrumentedMutexLock l(&sequence_wal_index_mutex_);
-        if (covered()) {
+        const bool peek_covered = covered();
+        if (!peek_covered &&
+            wal_durability_shutdown_.load(std::memory_order_acquire)) {
+          s = Status::ShutdownInProgress(
+              "DB shutdown while waiting for WAL durability");
+          decided = true;
           break;
         }
-        if (!wal_durability_bg_error_.load(std::memory_order_acquire)) {
+        const uint64_t cur_epoch =
+            wal_durability_wake_epoch_.load(std::memory_order_acquire);
+        if (!peek_covered && !check_error && cur_epoch == seen_epoch) {
           TEST_SYNC_POINT("DBImpl::WaitForWalDurability:BeforePark");
           wal_durability_cv_.Wait();
+          continue;
         }
-        // Else fall through without sleeping: the background error below is
-        // already published, so fetch it instead of parking on it.
+        // Else fall through without sleeping: covered, a first check, or a
+        // newer publication, all decided under mutex_ below.
       }
       {
         InstrumentedMutexLock l(&mutex_);
+        if (TaintedTargetError(target, &s)) {
+          decided = true;
+          break;
+        }
+        if (covered()) {
+          s = Status::OK();
+          decided = true;
+          break;
+        }
+        if (wal_durability_shutdown_.load(std::memory_order_acquire)) {
+          s = Status::ShutdownInProgress(
+              "DB shutdown while waiting for WAL durability");
+          decided = true;
+          break;
+        }
         s = error_handler_.GetBGError();
-      }
-      if (!s.ok()) {
-        break;
+        if (!s.ok()) {
+          bool failed_below = false;
+          for (const FailedWalRange& range : failed_wal_ranges_) {
+            if (range.low <= target) {
+              failed_below = true;
+              break;
+            }
+          }
+          if (failed_below) {
+            decided = true;
+            break;
+          }
+          // Otherwise the error cannot strand this target: a lower range
+          // still completes and covers it.
+        }
+        s = Status::OK();
+        seen_epoch = wal_durability_wake_epoch_.load(std::memory_order_acquire);
+        check_error = false;
       }
     }
     wal_durability_waiters_.fetch_sub(1, std::memory_order_relaxed);
@@ -3179,14 +3314,65 @@ void DBImpl::SignalWalDurabilityWaitersOnBGError() {
   // above sequence_wal_index_mutex_; see the LOCK ORDER note).
   mutex_.AssertHeld();
   wal_durability_bg_error_.store(true, std::memory_order_release);
+  wal_durability_wake_epoch_.fetch_add(1, std::memory_order_release);
   InstrumentedMutexLock l(&sequence_wal_index_mutex_);
   wal_durability_cv_.SignalAll();
   TEST_SYNC_POINT("DBImpl::SignalWalDurabilityWaitersOnBGError");
 }
 
+void DBImpl::SignalWalDurabilityWaitersOnShutdown() {
+  // Takes only sequence_wal_index_mutex_: the waiter reads the shutdown leg
+  // and the epoch under it before parking, so setting both before the
+  // signal leaves no miss either way, with or without mutex_ held.
+  wal_durability_shutdown_.store(true, std::memory_order_release);
+  wal_durability_wake_epoch_.fetch_add(1, std::memory_order_release);
+  InstrumentedMutexLock l(&sequence_wal_index_mutex_);
+  wal_durability_cv_.SignalAll();
+}
+
+void DBImpl::RecordFailedWalRange(size_t partition, SequenceNumber low,
+                                  SequenceNumber high) {
+  mutex_.AssertHeld();
+  for (const FailedWalRange& range : failed_wal_ranges_) {
+    if (range.partition == partition && range.low == low &&
+        range.high == high) {
+      return;
+    }
+  }
+  failed_wal_ranges_.push_back(FailedWalRange{partition, low, high});
+}
+
+bool DBImpl::TaintedTargetError(SequenceNumber target, Status* error) {
+  mutex_.AssertHeld();
+  for (const TaintedSeqInterval& interval : tainted_seq_intervals_) {
+    if (interval.taint_low <= target && target <= interval.taint_high) {
+      *error = Status::Aborted("Write sequence " + std::to_string(target) +
+                               " is above released failed WAL range [" +
+                               std::to_string(interval.failed_low) + ", " +
+                               std::to_string(interval.failed_high) +
+                               "] on partition " +
+                               std::to_string(interval.failed_partition));
+      return true;
+    }
+  }
+  return false;
+}
+
 void DBImpl::ClearWalDurabilityBGError() {
   mutex_.AssertHeld();
   wal_durability_bg_error_.store(false, std::memory_order_release);
+  // Taint first: every sequence allocated above a failed range belongs to a
+  // WAL record above a hole, so a group gating on one after this release
+  // must fail instead of seeing its target covered. Fresh sequences always
+  // exceed the recorded bound, so later writes never match.
+  const SequenceNumber max_allocated = versions_->LastAllocatedSequence();
+  for (const FailedWalRange& range : failed_wal_ranges_) {
+    if (range.high < max_allocated) {
+      tainted_seq_intervals_.push_back(
+          TaintedSeqInterval{range.partition, range.low, range.high,
+                             range.high + 1, max_allocated});
+    }
+  }
   // Durability first: the applied frontier this publishes must stay below
   // every range still pending its append. The trackers feed only the gates
   // and publication; recovery and the indeterminate-write fence still see the

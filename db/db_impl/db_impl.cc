@@ -485,6 +485,16 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
   if (s.ok() && context.IsWALWriteErrorRecovery()) {
     const bool has_blob_direct_write =
         HasAnyBlobDirectWriteColumnFamilyWithLockHeld();
+    // MANIFEST WAL tracking stays consistent through file-scoped recovery
+    // above one partition, so only N=1 keeps the upstream rejection: the
+    // atomic flush below emits DeleteWalsBefore past the failed WAL before
+    // retirement deletes any file, SyncWAL cannot re-record a retired WAL
+    // (the recovery cutoff skips it until it is popped), and the
+    // non-MANIFEST predecessor mode is rejected at N>1 at Open.
+    const bool wal_tracking_unsupported =
+        NumWalPartitions() == 1 &&
+        (immutable_db_options_.track_and_verify_wals_in_manifest ||
+         immutable_db_options_.track_and_verify_wals);
     if (immutable_db_options_.manual_wal_flush ||
         immutable_db_options_.allow_2pc || two_write_queues_ ||
         immutable_db_options_.enable_pipelined_write ||
@@ -492,8 +502,7 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
         immutable_db_options_.recycle_log_file_num != 0 ||
         immutable_db_options_.WAL_ttl_seconds != 0 ||
         immutable_db_options_.WAL_size_limit_MB != 0 ||
-        immutable_db_options_.track_and_verify_wals_in_manifest ||
-        immutable_db_options_.track_and_verify_wals || has_blob_direct_write) {
+        wal_tracking_unsupported || has_blob_direct_write) {
       ROCKS_LOG_WARN(
           immutable_db_options_.info_log,
           "[WAL recovery] Unsupported configuration; DB remains write-stopped: "
@@ -610,6 +619,19 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
   if (s.ok()) {
     recovering_from_wal_write_error_ = context.IsWALWriteErrorRecovery();
     recover_wal_through_number_ = context.failed_wal_number;
+    // Above one partition, bound this flush below the failed ranges: a write
+    // that appended above a failed range and failed at its gate is already
+    // in the memtable, and D-1 says it fails and is discarded, so the flush
+    // must skip it while the dropped immutables purge it. At N=1 no range
+    // is ever recorded and the cutoff stays kMaxSequenceNumber.
+    SequenceNumber flush_seqno_cutoff = kMaxSequenceNumber;
+    for (const FailedWalRange& range : failed_wal_ranges_) {
+      assert(range.low > 0);
+      flush_seqno_cutoff = std::min(flush_seqno_cutoff, range.low - 1);
+    }
+    for (auto* cfd : *versions_->GetColumnFamilySet()) {
+      cfd->SetFlushSeqnoCutoff(flush_seqno_cutoff);
+    }
     if (context.flush_reason == FlushReason::kErrorRecoveryRetryFlush) {
       s = RetryFlushesForErrorRecovery(FlushReason::kErrorRecoveryRetryFlush,
                                        true /* wait */);
@@ -639,6 +661,9 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
     }
     recovering_from_wal_write_error_ = false;
     recover_wal_through_number_ = 0;
+    for (auto* cfd : *versions_->GetColumnFamilySet()) {
+      cfd->SetFlushSeqnoCutoff(kMaxSequenceNumber);
+    }
     if (!s.ok()) {
       ROCKS_LOG_INFO(immutable_db_options_.info_log,
                      "DB resume requested but failed due to Flush failure [%s]",
@@ -909,6 +934,10 @@ void DBImpl::CancelAllBackgroundWork(bool wait) {
   }
   shutting_down_.store(true, std::memory_order_release);
   bg_cv_.SignalAll();
+  // Parked completion-gate writers are user threads, not background work, so
+  // the waits below do not cover them: wake them here so they return instead
+  // of parking past teardown. Takes only the gate mutex (leaf below mutex_).
+  SignalWalDurabilityWaitersOnShutdown();
   env_->UnSchedule(&bg_async_file_open_state_, Env::Priority::HIGH);
   if (!wait) {
     return;
@@ -1152,11 +1181,26 @@ Status DBImpl::CloseHelper() {
   shutdown_initiated_ = true;
   // Wake a recovery waiting in ResumeImpl() for UnlockWAL().
   bg_cv_.SignalAll();
+  // Parked completion-gate writers are user threads: wake them first so they
+  // return instead of parking past teardown. Takes only the gate mutex.
+  SignalWalDurabilityWaitersOnShutdown();
   error_handler_.CancelErrorRecoveryForShutDown();
   while (!error_handler_.ReadyForShutdown()) {
     bg_cv_.Wait();
   }
   mutex_.Unlock();
+
+  // Wait for woken gate writers to leave: the gate's cv and mutex are DBImpl
+  // members freed with it, so no thread may still be parked when teardown
+  // proceeds. Runs without mutex_ (a woken waiter takes it to exit) and
+  // always terminates (the shutdown leg needs nothing else to proceed).
+  while (wal_durability_waiters_.load(std::memory_order_acquire) != 0) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  // Unconditional: Close wakes every parked gate writer above, so by the time
+  // teardown reaches here no waiter may be parked. Tests block here to land a
+  // held append against live state before writers are dropped.
+  TEST_SYNC_POINT("DBImpl::CloseHelper:GateWaitersDrained");
 
   // Deregister before teardown and without mutex_ to preserve registry-to-DB
   // lock ordering.

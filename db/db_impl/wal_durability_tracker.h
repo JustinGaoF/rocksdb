@@ -172,6 +172,22 @@ class WalDurabilityTracker {
     }
   }
 
+  // Whether the exact range [low, high] is still registered on `partition`.
+  // Called with the caller's sequence mutex held; distinguishes a failed WAL
+  // append (record missing, range still outstanding) from a failure after the
+  // append landed (range already completed).
+  bool IsOutstanding(size_t partition, uint64_t low, uint64_t high) const {
+    if (partition >= inflight_.size()) {
+      return false;
+    }
+    for (const Range& r : inflight_[partition]) {
+      if (r.low == low && r.high == high) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   // Current durability frontier: every sequence at or below it is durable.
   // Monotonic; 0 before anything completes.
   uint64_t SafePoint() const {
