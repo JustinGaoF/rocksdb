@@ -1519,6 +1519,12 @@ DEFINE_bool(
 DEFINE_string(wal_compression, "none",
               "Algorithm to use for WAL compression. none to disable.");
 
+DEFINE_string(partition_wal_usage, "none",
+              "WAL record format. 'none' for the vanilla WAL format; "
+              "'partition_by_column_family' turns on WAL indexing, tagging "
+              "each WAL record with an ordering number. --wal_partitions "
+              "sets how many WAL files writes spread across.");
+
 DEFINE_bool(
     verify_sst_unique_id_in_manifest, false,
     "Enable DB options `verify_sst_unique_id_in_manifest`, if true, during "
