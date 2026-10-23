@@ -301,6 +301,24 @@ class LogTest
     }
   }
 
+  // Puts a WAL index marker with a `payload_size`-byte payload ahead of what
+  // was written, for marker sizes the writer never emits.
+  void PrependWALIndexMarker(int payload_size) {
+    const bool recyclable = std::get<0>(GetParam()) != 0;
+    std::string marker(recyclable ? kRecyclableHeaderSize : kHeaderSize, '\0');
+    marker[4] = static_cast<char>(payload_size & 0xff);
+    marker[5] = static_cast<char>(payload_size >> 8);
+    marker[6] = static_cast<char>(recyclable ? kRecyclableWALIndexMarkerType
+                                             : kWALIndexMarkerType);
+    if (recyclable) {
+      EncodeFixed32(&marker[7], 123 /* log_number */);
+    }
+    marker.append(static_cast<size_t>(payload_size), 'p');
+    dest_contents().insert(0, marker);
+    reset_source_contents();
+    FixChecksum(0, payload_size, recyclable);
+  }
+
   // Returns the wal_index the writer prefixed to each data record of an
   // indexed WAL image. Reader-side decoding lands later in the stack, so tests
   // that need to see what actually reached the file read it back from here.
@@ -959,6 +977,25 @@ TEST_P(LogTest, WALIndexMarkerRecordIsEmpty) {
   ASSERT_EQ(0U, length);
 }
 
+// A partition above 0 is recorded as the marker's fixed32 payload and is known
+// after the first record is read. Partition 0 stays empty (above).
+TEST_P(LogTest, WALIndexMarkerRecordsPartition) {
+  writer_->SetWALPartition(3);
+  EnableWALIndex();
+  Write("foo");
+
+  const std::string contents = get_reader_contents()->ToString();
+  const uint32_t length = (static_cast<uint32_t>(contents[4]) & 0xff) |
+                          ((static_cast<uint32_t>(contents[5]) & 0xff) << 8);
+  ASSERT_EQ(kWALIndexMarkerPartitionSize, length);
+
+  EXPECT_EQ(0U, reader_->WALPartition());
+  ASSERT_EQ("foo", Read());
+  EXPECT_EQ(3U, reader_->WALPartition());
+  ASSERT_EQ("EOF", Read());
+  ASSERT_EQ(0U, DroppedBytes());
+}
+
 // The marker precedes all data, so indexed-ness is known after the first
 // record is read, before the file's data records are consumed: no re-scan.
 TEST_P(LogTest, WALIndexMarkerKnownAfterFirstRecord) {
@@ -1078,6 +1115,23 @@ TEST_P(LogTest, WALIndexMarkerInsidePartialRecordAfterFirstRecord) {
   ASSERT_EQ("EOF", Read());
   ASSERT_EQ("OK", MatchError("not the first record"));
   ASSERT_EQ("OK", MatchError("interspersed partial record"));
+}
+
+// The marker payload is empty (partition 0) or one fixed32 partition. Any
+// other size is reported, by both readers and for the plain and recyclable
+// marker alike, and leaves the partition unset.
+TEST_P(LogTest, WALIndexMarkerWithInvalidPayloadSizeReportsCorruption) {
+  EnableWALIndex(/*write_marker=*/false);
+  Write("foo");
+  for (int payload_size : {5, 3, 1}) {
+    PrependWALIndexMarker(payload_size);
+  }
+
+  ASSERT_EQ("foo", Read());
+  EXPECT_TRUE(reader_->SawWALIndexMarker());
+  EXPECT_EQ(0U, reader_->WALPartition());
+  EXPECT_EQ(1U + 3U + 5U, DroppedBytes());
+  ASSERT_EQ("OK", MatchError("WAL_Index marker has invalid size"));
 }
 
 // A void record declares a closed range of wal_index values that were
