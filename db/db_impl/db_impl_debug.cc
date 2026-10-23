@@ -272,22 +272,36 @@ void DBImpl::TEST_SetBGError(const IOStatus& error,
   // SetBGError, exactly as in production; a suppressed error wakes nothing.
 }
 
-std::vector<std::pair<uint64_t, uint64_t>> DBImpl::TEST_AliveWalFiles(
+std::vector<std::pair<uint64_t, uint64_t>> DBImpl::SnapshotAliveWalFiles(
     size_t partition) {
-  InstrumentedMutexLock l(&mutex_);
-  WalWriteMutexLock wl(&WalWriteMutex(partition));
+  mutex_.AssertHeld();
+  WalWriteMutex(partition).AssertHeld();
+  assert(partition < alive_wal_files_.size());
   std::vector<std::pair<uint64_t, uint64_t>> files;
-  for (const WalFileNumberSize& file : AliveWalFiles(partition)) {
+  for (const WalFileNumberSize& file : alive_wal_files_[partition]) {
     files.emplace_back(file.number, file.size);
   }
   return files;
 }
 
+std::vector<std::pair<uint64_t, uint64_t>> DBImpl::TEST_AliveWalFiles(
+    size_t partition) {
+  InstrumentedMutexLock l(&mutex_);
+  WalWriteMutexLock wl(&WalWriteMutex(partition));
+  return SnapshotAliveWalFiles(partition);
+}
+
+std::pair<uint64_t, bool> DBImpl::TEST_OldestAliveWalStableFields(
+    size_t partition) {
+  InstrumentedMutexLock l(&mutex_);
+  WalFileNumberSize oldest = OldestAliveWal(partition);
+  return {oldest.number, oldest.getting_flushed};
+}
+
 uint64_t DBImpl::TEST_CurrentWalNumber(size_t partition) {
   InstrumentedMutexLock l(&mutex_);
   WalWriteMutexLock wl(&WalWriteMutex(partition));
-  assert(!WalLogs(partition).empty());
-  return WalLogs(partition).back().number;
+  return CurrentWal(partition).number;
 }
 
 std::vector<std::pair<uint64_t, bool>> DBImpl::TEST_WalSyncMarks(
