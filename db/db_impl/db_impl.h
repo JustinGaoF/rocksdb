@@ -2676,6 +2676,17 @@ class DBImpl : public DB
                          RecoveryContext* recovery_ctx,
                          std::vector<WALIndexSupersession>* supersessions);
 
+  // Indexed-WAL recovery through the N-file merge: one ordered stream feeds
+  // the same per-record path as ProcessLogFile. Predecessor chaining is
+  // absent (track_and_verify_wals falls back to ProcessLogFiles), so this
+  // takes no predecessor info.
+  Status ProcessLogFilesMerged(
+      const std::vector<uint64_t>& wal_numbers, bool read_only, bool is_retry,
+      uint64_t min_wal_number, int job_id, SequenceNumber* next_sequence,
+      std::unordered_map<int, VersionEdit>* version_edits,
+      bool* corrupted_wal_found, RecoveryContext* recovery_ctx,
+      std::vector<WALIndexSupersession>* supersessions);
+
   Status ProcessLogFile(uint64_t wal_number, uint64_t min_wal_number,
                         bool is_retry, bool read_only, int job_id,
                         SequenceNumber* next_sequence,
