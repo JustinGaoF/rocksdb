@@ -356,12 +356,20 @@ void ErrorHandler::HandleKnownErrors(const Status& bg_err,
     Status s = new_bg_err;
     EventHelpers::NotifyOnBackgroundError(db_options_.listeners, reason, &s,
                                           db_mutex_, &auto_recovery);
-    if (!s.ok() && s.severity() > bg_error_.severity()) {
-      bg_error_ = s;
-      UpdateRecoveryContext(context, /*replace_existing_context=*/true);
+    if (!s.ok() && (s.severity() > bg_error_.severity())) {
+      // Same store as the severity paths in SetBGError, including the
+      // durability wake.
+      CheckAndSetRecoveryAndBGError(s, context);
     } else {
       if (!s.ok()) {
         UpdateRecoveryContext(context, /*replace_existing_context=*/false);
+        // A repeat at the recorded severity re-wakes parked completion
+        // gates without recording anything, as CheckAndSetRecoveryAndBGError
+        // does. With nothing recorded (e.g. kNoError under
+        // paranoid_checks=false) nothing wakes and the flag stays clear.
+        if (!bg_error_.ok() && s.severity() >= bg_error_.severity()) {
+          db_->SignalWalDurabilityWaitersOnBGError();
+        }
       }
       ROCKS_LOG_INFO(db_options_.info_log,
                      "ErrorHandler: Hit less severe background error\n");
@@ -669,6 +677,9 @@ Status ErrorHandler::ClearBGError() {
     // Clear and check the recovery IO and BG error
     is_db_stopped_.store(false, std::memory_order_release);
     bg_error_ = Status::OK();
+    // The background error is OK again; parked durability waits (if any
+    // remained) must observe that instead of a stale error leg.
+    db_->ClearWalDurabilityBGError();
     recovery_error_ = IOStatus::OK();
     // Recovery facts belong to one background-error episode. Keeping a
     // retired WAL cutoff or reserved sequence here would attach it to a later,
@@ -898,14 +909,26 @@ void ErrorHandler::CheckAndSetRecoveryAndBGError(
     const Status& bg_err, const DBRecoverContext& context) {
   assert(context.flush_reason != FlushReason::kErrorRecoveryRetryFlush ||
          bg_err.severity() == Status::Severity::kSoftError);
+  db_mutex_->AssertHeld();
   if (recovery_in_prog_ && recovery_error_.ok()) {
     recovery_error_ = status_to_io_status(Status(bg_err));
   }
-  if (!bg_err.ok() && bg_err.severity() > bg_error_.severity()) {
+  if (bg_err.severity() > bg_error_.severity()) {
     bg_error_ = bg_err;
     UpdateRecoveryContext(context, /*replace_existing_context=*/true);
   } else {
     UpdateRecoveryContext(context, /*replace_existing_context=*/false);
+  }
+  // Wake parked gates only while an error is recorded: on the store above
+  // or on a repeat at the recorded severity (a spurious wake only
+  // rechecks). Never setting the flag while bg_error_ is OK keeps a gate
+  // from spinning on a flag that GetBGError cannot back.
+  if (!bg_error_.ok() && bg_err.severity() >= bg_error_.severity()) {
+    // Whatever the source (WAL, flush, compaction, MANIFEST): parked
+    // completion gates must fail on it instead of waiting out a frontier
+    // that can never cover them. mutex_ is held; the wake takes
+    // sequence_wal_index_mutex_ below it (see the LOCK ORDER note).
+    db_->SignalWalDurabilityWaitersOnBGError();
   }
   if (bg_error_.severity() >= Status::Severity::kHardError) {
     is_db_stopped_.store(true, std::memory_order_release);

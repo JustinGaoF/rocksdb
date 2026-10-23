@@ -934,6 +934,19 @@ class DBImpl : public DB
     return wal_durability_tracker_->SafePoint();
   }
 
+  // One WAL append attempt, published via the
+  // DBImpl::WriteToWAL:AppendOutcome sync point after AddRecord returns
+  // (and after the AfterAddRecord hook may have replaced its status, so
+  // `ok` is the outcome the write path acts on). Tests record these to
+  // prove a failed write was attempted exactly once, never moved between
+  // partitions, and that no acknowledged sequence lies above a failed hole.
+  struct WalAppendOutcome {
+    size_t wal_partition = 0;
+    SequenceNumber first_sequence = 0;
+    size_t sequence_count = 0;
+    bool ok = true;
+  };
+
   // REQUIRES: joined the main write queue if two_write_queues is disabled, and
   // the second write queue otherwise. With more than one WAL partition
   // (two_write_queues is rejected there) nothing calls it: write groups
@@ -1536,6 +1549,18 @@ class DBImpl : public DB
   // A WAL partition's open-WAL entries in deque order, as {number,
   // getting_synced} pairs.
   std::vector<std::pair<uint64_t, bool>> TEST_WalSyncMarks(size_t partition);
+
+  // Waiters currently parked in WaitForWalDurability. Tests use it to prove
+  // a write is parked in its completion gate before injecting a failure.
+  size_t TEST_WalDurabilityWaiters() const {
+    return wal_durability_waiters_.load(std::memory_order_relaxed);
+  }
+
+  // Background-error leg of the durability park predicate. Tests use it to
+  // prove the flag clears when the background error clears.
+  bool TEST_WalDurabilityBGError() const {
+    return wal_durability_bg_error_.load(std::memory_order_acquire);
+  }
 
   // Partition p's lowest registered, not yet completed sequence, or
   // WalDurabilityTracker::kIdle. Tests use it to observe a registration
@@ -3270,6 +3295,24 @@ class DBImpl : public DB
     }
   }
 
+  // Wakes durability waiters while a background error is recorded: on each
+  // publication that stores an error or repeats the recorded severity.
+  // Called only from ErrorHandler (CheckAndSetRecoveryAndBGError, and
+  // HandleKnownErrors for a repeat) with mutex_ held, never while bg_error_
+  // is OK. Sets the predicate flag first so a waiter checking after the
+  // store observes the error without needing the signal, then always
+  // signals under sequence_wal_index_mutex_ so a waiter already parked is
+  // woken. Either way no waiter can miss the error between its predicate
+  // check and park. Safe with no waiters; takes no WAL or sync-mark mutex.
+  void SignalWalDurabilityWaitersOnBGError();
+
+  // Clears the durability park predicate's background-error leg. Called only
+  // from ErrorHandler::ClearBGError with mutex_ held; the store itself is
+  // lock-free and needs no mutex.
+  void ClearWalDurabilityBGError() {
+    wal_durability_bg_error_.store(false, std::memory_order_release);
+  }
+
   // Runs a write group's completion gate: wait until the durability frontier
   // covers `target`, then, for a sync write whose leadership-time fsync may
   // not cover it (`pre_sync_safe_point` < `target`), sync again so the sync
@@ -3858,32 +3901,79 @@ class DBImpl : public DB
   // wal_empties_. Refer to the definition of each variable below for more
   // details.
   //
-  // LOCK ORDER (acyclic by construction):
-  //  1. mutex_ (the DB mutex) comes before every WAL write mutex.
+  // LOCK ORDER (acyclic; only rule 2 is mechanically checked, in debug
+  // builds -- see WalWriteMutexType. Every other rule below is documented
+  // and reviewed, not enforced: call-site AssertHeld checks cover a single
+  // mutex's presence, never an order).
+  //  1. mutex_ (the DB mutex) comes before every WAL write mutex. Scoped
+  //     mutex_ takes after WAL mutexes were released (the MarkLogsSynced
+  //     sections, SyncWalImpl's mark recording) nest nothing.
   //  2. WAL write mutexes are taken in ascending partition-index order, and
   //     a thread holding more than one always took them in that order.
-  //  3. sequence_wal_index_mutex_ is a leaf below the WAL write mutexes: it
-  //     is only ever acquired alone or while already holding a WAL write
-  //     mutex, and nothing acquired under it takes a WAL write mutex.
+  //     There is exactly one implementation of that order,
+  //     LockWalWriteMutexes()/UnlockWalWriteMutexes() (and the
+  //     AllWalWriteMutexesLock RAII wrapper); every multi-partition
+  //     acquisition goes through it, and single-partition takes use
+  //     WalWriteMutexLock on WalWriteMutex(p) directly.
+  //  3. sequence_wal_index_mutex_ is a leaf below mutex_ and below the WAL
+  //     write mutexes. Open takes it under mutex_ alone (with WAL
+  //     indexing, to allocate the post-recovery marker's index). The
+  //     standard and pipelined write paths take it with no other mutex held,
+  //     for both allocation and completion, as do the WAL-only path's
+  //     disableWAL allocation and a parked durability waiter. Only
+  //     ConcurrentWriteGroupToWAL takes it under a WAL write mutex (the
+  //     partition's). The background-error signal takes it under mutex_;
+  //     the frontier signal runs with it already held by the completion
+  //     site. Nothing acquired under it takes mutex_ or a WAL write mutex. It
+  //     stays global because it guards the one LastAllocatedSequence counter
+  //     and next_wal_index_ every partition allocates from, plus the
+  //     cross-partition durability frontier: contiguous sequence
+  //     assignment and one frontier need one mutex. It is never held
+  //     across I/O or batch merging.
   //  4. wal_sync_mark_mutex_ serializes sync-marking and sits above the WAL
   //     write mutexes: a marker takes it first, then one WAL mutex at a
   //     time. It is never held with mutex_.
-  // A write binds to and appends to exactly one partition, so the resolve
-  // step (SelectWalForWrite) and the append (WriteToWAL) hold exactly that
-  // partition's mutex and never a second. Operations that span partitions
-  // (sync, obsolete-file cleanup, close, the manual-flush API surface) hold
-  // all N, taken in index order. There is exactly one implementation of that
-  // order, LockWalWriteMutexes()/UnlockWalWriteMutexes() (and the
-  // AllWalWriteMutexesLock RAII wrapper); every multi-partition acquisition
-  // goes through it, and single-partition takes use WalWriteMutexLock on
-  // WalWriteMutex(p) directly. Debug builds check rule 2 on every Lock()
-  // (see WalWriteMutexType).
-  // A Wait() on WalSyncCV(p) holds WalWriteMutex(p) and no other partition
-  // mutex: pthread_cond_wait releases only the mutex the condvar is bound
-  // to, so waiting while holding others would keep them held while asleep,
-  // and the thread that signals (a sync completion holding all N) would
-  // block on them forever. Multi-partition waits are therefore sequential:
-  // take one partition's mutex, wait, mark, release, then move to the next.
+  //  5. Write-thread queues are entered in ascending partition-index order
+  //     (AllPartitionsWriter enters 0..N-1 and exits in reverse); mutex_,
+  //     which queue entry requires, is released while waiting for entry.
+  //  6. The memtable-switch gate (N > 1 only): leaders Enter before any WAL
+  //     take and Exit once their group has exited. Both the leader's
+  //     closed-gate wait and rotation's drain wait run on bg_cv_ under
+  //     mutex_ with no WAL mutex held, and rotation closes the gate before
+  //     taking all N, so gate waits never meet WAL-mutex holders.
+  //  7. cached_recoverable_state_mutex_ is a leaf: WriteGroupToWAL takes it
+  //     with no other mutex held, only to cache the recoverable state.
+  // A write's resolve step (SelectWalForWrite) and append (WriteToWAL) hold
+  // exactly its partition's mutex, but the write path does take all N in
+  // several places, always in index order through rule 2's implementation:
+  // PreprocessWrite's wal_dir_synced_ read (written under the rotated
+  // partition's mutex or all N), sync-write completion's MarkLogsSynced /
+  // MarkLogsNotSynced (WriteImpl, PipelinedWriteImpl), the manual-flush
+  // single-queue leadership sync in WriteGroupToWAL (at N > 1 without
+  // manual flush that sync takes each partition's mutex sequentially
+  // instead), and the two-queue
+  // WriteRecoverableState drain (concurrent WAL writers on any partition
+  // touch the cached state). Off the write path, all N are held by
+  // rotation in SwitchMemtable (plus mutex_), obsolete-file cleanup in
+  // FindObsoleteFiles (queue check and free-list takeover, plus mutex_),
+  // SyncWalImpl's horizon snapshot and closed-WAL publish (its claims are
+  // sequential per-partition takes), FlushWAL's buffer flush, CloseHelper's
+  // WAL free, the whole-DB readers WALBufferIsEmpty and GetOpenWalSizes,
+  // and the test-only TEST_LogsToFreeSize.
+  // Waits never hold two locks that can deadlock them. A Wait() on
+  // WalSyncCV(p) holds WalWriteMutex(p) and no other partition mutex:
+  // pthread_cond_wait releases only the mutex the condvar is bound to, so
+  // waiting while holding others would keep them held while asleep, and
+  // the thread that signals (a sync completion holding all N) would block
+  // on them forever. Multi-partition waits are therefore sequential: take
+  // one partition's mutex, wait, mark, release, then move to the next. A
+  // Wait() on wal_durability_cv_ holds sequence_wal_index_mutex_ only,
+  // never a WAL mutex or mutex_: frontier and error signals take that one
+  // mutex briefly and block on nothing. Per-writer state mutexes inside
+  // WriteThread are leaf-private to queue waiting and order against
+  // nothing above. This diff adds no lock; its one new order edge is the
+  // background-error signal taking sequence_wal_index_mutex_ under mutex_
+  // (rule 3's "under either").
   //
   // Private inheritance keeps InstrumentedMutexLock/InstrumentedMutexUnlock,
   // which would bypass the check, from compiling against these mutexes.
@@ -3961,9 +4051,23 @@ class DBImpl : public DB
   // while parked, never across the wait's bg-error check (see
   // WaitForWalDurability), so the leaf rule in the LOCK ORDER note holds.
   InstrumentedCondVar wal_durability_cv_{&sequence_wal_index_mutex_};
-  // Waiters parked in WaitForWalDurability. Gates the SignalAll on the
-  // completion path so uncontended writes pay one relaxed load.
+  // Waiters parked in WaitForWalDurability. A test hook first: tests
+  // use it to prove a write is parked before injecting a failure. The
+  // frontier signal also consults it, under sequence_wal_index_mutex_, so
+  // uncontended writes pay one relaxed load; the background-error signal
+  // never consults it (a count checked outside the mutex is what lost
+  // wakes).
   std::atomic<size_t> wal_durability_waiters_{0};
+  // Background-error leg of the durability park predicate. Set (release)
+  // before every background-error wake, which ErrorHandler issues only
+  // while an error is recorded, and read (acquire) under
+  // sequence_wal_index_mutex_ before parking, so an error published
+  // between the predicate check and the park still wakes the waiter. A
+  // set flag only means "recheck GetBGError under mutex_";
+  // the error itself still lives in the ErrorHandler. Cleared only in
+  // ErrorHandler::ClearBGError, the single transition of the background
+  // error back to OK.
+  std::atomic<bool> wal_durability_bg_error_{false};
   uint64_t next_wal_index_ = log::kWALIndexStartNumber;
 
   // If zero, manual compactions are allowed to proceed. If non-zero, manual

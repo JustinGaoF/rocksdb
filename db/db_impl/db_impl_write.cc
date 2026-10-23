@@ -130,13 +130,6 @@ class PutEntityFastPathWriteCallback final : public WriteCallback {
   bool AllowWriteBatching() override { return false; }
 };
 
-// How long a parked completion-gate wait sleeps between background-error
-// checks. Frontier coverage wakes come from SignalWalDurabilityWaiters; the
-// timeout only bounds how stale a background error can get before the wait
-// aborts on it, and bounds any missed wakeup (there are none by protocol:
-// the pre-park check runs under the same mutex the signaler holds).
-constexpr uint64_t kDurabilityWaitPollMicros = 1000;
-
 }  // namespace
 
 Status DBImpl::WalPartitionForWrite(
@@ -2526,6 +2519,8 @@ void DBImpl::WALIOStatusCheck(const IOStatus& io_status,
                                 BackgroundErrorReason::kWriteCallback,
                                 /*wal_related=*/true);
     }
+    // The background error is published; parked completion gates fail on
+    // it through the transition hook in SetBGError above.
     mutex_.Unlock();
   } else {
     // Force writable file to be continue writable.
@@ -2977,6 +2972,11 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
   io_s = log_writer->AddRecord(write_options, log_entry, sequence, wal_index);
   TEST_SYNC_POINT_CALLBACK("DBImpl::WriteToWAL:AfterAddRecord", &io_s);
 #ifndef NDEBUG
+  WalAppendOutcome append_outcome{wal_context.wal_partition, sequence,
+                                  sequence_count, io_s.ok()};
+  TEST_SYNC_POINT_CALLBACK("DBImpl::WriteToWAL:AppendOutcome", &append_outcome);
+#endif
+#ifndef NDEBUG
   if (io_s.ok() && sequence_count > 0) {
     log_writer->set_last_sequence_consumed(sequence + sequence_count - 1);
   }
@@ -3073,8 +3073,13 @@ Status DBImpl::WaitForWalDurability(SequenceNumber target, bool wal_record) {
   if (!covered()) {
     // Park until a completion advances the frontier, checking for a
     // background error on every wakeup. The pre-park check runs under the
-    // mutex the signaler holds, so no advance can slip between the check and
-    // the park; mutex_ is never held together with it (leaf rule).
+    // mutex both signalers hold, so no advance or error publication can
+    // slip between the check and the park; mutex_ is never held together
+    // with it (leaf rule). The background-error leg reads the predicate
+    // flag instead of the ErrorHandler, because that check needs mutex_
+    // and the park needs this mutex: the flag (set before the error wake)
+    // keeps the whole predicate under one mutex. The wait has no timeout:
+    // a missed wake would hang, loudly, instead of hiding behind a poll.
     wal_durability_waiters_.fetch_add(1, std::memory_order_relaxed);
     while (!covered()) {
       {
@@ -3082,8 +3087,12 @@ Status DBImpl::WaitForWalDurability(SequenceNumber target, bool wal_record) {
         if (covered()) {
           break;
         }
-        wal_durability_cv_.TimedWait(immutable_db_options_.clock->NowMicros() +
-                                     kDurabilityWaitPollMicros);
+        if (!wal_durability_bg_error_.load(std::memory_order_acquire)) {
+          TEST_SYNC_POINT("DBImpl::WaitForWalDurability:BeforePark");
+          wal_durability_cv_.Wait();
+        }
+        // Else fall through without sleeping: the background error below is
+        // already published, so fetch it instead of parking on it.
       }
       {
         InstrumentedMutexLock l(&mutex_);
@@ -3102,6 +3111,25 @@ Status DBImpl::WaitForWalDurability(SequenceNumber target, bool wal_record) {
     yield_credit.store(v, std::memory_order_relaxed);
   }
   return s;
+}
+
+void DBImpl::SignalWalDurabilityWaitersOnBGError() {
+  // Called with mutex_ held from ErrorHandler on each publication that
+  // stores an error or repeats the recorded severity, so every source
+  // (WAL, flush, compaction, MANIFEST) wakes parked gates through one path.
+  // Publish the predicate flag before the wake: a waiter checking after
+  // this store observes the error without needing the signal. A waiter
+  // already parked is woken by the signal below, which always runs under
+  // the same mutex as the park, so a publication between the waiter's
+  // check and park still wakes it. No waiter-count shortcut (the count is
+  // a test hook only): checking it outside the mutex is what lost wakes.
+  // Safe with no waiters; takes no WAL or sync-mark mutex (mutex_ sits
+  // above sequence_wal_index_mutex_; see the LOCK ORDER note).
+  mutex_.AssertHeld();
+  wal_durability_bg_error_.store(true, std::memory_order_release);
+  InstrumentedMutexLock l(&sequence_wal_index_mutex_);
+  wal_durability_cv_.SignalAll();
+  TEST_SYNC_POINT("DBImpl::SignalWalDurabilityWaitersOnBGError");
 }
 
 Status DBImpl::RunCompletionGate(SequenceNumber target, bool sync,
@@ -3125,6 +3153,9 @@ Status DBImpl::RunCompletionGate(SequenceNumber target, bool sync,
     const uint64_t sync_start = WalPartitionTimerStart();
     s = manual_wal_flush_ ? FlushWAL(true) : SyncWAL();
     sync_micros += WalPartitionTimerElapsed(sync_start);
+    // No WALIOStatusCheck here: SyncWAL/FlushWAL already route an I/O
+    // failure to it (which wakes other parked gates); this path only
+    // propagates the outcome to the group.
   }
   if (sync && WalPartitionTimersEnabled()) {
     RecordTimeToHistogram(stats_, WAL_SYNC_BARRIER_MICROS, sync_micros);
@@ -3288,6 +3319,11 @@ IOStatus DBImpl::WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
     if (UNLIKELY(needs_locking)) {
       UnlockWalWriteMutexes();
     }
+    // Fires after the leadership-time fsync above, before the directory
+    // sync: tests override io_s here to fail exactly this sync, which then
+    // follows the normal WAL error path (WALIOStatusCheck).
+    TEST_SYNC_POINT_CALLBACK("DBImpl::WriteGroupToWAL:AfterLeadershipSync",
+                             &io_s);
 
     if (io_s.ok() && need_wal_dir_sync) {
       // We only sync WAL directory the first time WAL syncing is
