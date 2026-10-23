@@ -1098,11 +1098,13 @@ TEST_P(LogTest, WALIndexVoidRecordIsSkipped) {
   ASSERT_EQ("", ReportMessage());
 }
 
-// A cover is written after the append it stands in for failed, so its range is
-// behind the writer's high-water mark by construction. That must not trip the
-// strictly-increasing check that guards data records, and must not move the
-// mark either.
-TEST_P(LogTest, WALIndexVoidRecordMayTrailTheHighWaterMark) {
+// A cover trailing behind higher-index data would be invisible to a streaming
+// merge at the moment it decides the hole the cover explains, so the reader
+// rejects it instead of tracking it. Real burns are singletons emitted at the
+// fresh watermark and always comply; only a synthetic trailing cover trips
+// this. (This test previously pinned trailing covers as legal; the merge
+// prototype showed they are unreadable-by-streaming-merge, hence corrupt.)
+TEST_P(LogTest, WALIndexTrailingVoidRecordReportsCorruption) {
   EnableWALIndex();
   next_wal_index_ = kWALIndexStartNumber + 4;
   Write("data");
@@ -1119,7 +1121,10 @@ TEST_P(LogTest, WALIndexVoidRecordMayTrailTheHighWaterMark) {
   ASSERT_EQ("more", Read());
   ASSERT_EQ(kWALIndexStartNumber + 5, reader_->GetLastReadWALIndex());
   ASSERT_EQ("EOF", Read());
-  ASSERT_EQ(0U, DroppedBytes());
+  ASSERT_EQ("OK", MatchError("trails the index order mark"));
+  EXPECT_EQ(0U, reader_->GetMaxVoidWALIndexHi());
+  EXPECT_FALSE(reader_->IsWALIndexVoidCovered(kWALIndexStartNumber));
+  EXPECT_FALSE(reader_->IsWALIndexVoidCovered(kWALIndexStartNumber + 1));
 }
 
 // A supersession is an open-ended cut over one older WAL file, not over the
@@ -1241,20 +1246,25 @@ TEST_P(LogTest, WALIndexSupersessionAfterDataReportsCorruption) {
 }
 
 // The reader folds valid void range ends into a separate high-water mark
-// without disturbing the per-record index.
+// without disturbing the per-record index. The cover sits at the watermark,
+// ahead of the data around it, as real burns do.
 TEST_P(LogTest, WALIndexVoidHiIsTrackedSeparately) {
   EnableWALIndex();
   Write("before");
-  ASSERT_OK(writer_->AddWALIndexVoidRecord(WriteOptions(), kWALIndexStartNumber,
-                                           kWALIndexStartNumber + 4));
+  const uint64_t burned = next_wal_index_++;
+  ASSERT_OK(writer_->AddWALIndexVoidRecord(WriteOptions(), burned, burned + 4));
+  next_wal_index_ += 4;  // the covered range carries no records.
   Write("after");
 
   ASSERT_EQ("before", Read());
   ASSERT_EQ(kWALIndexStartNumber, reader_->GetLastReadWALIndex());
   ASSERT_EQ("after", Read());
-  ASSERT_EQ(kWALIndexStartNumber + 1, reader_->GetLastReadWALIndex());
+  ASSERT_EQ(burned + 5, reader_->GetLastReadWALIndex());
   ASSERT_EQ("EOF", Read());
-  EXPECT_EQ(kWALIndexStartNumber + 4, reader_->GetMaxVoidWALIndexHi());
+  EXPECT_EQ(burned + 4, reader_->GetMaxVoidWALIndexHi());
+  EXPECT_TRUE(reader_->IsWALIndexVoidCovered(burned));
+  EXPECT_TRUE(reader_->IsWALIndexVoidCovered(burned + 4));
+  EXPECT_FALSE(reader_->IsWALIndexVoidCovered(burned + 5));
   ASSERT_EQ(0U, DroppedBytes());
 }
 
@@ -1769,6 +1779,367 @@ TEST_P(LogTest, WALIndexConsecutiveAcrossFilesInPartition) {
   for (size_t i = 0; i < indices.size(); ++i) {
     ASSERT_EQ(kWALIndexStartNumber + i, indices[i]);
   }
+}
+
+// A merge asks coverage at every hole, which the high-water mark cannot
+// answer. Both reader implementations inherit the same ranges from the shared
+// decode path; the fixture parameterisation runs this over both.
+TEST_P(LogTest, WALIndexVoidCoverageAnswersInsideBelowAbove) {
+  EnableWALIndex();
+  Write("before");
+  const uint64_t burned = next_wal_index_++;
+  ASSERT_OK(writer_->AddWALIndexVoidRecord(WriteOptions(), burned, burned + 1));
+  ASSERT_OK(
+      writer_->AddWALIndexVoidRecord(WriteOptions(), burned + 8, burned + 18));
+
+  ASSERT_EQ("before", Read());
+  ASSERT_EQ("EOF", Read());
+  EXPECT_FALSE(reader_->IsWALIndexVoidCovered(kWALIndexStartNumber));
+  EXPECT_FALSE(reader_->IsWALIndexVoidCovered(burned - 1));
+  EXPECT_TRUE(reader_->IsWALIndexVoidCovered(burned));
+  EXPECT_TRUE(reader_->IsWALIndexVoidCovered(burned + 1));
+  EXPECT_FALSE(reader_->IsWALIndexVoidCovered(burned + 2));
+  EXPECT_FALSE(reader_->IsWALIndexVoidCovered(burned + 7));
+  EXPECT_TRUE(reader_->IsWALIndexVoidCovered(burned + 8));
+  EXPECT_TRUE(reader_->IsWALIndexVoidCovered(burned + 18));
+  EXPECT_FALSE(reader_->IsWALIndexVoidCovered(burned + 19));
+  EXPECT_EQ(burned + 18, reader_->GetMaxVoidWALIndexHi());
+  ASSERT_EQ(0U, DroppedBytes());
+}
+
+TEST_P(LogTest, WALIndexVoidCoverageEmptyWhenNoneRead) {
+  EnableWALIndex();
+  Write("only");
+
+  ASSERT_EQ("only", Read());
+  ASSERT_EQ("EOF", Read());
+  EXPECT_FALSE(reader_->IsWALIndexVoidCovered(kWALIndexStartNumber));
+  EXPECT_FALSE(reader_->IsWALIndexVoidCovered(100));
+  EXPECT_EQ(0U, reader_->GetMaxVoidWALIndexHi());
+}
+
+// Progress bounds round-trip, re-assertion is idempotent, and progress
+// records disturb neither the per-record index nor the index counter.
+TEST_P(LogTest, WALIndexProgressRoundTrips) {
+  EnableWALIndex();
+  Write("before");
+  ASSERT_OK(writer_->AddWALIndexProgressRecord(WriteOptions(), 5));
+  ASSERT_OK(writer_->AddWALIndexProgressRecord(WriteOptions(), 5));
+  ASSERT_OK(writer_->AddWALIndexProgressRecord(WriteOptions(), 9));
+
+  ASSERT_EQ("before", Read());
+  ASSERT_EQ(kWALIndexStartNumber, reader_->GetLastReadWALIndex());
+  ASSERT_EQ("EOF", Read());
+  EXPECT_EQ(9U, reader_->GetWALIndexProgressBound());
+  EXPECT_EQ(kWALIndexStartNumber, reader_->GetLastReadWALIndex());
+  ASSERT_EQ(0U, DroppedBytes());
+}
+
+// The idle file: nothing but head metadata and progress assertions. Progress
+// before the first data record is the legal case, not a violation.
+TEST_P(LogTest, WALIndexProgressBeforeDataIsLegal) {
+  EnableWALIndex();
+  ASSERT_OK(writer_->AddWALIndexProgressRecord(WriteOptions(), 7));
+  ASSERT_OK(writer_->AddWALIndexProgressRecord(WriteOptions(), 10));
+
+  ASSERT_EQ("EOF", Read());
+  EXPECT_EQ(10U, reader_->GetWALIndexProgressBound());
+  EXPECT_EQ(0U, reader_->GetLastReadWALIndex());
+  ASSERT_EQ(0U, DroppedBytes());
+}
+
+TEST_P(LogTest, WALIndexProgressWithInvalidSizeReportsCorruption) {
+  const bool recyclable = std::get<0>(GetParam()) != 0;
+  const int header_size = recyclable ? kRecyclableHeaderSize : kHeaderSize;
+  EnableWALIndex();
+  ASSERT_OK(writer_->AddWALIndexProgressRecord(WriteOptions(), 7));
+
+  const int progress_header = header_size;
+  SetByte(progress_header + 4,
+          static_cast<char>(kWALIndexProgressPayloadSize - 1));
+  SetByte(progress_header + 5, 0);
+  FixChecksum(progress_header, kWALIndexProgressPayloadSize - 1, recyclable);
+
+  ASSERT_EQ("EOF", Read());
+  EXPECT_EQ("OK", MatchError("progress record has invalid size"));
+  EXPECT_EQ(0U, reader_->GetWALIndexProgressBound());
+}
+
+TEST_P(LogTest, WALIndexProgressAtZeroReportsCorruption) {
+  const bool recyclable = std::get<0>(GetParam()) != 0;
+  const int header_size = recyclable ? kRecyclableHeaderSize : kHeaderSize;
+  EnableWALIndex();
+  ASSERT_OK(writer_->AddWALIndexProgressRecord(WriteOptions(), 7));
+
+  const int progress_header = header_size;
+  SetFixed64(progress_header + header_size, 0);
+  FixChecksum(progress_header, kWALIndexProgressPayloadSize, recyclable);
+
+  ASSERT_EQ("EOF", Read());
+  EXPECT_EQ("OK", MatchError("progress bound is the unassigned index"));
+  EXPECT_EQ(0U, reader_->GetWALIndexProgressBound());
+}
+
+TEST_P(LogTest, WALIndexProgressBackwardReportsCorruption) {
+  const bool recyclable = std::get<0>(GetParam()) != 0;
+  const int header_size = recyclable ? kRecyclableHeaderSize : kHeaderSize;
+  EnableWALIndex();
+  ASSERT_OK(writer_->AddWALIndexProgressRecord(WriteOptions(), 9));
+  ASSERT_OK(writer_->AddWALIndexProgressRecord(WriteOptions(), 9));
+
+  // The writer API rejects a rewind, so rewrite the second bound in place.
+  const int second_header =
+      2 * header_size + static_cast<int>(kWALIndexProgressPayloadSize);
+  SetFixed64(second_header + header_size, 5);
+  FixChecksum(second_header, kWALIndexProgressPayloadSize, recyclable);
+
+  ASSERT_EQ("EOF", Read());
+  EXPECT_EQ("OK", MatchError("progress bound moves backward"));
+  EXPECT_EQ(9U, reader_->GetWALIndexProgressBound());
+}
+
+// A caller that rewinds a progress bound is rejected rather than asserted on,
+// mirroring the strictly-increasing data index check.
+TEST_P(LogTest, WALIndexProgressBackwardFailsWrite) {
+  EnableWALIndex();
+  ASSERT_OK(writer_->AddWALIndexProgressRecord(WriteOptions(), 9));
+  ASSERT_OK(writer_->AddWALIndexProgressRecord(WriteOptions(), 9));
+  const IOStatus rewound =
+      writer_->AddWALIndexProgressRecord(WriteOptions(), 5);
+  ASSERT_TRUE(rewound.IsCorruption());
+}
+
+// A progress record closes the head: a supersession after one is positioned
+// where no supersession may be, so the merge never misses head metadata it
+// already passed.
+TEST_P(LogTest, WALIndexSupersessionAfterProgressReportsCorruption) {
+  EnableWALIndex();
+  ASSERT_OK(writer_->AddWALIndexProgressRecord(WriteOptions(), 9));
+  ASSERT_OK(writer_->AddWALIndexSupersessionRecord(WriteOptions(), 122, 7));
+
+  ASSERT_EQ("EOF", Read());
+  EXPECT_EQ(
+      "OK",
+      MatchError("supersession follows a data record or progress assertion"));
+  EXPECT_EQ(0U, reader_->GetFirstSupersededWALIndex(122));
+  EXPECT_EQ(9U, reader_->GetWALIndexProgressBound());
+}
+
+TEST_P(LogTest, WALIndexPredecessorSpanRoundTrips) {
+  EnableWALIndex();
+  ASSERT_OK(
+      writer_->AddWALIndexPredecessorSpanRecord(WriteOptions(), 122, 30, 60));
+  Write("after");
+
+  ASSERT_EQ("after", Read());
+  ASSERT_EQ("EOF", Read());
+  uint64_t pred = 0;
+  uint64_t first = 0;
+  uint64_t last = 0;
+  EXPECT_TRUE(reader_->HasWALIndexPredecessorSpan());
+  EXPECT_TRUE(reader_->GetWALIndexPredecessorSpan(&pred, &first, &last));
+  EXPECT_EQ(122U, pred);
+  EXPECT_EQ(30U, first);
+  EXPECT_EQ(60U, last);
+  ASSERT_EQ(0U, DroppedBytes());
+}
+
+TEST_P(LogTest, WALIndexPredecessorSpanEmptyRoundTrips) {
+  EnableWALIndex();
+  ASSERT_OK(
+      writer_->AddWALIndexPredecessorSpanRecord(WriteOptions(), 122, 0, 0));
+
+  ASSERT_EQ("EOF", Read());
+  uint64_t pred = 0;
+  uint64_t first = 0;
+  uint64_t last = 0;
+  EXPECT_TRUE(reader_->HasWALIndexPredecessorSpan());
+  EXPECT_TRUE(reader_->GetWALIndexPredecessorSpan(&pred, &first, &last));
+  EXPECT_EQ(122U, pred);
+  EXPECT_EQ(0U, first);
+  EXPECT_EQ(0U, last);
+  ASSERT_EQ(0U, DroppedBytes());
+}
+
+TEST_P(LogTest, WALIndexPredecessorSpanWithInvalidSizeReportsCorruption) {
+  const bool recyclable = std::get<0>(GetParam()) != 0;
+  const int header_size = recyclable ? kRecyclableHeaderSize : kHeaderSize;
+  EnableWALIndex();
+  ASSERT_OK(
+      writer_->AddWALIndexPredecessorSpanRecord(WriteOptions(), 122, 30, 60));
+
+  const int span_header = header_size;
+  SetByte(span_header + 4,
+          static_cast<char>(kWALIndexPredecessorSpanPayloadSize - 1));
+  SetByte(span_header + 5, 0);
+  FixChecksum(span_header, kWALIndexPredecessorSpanPayloadSize - 1, recyclable);
+
+  ASSERT_EQ("EOF", Read());
+  EXPECT_EQ("OK", MatchError("predecessor span record has invalid size"));
+  EXPECT_FALSE(reader_->HasWALIndexPredecessorSpan());
+}
+
+TEST_P(LogTest, WALIndexPredecessorSpanForZeroWALReportsCorruption) {
+  const bool recyclable = std::get<0>(GetParam()) != 0;
+  const int header_size = recyclable ? kRecyclableHeaderSize : kHeaderSize;
+  EnableWALIndex();
+  ASSERT_OK(
+      writer_->AddWALIndexPredecessorSpanRecord(WriteOptions(), 122, 30, 60));
+
+  const int span_header = header_size;
+  SetFixed64(span_header + header_size, 0);
+  FixChecksum(span_header, kWALIndexPredecessorSpanPayloadSize, recyclable);
+
+  ASSERT_EQ("EOF", Read());
+  EXPECT_EQ("OK", MatchError("span names a non-older WAL"));
+  EXPECT_FALSE(reader_->HasWALIndexPredecessorSpan());
+}
+
+TEST_P(LogTest, WALIndexPredecessorSpanForNonOlderWALReportsCorruption) {
+  const bool recyclable = std::get<0>(GetParam()) != 0;
+  const int header_size = recyclable ? kRecyclableHeaderSize : kHeaderSize;
+  EnableWALIndex();
+  ASSERT_OK(
+      writer_->AddWALIndexPredecessorSpanRecord(WriteOptions(), 122, 30, 60));
+
+  const int span_header = header_size;
+  SetFixed64(span_header + header_size, 123);
+  FixChecksum(span_header, kWALIndexPredecessorSpanPayloadSize, recyclable);
+
+  ASSERT_EQ("EOF", Read());
+  EXPECT_EQ("OK", MatchError("span names a non-older WAL"));
+  EXPECT_FALSE(reader_->HasWALIndexPredecessorSpan());
+}
+
+TEST_P(LogTest, WALIndexPredecessorSpanHalfUnassignedReportsCorruption) {
+  const bool recyclable = std::get<0>(GetParam()) != 0;
+  const int header_size = recyclable ? kRecyclableHeaderSize : kHeaderSize;
+  EnableWALIndex();
+  ASSERT_OK(
+      writer_->AddWALIndexPredecessorSpanRecord(WriteOptions(), 122, 30, 60));
+
+  const int span_header = header_size;
+  SetFixed64(span_header + header_size + kWALIndexSize, 0);
+  FixChecksum(span_header, kWALIndexPredecessorSpanPayloadSize, recyclable);
+
+  ASSERT_EQ("EOF", Read());
+  EXPECT_EQ("OK", MatchError("span is half unassigned"));
+  EXPECT_FALSE(reader_->HasWALIndexPredecessorSpan());
+}
+
+TEST_P(LogTest, WALIndexPredecessorSpanReversedReportsCorruption) {
+  const bool recyclable = std::get<0>(GetParam()) != 0;
+  const int header_size = recyclable ? kRecyclableHeaderSize : kHeaderSize;
+  EnableWALIndex();
+  ASSERT_OK(
+      writer_->AddWALIndexPredecessorSpanRecord(WriteOptions(), 122, 30, 60));
+
+  const int span_header = header_size;
+  SetFixed64(span_header + header_size + kWALIndexSize, 61);
+  FixChecksum(span_header, kWALIndexPredecessorSpanPayloadSize, recyclable);
+
+  ASSERT_EQ("EOF", Read());
+  EXPECT_EQ("OK", MatchError("span is reversed"));
+  EXPECT_FALSE(reader_->HasWALIndexPredecessorSpan());
+}
+
+TEST_P(LogTest, WALIndexPredecessorSpanAfterDataReportsCorruption) {
+  EnableWALIndex();
+  Write("before");
+  ASSERT_OK(
+      writer_->AddWALIndexPredecessorSpanRecord(WriteOptions(), 122, 30, 60));
+
+  ASSERT_EQ("before", Read());
+  ASSERT_EQ("EOF", Read());
+  EXPECT_EQ("OK",
+            MatchError("span follows a data record or progress assertion"));
+  EXPECT_FALSE(reader_->HasWALIndexPredecessorSpan());
+}
+
+TEST_P(LogTest, WALIndexPredecessorSpanAfterProgressReportsCorruption) {
+  EnableWALIndex();
+  ASSERT_OK(writer_->AddWALIndexProgressRecord(WriteOptions(), 9));
+  ASSERT_OK(
+      writer_->AddWALIndexPredecessorSpanRecord(WriteOptions(), 122, 30, 60));
+
+  ASSERT_EQ("EOF", Read());
+  EXPECT_EQ("OK",
+            MatchError("span follows a data record or progress assertion"));
+  EXPECT_FALSE(reader_->HasWALIndexPredecessorSpan());
+  EXPECT_EQ(9U, reader_->GetWALIndexProgressBound());
+}
+
+TEST_P(LogTest, WALIndexSecondPredecessorSpanReportsCorruption) {
+  EnableWALIndex();
+  ASSERT_OK(
+      writer_->AddWALIndexPredecessorSpanRecord(WriteOptions(), 122, 30, 60));
+  ASSERT_OK(
+      writer_->AddWALIndexPredecessorSpanRecord(WriteOptions(), 121, 10, 29));
+
+  ASSERT_EQ("EOF", Read());
+  EXPECT_EQ("OK", MatchError("attests two predecessor spans"));
+  uint64_t pred = 0;
+  uint64_t first = 0;
+  uint64_t last = 0;
+  EXPECT_TRUE(reader_->GetWALIndexPredecessorSpan(&pred, &first, &last));
+  EXPECT_EQ(122U, pred);
+  EXPECT_EQ(30U, first);
+  EXPECT_EQ(60U, last);
+}
+
+TEST_P(LogTest, WALIndexProgressInsidePartialRecordReportsCorruption) {
+  const bool recyclable = std::get<0>(GetParam()) != 0;
+  const int header_size = recyclable ? kRecyclableHeaderSize : kHeaderSize;
+  EnableWALIndex();
+
+  constexpr int kTailSize = 100;
+  const int first_fragment = static_cast<int>(kBlockSize) - 2 * header_size;
+  const int middle_fragment = static_cast<int>(kBlockSize) - header_size;
+  Write(BigString("abcd", static_cast<size_t>(first_fragment) +
+                              middle_fragment - kWALIndexSize + kTailSize));
+
+  const int middle_header = static_cast<int>(kBlockSize);
+  SetByte(middle_header + 6,
+          static_cast<char>(recyclable ? kRecyclableWALIndexProgressType
+                                       : kWALIndexProgressType));
+  FixChecksum(middle_header, middle_fragment, recyclable);
+
+  ASSERT_EQ("EOF", Read());
+  ASSERT_EQ("OK", MatchError("progress interspersed partial record"));
+  ASSERT_EQ("OK", MatchError("missing start of fragmented record(2)"));
+}
+
+TEST_P(LogTest, WALIndexPredecessorSpanInsidePartialRecordReportsCorruption) {
+  const bool recyclable = std::get<0>(GetParam()) != 0;
+  const int header_size = recyclable ? kRecyclableHeaderSize : kHeaderSize;
+  EnableWALIndex();
+
+  constexpr int kTailSize = 100;
+  const int first_fragment = static_cast<int>(kBlockSize) - 2 * header_size;
+  const int middle_fragment = static_cast<int>(kBlockSize) - header_size;
+  Write(BigString("abcd", static_cast<size_t>(first_fragment) +
+                              middle_fragment - kWALIndexSize + kTailSize));
+
+  const int middle_header = static_cast<int>(kBlockSize);
+  SetByte(middle_header + 6,
+          static_cast<char>(recyclable ? kRecyclableWALIndexPredecessorSpanType
+                                       : kWALIndexPredecessorSpanType));
+  FixChecksum(middle_header, middle_fragment, recyclable);
+
+  ASSERT_EQ("EOF", Read());
+  ASSERT_EQ("OK", MatchError("span interspersed partial record"));
+  ASSERT_EQ("OK", MatchError("missing start of fragmented record(2)"));
+}
+
+// The new control records are no-ops with the index disabled, like the
+// existing ones: kNone WALs stay byte-identical.
+TEST_P(LogTest, WALIndexControlRecordsAreNoopWhenDisabled) {
+  ASSERT_OK(writer_->AddWALIndexVoidRecord(WriteOptions(), 1, 2));
+  ASSERT_OK(writer_->AddWALIndexSupersessionRecord(WriteOptions(), 122, 7));
+  ASSERT_OK(writer_->AddWALIndexProgressRecord(WriteOptions(), 9));
+  ASSERT_OK(
+      writer_->AddWALIndexPredecessorSpanRecord(WriteOptions(), 122, 30, 60));
+  ASSERT_EQ(0U, WrittenBytes());
 }
 
 // Do NOT enable compression for this instantiation.

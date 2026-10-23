@@ -288,16 +288,49 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch,
 
       case kWALIndexSupersessionType:
       case kRecyclableWALIndexSupersessionType: {
-        if (first_record_read_) {
-          ReportCorruption(fragment.size(),
-                           "WAL_Index supersession follows a data record");
-        } else {
-          DecodeWALIndexSupersessionRecord(fragment);
-        }
+        DecodeWALIndexSupersessionRecord(fragment);
         if (in_fragmented_record && !scratch->empty()) {
           ReportCorruption(
               scratch->size(),
               "WAL_Index supersession interspersed partial record");
+          if (record_checksum != nullptr) {
+            XXH3_64bits_reset(hash_state_);
+          }
+        }
+        prospective_record_offset = physical_record_offset;
+        scratch->clear();
+        in_fragmented_record = false;
+        last_record_offset_ = prospective_record_offset;
+        break;  // switch
+      }
+
+      case kWALIndexProgressType:
+      case kRecyclableWALIndexProgressType: {
+        // Metadata: skipped rather than returned, consumes no index. A
+        // progress record may legally precede the first data record: that is
+        // the idle file it exists for.
+        DecodeWALIndexProgressRecord(fragment);
+        if (in_fragmented_record && !scratch->empty()) {
+          ReportCorruption(scratch->size(),
+                           "WAL_Index progress interspersed partial record");
+          if (record_checksum != nullptr) {
+            XXH3_64bits_reset(hash_state_);
+          }
+        }
+        prospective_record_offset = physical_record_offset;
+        scratch->clear();
+        in_fragmented_record = false;
+        last_record_offset_ = prospective_record_offset;
+        break;  // switch
+      }
+
+      case kWALIndexPredecessorSpanType:
+      case kRecyclableWALIndexPredecessorSpanType: {
+        DecodeWALIndexPredecessorSpanRecord(fragment);
+        if (in_fragmented_record && !scratch->empty()) {
+          ReportCorruption(
+              scratch->size(),
+              "WAL_Index predecessor span interspersed partial record");
           if (record_checksum != nullptr) {
             XXH3_64bits_reset(hash_state_);
           }
@@ -543,6 +576,7 @@ void Reader::MaybeStripAndVerifyWALIndex(bool record_has_wal_index,
   // expected rather than a gap.
   last_read_wal_index_ = DecodeFixed64(record->data());
   record->remove_prefix(kWALIndexSize);
+  wal_index_order_mark_ = std::max(wal_index_order_mark_, last_read_wal_index_);
 
   if (record_checksum != nullptr) {
     *record_checksum = XXH3_64bits(record->data(), record->size());
@@ -572,10 +606,26 @@ void Reader::DecodeWALIndexVoidRecord(const Slice& fragment) {
     ReportCorruption(fragment.size(), "WAL_Index void range is reversed");
     return;
   }
+  if (lo <= wal_index_order_mark_) {
+    ReportCorruption(fragment.size(),
+                     "WAL_Index void range trails the index order mark");
+    return;
+  }
   max_void_wal_index_hi_ = std::max(max_void_wal_index_hi_, hi);
+  wal_index_void_ranges_.emplace_back(lo, hi);
+  wal_index_order_mark_ = std::max(wal_index_order_mark_, lo);
 }
 
 void Reader::DecodeWALIndexSupersessionRecord(const Slice& fragment) {
+  // Head position is enforced here rather than at the call sites so both
+  // readers inherit the same rule. A progress record closes the head: reading
+  // one proves no supersession is still coming.
+  if (first_record_read_ || last_progress_bound_read_ != 0) {
+    ReportCorruption(
+        fragment.size(),
+        "WAL_Index supersession follows a data record or progress assertion");
+    return;
+  }
   if (fragment.size() != kWALIndexSupersessionPayloadSize) {
     ReportCorruption(fragment.size(),
                      "WAL_Index supersession record has invalid size");
@@ -600,6 +650,69 @@ void Reader::DecodeWALIndexSupersessionRecord(const Slice& fragment) {
   if (!inserted) {
     it->second = std::min(it->second, first_superseded);
   }
+}
+
+void Reader::DecodeWALIndexProgressRecord(const Slice& fragment) {
+  if (fragment.size() != kWALIndexProgressPayloadSize) {
+    ReportCorruption(fragment.size(),
+                     "WAL_Index progress record has invalid size");
+    return;
+  }
+  const uint64_t bound = DecodeFixed64(fragment.data());
+  if (bound == 0) {
+    ReportCorruption(fragment.size(),
+                     "WAL_Index progress bound is the unassigned index");
+    return;
+  }
+  if (bound < last_progress_bound_read_) {
+    ReportCorruption(fragment.size(),
+                     "WAL_Index progress bound moves backward");
+    return;
+  }
+  last_progress_bound_read_ = bound;
+}
+
+void Reader::DecodeWALIndexPredecessorSpanRecord(const Slice& fragment) {
+  // Same head position as a supersession: before the first data record and
+  // the first progress record.
+  if (first_record_read_ || last_progress_bound_read_ != 0) {
+    ReportCorruption(
+        fragment.size(),
+        "WAL_Index predecessor span follows a data record or progress "
+        "assertion");
+    return;
+  }
+  if (fragment.size() != kWALIndexPredecessorSpanPayloadSize) {
+    ReportCorruption(fragment.size(),
+                     "WAL_Index predecessor span record has invalid size");
+    return;
+  }
+  if (has_predecessor_span_) {
+    ReportCorruption(fragment.size(),
+                     "WAL_Index file attests two predecessor spans");
+    return;
+  }
+  const uint64_t predecessor_wal_number = DecodeFixed64(fragment.data());
+  const uint64_t first = DecodeFixed64(fragment.data() + kWALIndexSize);
+  const uint64_t last = DecodeFixed64(fragment.data() + 2 * kWALIndexSize);
+  if (predecessor_wal_number == 0 || predecessor_wal_number >= log_number_) {
+    ReportCorruption(fragment.size(),
+                     "WAL_Index predecessor span names a non-older WAL");
+    return;
+  }
+  if ((first == 0) != (last == 0)) {
+    ReportCorruption(fragment.size(),
+                     "WAL_Index predecessor span is half unassigned");
+    return;
+  }
+  if (first > last) {
+    ReportCorruption(fragment.size(), "WAL_Index predecessor span is reversed");
+    return;
+  }
+  has_predecessor_span_ = true;
+  predecessor_span_wal_ = predecessor_wal_number;
+  predecessor_span_first_ = first;
+  predecessor_span_last_ = last;
 }
 
 uint64_t Reader::LastRecordOffset() { return last_record_offset_; }
@@ -1101,16 +1214,43 @@ bool FragmentBufferedReader::ReadRecord(Slice* record, std::string* scratch,
 
       case kWALIndexSupersessionType:
       case kRecyclableWALIndexSupersessionType: {
-        if (first_record_read_) {
-          ReportCorruption(fragment.size(),
-                           "WAL_Index supersession follows a data record");
-        } else {
-          DecodeWALIndexSupersessionRecord(fragment);
-        }
+        DecodeWALIndexSupersessionRecord(fragment);
         if (in_fragmented_record_ && !fragments_.empty()) {
           ReportCorruption(
               fragments_.size(),
               "WAL_Index supersession interspersed partial record");
+        }
+        fragments_.clear();
+        prospective_record_offset = physical_record_offset;
+        last_record_offset_ = prospective_record_offset;
+        in_fragmented_record_ = false;
+        break;
+      }
+
+      case kWALIndexProgressType:
+      case kRecyclableWALIndexProgressType: {
+        // See Reader::ReadRecord: metadata, skipped, consumes no index, and
+        // may precede the first data record. Decoding is shared so both
+        // readers accept exactly the same bounds.
+        DecodeWALIndexProgressRecord(fragment);
+        if (in_fragmented_record_ && !fragments_.empty()) {
+          ReportCorruption(fragments_.size(),
+                           "WAL_Index progress interspersed partial record");
+        }
+        fragments_.clear();
+        prospective_record_offset = physical_record_offset;
+        last_record_offset_ = prospective_record_offset;
+        in_fragmented_record_ = false;
+        break;
+      }
+
+      case kWALIndexPredecessorSpanType:
+      case kRecyclableWALIndexPredecessorSpanType: {
+        DecodeWALIndexPredecessorSpanRecord(fragment);
+        if (in_fragmented_record_ && !fragments_.empty()) {
+          ReportCorruption(
+              fragments_.size(),
+              "WAL_Index predecessor span interspersed partial record");
         }
         fragments_.clear();
         prospective_record_offset = physical_record_offset;

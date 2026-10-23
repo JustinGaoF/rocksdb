@@ -74,11 +74,14 @@ enum RecordType : uint8_t {
   // use it for indices that never carried data or for records it deliberately
   // discarded. Consumes no wal_index.
   //
-  // Unlike the marker these are not positionally constrained: a cover is
-  // written after the append it stands in for failed, so it can appear
-  // anywhere. They get their own types rather than a marker payload because
-  // the reader enforces the marker's "first record" rule, which a cover would
-  // violate by construction.
+  // A cover is written after the append it stands in for failed, so it lives
+  // mid-file rather than in the head, but it is order-constrained: the file's
+  // data indices and cover lower bounds must read in nondecreasing order. A
+  // cover trailing behind higher-index data would be invisible to a streaming
+  // merge at the moment it decides the hole the cover explains, so the reader
+  // rejects it. Covers get their own types rather than a marker payload
+  // because the reader enforces the marker's "first record" rule, which a
+  // cover would violate by construction.
   kWALIndexVoidType = 22,
   kRecyclableWALIndexVoidType = 23,
 
@@ -87,6 +90,27 @@ enum RecordType : uint8_t {
   // live. Consumes no wal_index.
   kWALIndexSupersessionType = 24,
   kRecyclableWALIndexSupersessionType = 25,
+
+  // Asserts that no record with a wal_index below the bound is still coming
+  // from this file. A merge cannot emit index k until every file has shown
+  // something above k or finished; an open, idle file does neither and would
+  // pin the stream, so it asserts progress instead. Consumes no wal_index.
+  //
+  // A progress assertion closes the file's head: supersessions and
+  // predecessor spans must precede the first progress record, so reading one
+  // proves the head metadata is complete. Bounds are nondecreasing; a file
+  // cannot un-assert progress.
+  kWALIndexProgressType = 26,
+  kRecyclableWALIndexProgressType = 27,
+
+  // Attests the wal_index span borne by this file's numeric predecessor: the
+  // predecessor's file number, first index, and last index. A merge derives
+  // its lower bound from surviving data, so a damaged head silently absorbs
+  // real loss; the successor-side span lets the merge detect the gap instead.
+  // A span of [0, 0] means the predecessor bears no indices. Consumes no
+  // wal_index. Precedes the first data record and the first progress record.
+  kWALIndexPredecessorSpanType = 28,
+  kRecyclableWALIndexPredecessorSpanType = 29,
 
   // For WAL verification
   kPredecessorWALInfoType = 130,
@@ -117,6 +141,12 @@ static_assert(kWALIndexMarkerType < kRecordTypeSafeIgnoreMask &&
               "WAL index record types must fail closed on older readers");
 static_assert(kRecyclableWALIndexSupersessionType < kRecordTypeSafeIgnoreMask,
               "WAL index supersession types must fail closed on older readers");
+static_assert(kRecyclableWALIndexProgressType < kRecordTypeSafeIgnoreMask,
+              "WAL index progress types must fail closed on older readers");
+static_assert(kRecyclableWALIndexPredecessorSpanType <
+                  kRecordTypeSafeIgnoreMask,
+              "WAL index predecessor span types must fail closed on older "
+              "readers");
 
 inline constexpr bool IsWALIndexRecordType(uint8_t type) {
   return (type >= kWALIndexFullType && type <= kWALIndexLastType) ||
@@ -130,7 +160,11 @@ inline constexpr bool IsWALIndexMetadataRecordType(uint8_t type) {
   return type == kWALIndexMarkerType || type == kRecyclableWALIndexMarkerType ||
          type == kWALIndexVoidType || type == kRecyclableWALIndexVoidType ||
          type == kWALIndexSupersessionType ||
-         type == kRecyclableWALIndexSupersessionType;
+         type == kRecyclableWALIndexSupersessionType ||
+         type == kWALIndexProgressType ||
+         type == kRecyclableWALIndexProgressType ||
+         type == kWALIndexPredecessorSpanType ||
+         type == kRecyclableWALIndexPredecessorSpanType;
 }
 
 inline constexpr bool IsRecyclableRecordType(uint8_t type) {
@@ -141,6 +175,8 @@ inline constexpr bool IsRecyclableRecordType(uint8_t type) {
          type == kRecyclableWALIndexMarkerType ||
          type == kRecyclableWALIndexVoidType ||
          type == kRecyclableWALIndexSupersessionType ||
+         type == kRecyclableWALIndexProgressType ||
+         type == kRecyclableWALIndexPredecessorSpanType ||
          type == kRecyclePredecessorWALInfoType;
 }
 
@@ -157,6 +193,14 @@ constexpr uint32_t kWALIndexVoidPayloadSize = 2 * kWALIndexSize;
 // A supersession record's payload is the superseded WAL file number followed
 // by its first obsolete wal_index. The index range is open-ended.
 constexpr uint32_t kWALIndexSupersessionPayloadSize = 2 * kWALIndexSize;
+
+// A progress record's payload is one fixed64: the bound below which nothing
+// is still coming from this file.
+constexpr uint32_t kWALIndexProgressPayloadSize = kWALIndexSize;
+
+// A predecessor span record's payload is the predecessor WAL file number,
+// its first wal_index, and its last wal_index.
+constexpr uint32_t kWALIndexPredecessorSpanPayloadSize = 3 * kWALIndexSize;
 
 // Header is checksum (4 bytes), length (2 bytes), type (1 byte)
 constexpr int kHeaderSize = 4 + 2 + 1;
