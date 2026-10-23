@@ -865,6 +865,62 @@ enum Histograms : uint32_t {
   // Time spent opening the secondary DB inside DB::OpenAndCompact().
   OPEN_AND_COMPACT_DB_OPEN_MICROS,
 
+  // Number of writers in a write batch group. One sample per group, recorded
+  // by the group leader when the group is formed: the distribution of batch
+  // sizes the write path actually sees.
+  WRITERS_PER_WRITE_GROUP,
+  // Number of writers excluded from a write batch group by
+  // max_write_batch_group_size_bytes: writers compatible with the leader in
+  // every way except that adding them would exceed the cap. One sample per
+  // group; the cap-hit rate is the fraction of groups with a non-zero sample.
+  WRITE_GROUP_CAP_EXCLUDED,
+  // Time (microseconds) a write spends blocked in WriteThread::JoinBatchGroup
+  // waiting to join or lead a write batch group. One sample per write;
+  // writers that link uncontended record ~0. In the same unit as
+  // WAL_DURABILITY_WAIT_MICROS, so the two wait distributions can be compared
+  // directly: this one is the queueing that write-partition routing could
+  // relieve, the durability wait is what it cannot touch. Recorded only at
+  // stats levels above kExceptDetailedTimers; at or below it no clock is
+  // read.
+  JOIN_BATCH_GROUP_WAIT_MICROS,
+
+  // The histograms below record only with wal_partitions > 1 (EXPERIMENTAL).
+  //
+  // Time (microseconds) a write group waits in its completion gate for every
+  // lower sequence number to reach the WAL. One sample per group that runs
+  // the gate; a group whose predecessors already landed records ~0. With
+  // more than one WAL partition, a wait that cannot end before a running
+  // gate sync does (a sync group's wait for the records below it to be
+  // written, or a wait to become visible behind that sync) includes the time
+  // the group spends fsyncing partitions of that sync.
+  WAL_DURABILITY_WAIT_MICROS,
+  // Time (microseconds) from the start of a write group's WAL append to the
+  // durability tracker marking its range complete. One sample per group.
+  WAL_PARTITION_COMPLETION_MICROS,
+  // Number of WAL partitions a sync=true write group's sync fsynced: only
+  // those holding unsynced data the group depends on. One sample per sync
+  // the group runs.
+  WAL_SYNC_FSYNCED_PARTITIONS,
+  // Number of WAL partitions holding an unsynced record at or below a
+  // sync=true write group's sequence when its sync claimed them: the
+  // partitions that sync had to persist. One sample per sync the group runs.
+  WAL_SYNC_UNSYNCED_PARTITIONS,
+  // Time (microseconds) a sync=true write group spends syncing across WAL
+  // partitions: the wait for every lower sequence number to reach the WAL,
+  // then one sync of the partitions holding records it depends on (claim
+  // and fsyncs). One sample per such group.
+  WAL_SYNC_BARRIER_MICROS,
+  // Time (microseconds) external file ingestion holds writers out of every
+  // WAL partition's write queue. One sample per ingestion.
+  WAL_PARTITION_INGESTION_STALL_MICROS,
+  // Time (microseconds) a write group's WAL append waits for its partition's
+  // WAL write mutex. One sample per append that takes it.
+  WAL_WRITE_MUTEX_WAIT_MICROS,
+  // Time (microseconds) to take every partition's WAL write mutex at once.
+  // One sample per such acquisition, so the count is the number of times
+  // the partitions were serialized against each other.
+  WAL_WRITE_MUTEX_ALL_WAIT_MICROS,
+
   HISTOGRAM_ENUM_MAX
 };
 

@@ -6098,6 +6098,28 @@ class HistogramTypeJni {
       case ROCKSDB_NAMESPACE::Histograms::
           IO_DISPATCHER_ASYNC_READ_PREFETCH_LEAD_MICROS:
         return 0x4E;
+      case ROCKSDB_NAMESPACE::Histograms::WRITERS_PER_WRITE_GROUP:
+        return 0x4F;
+      case ROCKSDB_NAMESPACE::Histograms::WRITE_GROUP_CAP_EXCLUDED:
+        return 0x50;
+      case ROCKSDB_NAMESPACE::Histograms::JOIN_BATCH_GROUP_WAIT_MICROS:
+        return 0x51;
+      case ROCKSDB_NAMESPACE::Histograms::WAL_DURABILITY_WAIT_MICROS:
+        return 0x52;
+      case ROCKSDB_NAMESPACE::Histograms::WAL_PARTITION_COMPLETION_MICROS:
+        return 0x53;
+      case ROCKSDB_NAMESPACE::Histograms::WAL_SYNC_FSYNCED_PARTITIONS:
+        return 0x54;
+      case ROCKSDB_NAMESPACE::Histograms::WAL_SYNC_UNSYNCED_PARTITIONS:
+        return 0x55;
+      case ROCKSDB_NAMESPACE::Histograms::WAL_SYNC_BARRIER_MICROS:
+        return 0x56;
+      case ROCKSDB_NAMESPACE::Histograms::WAL_PARTITION_INGESTION_STALL_MICROS:
+        return 0x57;
+      case ROCKSDB_NAMESPACE::Histograms::WAL_WRITE_MUTEX_WAIT_MICROS:
+        return 0x58;
+      case ROCKSDB_NAMESPACE::Histograms::WAL_WRITE_MUTEX_ALL_WAIT_MICROS:
+        return 0x59;
       case ROCKSDB_NAMESPACE::Histograms::HISTOGRAM_ENUM_MAX:
         // 0x3E is reserved for backwards compatibility on current minor
         // version.
@@ -6280,6 +6302,29 @@ class HistogramTypeJni {
       case 0x4E:
         return ROCKSDB_NAMESPACE::Histograms::
             IO_DISPATCHER_ASYNC_READ_PREFETCH_LEAD_MICROS;
+      case 0x4F:
+        return ROCKSDB_NAMESPACE::Histograms::WRITERS_PER_WRITE_GROUP;
+      case 0x50:
+        return ROCKSDB_NAMESPACE::Histograms::WRITE_GROUP_CAP_EXCLUDED;
+      case 0x51:
+        return ROCKSDB_NAMESPACE::Histograms::JOIN_BATCH_GROUP_WAIT_MICROS;
+      case 0x52:
+        return ROCKSDB_NAMESPACE::Histograms::WAL_DURABILITY_WAIT_MICROS;
+      case 0x53:
+        return ROCKSDB_NAMESPACE::Histograms::WAL_PARTITION_COMPLETION_MICROS;
+      case 0x54:
+        return ROCKSDB_NAMESPACE::Histograms::WAL_SYNC_FSYNCED_PARTITIONS;
+      case 0x55:
+        return ROCKSDB_NAMESPACE::Histograms::WAL_SYNC_UNSYNCED_PARTITIONS;
+      case 0x56:
+        return ROCKSDB_NAMESPACE::Histograms::WAL_SYNC_BARRIER_MICROS;
+      case 0x57:
+        return ROCKSDB_NAMESPACE::Histograms::
+            WAL_PARTITION_INGESTION_STALL_MICROS;
+      case 0x58:
+        return ROCKSDB_NAMESPACE::Histograms::WAL_WRITE_MUTEX_WAIT_MICROS;
+      case 0x59:
+        return ROCKSDB_NAMESPACE::Histograms::WAL_WRITE_MUTEX_ALL_WAIT_MICROS;
       case 0x3E:
         // 0x3E is reserved for backwards compatibility on current minor
         // version.
