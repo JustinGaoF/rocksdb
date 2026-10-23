@@ -2566,6 +2566,9 @@ class DB {
   //
   // Additionally, for the sake of optimization current_wal_file->StartSequence
   // would always be set to 0
+  //
+  // With wal_partitions > 1 there is one current WAL per partition, so this
+  // returns Status::NotSupported.
   virtual Status GetCurrentWalFile(
       std::unique_ptr<WalFile>* current_wal_file) = 0;
 
