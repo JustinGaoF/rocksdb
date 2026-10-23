@@ -7345,6 +7345,102 @@ TEST_F(DBWALTest, SingleWalPartition) {
   ASSERT_EQ(1, dbfull()->TEST_NumWalPartitions());
   ASSERT_EQ("v1", Get("foo"));
 }
+
+TEST_F(DBWALTest, SplitWalMutexConcurrentManualFlush) {
+  // The WAL write mutex is split per partition: the single-partition append
+  // path (WriteToWAL under manual_wal_flush) must exclude the spanning
+  // FlushWAL on the written partition, the single-partition resolve step
+  // (PreprocessWrite) must exclude concurrent WAL bookkeeping, and the
+  // spanning manual-flush surface (FlushWAL, WALBufferIsEmpty,
+  // LockWAL/UnlockWAL) must stay correct under concurrent writes. Hammer
+  // both sides; TSan watches for a missed exclusion. Runs with
+  // two_write_queues off and on.
+  for (bool two_write_queues : {false, true}) {
+    Options options = CurrentOptions();
+    options.create_if_missing = true;
+    options.manual_wal_flush = true;
+    options.two_write_queues = two_write_queues;
+    // Small buffer: force WAL rotations so obsolete-file cleanup runs
+    // against the resolve step.
+    options.write_buffer_size = 8192;
+    DestroyAndReopen(options);
+
+    constexpr int kWriterThreads = 4;
+    constexpr int kWritesPerThread = 200;
+    constexpr int kTotalWrites = kWriterThreads * kWritesPerThread;
+    std::atomic<int> puts_done{0};
+    std::vector<port::Thread> writers;
+    for (int t = 0; t < kWriterThreads; ++t) {
+      writers.emplace_back([&, t]() {
+        for (int i = 0; i < kWritesPerThread; ++i) {
+          ASSERT_OK(Put(Key(t * kWritesPerThread + i), "v"));
+          ++puts_done;
+        }
+      });
+    }
+    // Flush surface across the whole write phase, with periodic flushes so
+    // rotated WALs become obsolete while writes are still resolving.
+    int rounds = 0;
+    bool lock_cycled = false;
+    while (puts_done.load() < kTotalWrites) {
+      ASSERT_OK(db_->FlushWAL(false));
+      (void)dbfull()->WALBufferIsEmpty();
+      if (++rounds % 100 == 0) {
+        ASSERT_OK(Flush());
+      }
+      if (!lock_cycled && puts_done.load() >= kTotalWrites / 2) {
+        // Writes stall for the hold, then proceed after UnlockWAL.
+        ASSERT_OK(db_->LockWAL());
+        ASSERT_OK(db_->UnlockWAL());
+        lock_cycled = true;
+      }
+    }
+    for (auto& w : writers) {
+      w.join();
+    }
+
+    ASSERT_OK(db_->FlushWAL(true));
+    for (int t = 0; t < kWriterThreads; ++t) {
+      for (int i = 0; i < kWritesPerThread; ++i) {
+        ASSERT_EQ("v", Get(Key(t * kWritesPerThread + i)));
+      }
+    }
+    ASSERT_OK(db_->LockWAL());
+    ASSERT_OK(db_->UnlockWAL());
+    Destroy(options);
+  }
+}
+
+TEST_F(DBWALTest, MemtableInsertFailureTruncatesBoundWal) {
+  // A write whose WAL append lands but whose memtable insert fails marks the
+  // WAL it bound to for truncation back to its pre-append size, applied when
+  // the WAL writer is cleared on close.
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("good", "v"));
+  const std::string wal_path =
+      LogFileName(dbname_, dbfull()->TEST_GetCurrentLogNumber());
+  uint64_t size_before = 0;
+  ASSERT_OK(env_->GetFileSize(wal_path, &size_before));
+
+  // No column family 99 exists, so the insert fails after the append.
+  WriteBatch batch;
+  ASSERT_OK(WriteBatchInternal::Put(&batch, 99, "bad", "v"));
+  ASSERT_TRUE(db_->Write(WriteOptions(), &batch).IsInvalidArgument());
+  uint64_t size_after_append = 0;
+  ASSERT_OK(env_->GetFileSize(wal_path, &size_after_append));
+  ASSERT_GT(size_after_append, size_before);
+
+  Close();
+  uint64_t size_after_close = 0;
+  ASSERT_OK(env_->GetFileSize(wal_path, &size_after_close));
+  ASSERT_EQ(size_before, size_after_close);
+
+  Reopen(options);
+  ASSERT_EQ("v", Get("good"));
+}
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

@@ -109,7 +109,7 @@ Step 3 - Constructs a new `MemTable` with `earliest_seq` set to the current last
 
 Step 4 - Constructs `FragmentedRangeTombstones` on the old memtable for read efficiency.
 
-Step 5 - Under `wal_write_mutex_`, flushes the current WAL writer's buffer and switches to the new WAL.
+Step 5 - Under the rotated partition's WAL write mutex, flushes the current WAL writer's buffer and switches to the new WAL.
 
 Step 6 - Moves the old memtable to the immutable list and installs a new `SuperVersion`.
 
