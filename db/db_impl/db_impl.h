@@ -2290,6 +2290,7 @@ class DBImpl : public DB
   friend class DBImplFollower;
 #ifndef NDEBUG
   friend class DBTest_ConcurrentFlushWAL_Test;
+  friend class DBWritePartitionTest;
   friend class DBTest_MixedSlowdownOptionsStop_Test;
   friend class DBCompactionTest_CompactBottomLevelFilesWithDeletions_Test;
   friend class DBCompactionTest_CompactionDuringShutdown_Test;
@@ -2835,9 +2836,53 @@ class DBImpl : public DB
   Status DelayWrite(uint64_t num_bytes, WriteThread& write_thread,
                     const WriteOptions& write_options);
 
-  // Begin stalling of writes when memory usage increases beyond a certain
-  // threshold.
-  Status WriteBufferManagerStallWrites(WriteContext* write_context);
+  // Begin stalling of writes to `wal_partition` when memory usage increases
+  // beyond a certain threshold.
+  Status WriteBufferManagerStallWrites(size_t wal_partition,
+                                       WriteContext* write_context);
+
+  // Whether `write_thread` is one of the per-partition main write queues
+  // rather than a nonmem queue.
+  bool IsMainWriteThread(const WriteThread& write_thread) {
+    for (size_t p = 0; p < NumWalPartitions(); ++p) {
+      if (&write_thread == &PartitionWriteThread(p)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Memtable-switch gate, used only with more than one WAL partition. Leaders
+  // of different partitions append and insert into the shared memtables
+  // concurrently, so a leader that must switch memtables or WALs in
+  // PreprocessWrite() first closes the gate and waits for the leaders already
+  // past it to exit their groups; leaders arriving while it is closed wait at
+  // it. Callers outside the write path exclude every leader by entering all
+  // partitions' queues unbatched instead.
+  //
+  // A closing leader has not entered the gate itself, and a leader past the
+  // gate never closes it, so no leader waits on itself.
+  // REQUIRES: mutex_ held; it is released while waiting.
+  void CloseMemTableSwitchGate();
+  // REQUIRES: mutex_ held.
+  void OpenMemTableSwitchGate();
+  // Called by PreprocessWrite() after any switch, before it binds a WAL.
+  // REQUIRES: mutex_ not held.
+  void EnterMemTableSwitchGate();
+  // Called once per group that entered, by whichever thread exits the group.
+  void ExitMemTableSwitchGate();
+
+  // Publishes `seq` as the last visible sequence. With more than one WAL
+  // partition, leaders publish out of sequence order; a publish that a higher
+  // one has already overtaken is skipped rather than moving LastSequence()
+  // backwards.
+  void PublishLastSequence(SequenceNumber seq) {
+    if (NumWalPartitions() == 1) {
+      versions_->SetLastSequence(seq);
+    } else {
+      versions_->SetLastSequenceAtLeast(seq);
+    }
+  }
 
   Status ThrottleLowPriWritesIfNeeded(const WriteOptions& write_options,
                                       WriteBatch* my_batch);
@@ -2955,7 +3000,9 @@ class DBImpl : public DB
       // Memtable writers may call DB::Get in case max_successive_merges > 0,
       // which may lock mutex. Unlocking mutex here to avoid deadlock.
       mutex_.Unlock();
-      write_thread_.WaitForMemTableWriters();
+      for (size_t p = 0; p < NumWalPartitions(); ++p) {
+        PartitionWriteThread(p).WaitForMemTableWriters();
+      }
       mutex_.Lock();
     }
 
@@ -3001,13 +3048,19 @@ class DBImpl : public DB
   // DBs. REQUIRES: mutex_ held.
   bool WouldBlockJoiningWriteThread() {
     mutex_.AssertHeld();
-    return write_thread_.GetBegunCountOfOutstandingStall() != 0 ||
-           (two_write_queues_ &&
-            nonmem_write_thread_.GetBegunCountOfOutstandingStall() != 0);
+    for (size_t p = 0; p < NumWalPartitions(); ++p) {
+      if (PartitionWriteThread(p).GetBegunCountOfOutstandingStall() != 0 ||
+          (two_write_queues_ &&
+           NonmemWriteThread(p).GetBegunCountOfOutstandingStall() != 0)) {
+        return true;
+      }
+    }
+    return false;
   }
 
-  Status EnterWriteThreadForNonBlockingFlush(WriteThread::Writer* w,
-                                             WriteThread::Writer* nonmem_w);
+  class AllPartitionsWriter;
+  Status EnterWriteThreadForNonBlockingFlush(AllPartitionsWriter* w,
+                                             AllPartitionsWriter* nonmem_w);
 
   // REQUIRES: mutex locked and in write thread.
   void AssignAtomicFlushSeq(const autovector<ColumnFamilyData*>& cfds);
@@ -3106,11 +3159,12 @@ class DBImpl : public DB
                       const WriteOptions& write_options,
                       WalContext& wal_context, uint64_t* wal_used,
                       uint64_t* log_size, SequenceNumber sequence,
-                      uint64_t wal_index);
+                      uint64_t wal_index, size_t sequence_count);
 
   IOStatus WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
                            WalContext& wal_context, uint64_t* wal_used,
-                           SequenceNumber sequence, uint64_t wal_index);
+                           SequenceNumber sequence, uint64_t wal_index,
+                           size_t sequence_count);
 
   IOStatus ConcurrentWriteGroupToWAL(const WriteThread::WriteGroup& write_group,
                                      uint64_t* wal_used,
@@ -3885,8 +3939,8 @@ class DBImpl : public DB
   //    FindObsoleteFiles() which ensure that both mutex_ and all N WAL write
   //    mutexes are held when accessing alive_wal_files_.
   // 4. read by DBImpl::Open() is protected by mutex_.
-  // 5. push_back() by SwitchMemtable(). Both mutex_ and the rotated
-  //    partition's WalWriteMutex (partition 0 today) are held. This is done
+  // 5. push_back() by SwitchMemtable(). Both mutex_ and all N WAL write
+  //    mutexes are held; every partition rotates together. This is done
   //    by the write group leader. Note that in the case of
   //    two-write-queues, another WAL-only write thread can be writing to the
   //    WAL concurrently. See 9.
@@ -3952,10 +4006,9 @@ class DBImpl : public DB
   //     concurrently. This is fine because every party holds the touched
   //     partition's mutex. See 2, 5, 9.
   // 12. reads, empty(), back() called by SwitchMemtable() hold both mutex_ and
-  //     the rotated partition's WalWriteMutex (partition 0 today). This
-  //     happens in the write group leader.
-  // 13. emplace_back() by SwitchMemtable() hold both mutex_ and the rotated
-  //     partition's WalWriteMutex (partition 0 today). This happens in the
+  //     all N WAL write mutexes. This happens in the write group leader.
+  // 13. emplace_back() by SwitchMemtable() hold both mutex_ and all N WAL
+  //     write mutexes; every partition rotates together. This happens in the
   //     write group leader. Can conflict with bg threads calling
   //     FindObsoleteFiles(), MarkLogsSynced(), SyncClosedWals(), etc. as well
   //     as application threads calling FlushWAL(), SyncWAL(), LockWAL().
@@ -3995,7 +4048,7 @@ class DBImpl : public DB
   // Partition access. An interim chokepoint, not the container abstraction
   // (that gets extracted once real N-partition usage is known): every use
   // names its partition explicitly so a future change cannot silently mix
-  // partitions, and the asserts pin the layout (all seven vectors always have
+  // partitions, and the asserts pin the layout (all nine vectors always have
   // one entry per partition). Do not touch the vectors directly; use these.
   // Element addresses are stable: deque elements never move, and none of the
   // vectors is ever resized, so references and pointers into a partition's
@@ -4036,7 +4089,15 @@ class DBImpl : public DB
     assert(partition < wals_to_free_.size());
     return wals_to_free_[partition];
   }
-  // Number of WAL partitions. All seven vectors always have this many
+  WriteThread& PartitionWriteThread(size_t partition) {
+    assert(partition < write_threads_.size());
+    return *write_threads_[partition];
+  }
+  WriteThread& NonmemWriteThread(size_t partition) {
+    assert(partition < nonmem_write_threads_.size());
+    return *nonmem_write_threads_[partition];
+  }
+  // Number of WAL partitions. All nine vectors always have this many
   // entries.
   size_t NumWalPartitions() const {
     assert(logs_.size() == alive_wal_files_.size());
@@ -4045,6 +4106,8 @@ class DBImpl : public DB
     assert(logs_.size() == wal_sync_cvs_.size());
     assert(logs_.size() == wal_empties_.size());
     assert(logs_.size() == wals_to_free_.size());
+    assert(logs_.size() == write_threads_.size());
+    assert(logs_.size() == nonmem_write_threads_.size());
     return logs_.size();
   }
 
@@ -4067,6 +4130,61 @@ class DBImpl : public DB
   uint64_t WalPartitionTimerElapsed(uint64_t start) const {
     return start == 0 ? 0 : immutable_db_options_.clock->NowMicros() - start;
   }
+
+  // One Writer per WAL partition, for entering every partition's main (or
+  // nonmem) write queue unbatched. Queues are entered in ascending partition
+  // order and exited in reverse. A leader only ever occupies its own
+  // partition's queue, so callers that follow this order exclude all writers
+  // without deadlocking against leaders or against each other.
+  class AllPartitionsWriter {
+   public:
+    AllPartitionsWriter(DBImpl* db, bool nonmem) : db_(db), nonmem_(nonmem) {}
+    // REQUIRES: db mutex held; it is released while waiting.
+    void EnterUnbatched() {
+      AllocateWriters();
+      for (size_t p = 0; p < db_->NumWalPartitions(); ++p) {
+        Queue(p).EnterUnbatched(&Writer(p), &db_->mutex_);
+      }
+    }
+    // Refuses a stall on any partition's queue. Call ExitUnbatched() only when
+    // this returns true; false leaves no queue entered.
+    // REQUIRES: db mutex held; it is released while waiting.
+    bool EnterUnbatchedNonBlocking() {
+      AllocateWriters();
+      for (size_t p = 0; p < db_->NumWalPartitions(); ++p) {
+        if (!Queue(p).EnterUnbatchedNonBlocking(&Writer(p), &db_->mutex_)) {
+          for (; p > 0; --p) {
+            Queue(p - 1).ExitUnbatched(&Writer(p - 1));
+          }
+          return false;
+        }
+      }
+      return true;
+    }
+    void ExitUnbatched() {
+      for (size_t p = db_->NumWalPartitions(); p > 0; --p) {
+        Queue(p - 1).ExitUnbatched(&Writer(p - 1));
+      }
+    }
+
+   private:
+    void AllocateWriters() {
+      const size_t num_partitions = db_->NumWalPartitions();
+      if (num_partitions > 1) {
+        other_writers_.reset(new WriteThread::Writer[num_partitions - 1]);
+      }
+    }
+    WriteThread& Queue(size_t p) {
+      return nonmem_ ? db_->NonmemWriteThread(p) : db_->PartitionWriteThread(p);
+    }
+    WriteThread::Writer& Writer(size_t p) {
+      return p == 0 ? first_writer_ : other_writers_[p - 1];
+    }
+    DBImpl* const db_;
+    const bool nonmem_;
+    WriteThread::Writer first_writer_;
+    std::unique_ptr<WriteThread::Writer[]> other_writers_;
+  };
 
   // Resolves a write's partition before group formation. Data-bearing batches
   // use a stable hash of their smallest column-family id. This explicit
@@ -4158,6 +4276,12 @@ class DBImpl : public DB
   // (a future change) must keep a common mutex for this state.
   WriteBatch cached_recoverable_state_;
   std::atomic<bool> cached_recoverable_state_empty_ = {true};
+  // Without two_write_queues, partition leaders cache the state concurrently:
+  // they assign it under this leaf mutex (LOCK ORDER rule 7), and only
+  // replace a state cached at a lower sequence, recorded here. The drain in
+  // WriteRecoverableState() runs with every leader excluded.
+  InstrumentedMutex cached_recoverable_state_mutex_;
+  SequenceNumber cached_recoverable_state_seq_ = 0;
 
   // If partition p's list is non-empty, we need to delete these log files in
   // background threads. Appends hold WalWriteMutex(p); the takeover into a
@@ -4177,18 +4301,29 @@ class DBImpl : public DB
 
   WriteBufferManager* write_buffer_manager_;
 
-  WriteThread write_thread_;
-  // The write thread when the writers have no memtable write. This will be used
-  // in 2PC to batch the prepares separately from the serial commit.
-  WriteThread nonmem_write_thread_;
+  // One write queue per WAL partition, indexed like the partition vectors: a
+  // writer joins the queue of the partition it was routed to, so leaders of
+  // different partitions run concurrently and share no queue state. Sized in
+  // the constructor and never resized.
+  std::vector<std::unique_ptr<WriteThread>> write_threads_;
+  // The per-partition write queues for writers that have no memtable write.
+  // These are used in 2PC to batch the prepares separately from the serial
+  // commit.
+  std::vector<std::unique_ptr<WriteThread>> nonmem_write_threads_;
+
+  // See CloseMemTableSwitchGate().
+  std::atomic<size_t> leaders_past_switch_gate_{0};
+  std::atomic<bool> switch_gate_closed_{false};
 
   WriteController write_controller_;
 
-  // Size of the last batch group. In slowdown mode, next write needs to
-  // sleep if it uses up the quota.
+  // Size of the last batch group, per WAL partition. In slowdown mode, next
+  // write needs to sleep if it uses up the quota. Each partition's leader
+  // charges its own partition's last group, as the only leader does at N=1.
   // Note: This is to protect memtable and compaction. If the batch only writes
   // to the WAL its size need not to be included in this.
-  uint64_t last_batch_group_size_ = 0;
+  std::vector<RelaxedAtomic<uint64_t>> last_batch_group_size_ =
+      std::vector<RelaxedAtomic<uint64_t>>(1);
 
   FlushScheduler flush_scheduler_;
 
@@ -4479,8 +4614,13 @@ class DBImpl : public DB
 
   BlobFileCompletionCallback blob_callback_;
 
-  // Pointer to WriteBufferManager stalling interface.
-  std::unique_ptr<StallInterface> wbm_stall_;
+  // WriteBufferManager stalling interfaces, one per WAL partition: each
+  // partition's leader stalls on its own, so the manager queues, signals and
+  // removes every stalled leader separately.
+  std::vector<std::unique_ptr<StallInterface>> wbm_stall_;
+  // Stalled leaders currently hiding wbm_flush_initiator_; the DB is marked
+  // flushable again only when the last of them leaves. Guarded by mutex_.
+  size_t wbm_leaders_hiding_flush_initiator_ = 0;
 
   // seqno_to_time_mapping_ stores the sequence number to time mapping, it's not
   // thread safe, both read and write need db mutex hold.

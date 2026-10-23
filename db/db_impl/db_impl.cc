@@ -220,8 +220,6 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
       batch_per_txn_(batch_per_txn),
       bg_cv_(&mutex_),
       write_buffer_manager_(immutable_db_options_.write_buffer_manager.get()),
-      write_thread_(immutable_db_options_),
-      nonmem_write_thread_(immutable_db_options_),
       write_controller_(mutable_db_options_.delayed_write_rate),
       delete_obsolete_files_last_run_(immutable_db_options_.clock->NowMicros()),
       wal_manager_(immutable_db_options_, file_options_, io_tracer_,
@@ -252,6 +250,27 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
   immutable_db_options_.fs->SetReadIOExecutorThreads(
       immutable_db_options_.read_io_executor_threads);
 #endif  // USE_COROUTINES
+
+  // Read-only instances never write, so they keep one partition whatever the
+  // option says; writable opens validate wal_partitions before getting here.
+  const size_t num_wal_partitions =
+      read_only ? 1 : std::max<size_t>(1, immutable_db_options_.wal_partitions);
+  if (num_wal_partitions > 1) {
+    logs_ = decltype(logs_)(num_wal_partitions);
+    alive_wal_files_ = decltype(alive_wal_files_)(num_wal_partitions);
+    wal_merge_buffers_ = decltype(wal_merge_buffers_)(num_wal_partitions);
+    wal_write_mutexes_ = decltype(wal_write_mutexes_)(num_wal_partitions);
+    wal_empties_ = decltype(wal_empties_)(num_wal_partitions, 1);
+    wals_to_free_ = decltype(wals_to_free_)(num_wal_partitions);
+    last_batch_group_size_ =
+        decltype(last_batch_group_size_)(num_wal_partitions);
+  }
+  for (size_t p = 0; p < num_wal_partitions; ++p) {
+    write_threads_.emplace_back(
+        std::make_unique<WriteThread>(immutable_db_options_));
+    nonmem_write_threads_.emplace_back(
+        std::make_unique<WriteThread>(immutable_db_options_));
+  }
 
   // Bind one sync condvar to each WAL partition's mutex. This is the only
   // partition vector filled here rather than at declaration: a condvar needs
@@ -333,7 +352,9 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
   max_total_wal_size_.store(mutable_db_options_.max_total_wal_size,
                             std::memory_order_relaxed);
   if (write_buffer_manager_) {
-    wbm_stall_.reset(new WBMStallInterface());
+    for (size_t p = 0; p < write_threads_.size(); ++p) {
+      wbm_stall_.emplace_back(new WBMStallInterface());
+    }
   }
 }
 
@@ -433,16 +454,16 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
   // memtable-switch fence, after FlushAllColumnFamilies() has dropped and
   // re-acquired the DB mutex.
   if (two_write_queues_) {
-    WriteThread::Writer w;
-    write_thread_.EnterUnbatched(&w, &mutex_);
-    WriteThread::Writer nonmem_w;
-    nonmem_write_thread_.EnterUnbatched(&nonmem_w, &mutex_);
+    AllPartitionsWriter w(this, /*nonmem=*/false);
+    w.EnterUnbatched();
+    AllPartitionsWriter nonmem_w(this, /*nonmem=*/true);
+    nonmem_w.EnterUnbatched();
     WaitForPendingWrites();
 
     versions_->SyncLastSequenceWithAllocated();
 
-    nonmem_write_thread_.ExitUnbatched(&nonmem_w);
-    write_thread_.ExitUnbatched(&w);
+    nonmem_w.ExitUnbatched();
+    w.ExitUnbatched();
   }
 
   TEST_SYNC_POINT("DBImpl::ResumeImpl:AfterSyncSeq");
@@ -1374,8 +1395,10 @@ Status DBImpl::CloseHelper() {
     }
   }
 
-  if (write_buffer_manager_ && wbm_stall_) {
-    write_buffer_manager_->RemoveDBFromQueue(wbm_stall_.get());
+  if (write_buffer_manager_) {
+    for (const auto& wbm_stall : wbm_stall_) {
+      write_buffer_manager_->RemoveDBFromQueue(wbm_stall.get());
+    }
   }
 
   IOStatus io_s = directories_.Close(IOOptions(), nullptr /* dbg */);
@@ -2257,8 +2280,8 @@ Status DBImpl::SetDBOptions(
       TEST_SYNC_POINT_CALLBACK("DBImpl::SetDBOptions:FileOptionsForCompaction",
                                &file_options_for_compaction_);
       if (wal_other_option_changed || wal_size_option_changed) {
-        WriteThread::Writer w;
-        write_thread_.EnterUnbatched(&w, &mutex_);
+        AllPartitionsWriter w(this, /*nonmem=*/false);
+        w.EnterUnbatched();
         if (wal_other_option_changed ||
             wals_total_size_.LoadRelaxed() > GetMaxTotalWalSize()) {
           Status purge_wal_status = SwitchWAL(&write_context);
@@ -2268,7 +2291,7 @@ Status DBImpl::SetDBOptions(
                            purge_wal_status.ToString().c_str());
           }
         }
-        write_thread_.ExitUnbatched(&w);
+        w.ExitUnbatched();
       }
       persist_options_status =
           WriteOptionsFile(WriteOptions(), true /*db_mutex_already_held*/);
@@ -2685,11 +2708,11 @@ Status DBImpl::LockWAL() {
       // the naive way, we could deadlock by locking the two queues in different
       // orders.
 
-      WriteThread::Writer w;
-      write_thread_.EnterUnbatched(&w, &mutex_);
-      WriteThread::Writer nonmem_w;
+      AllPartitionsWriter w(this, /*nonmem=*/false);
+      w.EnterUnbatched();
+      AllPartitionsWriter nonmem_w(this, /*nonmem=*/true);
       if (two_write_queues_) {
-        nonmem_write_thread_.EnterUnbatched(&nonmem_w, &mutex_);
+        nonmem_w.EnterUnbatched();
       }
 
       // NOTE: releasing mutex in EnterUnbatched might mean we are actually
@@ -2702,9 +2725,9 @@ Status DBImpl::LockWAL() {
       ++lock_wal_owner_thread_id_counts_[thread_id];
 
       if (two_write_queues_) {
-        nonmem_write_thread_.ExitUnbatched(&nonmem_w);
+        nonmem_w.ExitUnbatched();
       }
-      write_thread_.ExitUnbatched(&w);
+      w.ExitUnbatched();
     }
   }
   // NOTE: avoid I/O holding DB mutex
@@ -2719,8 +2742,8 @@ Status DBImpl::LockWAL() {
 Status DBImpl::UnlockWAL() {
   const uint64_t thread_id = env_->GetThreadID();
   bool signal = false;
-  uint64_t maybe_stall_begun_count = 0;
-  uint64_t nonmem_maybe_stall_begun_count = 0;
+  std::vector<uint64_t> maybe_stall_begun_counts(NumWalPartitions(), 0);
+  std::vector<uint64_t> nonmem_maybe_stall_begun_counts(NumWalPartitions(), 0);
   {
     InstrumentedMutexLock lock(&mutex_);
     const auto owner = lock_wal_owner_thread_id_counts_.find(thread_id);
@@ -2737,10 +2760,13 @@ Status DBImpl::UnlockWAL() {
       // until the thread(s) that called BeginWriteStall() have had a chance to
       // call EndWriteStall(), so that no_slowdown writes after UnlockWAL() are
       // guaranteed to succeed if there's no other source of stall.
-      maybe_stall_begun_count = write_thread_.GetBegunCountOfOutstandingStall();
-      if (two_write_queues_) {
-        nonmem_maybe_stall_begun_count =
-            nonmem_write_thread_.GetBegunCountOfOutstandingStall();
+      for (size_t p = 0; p < NumWalPartitions(); ++p) {
+        maybe_stall_begun_counts[p] =
+            PartitionWriteThread(p).GetBegunCountOfOutstandingStall();
+        if (two_write_queues_) {
+          nonmem_maybe_stall_begun_counts[p] =
+              NonmemWriteThread(p).GetBegunCountOfOutstandingStall();
+        }
       }
     }
   }
@@ -2749,11 +2775,15 @@ Status DBImpl::UnlockWAL() {
     bg_cv_.SignalAll();
   }
   // Ensure stalls have cleared
-  if (maybe_stall_begun_count) {
-    write_thread_.WaitForStallEndedCount(maybe_stall_begun_count);
-  }
-  if (nonmem_maybe_stall_begun_count) {
-    nonmem_write_thread_.WaitForStallEndedCount(nonmem_maybe_stall_begun_count);
+  for (size_t p = 0; p < NumWalPartitions(); ++p) {
+    if (maybe_stall_begun_counts[p]) {
+      PartitionWriteThread(p).WaitForStallEndedCount(
+          maybe_stall_begun_counts[p]);
+    }
+    if (nonmem_maybe_stall_begun_counts[p]) {
+      NonmemWriteThread(p).WaitForStallEndedCount(
+          nonmem_maybe_stall_begun_counts[p]);
+    }
   }
   return Status::OK();
 }
@@ -2892,18 +2922,18 @@ Status DBImpl::GetNewestUserDefinedTimestamp(ColumnFamilyHandle* column_family,
   {
     InstrumentedMutexLock l(&mutex_);
     bool enter_write_thread = sv->mem == cfd->mem();
-    WriteThread::Writer w;
+    AllPartitionsWriter w(this, /*nonmem=*/false);
     // Enter write thread to read the mutable memtable to avoid racing access
     // with concurrent writes. No need to enter nonmem_write_thread_ since this
     // call only care about memtable writes, not WAL writes.
     if (enter_write_thread) {
-      write_thread_.EnterUnbatched(&w, &mutex_);
+      w.EnterUnbatched();
       WaitForPendingWrites();
     }
     *newest_timestamp = sv->mem->GetNewestUDT().ToString();
     assert(!newest_timestamp->empty() || sv->mem->IsEmpty());
     if (enter_write_thread) {
-      write_thread_.ExitUnbatched(&w);
+      w.ExitUnbatched();
     }
   }
   // Read from immutable memtables if nothing found in mutable memtable.
@@ -4884,12 +4914,12 @@ Status DBImpl::CreateColumnFamilyWithPreparedOptions(
     // LogAndApply will both write the creation in MANIFEST and create
     // ColumnFamilyData object
     {  // write thread
-      WriteThread::Writer w;
-      write_thread_.EnterUnbatched(&w, &mutex_);
+      AllPartitionsWriter w(this, /*nonmem=*/false);
+      w.EnterUnbatched();
       s = versions_->LogAndApplyColumnFamilyAddWithSanitizedOptions(
           read_options, write_options, &edit, &mutex_, directories_.GetDbDir(),
           sanitized_cf_options);
-      write_thread_.ExitUnbatched(&w);
+      w.ExitUnbatched();
     }
     if (s.ok() && options_file_number != 0) {
       versions_->options_file_size_ = options_file_size;
@@ -5102,12 +5132,12 @@ Status DBImpl::DropColumnFamilyWithOptionsFile(
     }
     if (s.ok()) {
       // we drop column family from a single write thread
-      WriteThread::Writer w;
-      write_thread_.EnterUnbatched(&w, &mutex_);
+      AllPartitionsWriter w(this, /*nonmem=*/false);
+      w.EnterUnbatched();
       WaitForPendingWrites();
       s = versions_->LogAndApply(cfd, read_options, write_options, &edit,
                                  &mutex_, directories_.GetDbDir());
-      write_thread_.ExitUnbatched(&w);
+      w.ExitUnbatched();
       if (s.ok() && options_file_number != 0) {
         versions_->options_file_size_ = options_file_size;
       }
@@ -7867,12 +7897,13 @@ Status DBImpl::CommitFileIngestionHandles(
     InstrumentedMutexLock l(&mutex_);
     TEST_SYNC_POINT("DBImpl::AddFile:MutexLock");
 
+    const uint64_t stall_start = WalPartitionTimerStart();
     // Stop writes to the DB by entering both write threads
-    WriteThread::Writer w;
-    write_thread_.EnterUnbatched(&w, &mutex_);
-    WriteThread::Writer nonmem_w;
+    AllPartitionsWriter w(this, /*nonmem=*/false);
+    w.EnterUnbatched();
+    AllPartitionsWriter nonmem_w(this, /*nonmem=*/true);
     if (two_write_queues_) {
-      nonmem_write_thread_.EnterUnbatched(&nonmem_w, &mutex_);
+      nonmem_w.EnterUnbatched();
     }
     PERF_TIMER_GUARD(file_ingestion_blocking_live_writes_nanos);
 
@@ -8052,9 +8083,13 @@ Status DBImpl::CommitFileIngestionHandles(
 
     // Resume writes to the DB
     if (two_write_queues_) {
-      nonmem_write_thread_.ExitUnbatched(&nonmem_w);
+      nonmem_w.ExitUnbatched();
     }
-    write_thread_.ExitUnbatched(&w);
+    w.ExitUnbatched();
+    if (stall_start != 0) {
+      RecordTimeToHistogram(stats_, WAL_PARTITION_INGESTION_STALL_MICROS,
+                            WalPartitionTimerElapsed(stall_start));
+    }
     PERF_TIMER_STOP(file_ingestion_blocking_live_writes_nanos);
 
     if (status.ok()) {
@@ -8197,12 +8232,13 @@ Status DBImpl::CreateColumnFamilyWithImport(
       // Lock db mutex
       InstrumentedMutexLock l(&mutex_);
 
+      const uint64_t stall_start = WalPartitionTimerStart();
       // Stop writes to the DB by entering both write threads
-      WriteThread::Writer w;
-      write_thread_.EnterUnbatched(&w, &mutex_);
-      WriteThread::Writer nonmem_w;
+      AllPartitionsWriter w(this, /*nonmem=*/false);
+      w.EnterUnbatched();
+      AllPartitionsWriter nonmem_w(this, /*nonmem=*/true);
       if (two_write_queues_) {
-        nonmem_write_thread_.EnterUnbatched(&nonmem_w, &mutex_);
+        nonmem_w.EnterUnbatched();
       }
 
       num_running_ingest_file_++;
@@ -8223,9 +8259,13 @@ Status DBImpl::CreateColumnFamilyWithImport(
 
       // Resume writes to the DB
       if (two_write_queues_) {
-        nonmem_write_thread_.ExitUnbatched(&nonmem_w);
+        nonmem_w.ExitUnbatched();
       }
-      write_thread_.ExitUnbatched(&w);
+      w.ExitUnbatched();
+      if (stall_start != 0) {
+        RecordTimeToHistogram(stats_, WAL_PARTITION_INGESTION_STALL_MICROS,
+                              WalPartitionTimerElapsed(stall_start));
+      }
 
       num_running_ingest_file_--;
       if (num_running_ingest_file_ == 0) {

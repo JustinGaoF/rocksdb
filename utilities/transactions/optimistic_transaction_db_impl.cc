@@ -72,6 +72,15 @@ Status OptimisticTransactionDB::Open(
     const std::vector<ColumnFamilyDescriptor>& column_families,
     std::vector<ColumnFamilyHandle*>* handles,
     OptimisticTransactionDB** dbptr) {
+  if (db_options.wal_partitions > 1 &&
+      occ_options.validate_policy == OccValidationPolicy::kValidateSerial) {
+    // Serial validation commits through WriteWithCallback, which rejects a
+    // callback at N>1.
+    return Status::NotSupported(
+        "wal_partitions > 1 is not supported with "
+        "OccValidationPolicy::kValidateSerial");
+  }
+
   Status s;
   std::unique_ptr<DB> db;
 

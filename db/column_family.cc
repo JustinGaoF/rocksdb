@@ -1543,6 +1543,24 @@ Status ColumnFamilyData::ValidateOptions(
     s = Status::InvalidArgument(
         "max_successive_merges > 0 is incompatible with unordered_write");
   }
+  if (s.ok() && db_options.wal_partitions > 1 &&
+      cf_options.max_successive_merges != 0) {
+    // Merge batches take the concurrent memtable path at N>1, as with
+    // unordered_write, and the successive-merge counting there is not
+    // concurrent-safe.
+    s = Status::InvalidArgument(
+        "max_successive_merges > 0 is incompatible with "
+        "wal_partitions > 1");
+  }
+  if (s.ok() && db_options.wal_partitions > 1 &&
+      !cf_options.memtable_factory->IsInstanceOf(
+          SkipListFactory::kClassName())) {
+    // The N>1 memtable decision supports the concurrent skiplist only;
+    // other reps' concurrent inserts are not validated for multi-leader
+    // use.
+    s = Status::NotSupported(
+        "wal_partitions > 1 requires the SkipList memtable");
+  }
   if (s.ok()) {
     s = CheckCFPathsSupported(db_options, cf_options);
   }

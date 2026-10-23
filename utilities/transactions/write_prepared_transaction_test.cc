@@ -6,12 +6,15 @@
 #include <algorithm>
 #include <atomic>
 #include <cinttypes>
+#include <condition_variable>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <thread>
 
 #include "db/db_impl/db_impl.h"
 #include "db/dbformat.h"
+#include "db/write_batch_internal.h"
 #include "port/port.h"
 #include "port/stack_trace.h"
 #include "rocksdb/db.h"
@@ -4609,6 +4612,334 @@ TEST_P(WritePreparedTransactionTest, TxnGetEntitySkipsPreparedUncommitted) {
 
   reader.reset();
   scenario.TearDown(db);
+}
+
+// WritePrepared with more than one WAL partition (allowed only through the
+// debug hook), one queue, and the commit-time batch cached for recovery: the
+// leaders of different partitions cache the recoverable state concurrently.
+class WritePreparedPartitionedWalTest : public testing::Test {
+ public:
+  WritePreparedPartitionedWalTest()
+      : dbname_(test::PerThreadDBPath("write_prepared_partitioned_wal")) {
+    options_.create_if_missing = true;
+    options_.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+    options_.track_and_verify_wals_in_manifest = true;
+    options_.two_write_queues = false;
+    txn_db_options_.write_policy = WRITE_PREPARED;
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::ValidateOptions:AllowWalPartitions",
+        [](void* arg) { *static_cast<bool*>(arg) = true; });
+    SyncPoint::GetInstance()->EnableProcessing();
+    EXPECT_OK(DestroyDB(dbname_, options_));
+  }
+
+  ~WritePreparedPartitionedWalTest() override {
+    Close();
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    EXPECT_OK(DestroyDB(dbname_, options_));
+  }
+
+  // Opens with `num_partitions` WAL partitions and creates column families,
+  // whose ids follow creation order, until one routes to every partition.
+  void Open(size_t num_partitions) {
+    options_.wal_partitions = static_cast<uint32_t>(num_partitions);
+    ASSERT_OK(TransactionDB::Open(options_, txn_db_options_, dbname_, &db_));
+    cf_for_partition_.assign(num_partitions, 0);
+    std::vector<bool> covered(num_partitions, false);
+    size_t num_covered = 0;
+    for (uint32_t cf_id = 1; num_covered < num_partitions; ++cf_id) {
+      ColumnFamilyHandle* handle = nullptr;
+      ASSERT_OK(db_->CreateColumnFamily(ColumnFamilyOptions(options_),
+                                        "cf" + std::to_string(cf_id), &handle));
+      ASSERT_EQ(cf_id, handle->GetID());
+      ASSERT_OK(db_->DestroyColumnFamilyHandle(handle));
+      cf_names_.push_back("cf" + std::to_string(cf_id));
+      WriteBatch batch;
+      ASSERT_OK(WriteBatchInternal::Put(&batch, cf_id, "key", "value"));
+      size_t partition = num_partitions;
+      ASSERT_OK(
+          DBImpl::TEST_WalPartitionForWrite(batch, num_partitions, &partition));
+      if (!covered[partition]) {
+        covered[partition] = true;
+        cf_for_partition_[partition] = cf_id;
+        ++num_covered;
+      }
+    }
+    Reopen();
+  }
+
+  // Reopens every column family; handles_ is indexed by column family id.
+  void Reopen() {
+    Close();
+    std::vector<ColumnFamilyDescriptor> descriptors = {
+        {kDefaultColumnFamilyName, ColumnFamilyOptions(options_)}};
+    for (const std::string& name : cf_names_) {
+      descriptors.emplace_back(name, ColumnFamilyOptions(options_));
+    }
+    ASSERT_OK(TransactionDB::Open(options_, txn_db_options_, dbname_,
+                                  descriptors, &handles_, &db_));
+  }
+
+  void Close() {
+    for (ColumnFamilyHandle* handle : handles_) {
+      EXPECT_OK(db_->DestroyColumnFamilyHandle(handle));
+    }
+    handles_.clear();
+    delete db_;
+    db_ = nullptr;
+  }
+
+  ColumnFamilyHandle* CfOnPartition(size_t partition) {
+    return handles_[cf_for_partition_[partition]];
+  }
+
+  // Commits a transaction whose commit-time batch, the recoverable state,
+  // puts "state" = `value` into `cf`, so the commit routes by `cf`.
+  Status CommitWithState(ColumnFamilyHandle* cf, const std::string& name,
+                         const std::string& value) {
+    TransactionOptions txn_options;
+    txn_options.use_only_the_last_commit_time_batch_for_recovery = true;
+    std::unique_ptr<Transaction> txn(
+        db_->BeginTransaction(WriteOptions(), txn_options));
+    Status s = txn->SetName(name);
+    if (s.ok()) {
+      s = txn->Put(cf, name, value);
+    }
+    if (s.ok()) {
+      // Prepares on different partitions would add their sequences to the
+      // prepared heap out of order, which it does not support; only the
+      // commits, which cache the state, need to run concurrently.
+      std::lock_guard<std::mutex> lock(prepare_mu_);
+      s = txn->Prepare();
+    }
+    if (s.ok()) {
+      s = txn->GetCommitTimeWriteBatch()->Put(cf, "state", value);
+    }
+    if (s.ok()) {
+      s = txn->Commit();
+    }
+    return s;
+  }
+
+  void FlushAll() {
+    for (ColumnFamilyHandle* handle : handles_) {
+      ASSERT_OK(db_->Flush(FlushOptions(), handle));
+    }
+  }
+
+  std::string GetState(ColumnFamilyHandle* cf) {
+    std::string value;
+    Status s = db_->Get(ReadOptions(), cf, "state", &value);
+    if (s.IsNotFound()) {
+      return "NOT_FOUND";
+    }
+    EXPECT_OK(s);
+    return value;
+  }
+
+  const std::string dbname_;
+  Options options_;
+  TransactionDBOptions txn_db_options_;
+  TransactionDB* db_ = nullptr;
+  std::vector<std::string> cf_names_;
+  std::vector<ColumnFamilyHandle*> handles_;
+  // Column family id routed to each partition.
+  std::vector<uint32_t> cf_for_partition_;
+  std::mutex prepare_mu_;
+};
+
+TEST_F(WritePreparedPartitionedWalTest, ConcurrentRecoverableStateCaching) {
+  // G-18: leaders of all four partitions cache the recoverable state at the
+  // same moment, with flushes draining it in between. A barrier at the cache
+  // site (from D126602590) releases the parked leaders together once one per
+  // partition is parked; while a flush runs it releases them at once
+  // instead, since the flush's memtable switch waits for those leaders. The
+  // flusher starts after the first four-way release, so every run races.
+  // TSan reports any unguarded access to the cached state.
+  constexpr size_t kPartitions = 4;
+  constexpr int kCommitsPerThread = 100;
+  Open(kPartitions);
+
+  std::mutex mu;
+  std::condition_variable cv;
+  size_t parked = 0;
+  uint64_t generation = 0;
+  int full_releases = 0;
+  bool flushing = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WriteGroupToWAL:BeforeCacheRecoverableState", [&](void*) {
+        std::unique_lock<std::mutex> lock(mu);
+        const uint64_t my_generation = generation;
+        if (++parked == kPartitions) {
+          ++full_releases;
+        } else if (!flushing) {
+          cv.wait(lock,
+                  [&] { return generation != my_generation || flushing; });
+          if (generation != my_generation) {
+            return;
+          }
+        }
+        ++generation;
+        parked = 0;
+        cv.notify_all();
+      });
+  // Every round, all threads prepare before any commits: a prepare issued
+  // while a commit is parked above would wait for that commit to publish,
+  // holding prepare_mu_, and no other commit could reach the barrier.
+  size_t prepared = 0;
+  uint64_t round = 0;
+  auto wait_for_round = [&]() {
+    std::unique_lock<std::mutex> lock(mu);
+    const uint64_t my_round = round;
+    if (++prepared == kPartitions) {
+      prepared = 0;
+      ++round;
+      cv.notify_all();
+      return true;
+    }
+    return cv.wait_for(lock, std::chrono::seconds(30),
+                       [&] { return round != my_round; });
+  };
+
+  std::atomic<bool> writers_done{false};
+  std::vector<port::Thread> writers;
+  for (size_t p = 0; p < kPartitions; ++p) {
+    writers.emplace_back([&, p] {
+      ColumnFamilyHandle* cf = CfOnPartition(p);
+      for (int i = 0; i < kCommitsPerThread; ++i) {
+        const std::string name =
+            "p" + std::to_string(p) + "_" + std::to_string(i);
+        TransactionOptions txn_options;
+        txn_options.use_only_the_last_commit_time_batch_for_recovery = true;
+        std::unique_ptr<Transaction> txn(
+            db_->BeginTransaction(WriteOptions(), txn_options));
+        ASSERT_OK(txn->SetName(name));
+        ASSERT_OK(txn->Put(cf, name, name));
+        {
+          std::lock_guard<std::mutex> lock(prepare_mu_);
+          ASSERT_OK(txn->Prepare());
+        }
+        ASSERT_OK(txn->GetCommitTimeWriteBatch()->Put(cf, "state", name));
+        ASSERT_TRUE(wait_for_round());
+        ASSERT_OK(txn->Commit());
+      }
+    });
+  }
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(30),
+                            [&] { return full_releases > 0; }));
+  }
+  port::Thread flusher([&] {
+    Random rnd(301);
+    while (!writers_done.load()) {
+      {
+        std::lock_guard<std::mutex> lock(mu);
+        flushing = true;
+        cv.notify_all();
+      }
+      ASSERT_OK(db_->Flush(
+          FlushOptions(),
+          CfOnPartition(rnd.Uniform(static_cast<int>(kPartitions)))));
+      std::lock_guard<std::mutex> lock(mu);
+      flushing = false;
+    }
+  });
+  for (auto& writer : writers) {
+    writer.join();
+  }
+  writers_done.store(true);
+  flusher.join();
+  SyncPoint::GetInstance()->ClearCallBack(
+      "DBImpl::WriteGroupToWAL:BeforeCacheRecoverableState");
+  ASSERT_GE(full_releases, 1);
+
+  // The last commit has the highest sequence, so its state is the one
+  // persisted and recovered.
+  ASSERT_OK(CommitWithState(CfOnPartition(1), "final", "final"));
+  FlushAll();
+  Reopen();
+  ASSERT_EQ("final", GetState(CfOnPartition(1)));
+}
+
+TEST_F(WritePreparedPartitionedWalTest, HigherSequenceRecoverableStateWins) {
+  // G-18 / F010: A takes the lower sequence on partition 0 but caches its
+  // state only after B, on partition 1, has committed with a higher
+  // sequence. The state persisted at the flush, and recovered, is B's.
+  constexpr size_t kPartitions = 2;
+  Open(kPartitions);
+
+  static thread_local bool is_a = false;
+  std::mutex mu;
+  std::condition_variable cv;
+  bool a_parked = false;
+  bool b_committed = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WriteGroupToWAL:BeforeCacheRecoverableState", [&](void*) {
+        if (!is_a) {
+          return;
+        }
+        std::unique_lock<std::mutex> lock(mu);
+        a_parked = true;
+        cv.notify_all();
+        cv.wait_for(lock, std::chrono::seconds(30),
+                    [&] { return b_committed; });
+      });
+
+  port::Thread a([&] {
+    is_a = true;
+    ASSERT_OK(CommitWithState(CfOnPartition(0), "a", "low"));
+  });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    ASSERT_TRUE(
+        cv.wait_for(lock, std::chrono::seconds(30), [&] { return a_parked; }));
+  }
+  ASSERT_OK(CommitWithState(CfOnPartition(1), "b", "high"));
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    b_committed = true;
+    cv.notify_all();
+  }
+  a.join();
+  SyncPoint::GetInstance()->ClearCallBack(
+      "DBImpl::WriteGroupToWAL:BeforeCacheRecoverableState");
+
+  FlushAll();
+  Reopen();
+  ASSERT_EQ("high", GetState(CfOnPartition(1)));
+  ASSERT_EQ("NOT_FOUND", GetState(CfOnPartition(0)));
+}
+
+// G-56 (not fixed here): prepares routed to different partitions add their
+// sequences to the prepared heap out of sequence order, which PreparedHeap
+// does not support; entries are never popped and closing the DB fails
+// `assert(heap_.empty())` in ~PreparedHeap (debug builds).
+TEST_F(WritePreparedPartitionedWalTest,
+       DISABLED_ConcurrentPreparesAcrossPartitions) {
+  constexpr size_t kPartitions = 4;
+  constexpr int kTxnsPerPartition = 100;
+  Open(kPartitions);
+  std::vector<port::Thread> writers;
+  for (size_t p = 0; p < kPartitions; ++p) {
+    writers.emplace_back([&, p] {
+      for (int i = 0; i < kTxnsPerPartition; ++i) {
+        const std::string name =
+            "p" + std::to_string(p) + "_" + std::to_string(i);
+        std::unique_ptr<Transaction> txn(
+            db_->BeginTransaction(WriteOptions(), TransactionOptions()));
+        ASSERT_OK(txn->SetName(name));
+        ASSERT_OK(txn->Put(CfOnPartition(p), name, name));
+        ASSERT_OK(txn->Prepare());
+        ASSERT_OK(txn->Commit());
+      }
+    });
+  }
+  for (auto& writer : writers) {
+    writer.join();
+  }
+  Close();
 }
 
 #if USE_COROUTINES
