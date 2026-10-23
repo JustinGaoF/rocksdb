@@ -1125,6 +1125,61 @@ Status DBImpl::LogAndApplyForRecovery(RecoveryContext& recovery_ctx) {
   return s;
 }
 
+Status DBImpl::UpdateWALIndexGuard() {
+  mutex_.AssertHeld();
+  const uint64_t guard = versions_->wal_index_guard();
+  uint64_t new_guard = guard;
+  if (log::WALIndexEnabled(immutable_db_options_.partition_wal_usage)) {
+    new_guard = std::numeric_limits<uint64_t>::max();
+  } else if (guard != 0) {
+    // This instance writes no index, so only a WAL an earlier instance
+    // created, numbered below this instance's first WAL, may hold one.
+    std::vector<std::string> files;
+    IOOptions io_opts;
+    io_opts.do_not_recurse = true;
+    Status s = immutable_db_options_.fs->GetChildren(
+        immutable_db_options_.GetWalDir(), io_opts, &files,
+        /*IODebugContext*=*/nullptr);
+    if (!s.ok()) {
+      return s;
+    }
+    new_guard = 0;
+    for (const std::string& file : files) {
+      uint64_t number = 0;
+      FileType type = kWalFile;
+      if (ParseFileName(file, &number, &type) && type == kWalFile &&
+          number < min_wal_number_to_recycle_ && number <= guard) {
+        new_guard = std::max(new_guard, number);
+      }
+    }
+    // Recovery, in this binary or an older one, reads no WAL below this.
+    uint64_t min_wal_number = MinLogNumberToKeep();
+    if (!allow_2pc()) {
+      min_wal_number =
+          std::max(min_wal_number, versions_->MinLogNumberWithUnflushedData());
+    }
+    if (new_guard < min_wal_number) {
+      new_guard = 0;
+    }
+  }
+  if (new_guard == guard) {
+    return Status::OK();
+  }
+  VersionEdit edit;
+  if (new_guard == 0) {
+    // The current MANIFEST already holds the guard, so only a new one, whose
+    // snapshot omits it, clears it.
+    versions_->ClearWALIndexGuard();
+  } else {
+    edit.SetWALIndexGuard(new_guard);
+  }
+  const ReadOptions read_options(Env::IOActivity::kDBOpen);
+  const WriteOptions write_options(Env::IOActivity::kDBOpen);
+  return versions_->LogAndApplyToDefaultColumnFamily(
+      read_options, write_options, &edit, &mutex_, directories_.GetDbDir(),
+      /*new_descriptor_log=*/new_guard == 0);
+}
+
 void DBImpl::InvokeWalFilterIfNeededOnColumnFamilyToWalNumberMap() {
   if (immutable_db_options_.wal_filter == nullptr) {
     return;
@@ -3756,6 +3811,9 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
   }
   if (s.ok()) {
     s = impl->LogAndApplyForRecovery(recovery_ctx);
+  }
+  if (s.ok()) {
+    s = impl->UpdateWALIndexGuard();
   }
 
   if (s.ok() && !impl->immutable_db_options_.write_identity_file) {

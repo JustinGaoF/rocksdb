@@ -2213,6 +2213,11 @@ class DBImpl : public DB
   // recovery.
   Status LogAndApplyForRecovery(RecoveryContext& recovery_ctx);
 
+  // Sets, lowers or clears the MANIFEST's WAL index guard to match the WALs
+  // that may carry WAL index records once recovery edits are applied. Runs
+  // before Open returns, so before any write can be acknowledged.
+  Status UpdateWALIndexGuard();
+
   // Schedule background work to open and validate SST files asynchronously.
   // Called when open_files_async is enabled.
   void ScheduleAsyncFileOpening();

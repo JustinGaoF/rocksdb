@@ -18,6 +18,8 @@
 #include "port/port.h"
 #include "port/stack_trace.h"
 #include "rocksdb/file_system.h"
+#include "rocksdb/utilities/checkpoint.h"
+#include "rocksdb/utilities/ldb_cmd.h"
 #include "rocksdb/wal_filter.h"
 #include "test_util/sync_point.h"
 #include "util/crc32c.h"
@@ -6279,6 +6281,514 @@ TEST_F(DBWALIndexTest, IndexedWALsOpenAfterDisablingWALIndex) {
     EXPECT_FALSE(log::IsWALIndexRecordType(type));
     EXPECT_NE(log::kWALIndexMarkerType, type);
     EXPECT_NE(log::kRecyclableWALIndexMarkerType, type);
+  }
+  Destroy(none);
+}
+
+// Runs `ldb check_wal_index` against a closed DB, returning its exit code
+// and appending its standard output to `output`.
+static int RunCheckWALIndex(const std::string& db, const Options& options,
+                            std::string* output) {
+  const std::string db_arg = "--db=" + db;
+  const char* argv[] = {"./ldb", db_arg.c_str(), "check_wal_index"};
+  testing::internal::CaptureStdout();
+  const int code = LDBCommandRunner::RunCommand(3, argv, options, LDBOptions(),
+                                                /*column_families=*/nullptr);
+  *output += testing::internal::GetCapturedStdout();
+  return code;
+}
+
+// The line `ldb check_wal_index` printed for the WAL named `file`, or "".
+static std::string CheckWALIndexLine(const std::string& output,
+                                     const std::string& file) {
+  std::istringstream lines(output);
+  std::string line;
+  while (std::getline(lines, line)) {
+    if (line.find("/" + file + ":") != std::string::npos) {
+      return line;
+    }
+  }
+  return "";
+}
+
+static uint64_t ManifestWALIndexGuard(Env* env, const std::string& db) {
+  uint64_t guard = 0;
+  EXPECT_OK(
+      VersionSet::ReadWALIndexGuard(db, env->GetFileSystem().get(), &guard));
+  return guard;
+}
+
+constexpr uint64_t kGuardAnyWAL = std::numeric_limits<uint64_t>::max();
+
+// The guard against older binaries is synced into the MANIFEST before the
+// first indexed record reaches the WAL, and survives losing every unsynced
+// byte.
+TEST_F(DBWALIndexTest, WALIndexGuardIsDurableBeforeFirstIndexedWrite) {
+  std::unique_ptr<FaultInjectionTestEnv> fault_env(
+      new FaultInjectionTestEnv(env_));
+  Options options =
+      WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+  options.env = fault_env.get();
+  DestroyAndReopen(options);
+  std::vector<uint64_t> guard_at_append;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WriteToWAL:log_entry", [&](void* /*arg*/) {
+        guard_at_append.push_back(ManifestWALIndexGuard(env_, dbname_));
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_OK(Put(Key(0), "value0"));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_EQ(1U, guard_at_append.size());
+  EXPECT_EQ(kGuardAnyWAL, guard_at_append[0]);
+
+  Close();
+  ASSERT_OK(fault_env->DropUnsyncedFileData());
+  EXPECT_EQ(kGuardAnyWAL, ManifestWALIndexGuard(env_, dbname_));
+  Reopen(options);
+  Close();
+  options.env = env_;
+  Destroy(options);
+}
+
+// Every new MANIFEST carries the guard while it is set: here one per write.
+TEST_F(DBWALIndexTest, WALIndexGuardSurvivesManifestRollover) {
+  Options options =
+      WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+  options.max_manifest_file_size = 1;
+  options.max_manifest_space_amp_pct = 0;
+  DestroyAndReopen(options);
+  const uint64_t first_manifest = dbfull()->TEST_Current_Manifest_FileNo();
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(Put(Key(i), "value" + std::to_string(i)));
+    ASSERT_OK(Flush());
+  }
+  EXPECT_NE(first_manifest, dbfull()->TEST_Current_Manifest_FileNo());
+  EXPECT_EQ(kGuardAnyWAL, ManifestWALIndexGuard(env_, dbname_));
+  Reopen(options);
+  EXPECT_EQ(kGuardAnyWAL, ManifestWALIndexGuard(env_, dbname_));
+  Close();
+  Destroy(options);
+}
+
+// A DB that never enables indexing writes no guard, in any MANIFEST.
+TEST_F(DBWALIndexTest, NeverIndexedDBWritesNoWALIndexGuard) {
+  Options options = WALIndexOptions(PartitionWALUsage::kNone);
+  options.max_manifest_file_size = 1;
+  options.max_manifest_space_amp_pct = 0;
+  DestroyAndReopen(options);
+  for (int i = 0; i < 2; ++i) {
+    ASSERT_OK(Put(Key(i), "value" + std::to_string(i)));
+    ASSERT_OK(Flush());
+    EXPECT_EQ(0U, ManifestWALIndexGuard(env_, dbname_));
+    Reopen(options);
+  }
+  EXPECT_EQ(0U, ManifestWALIndexGuard(env_, dbname_));
+  Close();
+  Destroy(options);
+}
+
+// A kNone open whose recovery flushes the indexed WALs' contents
+// (avoid_flush_during_recovery=false) leaves none of them live, so it clears
+// the guard itself, while the obsolete files are still on disk.
+TEST_F(DBWALIndexTest, KNoneOpenThatFlushesIndexedWALsClearsTheGuard) {
+  Options options =
+      WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+  DestroyAndReopen(options);
+  WriteKeyRange(0, 4);
+  Close();
+  options.partition_wal_usage = PartitionWALUsage::kNone;
+  options.avoid_flush_during_recovery = false;
+  Reopen(options);
+  EXPECT_EQ(0U, ManifestWALIndexGuard(env_, dbname_));
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ("value" + std::to_string(i), Get(Key(i))) << "key " << i;
+  }
+  Close();
+  Destroy(options);
+}
+
+// `ldb check_wal_index` reports an empty WAL and a damaged one as such, never
+// as unindexed: a torn marker hides whether the file is indexed.
+TEST_F(DBWALIndexTest, CheckWALIndexReportsEmptyAndDamagedWALs) {
+  Options options =
+      WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+  DestroyAndReopen(options);
+  Close();
+  const uint64_t wal_number = LatestWALNumber();
+  const std::string wal_path = WALPath(wal_number);
+  const std::string file = wal_path.substr(wal_path.rfind('/') + 1);
+  std::string contents = ReadWALContents(wal_path);
+  const std::vector<PhysicalRecord> records = ScanPhysicalRecords(contents);
+  ASSERT_EQ(1U, records.size());
+  ASSERT_EQ(log::kWALIndexMarkerType, records[0].type);
+
+  std::string output;
+  EXPECT_NE(0, RunCheckWALIndex(dbname_, options, &output));
+  EXPECT_EQ("live WAL " + wal_path + ": indexed",
+            CheckWALIndexLine(output, file));
+
+  contents[0] ^= 0x1;
+  WriteWALContents(wal_path, contents);
+  output.clear();
+  EXPECT_NE(0, RunCheckWALIndex(dbname_, options, &output));
+  EXPECT_NE(std::string::npos,
+            CheckWALIndexLine(output, file)
+                .find(": damaged, may hide WAL index records"))
+      << output;
+
+  WriteWALContents(wal_path, "");
+  output.clear();
+  // Still fails: the MANIFEST keeps the guard for a DB that indexed.
+  EXPECT_NE(0, RunCheckWALIndex(dbname_, options, &output));
+  EXPECT_EQ("live WAL " + wal_path + ": empty",
+            CheckWALIndexLine(output, file));
+  EXPECT_NE(std::string::npos, output.find("WAL index guard: set, any WAL"));
+  Destroy(options);
+}
+
+// The rollback procedure in PartitionWALUsage's comment, end to end: set
+// kNone, flush every column family, let the indexed WALs go, purge the
+// archive, reopen once more, then require that `ldb check_wal_index` finds
+// nothing and the guard is clear. With an archive the check fails until the
+// archive is purged. A checkpoint taken before the rollback keeps the guard,
+// so an older binary refuses it; one taken after does not.
+TEST_F(DBWALIndexTest, RollbackProcedureLeavesNoIndexedWAL) {
+  std::vector<CompressionType> compressions = {kNoCompression};
+  if (StreamingCompressionTypeSupported(kZSTD)) {
+    compressions.push_back(kZSTD);
+  }
+  const std::string checkpoint_before = dbname_ + "_checkpoint_before";
+  const std::string checkpoint_after = dbname_ + "_checkpoint_after";
+  auto checkpoint = [this](const std::string& dir) {
+    ASSERT_OK(DestroyDB(dir, CurrentOptions()));
+    Checkpoint* raw = nullptr;
+    ASSERT_OK(Checkpoint::Create(db_.get(), &raw));
+    std::unique_ptr<Checkpoint> owned(raw);
+    // No flush: the checkpoint copies the live WALs.
+    ASSERT_OK(
+        owned->CreateCheckpoint(dir, /*log_size_for_flush=*/kGuardAnyWAL));
+  };
+  for (const CompressionType compression : compressions) {
+    for (const bool archive : {false, true}) {
+      SCOPED_TRACE(std::to_string(static_cast<int>(compression)) + " " +
+                   std::to_string(archive));
+      Options indexed =
+          WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+      indexed.wal_compression = compression;
+      indexed.WAL_ttl_seconds = archive ? 1000 : 0;
+      DestroyAndReopen(indexed);
+      CreateAndReopenWithCF({"one"}, indexed);
+      ASSERT_OK(Put(0, "key0", "value0"));
+      ASSERT_OK(Put(1, "key1", "value1"));
+      checkpoint(checkpoint_before);
+      Close();
+      const std::vector<uint64_t> indexed_wals = ListWalNumbers();
+      ASSERT_FALSE(indexed_wals.empty());
+      const std::string indexed_path = WALPath(indexed_wals.back());
+      const std::string indexed_file =
+          indexed_path.substr(indexed_path.rfind('/') + 1);
+      std::string output;
+      EXPECT_NE(0, RunCheckWALIndex(dbname_, indexed, &output));
+      EXPECT_EQ("live WAL " + indexed_path + ": indexed",
+                CheckWALIndexLine(output, indexed_file))
+          << output;
+
+      // 1. Set kNone. The indexed WALs stay live until the flush below
+      // (avoid_flush_during_recovery), and so does the guard.
+      Options none = indexed;
+      none.partition_wal_usage = PartitionWALUsage::kNone;
+      ReopenWithColumnFamilies({"default", "one"}, none);
+      EXPECT_EQ("value0", Get(0, "key0"));
+      EXPECT_EQ("value1", Get(1, "key1"));
+      ASSERT_OK(Put(0, "key2", "value2"));
+      const uint64_t none_wal = dbfull()->TEST_LogfileNumber();
+      const std::vector<uint8_t> none_types =
+          ReadWALRecordTypes(WALPath(none_wal));
+      ASSERT_FALSE(none_types.empty());
+      for (const uint8_t type : none_types) {
+        EXPECT_FALSE(log::IsWALIndexRecordType(type));
+        EXPECT_FALSE(log::IsWALIndexMetadataRecordType(type));
+      }
+      EXPECT_EQ(indexed_wals.back(), ManifestWALIndexGuard(env_, dbname_));
+
+      // 2. Flush every column family. 3. The indexed WALs are deleted, or
+      // moved to the archive.
+      ASSERT_OK(Flush(0));
+      ASSERT_OK(Flush(1));
+      Close();
+      for (const uint64_t wal_number : indexed_wals) {
+        EXPECT_TRUE(env_->FileExists(WALPath(wal_number)).IsNotFound());
+        EXPECT_EQ(
+            archive,
+            env_->FileExists(ArchivedLogFileName(dbname_, wal_number)).ok());
+      }
+      output.clear();
+      EXPECT_NE(0, RunCheckWALIndex(dbname_, none, &output));
+      EXPECT_EQ(archive
+                    ? "archived WAL " +
+                          ArchivedLogFileName(dbname_, indexed_wals.back()) +
+                          ": indexed"
+                    : "",
+                CheckWALIndexLine(output, indexed_file))
+          << output;
+      if (archive) {
+        // 4. Wait out WAL_ttl_seconds; the reopen below purges the archive.
+        env_->SetMockSleep();
+        env_->MockSleepForSeconds(2 *
+                                  static_cast<int64_t>(none.WAL_ttl_seconds));
+      }
+
+      // The guard clears at the first open that finds no indexed WAL live.
+      ReopenWithColumnFamilies({"default", "one"}, none);
+      checkpoint(checkpoint_after);
+      Close();
+
+      // 5. The check finds nothing. 6. The guard is clear.
+      output.clear();
+      EXPECT_EQ(0, RunCheckWALIndex(dbname_, none, &output)) << output;
+      EXPECT_NE(std::string::npos,
+                output.find("No WAL index records and no WAL index guard"));
+      EXPECT_EQ(0U, ManifestWALIndexGuard(env_, dbname_));
+      EXPECT_EQ(0U, ManifestWALIndexGuard(env_, checkpoint_after));
+      EXPECT_EQ(kGuardAnyWAL, ManifestWALIndexGuard(env_, checkpoint_before));
+      output.clear();
+      EXPECT_NE(0, RunCheckWALIndex(checkpoint_before, indexed, &output));
+      // What an older binary reads: no remaining WAL holds a WAL index type.
+      for (const uint64_t wal_number : ListWalNumbers()) {
+        for (const uint8_t type : ReadWALRecordTypes(WALPath(wal_number))) {
+          EXPECT_FALSE(log::IsWALIndexRecordType(type)) << wal_number;
+          EXPECT_FALSE(log::IsWALIndexMetadataRecordType(type)) << wal_number;
+        }
+      }
+
+      // 7. Every key is still there.
+      ReopenWithColumnFamilies({"default", "one"}, none);
+      EXPECT_EQ("value0", Get(0, "key0"));
+      EXPECT_EQ("value1", Get(1, "key1"));
+      EXPECT_EQ("value2", Get(0, "key2"));
+      Close();
+      ASSERT_OK(DestroyDB(checkpoint_before, CurrentOptions()));
+      ASSERT_OK(DestroyDB(checkpoint_after, CurrentOptions()));
+      Destroy(none);
+    }
+  }
+}
+
+// RunCheckWALIndex with one more argument, appending standard error to
+// `output` after standard output.
+static int RunCheckWALIndexWithArg(const std::string& db,
+                                   const std::string& arg,
+                                   const Options& options,
+                                   std::string* output) {
+  const std::string db_arg = "--db=" + db;
+  const char* argv[] = {"./ldb", db_arg.c_str(), "check_wal_index",
+                        arg.c_str()};
+  testing::internal::CaptureStdout();
+  testing::internal::CaptureStderr();
+  const int code = LDBCommandRunner::RunCommand(4, argv, options, LDBOptions(),
+                                                /*column_families=*/nullptr);
+  const std::string err = testing::internal::GetCapturedStderr();
+  *output += testing::internal::GetCapturedStdout() + err;
+  return code;
+}
+
+// `ldb check_wal_index` scans the wal_dir the OPTIONS file names, or the one
+// --wal_dir names, and fails rather than scanning the DB directory when that
+// directory does not exist. Rolling back per the procedure makes it pass.
+TEST_F(DBWALIndexTest, CheckWALIndexScansTheConfiguredWALDir) {
+  const std::string wal_dir = dbname_ + "_wal";
+  const std::string missing_dir = dbname_ + "_no_such_wal_dir";
+  Options indexed =
+      WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+  indexed.wal_dir = wal_dir;
+  DestroyAndReopen(indexed);
+  WriteKeyRange(0, 4);
+  const std::string wal_path =
+      LogFileName(wal_dir, dbfull()->TEST_LogfileNumber());
+  const std::string file = wal_path.substr(wal_path.rfind('/') + 1);
+  Close();
+
+  // Opening ldb with the DB's own options, as the OPTIONS file holds them.
+  std::string output;
+  EXPECT_NE(0, RunCheckWALIndex(dbname_, indexed, &output));
+  EXPECT_EQ("live WAL " + wal_path + ": indexed",
+            CheckWALIndexLine(output, file))
+      << output;
+  output.clear();
+  EXPECT_NE(0, RunCheckWALIndexWithArg(dbname_, "--wal_dir=" + wal_dir, indexed,
+                                       &output));
+  EXPECT_EQ("live WAL " + wal_path + ": indexed",
+            CheckWALIndexLine(output, file))
+      << output;
+  output.clear();
+  EXPECT_NE(0, RunCheckWALIndexWithArg(dbname_, "--wal_dir=" + missing_dir,
+                                       indexed, &output));
+  EXPECT_NE(std::string::npos,
+            output.find("WAL directory " + missing_dir + " does not exist"))
+      << output;
+
+  Options none = indexed;
+  none.partition_wal_usage = PartitionWALUsage::kNone;
+  Reopen(none);
+  ASSERT_OK(Flush());
+  Close();
+  Reopen(none);
+  Close();
+  output.clear();
+  EXPECT_EQ(0, RunCheckWALIndex(dbname_, none, &output)) << output;
+  EXPECT_NE(std::string::npos,
+            output.find("No WAL index records and no WAL index guard"));
+  output.clear();
+  EXPECT_EQ(0, RunCheckWALIndexWithArg(dbname_, "--wal_dir=" + wal_dir, none,
+                                       &output))
+      << output;
+
+  // The configured WAL directory is gone, as with an unmounted volume: the
+  // check fails instead of finding no WAL in the DB directory.
+  std::vector<std::string> children;
+  ASSERT_OK(env_->GetChildren(wal_dir, &children));
+  for (const std::string& child : children) {
+    if (child != "." && child != "..") {
+      ASSERT_OK(env_->DeleteFile(wal_dir + "/" + child));
+    }
+  }
+  ASSERT_OK(env_->DeleteDir(wal_dir));
+  output.clear();
+  EXPECT_NE(
+      0, RunCheckWALIndexWithArg(dbname_, "--try_load_options", none, &output));
+  EXPECT_NE(std::string::npos,
+            output.find("WAL directory " + wal_dir + " does not exist"))
+      << output;
+  EXPECT_EQ(std::string::npos, output.find("No WAL index records")) << output;
+  ASSERT_OK(env_->CreateDirIfMissing(wal_dir));
+  Destroy(none);
+}
+
+// RunCheckWALIndex with more arguments, appending standard error to `output`
+// after standard output.
+static int RunCheckWALIndexWithArgs(const std::string& db,
+                                    const std::vector<std::string>& args,
+                                    const Options& options,
+                                    std::string* output) {
+  const std::string db_arg = "--db=" + db;
+  std::vector<const char*> argv = {"./ldb", db_arg.c_str(), "check_wal_index"};
+  for (const std::string& arg : args) {
+    argv.push_back(arg.c_str());
+  }
+  testing::internal::CaptureStdout();
+  testing::internal::CaptureStderr();
+  const int code = LDBCommandRunner::RunCommand(
+      static_cast<int>(argv.size()), argv.data(), options, LDBOptions(),
+      /*column_families=*/nullptr);
+  const std::string err = testing::internal::GetCapturedStderr();
+  *output += testing::internal::GetCapturedStdout() + err;
+  return code;
+}
+
+// Without --wal_dir, `ldb check_wal_index` finds the WAL directory in the
+// OPTIONS file. When OPTIONS loading is disabled or the file cannot be read,
+// it fails and suggests --wal_dir, rather than scanning the DB directory: here
+// that would miss the indexed WAL archived under the configured wal_dir, whose
+// guard is already clear, and pass. Explicit OPTIONS load credit: D126218376.
+TEST_F(DBWALIndexTest, CheckWALIndexFailsWithoutTheOptionsFile) {
+  const std::string wal_dir = dbname_ + "_wal";
+  Options indexed =
+      WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+  indexed.wal_dir = wal_dir;
+  indexed.WAL_ttl_seconds = 1000;
+  DestroyAndReopen(indexed);
+  WriteKeyRange(0, 4);
+  const uint64_t indexed_wal = dbfull()->TEST_LogfileNumber();
+  Options none = indexed;
+  none.partition_wal_usage = PartitionWALUsage::kNone;
+  Reopen(none);
+  ASSERT_OK(Flush());
+  Close();
+  Reopen(none);
+  Close();
+  const std::string archived = ArchivedLogFileName(wal_dir, indexed_wal);
+  ASSERT_OK(env_->FileExists(archived));
+  ASSERT_EQ(0U, ManifestWALIndexGuard(env_, dbname_));
+  // What ldb is given when its caller does not know the DB's wal_dir.
+  Options unknown = none;
+  unknown.wal_dir = "";
+
+  std::string output;
+  EXPECT_NE(0, RunCheckWALIndexWithArgs(dbname_, {}, unknown, &output));
+  EXPECT_NE(std::string::npos, output.find("archived WAL " + archived))
+      << output;
+  output.clear();
+  EXPECT_NE(0, RunCheckWALIndexWithArgs(dbname_, {"--try_load_options=false"},
+                                        unknown, &output));
+  EXPECT_NE(std::string::npos, output.find("OPTIONS loading is disabled"))
+      << output;
+  EXPECT_NE(std::string::npos, output.find("--wal_dir")) << output;
+
+  std::vector<std::string> children;
+  ASSERT_OK(env_->GetChildren(dbname_, &children));
+  std::vector<std::string> options_files;
+  for (const std::string& child : children) {
+    uint64_t number = 0;
+    FileType type;
+    if (ParseFileName(child, &number, &type) && type == kOptionsFile) {
+      options_files.push_back(child);
+      ASSERT_OK(env_->RenameFile(dbname_ + "/" + child,
+                                 dbname_ + "/hidden_" + child));
+    }
+  }
+  ASSERT_FALSE(options_files.empty());
+  output.clear();
+  EXPECT_NE(0, RunCheckWALIndexWithArgs(dbname_, {}, unknown, &output));
+  EXPECT_NE(std::string::npos, output.find("Failed to load OPTIONS")) << output;
+  EXPECT_NE(std::string::npos, output.find("--wal_dir")) << output;
+  const std::string garbage = OptionsFileName(dbname_, 999999);
+  ASSERT_OK(WriteStringToFile(env_, "not an OPTIONS file", garbage));
+  output.clear();
+  EXPECT_NE(0, RunCheckWALIndexWithArgs(dbname_, {}, unknown, &output));
+  EXPECT_NE(std::string::npos, output.find("Failed to load OPTIONS")) << output;
+  ASSERT_OK(env_->DeleteFile(garbage));
+
+  // With --wal_dir all work as before, including with a corrupt OPTIONS file
+  // (ported from D126568250): they find the archived WAL, failing because it
+  // is indexed rather than over OPTIONS, and pass once it is purged.
+  for (const bool purged : {false, true}) {
+    SCOPED_TRACE(purged);
+    if (purged) {
+      ASSERT_OK(env_->DeleteFile(archived));
+    }
+    for (const std::vector<std::string>& args :
+         {std::vector<std::string>{"--wal_dir=" + wal_dir},
+          std::vector<std::string>{"--wal_dir=" + wal_dir,
+                                   "--try_load_options=false"},
+          std::vector<std::string>{"--wal_dir=" + wal_dir, "corrupt"}}) {
+      const bool corrupt = args.back() == "corrupt";
+      if (corrupt) {
+        ASSERT_OK(WriteStringToFile(env_, "not an OPTIONS file", garbage));
+      }
+      output.clear();
+      const int code = RunCheckWALIndexWithArgs(
+          dbname_, corrupt ? std::vector<std::string>{args.front()} : args,
+          unknown, &output);
+      if (corrupt) {
+        ASSERT_OK(env_->DeleteFile(garbage));
+        EXPECT_EQ(std::string::npos, output.find("OPTIONS")) << output;
+      }
+      if (purged) {
+        EXPECT_EQ(0, code) << output;
+        EXPECT_NE(std::string::npos,
+                  output.find("No WAL index records and no WAL index guard"))
+            << output;
+      } else {
+        EXPECT_NE(0, code) << output;
+        EXPECT_NE(std::string::npos, output.find("archived WAL " + archived))
+            << output;
+      }
+    }
+  }
+  for (const std::string& file : options_files) {
+    ASSERT_OK(
+        env_->RenameFile(dbname_ + "/hidden_" + file, dbname_ + "/" + file));
   }
   Destroy(none);
 }
