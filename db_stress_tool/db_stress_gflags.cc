@@ -1305,6 +1305,11 @@ DEFINE_int32(sync_wal_one_in, 0,
              "If non-zero, then SyncWAL() will be called once for every N ops "
              "on average. 0 indicates that calls to SyncWAL() are disabled.");
 
+DEFINE_int32(sync_write_one_in, 0,
+             "If non-zero and --sync is false, about one in every N write ops "
+             "sets WriteOptions::sync, so one run mixes sync and non-sync "
+             "writes. 0 disables it.");
+
 DEFINE_bool(avoid_unnecessary_blocking_io,
             ROCKSDB_NAMESPACE::Options().avoid_unnecessary_blocking_io,
             "If true, some expensive cleaning up operations will be moved from "
