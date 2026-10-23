@@ -1771,8 +1771,14 @@ class DBImpl : public DB
   // all background jobs then attempts to close when close_db_ option is true.
   bool reject_new_background_jobs_ = false;
 
-  // RecoveryContext struct stores the context about version edits along
-  // with corresponding column_family_data and column_family_options.
+  // Identifies an open-ended obsolete suffix in one WAL file.
+  struct WALIndexSupersession {
+    uint64_t wal_number;
+    uint64_t first_obsolete_wal_index;
+  };
+
+  // Stores recovery version edits and the WAL supersessions that must be
+  // persisted before the recovered database becomes writable.
   class RecoveryContext {
    public:
     RecoveryContext() = default;
@@ -1821,6 +1827,7 @@ class DBImpl : public DB
     // All existing data files (SST files and Blob files) found during DB::Open.
     std::vector<std::string> existing_data_files_;
     bool is_new_db_ = false;
+    std::vector<WALIndexSupersession> wal_index_supersessions_;
   };
 
   // Persist options to options file. Must be holding options_mutex_.
@@ -2651,6 +2658,11 @@ class DBImpl : public DB
                          bool is_retry, bool* corrupted_wal_found,
                          RecoveryContext* recovery_ctx);
 
+  Status SetNextWALIndexAfterRecovery(uint64_t wal_index);
+  IOStatus WriteWALIndexSupersessions(
+      const WriteOptions& write_options, log::Writer* new_log,
+      const std::vector<WALIndexSupersession>& supersessions);
+
   void SetupLogFilesRecovery(
       const std::vector<uint64_t>& wal_numbers,
       std::unordered_map<int, VersionEdit>* version_edits, int* job_id,
@@ -2661,15 +2673,19 @@ class DBImpl : public DB
                          int job_id, SequenceNumber* next_sequence,
                          std::unordered_map<int, VersionEdit>* version_edits,
                          bool* corrupted_wal_found,
-                         RecoveryContext* recovery_ctx);
+                         RecoveryContext* recovery_ctx,
+                         std::vector<WALIndexSupersession>* supersessions);
 
-  Status ProcessLogFile(
-      uint64_t wal_number, uint64_t min_wal_number, bool is_retry,
-      bool read_only, int job_id, SequenceNumber* next_sequence,
-      bool* stop_replay_for_corruption, bool* stop_replay_by_wal_filter,
-      uint64_t* corrupted_wal_number, bool* corrupted_wal_found,
-      std::unordered_map<int, VersionEdit>* version_edits, bool* flushed,
-      PredecessorWALInfo& predecessor_wal_info);
+  Status ProcessLogFile(uint64_t wal_number, uint64_t min_wal_number,
+                        bool is_retry, bool read_only, int job_id,
+                        SequenceNumber* next_sequence,
+                        bool* stop_replay_for_corruption,
+                        bool* stop_replay_by_wal_filter,
+                        uint64_t* corrupted_wal_number,
+                        bool* corrupted_wal_found,
+                        std::unordered_map<int, VersionEdit>* version_edits,
+                        bool* flushed, PredecessorWALInfo& predecessor_wal_info,
+                        std::vector<WALIndexSupersession>* supersessions);
 
   void SetupLogFileProcessing(uint64_t wal_number);
 
