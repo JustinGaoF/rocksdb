@@ -4,18 +4,27 @@
 //  (found in the LICENSE.Apache file in the root directory).
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
+#include "db/db_impl/compacted_db_impl.h"
 #include "db/db_test_util.h"
 #include "db/write_batch_internal.h"
 #include "db/write_thread.h"
 #include "port/port.h"
 #include "port/stack_trace.h"
+#include "rocksdb/memtablerep.h"
+#include "rocksdb/utilities/checkpoint.h"
+#include "rocksdb/utilities/options_util.h"
 #include "test_util/sync_point.h"
 #include "util/coding.h"
 #include "util/hash.h"
@@ -1921,6 +1930,947 @@ TEST_P(DBWriteTest, IngestWriteBatchWithIndex) {
   ASSERT_NOK(db_->IngestWriteBatchWithIndex(wo, wbwi2));
 }
 
+TEST_F(DBWriteTestUnparameterized, WalPartitionsTestingOptIn) {
+  // Uses no sync point, so it also runs in release builds: there the
+  // testing-only opt-in is the only way to open wal_partitions > 1, and it
+  // admits indexed WALs only.
+  constexpr uint32_t kPartitions = 4;
+  Options options = CurrentOptions();
+  options.wal_partitions = kPartitions;
+  options.track_and_verify_wals_in_manifest = true;
+  options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  options.avoid_flush_during_shutdown = true;
+  options.avoid_flush_during_recovery = true;
+  DestroyDB(dbname_, options).PermitUncheckedError();
+  Status s = TryReopen(options);
+  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+  ASSERT_NE(nullptr, std::strstr(s.getState(),
+                                 "wal_partitions > 1 is not supported yet"));
+
+  options.experimental_allow_wal_partitions_for_testing = true;
+  options.partition_wal_usage = PartitionWALUsage::kNone;
+  s = TryReopen(options);
+  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+  ASSERT_NE(nullptr, std::strstr(s.getState(),
+                                 "wal_partitions > 1 is not supported yet"));
+
+  options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  ASSERT_OK(TryReopen(options));
+  std::vector<std::string> children;
+  ASSERT_OK(env_->GetChildren(dbname_, &children));
+  size_t num_wals = 0;
+  for (const std::string& child : children) {
+    uint64_t number = 0;
+    FileType type;
+    if (ParseFileName(child, &number, &type) && type == kWalFile) {
+      ++num_wals;
+    }
+  }
+  ASSERT_EQ(kPartitions, num_wals);
+  WriteOptions sync_wo;
+  sync_wo.sync = true;
+  ASSERT_OK(Put("k1", "v1", sync_wo));
+  ASSERT_OK(Put("k2", "v2"));
+  ASSERT_OK(TryReopen(options));
+  ASSERT_EQ("v1", Get("k1"));
+  ASSERT_EQ("v2", Get("k2"));
+
+  // The OPTIONS file keeps wal_partitions but not the opt-in, so reopening
+  // from it is rejected.
+  DBOptions loaded_db_options;
+  std::vector<ColumnFamilyDescriptor> loaded_cfs;
+  ConfigOptions config_options;
+  config_options.env = env_;
+  ASSERT_OK(LoadLatestOptions(config_options, dbname_, &loaded_db_options,
+                              &loaded_cfs));
+  ASSERT_EQ(kPartitions, loaded_db_options.wal_partitions);
+  ASSERT_FALSE(loaded_db_options.experimental_allow_wal_partitions_for_testing);
+  Close();
+  s = TryReopen(Options(loaded_db_options, loaded_cfs[0].options));
+  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+}
+
+// Unindexed WALs cannot be merged at recovery, so kNone with N > 1 is rejected
+// with and without the test hook, naming both options.
+TEST_F(DBWriteTestUnparameterized, UnindexedWalPartitionsAlwaysRejected) {
+  for (const bool hook : {false, true}) {
+    if (hook) {
+      SyncPoint::GetInstance()->SetCallBack(
+          "DBImpl::ValidateOptions:AllowWalPartitions",
+          [](void* arg) { *static_cast<bool*>(arg) = true; });
+      SyncPoint::GetInstance()->EnableProcessing();
+    }
+    for (const uint32_t partitions : {2U, 4U}) {
+      SCOPED_TRACE("hook=" + std::to_string(hook) +
+                   " partitions=" + std::to_string(partitions));
+      Options options = CurrentOptions();
+      options.wal_partitions = partitions;
+      options.partition_wal_usage = PartitionWALUsage::kNone;
+      Destroy(options);
+      const Status s = TryReopen(options);
+      ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+      EXPECT_NE(nullptr, std::strstr(s.getState(), "wal_partitions"));
+      EXPECT_NE(nullptr, std::strstr(s.getState(), "partition_wal_usage"));
+    }
+  }
+  Options options = CurrentOptions();
+  options.wal_partitions = 4;
+  options.track_and_verify_wals_in_manifest = true;
+  options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  options.avoid_flush_during_shutdown = true;
+  Destroy(options);
+  ASSERT_OK(TryReopen(options));
+  ASSERT_EQ(4U, dbfull()->TEST_NumWalPartitions());
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_EQ("value", Get("key"));
+}
+
+// wal_partitions above kMaxWalPartitions is rejected with and without the
+// test hook; kMaxWalPartitions itself opens with the hook.
+TEST_F(DBWriteTestUnparameterized, WalPartitionsUpperBound) {
+  Options options = CurrentOptions();
+  options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  options.avoid_flush_during_shutdown = true;
+  options.wal_partitions = DBImpl::kMaxWalPartitions + 1;
+  options.track_and_verify_wals_in_manifest = true;
+  Destroy(options);
+  for (const bool hook : {false, true}) {
+    SCOPED_TRACE("hook=" + std::to_string(hook));
+    if (hook) {
+      SyncPoint::GetInstance()->SetCallBack(
+          "DBImpl::ValidateOptions:AllowWalPartitions",
+          [](void* arg) { *static_cast<bool*>(arg) = true; });
+      SyncPoint::GetInstance()->EnableProcessing();
+    }
+    const Status s = TryReopen(options);
+    ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+    EXPECT_NE(nullptr, std::strstr(s.getState(), "wal_partitions"));
+    EXPECT_NE(nullptr,
+              std::strstr(s.getState(),
+                          std::to_string(DBImpl::kMaxWalPartitions).c_str()));
+  }
+  options.wal_partitions = DBImpl::kMaxWalPartitions;
+  ASSERT_OK(TryReopen(options));
+  ASSERT_EQ(DBImpl::kMaxWalPartitions, dbfull()->TEST_NumWalPartitions());
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_EQ("value", Get("key"));
+}
+
+// Opens with more than one WAL partition, which Open() rejects outside tests,
+// and with a column family routed to every partition. The parameter is
+// two_write_queues, which rejects the WAL indexing N > 1 needs, so tests that
+// open N > 1 bypass the true instance.
+class DBWritePartitionTest : public DBTestBase,
+                             public testing::WithParamInterface<bool> {
+ public:
+  DBWritePartitionTest()
+      : DBTestBase("db_write_partition_test", /*env_do_fsync=*/false) {}
+
+  void OpenWithPartitions(size_t num_partitions, Options options) {
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::ValidateOptions:AllowWalPartitions",
+        [](void* arg) { *static_cast<bool*>(arg) = true; });
+    SyncPoint::GetInstance()->EnableProcessing();
+
+    // Column family ids are assigned in creation order, so cf_id is also the
+    // handle index once the families are created.
+    std::vector<std::string> cf_names;
+    cf_for_partition_.assign(num_partitions, 0);
+    std::vector<bool> covered(num_partitions, false);
+    size_t num_covered = 0;
+    for (uint32_t cf_id = 1; num_covered < num_partitions; ++cf_id) {
+      WriteBatch batch;
+      ASSERT_OK(WriteBatchInternal::Put(&batch, cf_id, "key", "value"));
+      size_t partition = num_partitions;
+      ASSERT_OK(
+          DBImpl::TEST_WalPartitionForWrite(batch, num_partitions, &partition));
+      cf_names.push_back("cf" + std::to_string(cf_id));
+      if (!covered[partition]) {
+        covered[partition] = true;
+        cf_for_partition_[partition] = static_cast<int>(cf_id);
+        ++num_covered;
+      }
+    }
+    options.wal_partitions = static_cast<uint32_t>(num_partitions);
+    if (num_partitions > 1) {
+      options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+      options.track_and_verify_wals_in_manifest = true;
+    }
+    options.two_write_queues = GetParam();
+    CreateAndReopenWithCF(cf_names, options);
+    ASSERT_EQ(num_partitions, dbfull()->TEST_NumWalPartitions());
+  }
+
+  // A write with no memtable insert, which goes through the nonmem queue
+  // when two_write_queues is set.
+  Status WalOnlyPut(int cf, const std::string& key, const std::string& value) {
+    WriteBatch batch;
+    Status s = batch.Put(handles_[cf], key, value);
+    if (!s.ok()) {
+      return s;
+    }
+    return dbfull()->WriteImpl(WriteOptions(), &batch, /*callback=*/nullptr,
+                               /*user_write_cb=*/nullptr, /*wal_used=*/nullptr,
+                               /*log_ref=*/0, /*disable_memtable=*/true);
+  }
+
+  // WriteWithCallback rejects a callback at N > 1; internal writers pass one
+  // to WriteImpl directly.
+  Status WriteImplWithCallback(WriteBatch* batch, WriteCallback* callback) {
+    return dbfull()->WriteImpl(WriteOptions(), batch, callback,
+                               /*user_write_cb=*/nullptr);
+  }
+
+  // Runs one write per partition on its own thread, each holding its WAL
+  // append open until every partition is inside one, and returns the most
+  // appends seen in flight at once. An append counts from inside its
+  // partition's WAL mutex (after the timestamp-size record, before
+  // AddRecord) until AddRecord returns, so appends whose mutexes serialize
+  // them never get past one, and each waiter gives up at a shared deadline.
+  size_t MaxConcurrentAppends(
+      const std::function<Status(size_t partition)>& write) {
+    const size_t num_partitions = cf_for_partition_.size();
+    std::mutex mu;
+    std::condition_variable cv;
+    size_t in_append = 0;
+    size_t max_in_append = 0;
+    bool all_in = false;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::WriteToWAL:AfterMaybeAddUserDefinedTimestampSizeRecord",
+        [&](void*) {
+          std::unique_lock<std::mutex> lock(mu);
+          max_in_append = std::max(max_in_append, ++in_append);
+          if (in_append == num_partitions) {
+            all_in = true;
+            cv.notify_all();
+          }
+          cv.wait_until(lock, deadline, [&] { return all_in; });
+        });
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::WriteToWAL:AfterAddRecord", [&](void*) {
+          std::lock_guard<std::mutex> lock(mu);
+          --in_append;
+        });
+
+    std::vector<port::Thread> writers;
+    for (size_t p = 0; p < num_partitions; ++p) {
+      writers.emplace_back([&write, p] { ASSERT_OK(write(p)); });
+    }
+    for (auto& writer : writers) {
+      writer.join();
+    }
+    SyncPoint::GetInstance()->ClearCallBack(
+        "DBImpl::WriteToWAL:AfterMaybeAddUserDefinedTimestampSizeRecord");
+    SyncPoint::GetInstance()->ClearCallBack(
+        "DBImpl::WriteToWAL:AfterAddRecord");
+    return max_in_append;
+  }
+
+  // Handle index of a column family routed to each partition.
+  std::vector<int> cf_for_partition_;
+};
+
+TEST_P(DBWritePartitionTest, MemtableDecisionEnforcedAtOpen) {
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS(
+        "N > 1 needs indexed WALs, which two_write_queues "
+        "rejects");
+    return;
+  }
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::ValidateOptions:AllowWalPartitions",
+      [](void* arg) { *static_cast<bool*>(arg) = true; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  Options options = CurrentOptions();
+  options.wal_partitions = 4;
+  options.track_and_verify_wals_in_manifest = true;
+  options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  options.allow_concurrent_memtable_write = false;
+  Status s = TryReopen(options);
+  ASSERT_TRUE(s.IsNotSupported());
+  ASSERT_NE(nullptr,
+            std::strstr(s.getState(), "allow_concurrent_memtable_write"));
+
+  options.allow_concurrent_memtable_write = true;
+  ASSERT_OK(TryReopen(options));
+  ASSERT_EQ(4U, dbfull()->TEST_NumWalPartitions());
+}
+
+TEST_P(DBWritePartitionTest, PartitionLeadersAppendConcurrently) {
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS(
+        "N > 1 needs indexed WALs, which two_write_queues "
+        "rejects");
+    return;
+  }
+  constexpr size_t kPartitions = 16;
+  Options options = CurrentOptions();
+  options.avoid_flush_during_shutdown = true;
+  OpenWithPartitions(kPartitions, options);
+
+  ASSERT_EQ(kPartitions, MaxConcurrentAppends([&](size_t p) {
+              return Put(cf_for_partition_[p], "main" + std::to_string(p),
+                         "value");
+            }));
+  for (size_t p = 0; p < kPartitions; ++p) {
+    ASSERT_EQ("value", Get(cf_for_partition_[p], "main" + std::to_string(p)));
+  }
+
+  // Each partition appended to a WAL of its own.
+  VectorWalPtr wal_files;
+  ASSERT_OK(db_->GetSortedWalFiles(wal_files));
+  ASSERT_GE(wal_files.size(), kPartitions);
+}
+
+TEST_P(DBWritePartitionTest, SwitchWaitsForOtherPartitionsLeaders) {
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS(
+        "N > 1 needs indexed WALs, which two_write_queues "
+        "rejects");
+    return;
+  }
+  constexpr size_t kPartitions = 4;
+  Options options = CurrentOptions();
+  options.write_buffer_size = 64 << 10;
+  options.avoid_flush_during_shutdown = true;
+  OpenWithPartitions(kPartitions, options);
+  const int blocked_cf = cf_for_partition_[0];
+  const int switching_cf = cf_for_partition_[1];
+
+  // The blocked leader holds its append open until a switch is waiting on
+  // it. The switch must not start before that append completes.
+  std::mutex mu;
+  std::condition_variable cv;
+  bool switch_waiting = false;
+  std::atomic<bool> blocked_append_done{false};
+  std::atomic<bool> switched_after_append{false};
+  std::atomic<bool> switched{false};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WriteToWAL:log_entry", [&](void* arg) {
+        if (!static_cast<Slice*>(arg)->ends_with("blocked")) {
+          return;
+        }
+        std::unique_lock<std::mutex> lock(mu);
+        cv.wait_for(lock, std::chrono::seconds(10),
+                    [&] { return switch_waiting; });
+      });
+  SyncPoint::GetInstance()->SetCallBack("DBImpl::WriteToWAL:AfterAddRecord",
+                                        [&](void*) {
+                                          std::lock_guard<std::mutex> lock(mu);
+                                          if (switch_waiting) {
+                                            blocked_append_done = true;
+                                          }
+                                        });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::CloseMemTableSwitchGate:WaitForLeaders", [&](void*) {
+        std::lock_guard<std::mutex> lock(mu);
+        switch_waiting = true;
+        cv.notify_all();
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SwitchMemtable:AfterCreateWAL", [&](void*) {
+        switched_after_append = blocked_append_done.load();
+        switched = true;
+      });
+
+  port::Thread blocked_writer(
+      [&] { ASSERT_OK(Put(blocked_cf, "key", "blocked")); });
+  // Fills the switching partition's memtable while the blocked append is
+  // still open. A concurrent insert schedules the flush on the memtable's
+  // next insert, and the write after that switches.
+  ASSERT_OK(Put(switching_cf, "fill", std::string(128 << 10, 'x')));
+  for (int i = 0; i < 3 && !switched.load(); ++i) {
+    ASSERT_OK(Put(switching_cf, "switch", "value"));
+  }
+  blocked_writer.join();
+
+  ASSERT_TRUE(switched.load());
+  ASSERT_TRUE(switched_after_append.load());
+  ASSERT_EQ("blocked", Get(blocked_cf, "key"));
+  ASSERT_EQ("value", Get(switching_cf, "switch"));
+}
+
+TEST_P(DBWritePartitionTest, SequenceOrderHoldsUnderConcurrentSwitches) {
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS(
+        "N > 1 needs indexed WALs, which two_write_queues "
+        "rejects");
+    return;
+  }
+  constexpr size_t kPartitions = 16;
+  constexpr int kThreads = 16;
+  constexpr int kWritesPerThread = 200;
+  Options options = CurrentOptions();
+  // Small enough that leaders keep switching memtables and rotating every
+  // partition's WAL while other partitions append.
+  options.db_write_buffer_size = 256 << 10;
+  options.max_total_wal_size = 512 << 10;
+  options.avoid_flush_during_shutdown = true;
+  OpenWithPartitions(kPartitions, options);
+  const int num_cfs = static_cast<int>(handles_.size());
+
+  std::atomic<int> rotations{0};
+  SyncPoint::GetInstance()->SetCallBack("DBImpl::SwitchMemtable:AfterCreateWAL",
+                                        [&](void*) { rotations.fetch_add(1); });
+
+  // Every append asserts in WriteToWAL that it starts above the sequences
+  // its file already holds.
+  const std::string value(1 << 10, 'v');
+  std::vector<port::Thread> threads;
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&, t] {
+      Random rnd(301 + t);
+      for (int i = 0; i < kWritesPerThread; ++i) {
+        const std::string key =
+            "t" + std::to_string(t) + "_" + std::to_string(i);
+        const int cf = static_cast<int>(rnd.Uniform(num_cfs));
+        if (GetParam() && i % 4 == 0) {
+          ASSERT_OK(WalOnlyPut(cf, key, value));
+        } else {
+          ASSERT_OK(Put(cf, key, value));
+        }
+      }
+    });
+  }
+  // Switches from outside the write path enter every partition's queue.
+  threads.emplace_back([&] {
+    for (int i = 0; i < 5; ++i) {
+      ASSERT_OK(Flush(i % num_cfs));
+    }
+  });
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  ASSERT_GT(rotations.load(), 0);
+
+  for (int t = 0; t < kThreads; ++t) {
+    Random rnd(301 + t);
+    for (int i = 0; i < kWritesPerThread; ++i) {
+      const std::string key = "t" + std::to_string(t) + "_" + std::to_string(i);
+      const int cf = static_cast<int>(rnd.Uniform(num_cfs));
+      if (GetParam() && i % 4 == 0) {
+        ASSERT_EQ("NOT_FOUND", Get(cf, key));
+      } else {
+        ASSERT_EQ(value, Get(cf, key));
+      }
+    }
+  }
+}
+
+TEST_P(DBWritePartitionTest, MergeBatchesInsertConcurrentlyAcrossPartitions) {
+  // Q5: at N>1 every memtable insert must be concurrent-safe, because other
+  // partitions' leaders may be inserting into the same memtable at the same
+  // time (a batch routes by its minimum CF id but inserts into every CF it
+  // touches). A batch containing a Merge therefore stays on the parallel
+  // path instead of leaving it for a non-concurrent insert. Merges from both
+  // partitions land and merge correctly. (Without the fix, any Merge batch
+  // trips the debug assert that the non-parallel path is unreachable at N>1;
+  // under TSan the unsynchronized same-memtable inserts race.)
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS(
+        "N > 1 needs indexed WALs, which two_write_queues "
+        "rejects");
+    return;
+  }
+  constexpr size_t kPartitions = 2;
+  Options options = CurrentOptions();
+  options.avoid_flush_during_shutdown = true;
+  options.merge_operator = MergeOperators::CreateStringAppendOperator();
+  OpenWithPartitions(kPartitions, options);
+
+  const int cf_a = cf_for_partition_[0];
+  const int cf_b = cf_for_partition_[1];
+  const int shared_cf = std::max(cf_a, cf_b);
+  // Each thread merges into its own partition's CF plus the shared CF, so
+  // the two partitions insert into the shared CF's memtable concurrently.
+  constexpr int kThreads = 4;
+  constexpr int kMergesPerThread = 25;
+  std::atomic<int> failures{0};
+  std::vector<port::Thread> threads;
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&, t] {
+      const int own_cf = (t % 2 == 0) ? cf_a : cf_b;
+      for (int i = 0; i < kMergesPerThread; ++i) {
+        WriteBatch batch;
+        if (!batch
+                 .Merge(handles_[own_cf], "shared_merge_key",
+                        "t" + std::to_string(t))
+                 .ok()) {
+          ++failures;
+          continue;
+        }
+        std::string key =
+            "merge_t" + std::to_string(t) + "_" + std::to_string(i);
+        if (!batch.Merge(handles_[shared_cf], key, "solo").ok()) {
+          ++failures;
+          continue;
+        }
+        if (!batch
+                 .Merge(handles_[shared_cf], "cross_key",
+                        "t" + std::to_string(t))
+                 .ok()) {
+          ++failures;
+          continue;
+        }
+        if (!db_->Write(WriteOptions(), &batch).ok()) {
+          ++failures;
+        }
+      }
+    });
+  }
+  for (auto& th : threads) {
+    th.join();
+  }
+  ASSERT_EQ(0, failures.load());
+
+  for (int t = 0; t < kThreads; ++t) {
+    for (int i = 0; i < kMergesPerThread; ++i) {
+      std::string key = "merge_t" + std::to_string(t) + "_" + std::to_string(i);
+      ASSERT_EQ("solo", Get(shared_cf, key));
+    }
+  }
+  // Every thread's marker merged into the cross-partition key.
+  std::string cross = Get(shared_cf, "cross_key");
+  for (int t = 0; t < kThreads; ++t) {
+    EXPECT_NE(std::string::npos, cross.find("t" + std::to_string(t)));
+  }
+  // Each partition's own shared key merged its two writers' markers.
+  for (int t = 0; t < kThreads; ++t) {
+    const int own_cf = (t % 2 == 0) ? cf_a : cf_b;
+    EXPECT_NE(std::string::npos,
+              Get(own_cf, "shared_merge_key").find("t" + std::to_string(t)));
+  }
+}
+
+TEST_P(DBWritePartitionTest, IngestWriteBatchWithIndexRejectedAtNPartitions) {
+  // Q5: ingesting a WriteBatchWithIndex switches memtables inside the
+  // leader, which is not part of the concurrent contract, so N>1 rejects it
+  // at runtime in WriteImpl's wbwi block (the direct call and commit-time
+  // ingestion both funnel through WriteImpl). Reverting the check trips the
+  // debug assert in IngestWBWIAsMemtable instead, and fails this test
+  // either way.
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS(
+        "N > 1 needs indexed WALs, which two_write_queues "
+        "rejects");
+    return;
+  }
+  constexpr size_t kPartitions = 2;
+  Options options = CurrentOptions();
+  options.avoid_flush_during_shutdown = true;
+  OpenWithPartitions(kPartitions, options);
+  auto wbwi = std::make_shared<WriteBatchWithIndex>(options.comparator, 0,
+                                                    /*overwrite_key=*/true);
+  ASSERT_OK(wbwi->Put("ingest_key", "ingest_value"));
+  WriteOptions wo;
+  wo.disableWAL = true;
+  Status s = db_->IngestWriteBatchWithIndex(wo, wbwi);
+  ASSERT_TRUE(s.IsNotSupported());
+  ASSERT_NE(nullptr, s.getState());
+  EXPECT_NE(nullptr, std::strstr(s.getState(), "wal_partitions"));
+}
+
+TEST_P(DBWritePartitionTest, ConcurrentUnsafeConfigsRejectedAtOpen) {
+  // Q5: configurations whose memtable work cannot be concurrent-safe are
+  // rejected at Open when N>1. The blob and inplace-update rejections name
+  // wal_partitions ahead of the concurrent-writes checks (N>1 forces
+  // allow_concurrent_memtable_write on); the merge-counting and non-SkipList
+  // rejections are new. Reverting either new guard opens successfully and
+  // fails its case below; the last case is the allowed-config control.
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::ValidateOptions:AllowWalPartitions",
+      [](void* arg) { *static_cast<bool*>(arg) = true; });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  auto try_open =
+      [](const std::string& name,
+         std::function<void(Options*, ColumnFamilyOptions*)> tweak) {
+        Options options;
+        options.create_if_missing = true;
+        options.wal_partitions = 4;
+        options.track_and_verify_wals_in_manifest = true;
+        options.partition_wal_usage =
+            PartitionWALUsage::kPartitionByColumnFamily;
+        options.two_write_queues = false;
+        options.allow_concurrent_memtable_write = true;
+        options.avoid_flush_during_shutdown = true;
+        ColumnFamilyOptions cf_options(options);
+        tweak(&options, &cf_options);
+        const std::string dbname = test::PerThreadDBPath(name);
+        std::vector<ColumnFamilyDescriptor> cfs;
+        cfs.emplace_back(kDefaultColumnFamilyName, cf_options);
+        std::vector<ColumnFamilyHandle*> handles;
+        std::unique_ptr<DB> db;
+        Status s = DBImpl::Open(options, dbname, cfs, &handles, &db,
+                                /*seq_per_batch=*/false, /*batch_per_txn=*/true,
+                                /*is_retry=*/false, /*can_retry=*/nullptr);
+        if (s.ok()) {
+          for (auto* h : handles) {
+            delete h;
+          }
+          db.reset();
+          EXPECT_OK(DestroyDB(dbname, options));
+        }
+        return s;
+      };
+
+  auto expect_reject =
+      [&](const std::string& name,
+          std::function<void(Options*, ColumnFamilyOptions*)> tweak,
+          const char* fragment) {
+        Status s = try_open(name, tweak);
+        EXPECT_TRUE(s.IsNotSupported() || s.IsInvalidArgument())
+            << name << ": " << s.ToString();
+        ASSERT_NE(nullptr, s.getState()) << name;
+        EXPECT_NE(nullptr, std::strstr(s.getState(), fragment)) << name;
+      };
+
+  expect_reject(
+      "wal_q5_blob",
+      [](Options* /*db_options*/, ColumnFamilyOptions* cf_options) {
+        cf_options->enable_blob_files = true;
+        cf_options->enable_blob_direct_write = true;
+      },
+      "enable_blob_direct_write");
+  // VectorRep passes the generic concurrent-inserts check, so only the new
+  // SkipList-only guard rejects it.
+  expect_reject(
+      "wal_q5_vector_rep",
+      [](Options* /*db_options*/, ColumnFamilyOptions* cf_options) {
+        cf_options->memtable_factory.reset(new VectorRepFactory());
+      },
+      "SkipList");
+  expect_reject(
+      "wal_q5_inplace",
+      [](Options* /*db_options*/, ColumnFamilyOptions* cf_options) {
+        cf_options->inplace_update_support = true;
+      },
+      "inplace_update_support");
+  expect_reject(
+      "wal_q5_merges",
+      [](Options* /*db_options*/, ColumnFamilyOptions* cf_options) {
+        cf_options->max_successive_merges = 10;
+      },
+      "max_successive_merges");
+  EXPECT_OK(try_open(
+      "wal_q5_allowed",
+      [](Options* /*db_options*/, ColumnFamilyOptions* /*cf_options*/) {}));
+}
+
+TEST_P(DBWriteTest, N1ConcurrentUnsafeOptionsStillAccepted) {
+  // Q5: the N>1 Open rejections are scoped to N>1: the same options open
+  // fine at N=1 and Merge writes work there. (The existing
+  // IngestWriteBatchWithIndex test covers WBWI ingestion at N=1.)
+  Options options = GetOptions();
+  options.create_if_missing = true;
+  options.max_successive_merges = 10;
+  options.memtable_factory.reset(new VectorRepFactory());
+  options.merge_operator = MergeOperators::CreateStringAppendOperator();
+  Reopen(options);
+  ASSERT_OK(Merge("merge_key", "a"));
+  ASSERT_OK(Merge("merge_key", "b"));
+  ASSERT_EQ("a,b", Get("merge_key"));
+}
+
+TEST_P(DBWritePartitionTest, IngestionStallHistogram) {
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS(
+        "N > 1 needs indexed WALs, which two_write_queues "
+        "rejects");
+    return;
+  }
+  constexpr size_t kPartitions = 4;
+  Options options = CurrentOptions();
+  options.statistics = CreateDBStatistics();
+  OpenWithPartitions(kPartitions, options);
+  const std::string sst = dbname_ + "/ingest.sst";
+  SstFileWriter writer(EnvOptions(), options);
+  ASSERT_OK(writer.Open(sst));
+  ASSERT_OK(writer.Put("key", "value"));
+  ASSERT_OK(writer.Finish());
+  ASSERT_OK(options.statistics->Reset());
+  ASSERT_OK(db_->IngestExternalFile(handles_[cf_for_partition_[1]], {sst},
+                                    IngestExternalFileOptions()));
+  HistogramData stall;
+  options.statistics->histogramData(WAL_PARTITION_INGESTION_STALL_MICROS,
+                                    &stall);
+  EXPECT_EQ(1U, stall.count);
+  ASSERT_EQ("value", Get(cf_for_partition_[1], "key"));
+}
+
+TEST_P(DBWritePartitionTest, ImportStallHistogram) {
+  // CreateColumnFamilyWithImport holds every partition's writers like
+  // ingestion does, and records one stall sample.
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS(
+        "N > 1 needs indexed WALs, which two_write_queues "
+        "rejects");
+    return;
+  }
+  constexpr size_t kPartitions = 2;
+  Options options = CurrentOptions();
+  options.statistics = CreateDBStatistics();
+  OpenWithPartitions(kPartitions, options);
+  const int cf = cf_for_partition_[1];
+  ASSERT_OK(Put(cf, "key", "value"));
+  ASSERT_OK(Flush(cf));
+  Checkpoint* checkpoint = nullptr;
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
+  std::unique_ptr<Checkpoint> checkpoint_guard(checkpoint);
+  const std::string export_dir = dbname_ + "/export";
+  ASSERT_OK(DestroyDir(env_, export_dir));
+  ExportImportFilesMetaData* metadata = nullptr;
+  ASSERT_OK(
+      checkpoint->ExportColumnFamily(handles_[cf], export_dir, &metadata));
+  std::unique_ptr<ExportImportFilesMetaData> metadata_guard(metadata);
+  ASSERT_OK(options.statistics->Reset());
+  ColumnFamilyHandle* imported = nullptr;
+  ASSERT_OK(db_->CreateColumnFamilyWithImport(
+      options, "imported", ImportColumnFamilyOptions(), *metadata, &imported));
+  std::unique_ptr<ColumnFamilyHandle> imported_guard(imported);
+  HistogramData stall;
+  options.statistics->histogramData(WAL_PARTITION_INGESTION_STALL_MICROS,
+                                    &stall);
+  EXPECT_EQ(1U, stall.count);
+  std::string value;
+  ASSERT_OK(db_->Get(ReadOptions(), imported, "key", &value));
+  ASSERT_EQ("value", value);
+}
+
+TEST_P(DBWritePartitionTest, MalformedBatchFailsAsAtN1) {
+  // G-19b: routing never fails a write; a batch whose records stop parsing
+  // fails on the normal write path with the same status, and leaves the
+  // same background error, at N=4 as at N=1. Restoring the router's error
+  // return fails it before the append, with no background error.
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS(
+        "N > 1 needs indexed WALs, which two_write_queues "
+        "rejects");
+    return;
+  }
+  auto write_damaged = [this](size_t partitions) {
+    Options options = CurrentOptions();
+    options.avoid_flush_during_shutdown = true;
+    DestroyAndReopen(options);
+    OpenWithPartitions(partitions, options);
+    WriteBatch valid;
+    EXPECT_OK(WriteBatchInternal::Put(&valid, /*cf=*/1, "k", "v"));
+    std::string rep = valid.Data();
+    rep.push_back('\x7f');
+    WriteBatch damaged;
+    EXPECT_OK(WriteBatchInternal::SetContents(&damaged, rep));
+    const Status s = db_->Write(WriteOptions(), &damaged);
+    const Status bg_error = dbfull()->TEST_GetBGError();
+    Close();
+    return std::make_pair(s.ToString(), bg_error.ToString());
+  };
+  const auto at_one = write_damaged(1);
+  const auto at_four = write_damaged(4);
+  EXPECT_NE("OK", at_one.first);
+  EXPECT_EQ(at_one.first, at_four.first);
+  EXPECT_EQ(at_one.second, at_four.second);
+}
+
+// GC28 tests. Helpers shared by this block only.
+namespace {
+// Holds the first thread that reaches `point` (and passes `match`) until
+// Release(), and counts every matching hit.
+class GC28Hold {
+ public:
+  GC28Hold() = default;
+  GC28Hold(const GC28Hold&) = delete;
+  GC28Hold& operator=(const GC28Hold&) = delete;
+  ~GC28Hold() {
+    Release();
+    if (!point_.empty()) {
+      SyncPoint::GetInstance()->ClearCallBack(point_);
+    }
+  }
+  void Arm(const std::string& point,
+           const std::function<bool(void*)>& match = nullptr,
+           bool hold = true) {
+    point_ = point;
+    SyncPoint::GetInstance()->SetCallBack(
+        point, [this, match, hold](void* arg) {
+          if (match && !match(arg)) {
+            return;
+          }
+          std::unique_lock<std::mutex> lock(mu_);
+          ++hits_;
+          cv_.notify_all();
+          if (!hold || held_) {
+            return;
+          }
+          held_ = true;
+          cv_.wait(lock, [this] { return released_; });
+        });
+  }
+  bool WaitHeld(std::chrono::seconds timeout = std::chrono::seconds(30)) {
+    std::unique_lock<std::mutex> lock(mu_);
+    return cv_.wait_for(lock, timeout, [this] { return held_; });
+  }
+  bool WaitHits(int n,
+                std::chrono::seconds timeout = std::chrono::seconds(30)) {
+    std::unique_lock<std::mutex> lock(mu_);
+    return cv_.wait_for(lock, timeout, [this, n] { return hits_ >= n; });
+  }
+  int Hits() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return hits_;
+  }
+  void ResetHits() {
+    std::lock_guard<std::mutex> lock(mu_);
+    hits_ = 0;
+  }
+  void Release() {
+    std::lock_guard<std::mutex> lock(mu_);
+    released_ = true;
+    cv_.notify_all();
+  }
+
+ private:
+  std::string point_;
+  std::mutex mu_;
+  std::condition_variable cv_;
+  int hits_ = 0;
+  bool held_ = false;
+  bool released_ = false;
+};
+
+// Matches a sync point reached on the thread whose id `id` holds.
+std::function<bool(void*)> GC28OnThread(
+    const std::atomic<std::thread::id>* id) {
+  return [id](void*) { return std::this_thread::get_id() == id->load(); };
+}
+}  // namespace
+
+TEST_P(DBWritePartitionTest, JoinWaitTimerOffAtDefaultStatsLevel) {
+  // GC28 Q6 (F006, D-GC28f (i)): at the default stats level
+  // (kExceptDetailedTimers) the join-wait timer reads no clock and records
+  // nothing, N=1 included; above it every write records one sample.
+  // Neuter: the ungated StopWatch; the default level records 3.
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS("N > 1 rejects two_write_queues");
+    return;
+  }
+  Options options = CurrentOptions();
+  options.statistics = CreateDBStatistics();
+  ASSERT_EQ(StatsLevel::kExceptDetailedTimers,
+            options.statistics->get_stats_level());
+  OpenWithPartitions(1, options);
+  auto join_wait_count = [&] {
+    HistogramData data;
+    options.statistics->histogramData(JOIN_BATCH_GROUP_WAIT_MICROS, &data);
+    return data.count;
+  };
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(Put("k" + std::to_string(i), "v"));
+  }
+  EXPECT_EQ(0U, join_wait_count());
+  options.statistics->set_stats_level(StatsLevel::kExceptTimeForMutex);
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(Put("k" + std::to_string(i), "v"));
+  }
+  EXPECT_EQ(3U, join_wait_count());
+}
+namespace {
+
+// A write on its own thread. Joined when it goes out of scope, so declare it
+// before every hold that may block it: the holds release first.
+class GC30Write {
+ public:
+  GC30Write() = default;
+  GC30Write(const GC30Write&) = delete;
+  GC30Write& operator=(const GC30Write&) = delete;
+  ~GC30Write() { Join().PermitUncheckedError(); }
+  void Start(const std::function<Status()>& write) {
+    thread_ = port::Thread([this, write] {
+      Status s = write();
+      std::lock_guard<std::mutex> lock(mu_);
+      status_ = s;
+      done_ = true;
+      cv_.notify_all();
+    });
+  }
+  bool Done() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return done_;
+  }
+  bool WaitDone(std::chrono::seconds timeout = std::chrono::seconds(30)) {
+    std::unique_lock<std::mutex> lock(mu_);
+    return cv_.wait_for(lock, timeout, [this] { return done_; });
+  }
+  Status Join() {
+    if (thread_.joinable()) {
+      thread_.join();
+    }
+    std::lock_guard<std::mutex> lock(mu_);
+    return status_;
+  }
+
+ private:
+  std::mutex mu_;
+  std::condition_variable cv_;
+  bool done_ = false;
+  Status status_;
+  port::Thread thread_;
+};
+}  // namespace
+namespace {
+
+// Blocks the HIGH and LOW background pools until Release() (or
+// destruction), so a flush a switch schedules stays queued.
+class GC31BlockedPools {
+ public:
+  explicit GC31BlockedPools(Env* env) {
+    env->SetBackgroundThreads(1, Env::Priority::HIGH);
+    env->SetBackgroundThreads(1, Env::Priority::LOW);
+    env->Schedule(&test::SleepingBackgroundTask::DoSleepTask, &high_,
+                  Env::Priority::HIGH);
+    env->Schedule(&test::SleepingBackgroundTask::DoSleepTask, &low_,
+                  Env::Priority::LOW);
+    high_.WaitUntilSleeping();
+    low_.WaitUntilSleeping();
+  }
+  ~GC31BlockedPools() { Release(); }
+  void Release() {
+    if (released_) {
+      return;
+    }
+    released_ = true;
+    high_.WakeUp();
+    low_.WakeUp();
+    high_.WaitUntilDone();
+    low_.WaitUntilDone();
+  }
+
+ private:
+  test::SleepingBackgroundTask high_;
+  test::SleepingBackgroundTask low_;
+  bool released_ = false;
+};
+
+// Counts the hits of a sync point until destroyed.
+class GC31Counter {
+ public:
+  explicit GC31Counter(const std::string& point) : point_(point) {
+    SyncPoint::GetInstance()->SetCallBack(
+        point_, [this](void*) { hits_.fetch_add(1); });
+  }
+  ~GC31Counter() { SyncPoint::GetInstance()->ClearCallBack(point_); }
+  int Get() const { return hits_.load(); }
+  void Reset() { hits_.store(0); }
+
+ private:
+  const std::string point_;
+  std::atomic<int> hits_{0};
+};
+}  // namespace
+INSTANTIATE_TEST_CASE_P(DBWritePartitionTest, DBWritePartitionTest,
+                        testing::Bool());
+
 INSTANTIATE_TEST_CASE_P(DBWriteTestInstance, DBWriteTest,
                         testing::Values(DBTestBase::kDefault,
                                         DBTestBase::kConcurrentWALWrites,
@@ -2081,6 +3031,359 @@ TEST(WriteThreadTest, EnterUnbatchedNonBlockingQueuesBehindOrdinaryLeader) {
   EXPECT_TRUE(entered);
 }
 
+// G-07 opener gap: read-only and secondary opens apply the same N > 1 option
+// checks as a read-write open, with the same status and message. Every
+// DBOptions check runs for them, including the write-only ones. Neuter: drop
+// the check from the read-only open; its rows open.
+TEST_P(DBWritePartitionTest, ReadOnlyAndSecondaryApplyPartitionChecks) {
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS("N > 1 rejects two_write_queues");
+    return;
+  }
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::ValidateOptions:AllowWalPartitions",
+      [](void* arg) { *static_cast<bool*>(arg) = true; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  Options base = CurrentOptions();
+  DestroyAndReopen(base);
+  Close();
+  struct Row {
+    const char* name;
+    std::function<void(Options*)> tweak;
+    const char* message;
+  };
+  const std::vector<Row> rows = {
+      {"kNone",
+       [](Options* o) { o->partition_wal_usage = PartitionWALUsage::kNone; },
+       "requires partition_wal_usage other than kNone"},
+      {"track_and_verify_wals",
+       [](Options* o) { o->track_and_verify_wals = true; },
+       "not supported with track_and_verify_wals"},
+      {"recycle_log_file_num", [](Options* o) { o->recycle_log_file_num = 1; },
+       "recycle_log_file_num"},
+      {"bound",
+       [](Options* o) { o->wal_partitions = DBImpl::kMaxWalPartitions + 1; },
+       "wal_partitions must be at most"},
+      {"tracking",
+       [](Options* o) { o->track_and_verify_wals_in_manifest = false; },
+       "wal_partitions > 1 requires track_and_verify_wals_in_manifest"},
+  };
+  for (const Row& row : rows) {
+    SCOPED_TRACE(row.name);
+    Options options = base;
+    options.create_if_missing = false;
+    options.wal_partitions = 2;
+    options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+    options.track_and_verify_wals_in_manifest = true;
+    row.tweak(&options);
+    const Status read_write = TryReopen(options);
+    std::unique_ptr<DB> db;
+    const Status read_only = DB::OpenForReadOnly(options, dbname_, &db);
+    const Status secondary =
+        DB::OpenAsSecondary(options, dbname_, dbname_ + "_secondary", &db);
+    for (const Status& s : {read_write, read_only, secondary}) {
+      EXPECT_EQ(read_write.code(), s.code()) << s.ToString();
+      EXPECT_NE(std::string::npos, s.ToString().find(row.message))
+          << s.ToString();
+      EXPECT_NE(std::string::npos, s.ToString().find("wal_partitions"))
+          << s.ToString();
+    }
+  }
+  // A configuration a read-write open accepts opens read-only too.
+  Options options = base;
+  options.wal_partitions = 2;
+  options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  options.track_and_verify_wals_in_manifest = true;
+  std::unique_ptr<DB> db;
+  ASSERT_OK(DB::OpenForReadOnly(options, dbname_, &db));
+}
+
+// G-07 (GC12 Q8): a read-only open of a fully compacted DB takes the
+// CompactedDBImpl path first; it applies the same wal_partitions checks as
+// the other read-only opens. Neuter: run the checks after the compacted
+// attempt again; the kNone row opens.
+TEST_P(DBWritePartitionTest, ReadOnlyCompactedOpenAppliesPartitionChecks) {
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS("N > 1 rejects two_write_queues");
+    return;
+  }
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::ValidateOptions:AllowWalPartitions",
+      [](void* arg) { *static_cast<bool*>(arg) = true; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  Options options = CurrentOptions();
+  options.max_open_files = -1;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(Flush());
+  Close();
+  // A configuration the checks accept opens through the compacted path.
+  options.wal_partitions = 2;
+  options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  options.track_and_verify_wals_in_manifest = true;
+  std::unique_ptr<DB> db;
+  ASSERT_OK(DB::OpenForReadOnly(options, dbname_, &db));
+  EXPECT_NE(nullptr, dynamic_cast<CompactedDBImpl*>(db.get()));
+  std::string value;
+  ASSERT_OK(db->Get(ReadOptions(), "key", &value));
+  db.reset();
+
+  options.partition_wal_usage = PartitionWALUsage::kNone;
+  const Status s = DB::OpenForReadOnly(options, dbname_, &db);
+  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+  EXPECT_NE(std::string::npos,
+            s.ToString().find("requires partition_wal_usage other than kNone"))
+      << s.ToString();
+}
+
+// N-2-2: with more than one WAL partition, publishing above the allocated
+// sequence fails the debug assertion even without two_write_queues.
+TEST_P(DBWritePartitionTest, PublishAboveAllocatedAsserts) {
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS("single-queue path only");
+    return;
+  }
+#ifdef NDEBUG
+  ROCKSDB_GTEST_BYPASS("the assertion exists in debug builds only");
+#else
+#ifdef GTEST_FLAG_SET
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+#else
+  ::testing::GTEST_FLAG(death_test_style) = "threadsafe";
+#endif
+  Options options = CurrentOptions();
+  options.avoid_flush_during_shutdown = true;
+  OpenWithPartitions(2, options);
+  ASSERT_OK(Put(cf_for_partition_[1], "key", "value"));
+  VersionSet* versions = dbfull()->GetVersionSet();
+  const SequenceNumber above = versions->LastAllocatedSequence() + 1;
+  EXPECT_DEATH(versions->SetLastSequence(above), "");
+  EXPECT_DEATH(versions->SetLastSequenceAtLeast(above), "");
+#endif
+}
+
+namespace {
+// The number of immutable memtables of column family `cf` (a handle index).
+uint64_t GC33Immutable(DBTestBase* test, ColumnFamilyHandle* cf) {
+  uint64_t immutable = 0;
+  EXPECT_TRUE(test->dbfull()->GetIntProperty(
+      cf, DB::Properties::kNumImmutableMemTable, &immutable));
+  return immutable;
+}
+}  // namespace
+
+TEST_P(DBWritePartitionTest, WbmFlushQuiesceSkippedWhenNothingToSwitch) {
+  // GC33 Q3: above one partition a write-buffer-manager flush stops every
+  // partition only when it will switch a memtable or request a flush. The
+  // manager's memory is reserved past its limit, so ShouldFlush() stays
+  // true for every write group, and the blocked pools hold every flush. The
+  // first writes switch each partition's column family once; from then on
+  // each is flushing and nothing is selectable, so 200 writes from 8
+  // threads switch nothing and quiesce no partition. Once the pools run and
+  // the flushes finish, the next write's flush acts, once. Fails at the
+  // base, where every write group that reaches the manager's branch
+  // quiesces.
+  // Neuter: drop the pre-check; every such group quiesces.
+  // Neuter: let the pre-check never find a switch; the refill switches
+  // nothing.
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS("N > 1 rejects two_write_queues");
+    return;
+  }
+  constexpr size_t kPartitions = 8;
+  constexpr int kThreads = 8;
+  constexpr int kWritesPerThread = 25;
+  constexpr size_t kBufferSize = 1 << 20;
+  Options options = CurrentOptions();
+  options.write_buffer_size = 64 << 20;
+  options.avoid_flush_during_shutdown = true;
+  options.write_buffer_manager =
+      std::make_shared<WriteBufferManager>(kBufferSize);
+  OpenWithPartitions(kPartitions, options);
+  GC31BlockedPools pools(env_);
+  options.write_buffer_manager->ReserveMem(4 * kBufferSize);
+  ASSERT_TRUE(options.write_buffer_manager->ShouldFlush());
+  GC31Counter quiesces("DBImpl::WaitForPendingWrites:BeforeBlock");
+  auto switched = [&]() {
+    uint64_t total = 0;
+    for (const int cf : cf_for_partition_) {
+      total += std::min<uint64_t>(GC33Immutable(this, handles_[cf]), 1);
+    }
+    return total;
+  };
+  for (int i = 0; switched() < kPartitions; ++i) {
+    ASSERT_LT(i, 1000);
+    ASSERT_OK(Put(cf_for_partition_[i % kPartitions],
+                  "fill" + std::to_string(i), "v"));
+  }
+  std::vector<uint64_t> immutable_before;
+  for (ColumnFamilyHandle* handle : handles_) {
+    immutable_before.push_back(GC33Immutable(this, handle));
+  }
+  quiesces.Reset();
+  GC31Counter switches("DBImpl::SwitchMemtable:AfterCreateWAL");
+  std::vector<port::Thread> threads;
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&, t] {
+      for (int i = 0; i < kWritesPerThread; ++i) {
+        ASSERT_OK(Put(cf_for_partition_[t % kPartitions],
+                      "t" + std::to_string(t) + "_" + std::to_string(i), "v"));
+      }
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  EXPECT_EQ(0, quiesces.Get());
+  EXPECT_EQ(0, switches.Get());
+  for (size_t i = 0; i < handles_.size(); ++i) {
+    EXPECT_EQ(immutable_before[i], GC33Immutable(this, handles_[i])) << i;
+  }
+  EXPECT_EQ("v", Get(cf_for_partition_[kThreads - 1], "t7_24"));
+
+  // Once the pools run, the held flushes finish; the reservation keeps the
+  // manager past its limit, so the next write's flush acts, once.
+  pools.Release();
+  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+  quiesces.Reset();
+  for (int i = 0; switches.Get() == 0; ++i) {
+    ASSERT_LT(i, 1000);
+    ASSERT_OK(Put(cf_for_partition_[i % kPartitions],
+                  "refill" + std::to_string(i), "v"));
+  }
+  EXPECT_EQ(1, quiesces.Get());
+  EXPECT_EQ(1, switches.Get());
+  options.write_buffer_manager->ScheduleFreeMem(4 * kBufferSize);
+  options.write_buffer_manager->FreeMem(4 * kBufferSize);
+}
+
+TEST_P(DBWritePartitionTest, WbmFlushDecidedAgainAfterGateCloses) {
+  // GC33 Q3, the decision after closing: the manager's memory is reserved
+  // past its limit, every partition's column family but partition 1's is
+  // flushing (the blocked pools hold the flushes), and partition 1's holds
+  // one record, so the next manager flush switches it. D and A both find
+  // that the flush acts. D closes the switch gate first and waits for C,
+  // held past the gate; A then waits for the gate. Once C is
+  // let go D switches partition 1's column family and opens the gate. A
+  // closes it, finds nothing selectable any more, and opens it again
+  // without draining any partition: one quiesce in all, D's.
+  // Neuter: decide only before closing; A drains too (two quiesces).
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS("N > 1 rejects two_write_queues");
+    return;
+  }
+  constexpr size_t kPartitions = 4;
+  constexpr size_t kBufferSize = 1 << 20;
+  Options options = CurrentOptions();
+  options.write_buffer_size = 64 << 20;
+  options.avoid_flush_during_shutdown = true;
+  options.write_buffer_manager =
+      std::make_shared<WriteBufferManager>(kBufferSize);
+  OpenWithPartitions(kPartitions, options);
+  GC31BlockedPools pools(env_);
+  options.write_buffer_manager->ReserveMem(4 * kBufferSize);
+  ColumnFamilyHandle* const target = handles_[cf_for_partition_[1]];
+  auto others_switched = [&]() {
+    for (size_t p = 0; p < kPartitions; ++p) {
+      if (p != 1 && GC33Immutable(this, handles_[cf_for_partition_[p]]) == 0) {
+        return false;
+      }
+    }
+    return true;
+  };
+  for (int i = 0; !others_switched(); ++i) {
+    ASSERT_LT(i, 1000);
+    const size_t p = std::vector<size_t>{0, 2, 3}[i % 3];
+    ASSERT_OK(Put(cf_for_partition_[p], "fill" + std::to_string(i), "v"));
+  }
+  ASSERT_EQ(0, GC33Immutable(this, target));
+
+  GC30Write c;
+  GC30Write d;
+  GC30Write a;
+  // C is held past the gate, before it takes a sequence, so the next write
+  // does not wait for it.
+  std::atomic<std::thread::id> c_id;
+  GC28Hold c_held;
+  c_held.Arm("DBImpl::WriteImpl:BeforeLeaderEnters", GC28OnThread(&c_id));
+  c.Start([&] {
+    c_id.store(std::this_thread::get_id());
+    return Put(cf_for_partition_[2], "c", "v");
+  });
+  ASSERT_TRUE(c_held.WaitHeld());
+  // Nothing is selectable when this write checks, and it leaves partition
+  // 1's column family flushable.
+  ASSERT_OK(Put(cf_for_partition_[1], "y", "v"));
+  ASSERT_EQ(0, GC33Immutable(this, target));
+  GC31Counter quiesces("DBImpl::WaitForPendingWrites:BeforeBlock");
+  GC28Hold d_waits;
+  d_waits.Arm("DBImpl::CloseMemTableSwitchGate:WaitForLeaders", nullptr,
+              /*hold=*/false);
+  d.Start([&] { return Put(cf_for_partition_[0], "d", "v"); });
+  ASSERT_TRUE(d_waits.WaitHits(1));
+  std::atomic<std::thread::id> a_id;
+  GC28Hold a_decided;
+  a_decided.Arm("DBImpl::QuiescedWriteBufferManagerFlush:WouldAct",
+                GC28OnThread(&a_id), /*hold=*/false);
+  a.Start([&] {
+    a_id.store(std::this_thread::get_id());
+    return Put(cf_for_partition_[3], "a", "v");
+  });
+  ASSERT_TRUE(a_decided.WaitHits(1));
+  // A now waits for the gate D closed.
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  EXPECT_FALSE(a.Done());
+  c_held.Release();
+  ASSERT_OK(c.Join());
+  ASSERT_OK(d.Join());
+  ASSERT_OK(a.Join());
+  EXPECT_EQ(1, GC33Immutable(this, target));
+  EXPECT_EQ(1, quiesces.Get());
+  EXPECT_EQ("v", Get(cf_for_partition_[3], "a"));
+  options.write_buffer_manager->ScheduleFreeMem(4 * kBufferSize);
+  options.write_buffer_manager->FreeMem(4 * kBufferSize);
+}
+
+// GC27 Q7: ported from GC26's losing candidate (Muse, babe10dd6620), with
+// credit; adaptations are listed in the summary.
+// The N>1 column-family options through SetOptions: max_successive_merges is
+// the one mutable option of the set, so its runtime change reaches the N>1
+// guard and is refused by it; the rest are immutable and refuse with the
+// generic not-changeable error before any guard runs.
+// Neuter: drop the N>1 max_successive_merges check in
+// ColumnFamilyData::ValidateOptions; the change is accepted.
+TEST_F(DBWriteTestUnparameterized, WalPartitionsSetOptionsRuntimeConflicts) {
+  Options options = CurrentOptions();
+  options.wal_partitions = 2;
+  options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  options.track_and_verify_wals_in_manifest = true;
+  options.avoid_flush_during_shutdown = true;
+  Destroy(options);
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::ValidateOptions:AllowWalPartitions",
+      [](void* arg) { *static_cast<bool*>(arg) = true; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_OK(TryReopen(options));
+  ColumnFamilyHandle* cf = db_->DefaultColumnFamily();
+  const Status merges = db_->SetOptions(cf, {{"max_successive_merges", "10"}});
+  EXPECT_TRUE(merges.IsInvalidArgument()) << merges.ToString();
+  EXPECT_NE(std::string::npos, merges.ToString().find("wal_partitions"))
+      << merges.ToString();
+  EXPECT_NE(std::string::npos, merges.ToString().find("max_successive_merges"))
+      << merges.ToString();
+  for (const std::pair<const char*, const char*>& opt :
+       {std::make_pair("inplace_update_support", "true"),
+        std::make_pair("enable_blob_direct_write", "true"),
+        std::make_pair("persist_user_defined_timestamps", "false")}) {
+    SCOPED_TRACE(opt.first);
+    const Status s = db_->SetOptions(cf, {{opt.first, opt.second}});
+    EXPECT_TRUE(s.IsInvalidArgument()) << s.ToString();
+    EXPECT_NE(std::string::npos, s.ToString().find("Option not changeable"))
+        << s.ToString();
+  }
+  // memtable_factory takes no string value through this API, so there is no
+  // runtime change to refuse; CreateColumnFamily above covers its guard.
+}
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

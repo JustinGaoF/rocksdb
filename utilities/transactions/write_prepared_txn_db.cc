@@ -733,7 +733,8 @@ void WritePreparedTxnDB::AdvanceMaxEvictedSeq(const SequenceNumber& prev_max,
   SequenceNumber new_snapshots_version = new_max;
   std::vector<SequenceNumber> snapshots;
   bool update_snapshots = false;
-  if (new_snapshots_version > snapshots_version_) {
+  if (new_snapshots_version >
+      snapshots_version_.load(std::memory_order_relaxed)) {
     // This is to avoid updating the snapshots_ if it already updated
     // with a more recent version by a concurrent thread
     update_snapshots = true;
@@ -741,7 +742,11 @@ void WritePreparedTxnDB::AdvanceMaxEvictedSeq(const SequenceNumber& prev_max,
     snapshots = GetSnapshotListFromDB(new_max);
   }
   if (update_snapshots) {
-    UpdateSnapshots(snapshots, new_snapshots_version);
+    // A concurrent caller may have stored a newer list since the check
+    // above; then this older one is dropped.
+    update_snapshots = UpdateSnapshots(snapshots, new_snapshots_version);
+  }
+  if (update_snapshots) {
     if (!snapshots.empty()) {
       WriteLock wl(&old_commit_map_mutex_);
       for (auto snap : snapshots) {
@@ -915,7 +920,7 @@ void WritePreparedTxnDB::CleanupReleasedSnapshots(
   }
 }
 
-void WritePreparedTxnDB::UpdateSnapshots(
+bool WritePreparedTxnDB::UpdateSnapshots(
     const std::vector<SequenceNumber>& snapshots,
     const SequenceNumber& version) {
   ROCKS_LOG_DETAILS(info_log_, "UpdateSnapshots with version %" PRIu64,
@@ -927,7 +932,11 @@ void WritePreparedTxnDB::UpdateSnapshots(
 #endif
   ROCKS_LOG_DETAILS(info_log_, "snapshots_mutex_ overhead");
   WriteLock wl(&snapshots_mutex_);
-  snapshots_version_ = version;
+  if (version < snapshots_version_.load(std::memory_order_relaxed)) {
+    // A newer list is already stored; never replace it with an older one.
+    return false;
+  }
+  snapshots_version_.store(version, std::memory_order_relaxed);
   // We update the list concurrently with the readers.
   // Both new and old lists are sorted and the new list is subset of the
   // previous list plus some new items. Thus if a snapshot repeats in
@@ -971,6 +980,7 @@ void WritePreparedTxnDB::UpdateSnapshots(
 
   TEST_SYNC_POINT("WritePreparedTxnDB::UpdateSnapshots:p:end");
   TEST_SYNC_POINT("WritePreparedTxnDB::UpdateSnapshots:s:end");
+  return true;
 }
 
 void WritePreparedTxnDB::CheckAgainstSnapshots(const CommitEntry& evicted) {
