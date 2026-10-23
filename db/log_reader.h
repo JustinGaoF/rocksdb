@@ -150,6 +150,39 @@ class Reader {
   // if no void record has been read.
   uint64_t GetMaxVoidWALIndexHi() const { return max_void_wal_index_hi_; }
 
+  // Returns whether any valid void record read so far covers `wal_index`.
+  // A merge asks this at every hole, which the high-water mark above cannot
+  // answer.
+  bool IsWALIndexVoidCovered(uint64_t wal_index) const {
+    for (const auto& [lo, hi] : wal_index_void_ranges_) {
+      if (wal_index >= lo && wal_index <= hi) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Highest progress bound asserted by any valid progress record read so far,
+  // or zero if none was read. Below the bound nothing is still coming from
+  // this file.
+  uint64_t GetWALIndexProgressBound() const {
+    return last_progress_bound_read_;
+  }
+
+  // Predecessor span attested by this file's head, if one was read.
+  bool HasWALIndexPredecessorSpan() const { return has_predecessor_span_; }
+  bool GetWALIndexPredecessorSpan(uint64_t* predecessor_wal_number,
+                                  uint64_t* first_wal_index,
+                                  uint64_t* last_wal_index) const {
+    if (!has_predecessor_span_) {
+      return false;
+    }
+    *predecessor_wal_number = predecessor_span_wal_;
+    *first_wal_index = predecessor_span_first_;
+    *last_wal_index = predecessor_span_last_;
+    return true;
+  }
+
   // Returns whether a supersession record in this reader's WAL makes the
   // identified record obsolete. Supersession is open-ended in wal_index but
   // applies only to the WAL named by the record.
@@ -229,8 +262,24 @@ class Reader {
   // Highest `hi` of any valid void range read so far. Tracked separately
   // because a void record deliberately leaves last_read_wal_index_ alone.
   uint64_t max_void_wal_index_hi_ = 0;
+  // Valid void ranges read so far, in file order. Covers are order-constrained
+  // (see log_format.h), so ranges arrive lo-ordered in a well-formed file.
+  std::vector<std::pair<uint64_t, uint64_t>> wal_index_void_ranges_;
+  // Highest data index or void lower bound read so far. A void range may not
+  // start at or below this mark: it would trail behind data the merge has
+  // already passed, hence be invisible when the merge decides the hole.
+  uint64_t wal_index_order_mark_ = 0;
   // Lowest open-ended supersession boundary declared for each older WAL.
   UnorderedMap<uint64_t, uint64_t> first_superseded_wal_indices_;
+  // Highest progress bound asserted so far, or zero when no valid progress
+  // record has been read. A nonzero bound also proves the head is complete:
+  // supersessions and spans must precede the first progress record.
+  uint64_t last_progress_bound_read_ = 0;
+  // Predecessor span attested by this file's head, if one was read.
+  bool has_predecessor_span_ = false;
+  uint64_t predecessor_span_wal_ = 0;
+  uint64_t predecessor_span_first_ = 0;
+  uint64_t predecessor_span_last_ = 0;
 
   // Extend record types with the following special values
   enum : uint8_t {
@@ -286,14 +335,25 @@ class Reader {
   void MaybeStripAndVerifyWALIndex(bool record_has_wal_index, Slice* record,
                                    uint64_t* record_checksum);
 
-  // Validates a void record and folds its upper bound into the separate void
-  // high-water mark. Shared by both logical-reader implementations.
+  // Validates a void record, enforces its order against the mark above, and
+  // folds it into the void ranges. Shared by both logical-reader
+  // implementations.
   void DecodeWALIndexVoidRecord(const Slice& fragment);
 
-  // Validates an open-ended supersession record and folds its lower bound into
-  // the bearer-scoped supersession state. Shared by both reader
-  // implementations.
+  // Validates an open-ended supersession record, enforces its head position
+  // (before the first data record and the first progress record), and folds
+  // its lower bound into the bearer-scoped supersession state. Shared by both
+  // reader implementations.
   void DecodeWALIndexSupersessionRecord(const Slice& fragment);
+
+  // Validates a progress record and folds its bound into the progress mark.
+  // Shared by both reader implementations.
+  void DecodeWALIndexProgressRecord(const Slice& fragment);
+
+  // Validates a predecessor span record, enforces its head position like a
+  // supersession, and records the attested span. Shared by both reader
+  // implementations.
+  void DecodeWALIndexPredecessorSpanRecord(const Slice& fragment);
 };
 
 class FragmentBufferedReader : public Reader {
