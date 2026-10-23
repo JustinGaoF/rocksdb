@@ -14,6 +14,7 @@
 
 #include "db/db_impl/db_impl.h"
 #include "db/write_batch_internal.h"
+#include "file/file_util.h"
 #include "port/port.h"
 #include "rocksdb/attribute_groups.h"
 #include "rocksdb/compaction_filter.h"
@@ -29,6 +30,7 @@
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
 #include "test_util/transaction_test_util.h"
+#include "test_util/wal_partitions_test_util.h"
 #include "util/random.h"
 #include "util/string_util.h"
 #include "utilities/merge_operators.h"
@@ -10652,6 +10654,190 @@ TEST(TransactionPartitionedWalTest,
   SyncPoint::GetInstance()->DisableProcessing();
   SyncPoint::GetInstance()->ClearAllCallBacks();
   ASSERT_OK(DestroyDB(dbname, options));
+}
+
+// Q1 (G-56): two-phase commit at N in {1, 8} under every write policy with
+// one write queue (two queues reject the indexing N > 1 needs): a transaction
+// spanning partitions prepares and commits with its commit marker on another
+// partition, and a prepared transaction recovers as prepared across a reopen.
+// (A standalone fixture: TransactionTestBase pins recycle_log_file_num = 2,
+// which N > 1 rejects.)
+class TransactionPartitionCountTest
+    : public testing::Test,
+      public ::testing::WithParamInterface<uint32_t> {
+ public:
+  TransactionPartitionCountTest()
+      : dbname_(test::PerThreadDBPath("transaction_partition_count")) {}
+
+  ~TransactionPartitionCountTest() override { Close(); }
+
+  void Close() {
+    if (db_ != nullptr) {
+      for (ColumnFamilyHandle* handle : handles_) {
+        EXPECT_OK(db_->DestroyColumnFamilyHandle(handle));
+      }
+      handles_.clear();
+      db_.reset();
+    }
+  }
+
+  void Open(size_t num_partitions, TxnDBWritePolicy write_policy) {
+    Close();
+    options_.create_if_missing = true;
+    options_.create_missing_column_families = true;
+    options_.two_write_queues = false;
+    test::EnableWalPartitionsForTest(&options_,
+                                     static_cast<uint32_t>(num_partitions));
+    options_.avoid_flush_during_shutdown = true;
+    options_.avoid_flush_during_recovery = true;
+    cf_names_.clear();
+    EXPECT_OK(test::WalPartitionCoveringColumnFamilies(
+        num_partitions, &cf_names_, &cf_for_partition_));
+    std::vector<ColumnFamilyDescriptor> column_families;
+    column_families.emplace_back(kDefaultColumnFamilyName,
+                                 ColumnFamilyOptions(options_));
+    for (const auto& name : cf_names_) {
+      column_families.emplace_back(name, ColumnFamilyOptions(options_));
+    }
+    EXPECT_OK(DestroyDB(dbname_, options_));
+    txn_db_options_.write_policy = write_policy;
+    TransactionDB* db = nullptr;
+    EXPECT_OK(TransactionDB::Open(options_, txn_db_options_, dbname_,
+                                  column_families, &handles_, &db));
+    db_.reset(db);
+  }
+
+  void Reopen() { OpenAt(dbname_); }
+
+  void OpenAt(const std::string& dir) {
+    Close();
+    std::vector<ColumnFamilyDescriptor> column_families;
+    column_families.emplace_back(kDefaultColumnFamilyName,
+                                 ColumnFamilyOptions(options_));
+    for (const auto& name : cf_names_) {
+      column_families.emplace_back(name, ColumnFamilyOptions(options_));
+    }
+    TransactionDB* db = nullptr;
+    ASSERT_OK(TransactionDB::Open(options_, txn_db_options_, dir,
+                                  column_families, &handles_, &db));
+    db_.reset(db);
+  }
+
+  // Copies every file of the open DB but its LOCK to `dir`: with every write
+  // synced, what a crash at this point leaves behind.
+  void CopyDBAsCrashImage(const std::string& dir) {
+    Env* env = Env::Default();
+    ASSERT_OK(DestroyDir(env, dir));
+    ASSERT_OK(env->CreateDirIfMissing(dir));
+    std::vector<std::string> children;
+    ASSERT_OK(env->GetChildren(dbname_, &children));
+    for (const auto& child : children) {
+      uint64_t number = 0;
+      FileType type;
+      if (!ParseFileName(child, &number, &type) || type == kDBLockFile) {
+        continue;
+      }
+      std::unique_ptr<SequentialFile> src;
+      ASSERT_OK(
+          env->NewSequentialFile(dbname_ + "/" + child, &src, EnvOptions()));
+      std::unique_ptr<WritableFile> dst;
+      ASSERT_OK(env->NewWritableFile(dir + "/" + child, &dst, EnvOptions()));
+      char buf[8192];
+      Slice result;
+      while (true) {
+        ASSERT_OK(src->Read(sizeof(buf), &result, buf));
+        if (result.empty()) {
+          break;
+        }
+        ASSERT_OK(dst->Append(result));
+      }
+      ASSERT_OK(dst->Close());
+    }
+  }
+
+  // An XID whose commit marker routes away from `prepare_partition`.
+  std::string XidCommittingElsewhere(size_t prepare_partition,
+                                     size_t num_partitions) {
+    if (num_partitions == 1) {
+      return "xid" + std::to_string(next_xid_++);
+    }
+    while (true) {
+      const std::string xid = "xid" + std::to_string(next_xid_++);
+      WriteBatch commit;
+      EXPECT_OK(WriteBatchInternal::MarkCommit(&commit, xid));
+      size_t partition = num_partitions;
+      EXPECT_OK(DBImpl::TEST_WalPartitionForWrite(commit, num_partitions,
+                                                  &partition));
+      if (partition != prepare_partition) {
+        return xid;
+      }
+    }
+  }
+
+  std::string dbname_;
+  Options options_;
+  TransactionDBOptions txn_db_options_;
+  std::vector<std::string> cf_names_;
+  std::vector<int> cf_for_partition_;
+  std::vector<ColumnFamilyHandle*> handles_;
+  std::unique_ptr<TransactionDB> db_;
+  int next_xid_ = 0;
+};
+
+INSTANTIATE_TEST_CASE_P(TransactionPartitions, TransactionPartitionCountTest,
+                        ::testing::Values(1U, 8U));
+
+TEST_P(TransactionPartitionCountTest, TwoPhaseCommitAcrossPartitions) {
+  const size_t num_partitions = GetParam();
+  for (TxnDBWritePolicy write_policy :
+       {WRITE_COMMITTED, WRITE_PREPARED, WRITE_UNPREPARED}) {
+    SCOPED_TRACE("write_policy=" + std::to_string(write_policy));
+    Open(num_partitions, write_policy);
+    const size_t other = (num_partitions == 1) ? 0 : 1;
+    WriteOptions sync;
+    sync.sync = true;
+    Transaction* committed = db_->BeginTransaction(sync, TransactionOptions());
+    ASSERT_NE(nullptr, committed);
+    ASSERT_OK(committed->SetName(XidCommittingElsewhere(0, num_partitions)));
+    ASSERT_OK(committed->Put(handles_[cf_for_partition_[0]], "k0", "v0"));
+    ASSERT_OK(committed->Put(handles_[cf_for_partition_[other]], "k1", "v1"));
+    ASSERT_OK(committed->Prepare());
+    ASSERT_OK(committed->Commit());
+    delete committed;
+
+    // A prepared transaction cannot survive a clean close (its heap entry
+    // would outlive the DB), so the prepared leg reopens from a crash image.
+    const std::string prepared_xid =
+        XidCommittingElsewhere(other == 0 ? 0 : 1, num_partitions);
+    Transaction* prepared = db_->BeginTransaction(sync, TransactionOptions());
+    ASSERT_NE(nullptr, prepared);
+    ASSERT_OK(prepared->SetName(prepared_xid));
+    ASSERT_OK(prepared->Put(handles_[cf_for_partition_[other]], "kp", "vp"));
+    ASSERT_OK(prepared->Prepare());
+    const std::string crash_dir = dbname_ + "_crash";
+    CopyDBAsCrashImage(crash_dir);
+    ASSERT_OK(prepared->Rollback());
+    delete prepared;
+
+    OpenAt(crash_dir);
+    std::string value;
+    ASSERT_OK(
+        db_->Get(ReadOptions(), handles_[cf_for_partition_[0]], "k0", &value));
+    EXPECT_EQ("v0", value);
+    ASSERT_OK(db_->Get(ReadOptions(), handles_[cf_for_partition_[other]], "k1",
+                       &value));
+    EXPECT_EQ("v1", value);
+    EXPECT_TRUE(db_->Get(ReadOptions(), handles_[cf_for_partition_[other]],
+                         "kp", &value)
+                    .IsNotFound());
+    Transaction* recovered = db_->GetTransactionByName(prepared_xid);
+    ASSERT_NE(nullptr, recovered);
+    ASSERT_OK(recovered->Commit());
+    delete recovered;
+    ASSERT_OK(db_->Get(ReadOptions(), handles_[cf_for_partition_[other]], "kp",
+                       &value));
+    EXPECT_EQ("vp", value);
+  }
 }
 
 }  // namespace ROCKSDB_NAMESPACE

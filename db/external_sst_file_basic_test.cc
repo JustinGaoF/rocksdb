@@ -17,6 +17,7 @@
 #include "rocksdb/sst_file_writer.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
+#include "test_util/wal_partitions_test_util.h"
 #include "util/defer.h"
 #include "util/file_checksum_helper.h"
 #include "util/random.h"
@@ -3469,6 +3470,74 @@ TEST_F(ExternalSSTFileBasicTest, LargeSizeSstFileWriter) {
     EXPECT_TRUE(file_state->synced);
     EXPECT_TRUE(file_state->closed);
     EXPECT_TRUE(env_->FileExists(file_path).IsNotFound());
+  }
+}
+
+// Q1 (G-56): basic ingestion at N in {1, 8}: writes land on every partition,
+// an ingested file's keys are readable alongside them, and both survive a
+// reopen. (A plain subclass with an N loop: the base fixture already carries
+// a bool parameter, so a second WithParamInterface would be ambiguous.)
+class ExternalSSTFileBasicPartitionTest : public ExternalSSTFileBasicTest {
+ public:
+  void OpenWithPartitions(size_t num_partitions, Options options,
+                          std::vector<std::string>* cf_names,
+                          std::vector<int>* cf_for_partition) {
+    DestroyAndRecreateExternalSSTFilesDir();
+    DestroyAndReopen(options);
+    EXPECT_OK(test::WalPartitionCoveringColumnFamilies(num_partitions, cf_names,
+                                                       cf_for_partition));
+    test::EnableWalPartitionsForTest(&options,
+                                     static_cast<uint32_t>(num_partitions));
+    options.avoid_flush_during_shutdown = true;
+    options.avoid_flush_during_recovery = true;
+    CreateAndReopenWithCF(*cf_names, options);
+    EXPECT_EQ(num_partitions, dbfull()->TEST_NumWalPartitions());
+    last_options_ = options;
+  }
+
+  Options last_options_;
+};
+
+TEST_F(ExternalSSTFileBasicPartitionTest, IngestionAcrossPartitions) {
+  for (size_t num_partitions : {size_t{1}, size_t{8}}) {
+    SCOPED_TRACE("partitions=" + std::to_string(num_partitions));
+    Options options = CurrentOptions();
+    options.disable_auto_compactions = true;
+    std::vector<std::string> cf_names;
+    std::vector<int> cf_for_partition;
+    OpenWithPartitions(num_partitions, options, &cf_names, &cf_for_partition);
+    for (size_t p = 0; p < num_partitions; ++p) {
+      for (int i = 0; i < 10; ++i) {
+        ASSERT_OK(Put(cf_for_partition[p],
+                      "p" + std::to_string(p) + "_" + Key(i), "wval"));
+      }
+    }
+    std::map<std::string, std::string> true_data;
+    ASSERT_OK(GenerateAndAddExternalFile(
+        options, {1, 2, 3, 4, 5}, ValueType::kTypeValue, /*file_id=*/1,
+        /*verify_checksums_before_ingest=*/true, &true_data));
+    for (const auto& kv : true_data) {
+      ASSERT_EQ(kv.second, Get(0, kv.first));
+    }
+    for (size_t p = 0; p < num_partitions; ++p) {
+      for (int i = 0; i < 10; ++i) {
+        ASSERT_EQ("wval", Get(cf_for_partition[p],
+                              "p" + std::to_string(p) + "_" + Key(i)));
+      }
+    }
+    Close();
+    std::vector<std::string> all = {kDefaultColumnFamilyName};
+    all.insert(all.end(), cf_names.begin(), cf_names.end());
+    ReopenWithColumnFamilies(all, last_options_);
+    for (const auto& kv : true_data) {
+      ASSERT_EQ(kv.second, Get(0, kv.first));
+    }
+    for (size_t p = 0; p < num_partitions; ++p) {
+      for (int i = 0; i < 10; ++i) {
+        ASSERT_EQ("wval", Get(cf_for_partition[p],
+                              "p" + std::to_string(p) + "_" + Key(i)));
+      }
+    }
   }
 }
 

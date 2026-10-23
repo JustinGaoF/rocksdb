@@ -3,6 +3,11 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
+#include <map>
+#include <set>
+
+#include "file/file_util.h"
+#include "test_util/wal_partitions_test_util.h"
 #include "utilities/transactions/transaction_test.h"
 #include "utilities/transactions/write_unprepared_txn.h"
 #include "utilities/transactions/write_unprepared_txn_db.h"
@@ -1100,6 +1105,259 @@ TEST_P(WriteUnpreparedTransactionTest,
 
   // Verify the DB is usable after rollback.
   ASSERT_OK(ReOpenNoDelete());
+}
+
+// Q4 (N-5-4) and Q1 (G-56): WriteUnprepared at N in {1, 4, 8} with one write
+// queue, the counterpart of WritePreparedRecoversAcrossPartitions: a
+// transaction's unprepared batches, prepare and commit land on different
+// partitions. From a crash image, committed data is visible, and prepared
+// transactions recover as prepared and can then be committed or rolled back.
+// (A standalone fixture: TransactionTestBase pins recycle_log_file_num = 2,
+// which N > 1 rejects.)
+class WriteUnpreparedPartitionedWalTest
+    : public testing::Test,
+      public ::testing::WithParamInterface<uint32_t> {
+ public:
+  WriteUnpreparedPartitionedWalTest()
+      : dbname_(test::PerThreadDBPath("write_unprepared_partitioned_wal")) {}
+
+  ~WriteUnpreparedPartitionedWalTest() override { Close(); }
+
+  void Close() {
+    if (db_ != nullptr) {
+      for (ColumnFamilyHandle* handle : handles_) {
+        EXPECT_OK(db_->DestroyColumnFamilyHandle(handle));
+      }
+      handles_.clear();
+      db_.reset();
+    }
+  }
+
+  void Open(size_t num_partitions) {
+    Close();
+    options_.create_if_missing = true;
+    options_.create_missing_column_families = true;
+    options_.two_write_queues = false;
+    test::EnableWalPartitionsForTest(&options_,
+                                     static_cast<uint32_t>(num_partitions));
+    options_.avoid_flush_during_shutdown = true;
+    options_.avoid_flush_during_recovery = true;
+    cf_names_.clear();
+    EXPECT_OK(test::WalPartitionCoveringColumnFamilies(
+        num_partitions, &cf_names_, &cf_for_partition_));
+    std::vector<ColumnFamilyDescriptor> column_families;
+    column_families.emplace_back(kDefaultColumnFamilyName,
+                                 ColumnFamilyOptions(options_));
+    for (const auto& name : cf_names_) {
+      column_families.emplace_back(name, ColumnFamilyOptions(options_));
+    }
+    EXPECT_OK(DestroyDB(dbname_, options_));
+    txn_db_options_.write_policy = WRITE_UNPREPARED;
+    TransactionDB* db = nullptr;
+    EXPECT_OK(TransactionDB::Open(options_, txn_db_options_, dbname_,
+                                  column_families, &handles_, &db));
+    db_.reset(db);
+  }
+
+  void OpenAt(const std::string& dir) {
+    Close();
+    std::vector<ColumnFamilyDescriptor> column_families;
+    column_families.emplace_back(kDefaultColumnFamilyName,
+                                 ColumnFamilyOptions(options_));
+    for (const auto& name : cf_names_) {
+      column_families.emplace_back(name, ColumnFamilyOptions(options_));
+    }
+    TransactionDB* db = nullptr;
+    ASSERT_OK(TransactionDB::Open(options_, txn_db_options_, dir,
+                                  column_families, &handles_, &db));
+    db_.reset(db);
+  }
+
+  // An XID whose commit marker routes away from `prepare_partition`.
+  std::string XidCommittingElsewhere(size_t prepare_partition,
+                                     size_t num_partitions) {
+    if (num_partitions == 1) {
+      return "xid" + std::to_string(next_xid_++);
+    }
+    while (true) {
+      const std::string xid = "xid" + std::to_string(next_xid_++);
+      WriteBatch commit;
+      EXPECT_OK(WriteBatchInternal::MarkCommit(&commit, xid));
+      size_t partition = num_partitions;
+      EXPECT_OK(DBImpl::TEST_WalPartitionForWrite(commit, num_partitions,
+                                                  &partition));
+      if (partition != prepare_partition) {
+        return xid;
+      }
+    }
+  }
+
+  // Copies every file of the open DB but its LOCK to `dir`: with every write
+  // synced, what a crash at this point leaves behind.
+  void CopyDBAsCrashImage(const std::string& dir) {
+    Env* env = Env::Default();
+    ASSERT_OK(DestroyDir(env, dir));
+    ASSERT_OK(env->CreateDirIfMissing(dir));
+    std::vector<std::string> children;
+    ASSERT_OK(env->GetChildren(dbname_, &children));
+    for (const auto& child : children) {
+      uint64_t number = 0;
+      FileType type;
+      if (!ParseFileName(child, &number, &type) || type == kDBLockFile) {
+        continue;
+      }
+      std::unique_ptr<SequentialFile> src;
+      ASSERT_OK(
+          env->NewSequentialFile(dbname_ + "/" + child, &src, EnvOptions()));
+      std::unique_ptr<WritableFile> dst;
+      ASSERT_OK(env->NewWritableFile(dir + "/" + child, &dst, EnvOptions()));
+      char buf[8192];
+      Slice result;
+      while (true) {
+        ASSERT_OK(src->Read(sizeof(buf), &result, buf));
+        if (result.empty()) {
+          break;
+        }
+        ASSERT_OK(dst->Append(result));
+      }
+      ASSERT_OK(dst->Close());
+    }
+  }
+
+  std::string dbname_;
+  Options options_;
+  TransactionDBOptions txn_db_options_;
+  std::vector<std::string> cf_names_;
+  std::vector<int> cf_for_partition_;
+  std::vector<ColumnFamilyHandle*> handles_;
+  std::unique_ptr<TransactionDB> db_;
+  int next_xid_ = 0;
+};
+
+INSTANTIATE_TEST_CASE_P(WriteUnpreparedPartitions,
+                        WriteUnpreparedPartitionedWalTest,
+                        ::testing::Values(1U, 4U, 8U));
+
+TEST_P(WriteUnpreparedPartitionedWalTest,
+       WriteUnpreparedRecoversAcrossPartitions) {
+  const size_t num_partitions = GetParam();
+  Open(num_partitions);
+  const size_t p0 = 0;
+  const size_t p1 = (num_partitions > 1) ? 1 : 0;
+  const size_t p2 = (num_partitions > 2) ? 2 : 0;
+  const size_t p3 = (num_partitions > 3) ? 3 : 0;
+  WriteOptions sync;
+  sync.sync = true;
+  // A threshold every value below exceeds, so every Put flushes an unprepared
+  // batch to its partition's WAL.
+  TransactionOptions txn_options;
+  txn_options.write_batch_flush_threshold = 128;
+  const std::string big = "v" + std::string(1024, 'x');
+  std::map<std::string, size_t> partition_of;
+  auto prepare = [&](size_t p, const std::string& key, const std::string& xid) {
+    partition_of[key] = p;
+    const SequenceNumber before = db_->GetLatestSequenceNumber();
+    Transaction* txn = db_->BeginTransaction(sync, txn_options);
+    EXPECT_OK(txn->SetName(xid));
+    EXPECT_OK(txn->Put(handles_[cf_for_partition_[p]], key, big));
+    // The flush check runs before each write, so the second Put flushes the
+    // first as an unprepared batch, which consumes a sequence.
+    EXPECT_OK(txn->Put(handles_[cf_for_partition_[p]], key + "_more", big));
+    EXPECT_GT(db_->GetLatestSequenceNumber(), before);
+    EXPECT_OK(txn->Prepare());
+    return txn;
+  };
+  auto commit_partition_of = [&](const std::string& xid) {
+    WriteBatch commit;
+    EXPECT_OK(WriteBatchInternal::MarkCommit(&commit, xid));
+    size_t partition = num_partitions;
+    EXPECT_OK(
+        DBImpl::TEST_WalPartitionForWrite(commit, num_partitions, &partition));
+    return partition;
+  };
+  // The partition-spread precondition: unprepared batches land on every
+  // written partition and each commit marker lands away from its prepare.
+  // Neuter: route every batch to one partition; these fail.
+  if (num_partitions > 1) {
+    for (size_t p : {p0, p1}) {
+      WriteBatch batch;
+      EXPECT_OK(WriteBatchInternal::Put(
+          &batch, static_cast<uint32_t>(cf_for_partition_[p]), "k", "v"));
+      size_t routed = num_partitions;
+      EXPECT_OK(
+          DBImpl::TEST_WalPartitionForWrite(batch, num_partitions, &routed));
+      EXPECT_EQ(p, routed);
+    }
+  }
+  const std::string committed_xid = XidCommittingElsewhere(p0, num_partitions);
+  if (num_partitions > 1) {
+    EXPECT_NE(p0, commit_partition_of(committed_xid));
+  }
+  Transaction* committed = prepare(p0, "committed", committed_xid);
+  ASSERT_OK(committed->Commit());
+  delete committed;
+  const std::string prepared_xid = XidCommittingElsewhere(p1, num_partitions);
+  if (num_partitions > 1) {
+    EXPECT_NE(p1, commit_partition_of(prepared_xid));
+  }
+  Transaction* prepared = prepare(p1, "prepared", prepared_xid);
+  Transaction* a = prepare(p2, "a", XidCommittingElsewhere(p2, num_partitions));
+  const std::string c_xid = XidCommittingElsewhere(p3, num_partitions);
+  Transaction* c = prepare(p3, "c", c_xid);
+  Transaction* b = prepare(p3, "b", XidCommittingElsewhere(p3, num_partitions));
+  ASSERT_OK(b->Commit());
+  ASSERT_OK(a->Rollback());
+  delete a;
+  delete b;
+  const std::string crash_dir = dbname_ + "_crash";
+  CopyDBAsCrashImage(crash_dir);
+  ASSERT_OK(prepared->Rollback());
+  ASSERT_OK(c->Rollback());
+  delete prepared;
+  delete c;
+  auto value_of = [&](const std::string& key) {
+    std::string value;
+    const Status s =
+        db_->Get(ReadOptions(), handles_[cf_for_partition_[partition_of[key]]],
+                 key, &value);
+    EXPECT_TRUE(s.ok() || s.IsNotFound()) << s.ToString();
+    return s.ok() ? value : "NOT_FOUND";
+  };
+  OpenAt(crash_dir);
+  EXPECT_EQ(big, value_of("committed"));
+  EXPECT_EQ(big, value_of("b"));
+  EXPECT_EQ("NOT_FOUND", value_of("a"));
+  EXPECT_EQ("NOT_FOUND", value_of("prepared"));
+  EXPECT_EQ("NOT_FOUND", value_of("c"));
+  std::vector<Transaction*> recovered;
+  db_->GetAllPreparedTransactions(&recovered);
+  std::set<std::string> recovered_xids;
+  for (Transaction* txn : recovered) {
+    recovered_xids.insert(txn->GetName());
+  }
+  EXPECT_EQ((std::set<std::string>{prepared_xid, c_xid}), recovered_xids);
+  Transaction* recovered_prepared = db_->GetTransactionByName(prepared_xid);
+  ASSERT_NE(nullptr, recovered_prepared);
+  ASSERT_OK(recovered_prepared->Commit());
+  delete recovered_prepared;
+  Transaction* recovered_c = db_->GetTransactionByName(c_xid);
+  ASSERT_NE(nullptr, recovered_c);
+  ASSERT_OK(recovered_c->Rollback());
+  delete recovered_c;
+  EXPECT_EQ(big, value_of("prepared"));
+  EXPECT_EQ("NOT_FOUND", value_of("c"));
+
+  OpenAt(crash_dir);
+  recovered.clear();
+  db_->GetAllPreparedTransactions(&recovered);
+  EXPECT_TRUE(recovered.empty());
+  EXPECT_EQ(big, value_of("committed"));
+  EXPECT_EQ(big, value_of("prepared"));
+  EXPECT_EQ(big, value_of("b"));
+  EXPECT_EQ("NOT_FOUND", value_of("a"));
+  EXPECT_EQ("NOT_FOUND", value_of("c"));
+  Close();
+  EXPECT_OK(DestroyDir(Env::Default(), crash_dir));
 }
 
 }  // namespace ROCKSDB_NAMESPACE

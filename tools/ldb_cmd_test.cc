@@ -29,6 +29,7 @@
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
+#include "test_util/wal_partitions_test_util.h"
 #include "util/file_checksum_helper.h"
 #include "util/random.h"
 
@@ -287,6 +288,79 @@ TEST_F(LdbCmdTest, DumpWalOnPartitionedWals) {
   EXPECT_NE(std::string::npos, output.find("wal_partitions > 1")) << output;
   EXPECT_EQ(std::string::npos, output.find("Prev batch")) << output;
   EXPECT_EQ(std::string::npos, output.find("Checking wal file")) << output;
+  ASSERT_OK(DestroyDB(dbname, opts));
+}
+
+// Q1 (G-56): `ldb dump_wal` (full dump, no gaps flag) at N in {1, 8}. At N=1
+// no partition is shown. At N=8 the partition-0 file shows none either, while
+// other partitions' files and the directory dump show their "WAL partition:"
+// lines (GC12 Q2). The --only_print_seqno_gaps refusal is covered by
+// DumpWalOnPartitionedWals above and is not repeated here.
+class LdbPartitionedWalTest : public LdbCmdTest,
+                              public ::testing::WithParamInterface<uint32_t> {};
+
+INSTANTIATE_TEST_CASE_P(LdbPartitions, LdbPartitionedWalTest,
+                        ::testing::Values(1U, 8U));
+
+TEST_P(LdbPartitionedWalTest, DumpWalAtPartitions) {
+  Env* env = TryLoadCustomOrDefaultEnv();
+  const size_t num_partitions = GetParam();
+  Options opts;
+  opts.env = env;
+  opts.create_if_missing = true;
+  opts.create_missing_column_families = true;
+  opts.avoid_flush_during_shutdown = true;
+  test::EnableWalPartitionsForTest(&opts,
+                                   static_cast<uint32_t>(num_partitions));
+  std::vector<std::string> cf_names;
+  std::vector<int> cf_for_partition;
+  ASSERT_OK(test::WalPartitionCoveringColumnFamilies(num_partitions, &cf_names,
+                                                     &cf_for_partition));
+  std::vector<ColumnFamilyDescriptor> column_families;
+  column_families.emplace_back(kDefaultColumnFamilyName,
+                               ColumnFamilyOptions(opts));
+  for (const auto& name : cf_names) {
+    column_families.emplace_back(name, ColumnFamilyOptions(opts));
+  }
+  const std::string dbname = test::PerThreadDBPath(env, "ldb_cmd_test_npart");
+  ASSERT_OK(DestroyDB(dbname, opts));
+  std::vector<ColumnFamilyHandle*> handles;
+  std::unique_ptr<DB> db;
+  ASSERT_OK(DB::Open(opts, dbname, column_families, &handles, &db));
+  for (size_t p = 0; p < num_partitions; ++p) {
+    ASSERT_OK(db->Put(WriteOptions(), handles[cf_for_partition[p]],
+                      "key" + std::to_string(p), "value"));
+  }
+  std::vector<uint64_t> current_wals(num_partitions);
+  for (size_t p = 0; p < num_partitions; ++p) {
+    current_wals[p] = static_cast<DBImpl*>(db.get())->TEST_CurrentWalNumber(p);
+  }
+  for (auto* h : handles) {
+    ASSERT_OK(db->DestroyColumnFamilyHandle(h));
+  }
+  db.reset();
+  auto dump = [&](const std::string& walfile, std::string* output) {
+    const std::string wal_arg = "--walfile=" + walfile;
+    const char* argv[] = {"./ldb", "dump_wal", wal_arg.c_str()};
+    testing::internal::CaptureStdout();
+    testing::internal::CaptureStderr();
+    const int code =
+        LDBCommandRunner::RunCommand(3, argv, opts, LDBOptions(), nullptr);
+    *output = testing::internal::GetCapturedStderr();
+    *output += testing::internal::GetCapturedStdout();
+    return code;
+  };
+  std::string output;
+  ASSERT_EQ(0, dump(LogFileName(dbname, current_wals[0]), &output));
+  EXPECT_EQ(std::string::npos, output.find("WAL partition")) << output;
+  ASSERT_EQ(0, dump(dbname, &output));
+  if (num_partitions == 1) {
+    EXPECT_EQ(std::string::npos, output.find("WAL partition")) << output;
+  } else {
+    EXPECT_NE(std::string::npos, output.find("WAL partition: ")) << output;
+    ASSERT_EQ(0, dump(LogFileName(dbname, current_wals[3]), &output));
+    EXPECT_NE(std::string::npos, output.find("WAL partition: 3")) << output;
+  }
   ASSERT_OK(DestroyDB(dbname, opts));
 }
 

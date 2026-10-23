@@ -13,11 +13,14 @@
 #ifndef OS_WIN
 #include <unistd.h>
 #endif
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <functional>
 #include <iostream>
 #include <limits>
+#include <set>
 #include <thread>
 #include <utility>
 
@@ -44,6 +47,7 @@
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
+#include "test_util/wal_partitions_test_util.h"
 #include "util/defer.h"
 #include "utilities/fault_injection_env.h"
 #include "utilities/fault_injection_fs.h"
@@ -355,6 +359,323 @@ TEST_F(CheckpointTest, CheckpointCopiesIndexedWAL) {
         snapshot_db->Get(ReadOptions(), "key" + std::to_string(i), &value));
     ASSERT_EQ("value" + std::to_string(i), value);
   }
+}
+
+// Q1 (G-56): the WAL-relevant checkpoint behavior at N in {1, 8}: the
+// inclusion bound covers every partition's current WAL, and a copy taken
+// during writes is a prefix that opens in every recovery mode. Ported from
+// D127115188's CheckpointIncludesEveryPartitionCurrentWal and
+// CheckpointConcurrentWritesArePrefixAtN8, adapted to the base: the base
+// quiesces writes across the capture, so the concurrent copy must open in
+// every recovery mode, not only point-in-time.
+class CheckpointPartitionedWalTest
+    : public CheckpointTest,
+      public ::testing::WithParamInterface<uint32_t> {
+ public:
+  // Opens with `num_partitions` WAL partitions and column families covering
+  // every partition. Returns the handle index whose writes route to each
+  // partition, and fills `cf_names` with the created families (without
+  // default) for reopening copies.
+  std::vector<int> OpenWithPartitions(size_t num_partitions, Options options,
+                                      std::vector<std::string>* cf_names) {
+    DestroyAndReopen(options);
+    std::vector<int> cf_for_partition;
+    EXPECT_OK(test::WalPartitionCoveringColumnFamilies(num_partitions, cf_names,
+                                                       &cf_for_partition));
+    test::EnableWalPartitionsForTest(&options,
+                                     static_cast<uint32_t>(num_partitions));
+    options.avoid_flush_during_shutdown = true;
+    options.avoid_flush_during_recovery = true;
+    options.create_if_missing = true;
+    CreateAndReopenWithCF(*cf_names, options);
+    EXPECT_EQ(num_partitions, dbfull()->TEST_NumWalPartitions());
+    last_options_ = options;
+    return cf_for_partition;
+  }
+
+  // Opens the checkpoint copy at snapshot_name_ (created over cf_names) once
+  // per recovery mode and runs `check` on each open.
+  void VerifyCopyInEveryRecoveryMode(
+      const std::vector<std::string>& cf_names, Options copy_options,
+      const std::function<void(DB*, const std::vector<ColumnFamilyHandle*>&)>&
+          check) {
+    for (WALRecoveryMode mode : test::AllWalRecoveryModes()) {
+      SCOPED_TRACE("recovery_mode=" + std::to_string(static_cast<int>(mode)));
+      copy_options.wal_recovery_mode = mode;
+      std::vector<ColumnFamilyDescriptor> column_families;
+      column_families.emplace_back(kDefaultColumnFamilyName,
+                                   ColumnFamilyOptions(copy_options));
+      for (const auto& name : cf_names) {
+        column_families.emplace_back(name, ColumnFamilyOptions(copy_options));
+      }
+      std::vector<ColumnFamilyHandle*> copy_handles;
+      std::unique_ptr<DB> copy_db;
+      ASSERT_OK(DB::Open(copy_options, snapshot_name_, column_families,
+                         &copy_handles, &copy_db));
+      check(copy_db.get(), copy_handles);
+      for (auto* h : copy_handles) {
+        delete h;
+      }
+    }
+  }
+};
+
+INSTANTIATE_TEST_CASE_P(CheckpointPartitions, CheckpointPartitionedWalTest,
+                        ::testing::Values(1U, 8U));
+
+// At N > 1 the WAL inclusion bound is the highest current WAL across
+// partitions, so a checkpoint taken without a flush copies every partition's
+// current WAL and the copy replays every acknowledged write. Repeated with a
+// flush and writes between the switch and the capture. Neuter: restore
+// max_log_num = cur_wal_number_; the no-flush cases lose the partition
+// 1..N-1 keys.
+TEST_P(CheckpointPartitionedWalTest,
+       CheckpointIncludesEveryPartitionCurrentWal) {
+  const size_t num_partitions = GetParam();
+  for (bool flush_before : {false, true}) {
+    SCOPED_TRACE("partitions=" + std::to_string(num_partitions) +
+                 " flush_before=" + std::to_string(flush_before));
+    Options options = CurrentOptions();
+    std::vector<std::string> cf_names;
+    const std::vector<int> cf_for_partition =
+        OpenWithPartitions(num_partitions, options, &cf_names);
+    for (size_t p = 0; p < num_partitions; ++p) {
+      ASSERT_OK(Put(cf_for_partition[p], "key" + std::to_string(p),
+                    "value" + std::to_string(p)));
+    }
+    if (flush_before) {
+      for (size_t i = 0; i < handles_.size(); ++i) {
+        ASSERT_OK(Flush(static_cast<int>(i)));
+      }
+      ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+      for (size_t p = 0; p < num_partitions; ++p) {
+        ASSERT_OK(Put(cf_for_partition[p], "post" + std::to_string(p),
+                      "postval" + std::to_string(p)));
+      }
+    }
+    std::set<uint64_t> current_wals;
+    for (size_t p = 0; p < num_partitions; ++p) {
+      current_wals.insert(dbfull()->TEST_CurrentWalNumber(p));
+    }
+    LiveFilesStorageInfoOptions info_opts;
+    info_opts.wal_size_for_flush = std::numeric_limits<uint64_t>::max();
+    std::vector<LiveFileStorageInfo> live_files;
+    ASSERT_OK(db_->GetLiveFilesStorageInfo(info_opts, &live_files));
+    std::set<uint64_t> listed_wals;
+    for (const auto& f : live_files) {
+      if (f.file_type == kWalFile) {
+        listed_wals.insert(f.file_number);
+      }
+    }
+    for (uint64_t wal : current_wals) {
+      EXPECT_TRUE(listed_wals.count(wal) != 0) << "WAL " << wal;
+    }
+    Checkpoint* checkpoint = nullptr;
+    ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
+    std::unique_ptr<Checkpoint> owned(checkpoint);
+    ASSERT_OK(DestroyDB(snapshot_name_, options));
+    ASSERT_OK(owned->CreateCheckpoint(snapshot_name_,
+                                      std::numeric_limits<uint64_t>::max()));
+    Close();
+    Options copy_options = last_options_;
+    copy_options.create_if_missing = false;
+    VerifyCopyInEveryRecoveryMode(
+        cf_names, copy_options,
+        [&](DB* copy_db, const std::vector<ColumnFamilyHandle*>& copy_handles) {
+          for (size_t p = 0; p < num_partitions; ++p) {
+            std::string value;
+            ASSERT_OK(copy_db->Get(ReadOptions(),
+                                   copy_handles[cf_for_partition[p]],
+                                   "key" + std::to_string(p), &value));
+            EXPECT_EQ("value" + std::to_string(p), value);
+            if (flush_before) {
+              ASSERT_OK(copy_db->Get(ReadOptions(),
+                                     copy_handles[cf_for_partition[p]],
+                                     "post" + std::to_string(p), &value));
+              EXPECT_EQ("postval" + std::to_string(p), value);
+            }
+          }
+        });
+    ASSERT_OK(DestroyDB(snapshot_name_, options));
+  }
+}
+
+// Q5 (G-30/G-31): at N=8, CreateCheckpoint called by the thread holding
+// LockWAL returns, and the copy reopens with every write acknowledged before
+// LockWAL. Under LockWAL no group is in flight, so the quiesce is skipped.
+TEST_F(CheckpointPartitionedWalTest, CheckpointByLockWalHolderAtN8) {
+  constexpr size_t kPartitions = 8;
+  Options options = CurrentOptions();
+  std::vector<std::string> cf_names;
+  const std::vector<int> cf_for_partition =
+      OpenWithPartitions(kPartitions, options, &cf_names);
+  for (size_t p = 0; p < kPartitions; ++p) {
+    for (int i = 0; i < 10; ++i) {
+      ASSERT_OK(Put(cf_for_partition[p],
+                    "key" + std::to_string(p) + "_" + std::to_string(i),
+                    "value"));
+    }
+  }
+  ASSERT_OK(db_->LockWAL());
+  Checkpoint* checkpoint = nullptr;
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
+  std::unique_ptr<Checkpoint> owned(checkpoint);
+  ASSERT_OK(DestroyDB(snapshot_name_, options));
+  const auto start = std::chrono::steady_clock::now();
+  ASSERT_OK(owned->CreateCheckpoint(snapshot_name_,
+                                    std::numeric_limits<uint64_t>::max()));
+  EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(30));
+  ASSERT_OK(db_->UnlockWAL());
+  Close();
+  Options copy_options = last_options_;
+  copy_options.create_if_missing = false;
+  VerifyCopyInEveryRecoveryMode(
+      cf_names, copy_options,
+      [&](DB* copy_db, const std::vector<ColumnFamilyHandle*>& copy_handles) {
+        for (size_t p = 0; p < kPartitions; ++p) {
+          for (int i = 0; i < 10; ++i) {
+            std::string value;
+            ASSERT_OK(copy_db->Get(
+                ReadOptions(), copy_handles[cf_for_partition[p]],
+                "key" + std::to_string(p) + "_" + std::to_string(i), &value));
+            EXPECT_EQ("value", value);
+          }
+        }
+      });
+  ASSERT_OK(DestroyDB(snapshot_name_, options));
+}
+
+// Q5 (G-30/G-31): at N=8, a checkpoint racing LockWAL/UnlockWAL on another
+// thread completes within a bound (it may wait for UnlockWAL, never forever),
+// and its copy opens in every recovery mode.
+TEST_F(CheckpointPartitionedWalTest, CheckpointRacingLockWalAtN8) {
+  constexpr size_t kPartitions = 8;
+  Options options = CurrentOptions();
+  std::vector<std::string> cf_names;
+  const std::vector<int> cf_for_partition =
+      OpenWithPartitions(kPartitions, options, &cf_names);
+  for (size_t p = 0; p < kPartitions; ++p) {
+    ASSERT_OK(Put(cf_for_partition[p], "key" + std::to_string(p), "value"));
+  }
+  std::atomic<bool> stop{false};
+  std::atomic<int> lock_cycles{0};
+  port::Thread locker([&] {
+    while (!stop.load()) {
+      if (db_->LockWAL().ok()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        EXPECT_OK(db_->UnlockWAL());
+        ++lock_cycles;
+      }
+    }
+  });
+  Checkpoint* checkpoint = nullptr;
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
+  std::unique_ptr<Checkpoint> owned(checkpoint);
+  ASSERT_OK(DestroyDB(snapshot_name_, options));
+  const auto start = std::chrono::steady_clock::now();
+  ASSERT_OK(owned->CreateCheckpoint(snapshot_name_,
+                                    std::numeric_limits<uint64_t>::max()));
+  EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(30));
+  stop.store(true);
+  locker.join();
+  EXPECT_GT(lock_cycles.load(), 0);
+  Close();
+  Options copy_options = last_options_;
+  copy_options.create_if_missing = false;
+  VerifyCopyInEveryRecoveryMode(
+      cf_names, copy_options,
+      [&](DB* copy_db, const std::vector<ColumnFamilyHandle*>& copy_handles) {
+        for (size_t p = 0; p < kPartitions; ++p) {
+          std::string value;
+          ASSERT_OK(copy_db->Get(ReadOptions(),
+                                 copy_handles[cf_for_partition[p]],
+                                 "key" + std::to_string(p), &value));
+          EXPECT_EQ("value", value);
+        }
+      });
+  ASSERT_OK(DestroyDB(snapshot_name_, options));
+}
+
+// Writers keep writing during the capture; the reopened copy is a prefix that
+// includes every write acknowledged before the capture started, and opens in
+// every recovery mode. Neuter: drop the quiesce; the copy fails to open under
+// kAbsoluteConsistency in some repeats.
+TEST_P(CheckpointPartitionedWalTest, CheckpointConcurrentWritesArePrefix) {
+  const size_t num_partitions = GetParam();
+  constexpr int kKeysPerPartition = 200;
+  Options options = CurrentOptions();
+  std::vector<std::string> cf_names;
+  const std::vector<int> cf_for_partition =
+      OpenWithPartitions(num_partitions, options, &cf_names);
+  std::atomic<bool> stop{false};
+  std::vector<std::atomic<uint64_t>> acked(num_partitions);
+  for (auto& a : acked) {
+    a.store(0, std::memory_order_relaxed);
+  }
+  std::vector<port::Thread> writers;
+  for (size_t p = 0; p < num_partitions; ++p) {
+    writers.emplace_back([&, p] {
+      for (int i = 0; i < kKeysPerPartition && !stop.load(); ++i) {
+        Status s = Put(cf_for_partition[p], "ckey" + std::to_string(i),
+                       "cval" + std::to_string(i));
+        EXPECT_OK(s);
+        if (!s.ok()) {
+          return;
+        }
+        acked[p].store(i + 1, std::memory_order_relaxed);
+      }
+    });
+  }
+  uint64_t floor = 0;
+  while (floor < 20) {
+    floor = std::numeric_limits<uint64_t>::max();
+    for (size_t p = 0; p < num_partitions; ++p) {
+      floor = std::min(floor, acked[p].load(std::memory_order_relaxed));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  std::vector<uint64_t> acked_before(num_partitions);
+  for (size_t p = 0; p < num_partitions; ++p) {
+    acked_before[p] = acked[p].load(std::memory_order_relaxed);
+  }
+  Checkpoint* checkpoint = nullptr;
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
+  std::unique_ptr<Checkpoint> owned(checkpoint);
+  ASSERT_OK(DestroyDB(snapshot_name_, options));
+  ASSERT_OK(owned->CreateCheckpoint(snapshot_name_,
+                                    std::numeric_limits<uint64_t>::max()));
+  stop.store(true);
+  for (auto& w : writers) {
+    w.join();
+  }
+  Close();
+  Options copy_options = last_options_;
+  copy_options.create_if_missing = false;
+  VerifyCopyInEveryRecoveryMode(
+      cf_names, copy_options,
+      [&](DB* copy_db, const std::vector<ColumnFamilyHandle*>& copy_handles) {
+        for (size_t p = 0; p < num_partitions; ++p) {
+          SCOPED_TRACE("partition=" + std::to_string(p));
+          bool seen_missing = false;
+          for (int i = 0; i < kKeysPerPartition; ++i) {
+            std::string value;
+            Status s =
+                copy_db->Get(ReadOptions(), copy_handles[cf_for_partition[p]],
+                             "ckey" + std::to_string(i), &value);
+            if (!s.ok()) {
+              EXPECT_TRUE(s.IsNotFound()) << s.ToString();
+              EXPECT_GE(static_cast<uint64_t>(i), acked_before[p])
+                  << "key " << i;
+              seen_missing = true;
+            } else {
+              EXPECT_EQ("cval" + std::to_string(i), value);
+              EXPECT_FALSE(seen_missing)
+                  << "key " << i << " present above a gap";
+            }
+          }
+        }
+      });
+  ASSERT_OK(DestroyDB(snapshot_name_, options));
 }
 
 TEST_F(CheckpointTest, CheckpointWithBlob) {

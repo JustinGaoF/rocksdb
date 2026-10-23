@@ -20,6 +20,7 @@
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "test_util/transaction_test_util.h"
+#include "test_util/wal_partitions_test_util.h"
 #include "util/crc32c.h"
 #include "util/random.h"
 
@@ -2723,6 +2724,126 @@ TEST(OptimisticTransactionWalPartitionsTest, ValidatePolicyAtNPartitions) {
   SyncPoint::GetInstance()->DisableProcessing();
   SyncPoint::GetInstance()->ClearAllCallBacks();
   ASSERT_OK(DestroyDB(dbname, options));
+}
+
+// Q1 (G-56): optimistic transactions at N in {1, 8}. Serial validation is
+// rejected at Open with N > 1; parallel validation commits across partitions,
+// detects write conflicts, and recovers across a reopen.
+class OptimisticPartitionedWalTest
+    : public testing::Test,
+      public ::testing::WithParamInterface<uint32_t> {
+ public:
+  OptimisticPartitionedWalTest()
+      : dbname_(test::PerThreadDBPath("occ_partitioned_wal")) {}
+
+  ~OptimisticPartitionedWalTest() override { Close(); }
+
+  void Close() {
+    for (auto* h : handles_) {
+      delete h;
+    }
+    handles_.clear();
+    if (txn_db_ != nullptr) {
+      EXPECT_OK(txn_db_->Close());
+      txn_db_.reset();
+    }
+  }
+
+  Status Open(size_t num_partitions, OccValidationPolicy validate_policy,
+              bool destroy = true) {
+    Close();
+    options_.create_if_missing = true;
+    options_.create_missing_column_families = true;
+    test::EnableWalPartitionsForTest(&options_,
+                                     static_cast<uint32_t>(num_partitions));
+    options_.avoid_flush_during_shutdown = true;
+    options_.avoid_flush_during_recovery = true;
+    cf_names_.clear();
+    Status s = test::WalPartitionCoveringColumnFamilies(
+        num_partitions, &cf_names_, &cf_for_partition_);
+    if (!s.ok()) {
+      return s;
+    }
+    std::vector<ColumnFamilyDescriptor> column_families;
+    column_families.emplace_back(kDefaultColumnFamilyName,
+                                 ColumnFamilyOptions(options_));
+    for (const auto& name : cf_names_) {
+      column_families.emplace_back(name, ColumnFamilyOptions(options_));
+    }
+    if (destroy) {
+      s = DestroyDB(dbname_, options_);
+      if (!s.ok()) {
+        return s;
+      }
+    }
+    occ_opts_.validate_policy = validate_policy;
+    OptimisticTransactionDB* raw_txn_db = nullptr;
+    s = OptimisticTransactionDB::Open(options_, occ_opts_, dbname_,
+                                      column_families, &handles_, &raw_txn_db);
+    txn_db_.reset(raw_txn_db);
+    return s;
+  }
+
+  std::string dbname_;
+  Options options_;
+  OptimisticTransactionDBOptions occ_opts_;
+  std::vector<std::string> cf_names_;
+  std::vector<int> cf_for_partition_;
+  std::vector<ColumnFamilyHandle*> handles_;
+  std::unique_ptr<OptimisticTransactionDB> txn_db_;
+};
+
+INSTANTIATE_TEST_CASE_P(OptimisticPartitions, OptimisticPartitionedWalTest,
+                        ::testing::Values(1U, 8U));
+
+TEST_P(OptimisticPartitionedWalTest, CommitConflictAndRecovery) {
+  const size_t num_partitions = GetParam();
+  const size_t other = (num_partitions == 1) ? 0 : 1;
+
+  // Serial validation runs on the write group leader; N leaders reject it.
+  Status s = Open(num_partitions, OccValidationPolicy::kValidateSerial);
+  if (num_partitions == 1) {
+    ASSERT_OK(s) << s.ToString();
+    std::unique_ptr<Transaction> txn(txn_db_->BeginTransaction(WriteOptions()));
+    ASSERT_OK(txn->Put("serial", "v"));
+    ASSERT_OK(txn->Commit());
+  } else {
+    ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+    EXPECT_NE(std::string::npos, s.ToString().find("wal_partitions"))
+        << s.ToString();
+    EXPECT_NE(std::string::npos, s.ToString().find("kValidateSerial"))
+        << s.ToString();
+    ASSERT_EQ(nullptr, txn_db_.get());
+  }
+
+  ASSERT_OK(Open(num_partitions, OccValidationPolicy::kValidateParallel));
+  std::unique_ptr<Transaction> txn(txn_db_->BeginTransaction(WriteOptions()));
+  ASSERT_OK(txn->Put(handles_[cf_for_partition_[0]], "k0", "v0"));
+  ASSERT_OK(txn->Put(handles_[cf_for_partition_[other]], "k1", "v1"));
+  ASSERT_OK(txn->Commit());
+  txn.reset();
+
+  // A write-write conflict on one partition fails the loser's commit.
+  std::unique_ptr<Transaction> t1(txn_db_->BeginTransaction(WriteOptions()));
+  std::unique_ptr<Transaction> t2(txn_db_->BeginTransaction(WriteOptions()));
+  ASSERT_OK(t1->Put(handles_[cf_for_partition_[other]], "k1", "t1"));
+  ASSERT_OK(t2->Put(handles_[cf_for_partition_[other]], "k1", "t2"));
+  ASSERT_OK(t1->Commit());
+  t1.reset();
+  s = t2->Commit();
+  ASSERT_TRUE(s.IsBusy()) << s.ToString();
+  t2.reset();
+
+  Close();
+  ASSERT_OK(
+      Open(num_partitions, OccValidationPolicy::kValidateParallel, false));
+  std::string value;
+  ASSERT_OK(txn_db_->Get(ReadOptions(), handles_[cf_for_partition_[0]], "k0",
+                         &value));
+  EXPECT_EQ("v0", value);
+  ASSERT_OK(txn_db_->Get(ReadOptions(), handles_[cf_for_partition_[other]],
+                         "k1", &value));
+  EXPECT_EQ("t1", value);
 }
 
 TEST(OccLockBucketsTest, CacheAligned) {

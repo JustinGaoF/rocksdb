@@ -15,6 +15,7 @@
 #include "db/db_impl/db_impl.h"
 #include "db/dbformat.h"
 #include "db/write_batch_internal.h"
+#include "file/file_util.h"
 #include "port/port.h"
 #include "port/stack_trace.h"
 #include "rocksdb/db.h"
@@ -28,6 +29,7 @@
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
 #include "test_util/transaction_test_util.h"
+#include "test_util/wal_partitions_test_util.h"
 #include "util/mutexlock.h"
 #include "util/random.h"
 #include "util/string_util.h"
@@ -4642,6 +4644,9 @@ class WritePreparedPartitionedWalTest : public testing::Test {
     options_.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
     options_.track_and_verify_wals_in_manifest = true;
     options_.two_write_queues = false;
+    // The GC13 opt-in, so these opens keep working where the sync point
+    // below compiles out.
+    options_.experimental_allow_wal_partitions_for_testing = true;
     txn_db_options_.write_policy = WRITE_PREPARED;
     SyncPoint::GetInstance()->SetCallBack(
         "DBImpl::ValidateOptions:AllowWalPartitions",
@@ -4765,6 +4770,106 @@ class WritePreparedPartitionedWalTest : public testing::Test {
   std::vector<uint32_t> cf_for_partition_;
   std::mutex prepare_mu_;
 };
+
+// Q1 (G-56): WritePrepared prepare/commit/recovery at N in {1, 8} with one
+// write queue: a committed transaction's data is visible after a crash, and a
+// prepared transaction recovers as prepared and can then be committed.
+class WritePreparedPartitionedWalNTest
+    : public WritePreparedPartitionedWalTest,
+      public ::testing::WithParamInterface<uint32_t> {
+ public:
+  void OpenAt(const std::string& dir) {
+    Close();
+    std::vector<ColumnFamilyDescriptor> descriptors = {
+        {kDefaultColumnFamilyName, ColumnFamilyOptions(options_)}};
+    for (const std::string& name : cf_names_) {
+      descriptors.emplace_back(name, ColumnFamilyOptions(options_));
+    }
+    TransactionDB* db = nullptr;
+    ASSERT_OK(TransactionDB::Open(options_, txn_db_options_, dir, descriptors,
+                                  &handles_, &db));
+    db_ = db;
+  }
+
+  // Copies every file of the open DB but its LOCK to `dir`: with every write
+  // synced, what a crash at this point leaves behind.
+  void CopyDBAsCrashImage(const std::string& dir) {
+    Env* env = Env::Default();
+    ASSERT_OK(DestroyDir(env, dir));
+    ASSERT_OK(env->CreateDirIfMissing(dir));
+    std::vector<std::string> children;
+    ASSERT_OK(env->GetChildren(dbname_, &children));
+    for (const auto& child : children) {
+      uint64_t number = 0;
+      FileType type;
+      if (!ParseFileName(child, &number, &type) || type == kDBLockFile) {
+        continue;
+      }
+      std::unique_ptr<SequentialFile> src;
+      ASSERT_OK(
+          env->NewSequentialFile(dbname_ + "/" + child, &src, EnvOptions()));
+      std::unique_ptr<WritableFile> dst;
+      ASSERT_OK(env->NewWritableFile(dir + "/" + child, &dst, EnvOptions()));
+      char buf[8192];
+      Slice result;
+      while (true) {
+        ASSERT_OK(src->Read(sizeof(buf), &result, buf));
+        if (result.empty()) {
+          break;
+        }
+        ASSERT_OK(dst->Append(result));
+      }
+      ASSERT_OK(dst->Close());
+    }
+  }
+};
+
+INSTANTIATE_TEST_CASE_P(WritePreparedPartitions,
+                        WritePreparedPartitionedWalNTest,
+                        ::testing::Values(1U, 8U));
+
+TEST_P(WritePreparedPartitionedWalNTest,
+       PrepareCommitRecoveryAcrossPartitions) {
+  const size_t num_partitions = GetParam();
+  Open(num_partitions);
+  const size_t other = (num_partitions == 1) ? 0 : 1;
+  WriteOptions sync;
+  sync.sync = true;
+  std::unique_ptr<Transaction> committed(
+      db_->BeginTransaction(sync, TransactionOptions()));
+  ASSERT_OK(committed->SetName("committed"));
+  ASSERT_OK(committed->Put(CfOnPartition(0), "k0", "v0"));
+  ASSERT_OK(committed->Put(CfOnPartition(other), "k1", "v1"));
+  ASSERT_OK(committed->Prepare());
+  ASSERT_OK(committed->Commit());
+  committed.reset();
+  std::unique_ptr<Transaction> prepared(
+      db_->BeginTransaction(sync, TransactionOptions()));
+  ASSERT_OK(prepared->SetName("prepared"));
+  ASSERT_OK(prepared->Put(CfOnPartition(other), "kp", "vp"));
+  ASSERT_OK(prepared->Prepare());
+  const std::string crash_dir = dbname_ + "_crash";
+  CopyDBAsCrashImage(crash_dir);
+  ASSERT_OK(prepared->Rollback());
+  prepared.reset();
+
+  OpenAt(crash_dir);
+  std::string value;
+  ASSERT_OK(db_->Get(ReadOptions(), CfOnPartition(0), "k0", &value));
+  EXPECT_EQ("v0", value);
+  ASSERT_OK(db_->Get(ReadOptions(), CfOnPartition(other), "k1", &value));
+  EXPECT_EQ("v1", value);
+  EXPECT_TRUE(
+      db_->Get(ReadOptions(), CfOnPartition(other), "kp", &value).IsNotFound());
+  Transaction* recovered = db_->GetTransactionByName("prepared");
+  ASSERT_NE(nullptr, recovered);
+  ASSERT_OK(recovered->Commit());
+  delete recovered;
+  ASSERT_OK(db_->Get(ReadOptions(), CfOnPartition(other), "kp", &value));
+  EXPECT_EQ("vp", value);
+  Close();
+  EXPECT_OK(DestroyDir(Env::Default(), crash_dir));
+}
 
 TEST_F(WritePreparedPartitionedWalTest, ConcurrentRecoverableStateCaching) {
   // G-18: leaders of all four partitions cache the recoverable state at the
@@ -4941,12 +5046,12 @@ TEST_F(WritePreparedPartitionedWalTest, HigherSequenceRecoverableStateWins) {
   ASSERT_EQ("NOT_FOUND", GetState(CfOnPartition(0)));
 }
 
-// G-56 (not fixed here): prepares routed to different partitions add their
-// sequences to the prepared heap out of sequence order, which PreparedHeap
-// does not support; entries are never popped and closing the DB fails
-// `assert(heap_.empty())` in ~PreparedHeap (debug builds).
-TEST_F(WritePreparedPartitionedWalTest,
-       DISABLED_ConcurrentPreparesAcrossPartitions) {
+// Q2 (G-56): GC12 fixed PreparedHeap for out-of-order pushes across
+// partitions, so concurrent prepares on every partition keep the heap sorted
+// and the DB closes cleanly. Neuter: restore push_back with
+// assert(heap_top_ < v) in push; the test aborts on that assertion or on
+// assert(heap_.empty()) in ~PreparedHeap.
+TEST_F(WritePreparedPartitionedWalTest, ConcurrentPreparesAcrossPartitions) {
   constexpr size_t kPartitions = 4;
   constexpr int kTxnsPerPartition = 100;
   Open(kPartitions);
@@ -4968,6 +5073,228 @@ TEST_F(WritePreparedPartitionedWalTest,
   for (auto& writer : writers) {
     writer.join();
   }
+  Close();
+}
+
+// Q3 (N-5-4): with the in-place push, a lower prepare on another partition
+// can reach AddPrepared after a snapshot read the heap top (GetSnapshot pairs
+// the snapshot with the top it read). A holds its prepare on partition 0
+// between allocation and AddPrepared while B's higher prepare on partition 1
+// runs past its own AddPrepared into the completion gate; the snapshot taken
+// while both are in flight never sees A's writes as committed, before or
+// after A commits, and later snapshots see the commit. GC07 keeps the
+// snapshot below the unapplied prepare, so the late push stays above it.
+// (B commits after the release, not before the snapshot: the gate holds B's
+// completion until A applies, so B cannot commit while A is held. Committing
+// B first would allocate B below A, contradicting "higher".)
+TEST_F(WritePreparedPartitionedWalTest,
+       SnapshotStaysCorrectWhenHeapTopMovesBackwards) {
+  constexpr size_t kPartitions = 4;
+  Open(kPartitions);
+  WritePreparedTxnDB* wp_db = static_cast_with_check<WritePreparedTxnDB>(db_);
+  DBImpl* db_impl = static_cast_with_check<DBImpl>(db_->GetRootDB());
+  std::mutex mu;
+  std::condition_variable cv;
+  bool a_parked = false;
+  bool release_a = false;
+  std::atomic<int> pause_count{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "AddPreparedCallback::AddPrepared::begin:pause", [&](void*) {
+        if (++pause_count == 1) {
+          std::unique_lock<std::mutex> lock(mu);
+          a_parked = true;
+          cv.notify_all();
+          cv.wait(lock, [&] { return release_a; });
+        }
+      });
+  std::unique_ptr<Transaction> a_txn(
+      db_->BeginTransaction(WriteOptions(), TransactionOptions()));
+  ASSERT_OK(a_txn->SetName("a"));
+  ASSERT_OK(a_txn->Put(CfOnPartition(0), "akey", "aval"));
+  port::Thread a([&] { ASSERT_OK(a_txn->Prepare()); });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    ASSERT_TRUE(
+        cv.wait_for(lock, std::chrono::seconds(30), [&] { return a_parked; }));
+  }
+  std::unique_ptr<Transaction> b_txn(
+      db_->BeginTransaction(WriteOptions(), TransactionOptions()));
+  ASSERT_OK(b_txn->SetName("b"));
+  ASSERT_OK(b_txn->Put(CfOnPartition(1), "bkey", "bval"));
+  port::Thread b([&] {
+    ASSERT_OK(b_txn->Prepare());
+    ASSERT_OK(b_txn->Commit());
+  });
+  // B's prepare is past its AddPrepared and parked in the completion gate
+  // behind A's unapplied prefix.
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while (
+      (db_impl->TEST_WalDurabilityWaiters() == 0 || pause_count.load() < 2) &&
+      std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_GE(pause_count.load(), 2);
+  ASSERT_EQ(1U, db_impl->TEST_WalDurabilityWaiters());
+  const Snapshot* snap = db_->GetSnapshot();
+  const SequenceNumber snap_seq = snap->GetSequenceNumber();
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    release_a = true;
+    cv.notify_all();
+  }
+  a.join();
+  b.join();
+  SyncPoint::GetInstance()->ClearCallBack(
+      "AddPreparedCallback::AddPrepared::begin:pause");
+  const SequenceNumber a_prep = a_txn->GetId();
+  const SequenceNumber b_prep = b_txn->GetId();
+  EXPECT_LT(a_prep, b_prep);
+  // A's prepare landed below the snapshot's top read but is still uncommitted.
+  EXPECT_FALSE(wp_db->IsInSnapshot(a_prep, snap_seq));
+  ReadOptions ropts;
+  ropts.snapshot = snap;
+  std::string value;
+  EXPECT_TRUE(db_->Get(ropts, CfOnPartition(0), "akey", &value).IsNotFound());
+  ASSERT_OK(a_txn->Commit());
+  a_txn.reset();
+  b_txn.reset();
+  // Committed above the snapshot: still invisible at it.
+  EXPECT_FALSE(wp_db->IsInSnapshot(a_prep, snap_seq));
+  EXPECT_TRUE(db_->Get(ropts, CfOnPartition(0), "akey", &value).IsNotFound());
+  // And visible in snapshots taken after the commit.
+  const Snapshot* snap2 = db_->GetSnapshot();
+  EXPECT_TRUE(wp_db->IsInSnapshot(a_prep, snap2->GetSequenceNumber()));
+  ReadOptions ropts2;
+  ropts2.snapshot = snap2;
+  ASSERT_OK(db_->Get(ropts2, CfOnPartition(0), "akey", &value));
+  EXPECT_EQ("aval", value);
+  db_->ReleaseSnapshot(snap);
+  db_->ReleaseSnapshot(snap2);
+  Close();
+}
+
+// Q3 (N-5-4): a prepare pushed below future_max_evicted_seq_ at N > 1 is
+// handled through delayed_prepared_. With a tiny commit cache, committing past
+// a held prepare evicts beyond it; reads at old and new snapshots stay
+// correct. Neuter: skip the delayed_prepared_ move in CheckPreparedAgainstMax;
+// the old snapshot reads the uncommitted value.
+//
+// The commit cache sizes are private to TransactionDBOptions; this fixture
+// inherits WritePreparedTransactionTestBase only for its protected
+// UpdateTransactionDBOptions setter (the base is a friend).
+class WritePreparedEvictionPartitionedWalTest
+    : public WritePreparedTransactionTestBase {
+ public:
+  WritePreparedEvictionPartitionedWalTest()
+      : WritePreparedTransactionTestBase(
+            /*use_stackable_db=*/false, /*two_write_queue=*/false,
+            WRITE_PREPARED, kOrderedWrite,
+            /*use_per_key_point_lock_mgr=*/false,
+            /*deadlock_timeout_us=*/0) {
+    // The base opened an N=1 DB; this test reopens at N=4 below.
+    delete db;
+    db = nullptr;
+  }
+
+  ~WritePreparedEvictionPartitionedWalTest() override {
+    for (auto* h : handles_) {
+      EXPECT_OK(db->DestroyColumnFamilyHandle(h));
+    }
+  }
+
+  void Open(size_t num_partitions) {
+    options.recycle_log_file_num = 0;
+    test::EnableWalPartitionsForTest(&options,
+                                     static_cast<uint32_t>(num_partitions));
+    options.avoid_flush_during_shutdown = true;
+    options.avoid_flush_during_recovery = true;
+    options.create_missing_column_families = true;
+    // 8 commit entries evict quickly; snapshot bits stay at the default.
+    UpdateTransactionDBOptions(/*snapshot_cache_bits=*/7,
+                               /*commit_cache_bits=*/3);
+    EXPECT_OK(test::WalPartitionCoveringColumnFamilies(
+        num_partitions, &cf_names_, &cf_for_partition_));
+    std::vector<ColumnFamilyDescriptor> column_families;
+    column_families.emplace_back(kDefaultColumnFamilyName,
+                                 ColumnFamilyOptions(options));
+    for (const auto& name : cf_names_) {
+      column_families.emplace_back(name, ColumnFamilyOptions(options));
+    }
+    EXPECT_OK(DestroyDB(dbname, options));
+    EXPECT_OK(TransactionDB::Open(options, txn_db_options, dbname,
+                                  column_families, &handles_, &db));
+  }
+
+  void Close() {
+    for (auto* h : handles_) {
+      EXPECT_OK(db->DestroyColumnFamilyHandle(h));
+    }
+    handles_.clear();
+    delete db;
+    db = nullptr;
+  }
+
+  ColumnFamilyHandle* CfOnPartition(size_t partition) {
+    return handles_[cf_for_partition_[partition]];
+  }
+
+  std::vector<std::string> cf_names_;
+  std::vector<int> cf_for_partition_;
+  std::vector<ColumnFamilyHandle*> handles_;
+};
+
+TEST_F(WritePreparedEvictionPartitionedWalTest,
+       DelayedPreparedBelowEvictedMaxAtN4) {
+  constexpr size_t kPartitions = 4;
+  Open(kPartitions);
+  WritePreparedTxnDB* wp_db = static_cast_with_check<WritePreparedTxnDB>(db);
+  WriteOptions sync;
+  sync.sync = true;
+  std::unique_ptr<Transaction> held(
+      db->BeginTransaction(sync, TransactionOptions()));
+  ASSERT_OK(held->SetName("held"));
+  ASSERT_OK(held->Put(CfOnPartition(0), "hkey", "hval"));
+  ASSERT_OK(held->Prepare());
+  const SequenceNumber held_prep = held->GetId();
+  const Snapshot* old_snap = db->GetSnapshot();
+  const SequenceNumber old_seq = old_snap->GetSequenceNumber();
+  // Commit far past the held prepare on every partition, advancing
+  // max_evicted_seq_ beyond it.
+  for (int i = 0; i < 300; ++i) {
+    std::unique_ptr<Transaction> fill(
+        db->BeginTransaction(sync, TransactionOptions()));
+    ASSERT_OK(fill->SetName("fill" + std::to_string(i)));
+    ASSERT_OK(fill->Put(CfOnPartition(i % kPartitions), "f" + std::to_string(i),
+                        "v"));
+    ASSERT_OK(fill->Prepare());
+    ASSERT_OK(fill->Commit());
+  }
+  EXPECT_LE(held_prep, old_seq);
+  // Still uncommitted: invisible at the old snapshot.
+  EXPECT_FALSE(wp_db->IsInSnapshot(held_prep, old_seq));
+  ReadOptions old_ropts;
+  old_ropts.snapshot = old_snap;
+  std::string value;
+  EXPECT_TRUE(
+      db->Get(old_ropts, CfOnPartition(0), "hkey", &value).IsNotFound());
+  ASSERT_OK(held->Commit());
+  held.reset();
+  // Committed above the old snapshot: still invisible at it.
+  EXPECT_FALSE(wp_db->IsInSnapshot(held_prep, old_seq));
+  EXPECT_TRUE(
+      db->Get(old_ropts, CfOnPartition(0), "hkey", &value).IsNotFound());
+  // Visible in snapshots taken after the commit, alongside the fills.
+  const Snapshot* new_snap = db->GetSnapshot();
+  EXPECT_TRUE(wp_db->IsInSnapshot(held_prep, new_snap->GetSequenceNumber()));
+  ReadOptions new_ropts;
+  new_ropts.snapshot = new_snap;
+  ASSERT_OK(db->Get(new_ropts, CfOnPartition(0), "hkey", &value));
+  EXPECT_EQ("hval", value);
+  ASSERT_OK(db->Get(new_ropts, CfOnPartition(0), "f0", &value));
+  EXPECT_EQ("v", value);
+  db->ReleaseSnapshot(old_snap);
+  db->ReleaseSnapshot(new_snap);
   Close();
 }
 

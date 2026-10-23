@@ -24,6 +24,7 @@
 #include "rocksdb/utilities/transaction_db.h"
 #include "test_util/sync_point.h"
 #include "test_util/testutil.h"
+#include "test_util/wal_partitions_test_util.h"
 #include "util/defer.h"
 #include "utilities/fault_injection_fs.h"
 #include "utilities/merge_operators/string_append/stringappend2.h"
@@ -879,6 +880,57 @@ TEST_F(DBSecondaryTest, OpenAsSecondary) {
 
   ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
   verify_db_func("new_foo_value", "new_bar_value");
+}
+
+// Q1 (G-56): the secondary opens the primary's WALs at N in {1, 8}. At N=1
+// it catches up and reads the WAL-replayed keys. At N=8 it refuses with
+// NotSupported naming wal_partitions before applying anything (GC12 Q2).
+class DBSecondaryPartitionedWalTest
+    : public DBSecondaryTest,
+      public ::testing::WithParamInterface<uint32_t> {};
+
+INSTANTIATE_TEST_CASE_P(SecondaryPartitions, DBSecondaryPartitionedWalTest,
+                        ::testing::Values(1U, 8U));
+
+TEST_P(DBSecondaryPartitionedWalTest, SecondaryOpenAtPartitions) {
+  const size_t num_partitions = GetParam();
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.create_missing_column_families = true;
+  test::EnableWalPartitionsForTest(&options,
+                                   static_cast<uint32_t>(num_partitions));
+  options.avoid_flush_during_shutdown = true;
+  std::vector<std::string> cf_names;
+  std::vector<int> cf_for_partition;
+  ASSERT_OK(test::WalPartitionCoveringColumnFamilies(num_partitions, &cf_names,
+                                                     &cf_for_partition));
+  DestroyAndReopen(options);
+  CreateAndReopenWithCF(cf_names, options);
+  EXPECT_EQ(num_partitions, dbfull()->TEST_NumWalPartitions());
+  for (size_t p = 0; p < num_partitions; ++p) {
+    ASSERT_OK(Put(cf_for_partition[p], "key" + std::to_string(p), "value"));
+  }
+  ASSERT_OK(db_->FlushWAL(/*sync=*/true));
+  Options secondary_options = CurrentOptions();
+  secondary_options.max_open_files = -1;
+  if (num_partitions == 1) {
+    OpenSecondaryWithColumnFamilies(cf_names, secondary_options);
+    ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+    VerifySecondaryValue(handles_secondary_[cf_for_partition[0]], "key0",
+                         "value");
+  } else {
+    std::vector<ColumnFamilyDescriptor> cf_descs;
+    cf_descs.emplace_back(kDefaultColumnFamilyName, secondary_options);
+    for (const auto& name : cf_names) {
+      cf_descs.emplace_back(name, secondary_options);
+    }
+    const Status s =
+        DB::OpenAsSecondary(secondary_options, dbname_, secondary_path_,
+                            cf_descs, &handles_secondary_, &db_secondary_);
+    ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+    EXPECT_NE(std::string::npos, s.ToString().find("wal_partitions"))
+        << s.ToString();
+  }
 }
 
 TEST_F(DBSecondaryTest, OpenFilesAsync) {

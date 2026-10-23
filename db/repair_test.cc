@@ -4,6 +4,7 @@
 //  (found in the LICENSE.Apache file in the root directory).
 
 #include <algorithm>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -16,6 +17,7 @@
 #include "rocksdb/options.h"
 #include "rocksdb/wal_iterator.h"
 #include "table/unique_id_impl.h"
+#include "test_util/wal_partitions_test_util.h"
 #include "util/string_util.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -123,6 +125,73 @@ TEST_F(RepairTest, LostManifest) {
 
   ASSERT_EQ(Get("key"), "val");
   ASSERT_EQ(Get("key2"), "val2");
+}
+
+// Q1 (G-56): RepairDB at N in {1, 8}. At N=1 it repairs a MANIFEST-less DB.
+// At N=8 it refuses with NotSupported naming wal_partitions before writing
+// anything (GC12 Q2).
+class RepairPartitionedWalTest
+    : public RepairTest,
+      public ::testing::WithParamInterface<uint32_t> {};
+
+INSTANTIATE_TEST_CASE_P(RepairPartitions, RepairPartitionedWalTest,
+                        ::testing::Values(1U, 8U));
+
+TEST_P(RepairPartitionedWalTest, RepairAtPartitions) {
+  const size_t num_partitions = GetParam();
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.create_missing_column_families = true;
+  test::EnableWalPartitionsForTest(&options,
+                                   static_cast<uint32_t>(num_partitions));
+  options.avoid_flush_during_shutdown = true;
+  std::vector<std::string> cf_names;
+  std::vector<int> cf_for_partition;
+  ASSERT_OK(test::WalPartitionCoveringColumnFamilies(num_partitions, &cf_names,
+                                                     &cf_for_partition));
+  DestroyAndReopen(options);
+  CreateAndReopenWithCF(cf_names, options);
+  EXPECT_EQ(num_partitions, dbfull()->TEST_NumWalPartitions());
+  for (size_t p = 0; p < num_partitions; ++p) {
+    ASSERT_OK(Put(cf_for_partition[p], "key" + std::to_string(p), "value"));
+  }
+  for (auto* h : handles_) {
+    ASSERT_OK(db_->Flush(FlushOptions(), h));
+  }
+  std::string manifest_path =
+      DescriptorFileName(dbname_, dbfull()->TEST_Current_Manifest_FileNo());
+  Close();
+  if (num_partitions == 1) {
+    ASSERT_OK(env_->FileExists(manifest_path));
+    ASSERT_OK(env_->DeleteFile(manifest_path));
+    ASSERT_OK(RepairDB(dbname_, options));
+    std::vector<std::string> cfs = {kDefaultColumnFamilyName};
+    cfs.insert(cfs.end(), cf_names.begin(), cf_names.end());
+    ReopenWithColumnFamilies(cfs, options);
+    ASSERT_EQ("value", Get(cf_for_partition[0], "key0"));
+  } else {
+    auto file_sizes = [&]() {
+      std::map<std::string, uint64_t> sizes;
+      std::vector<std::string> children;
+      EXPECT_OK(env_->GetChildren(dbname_, &children));
+      for (const auto& child : children) {
+        // RepairDB opens a logger, which rotates LOG; that is not DB state.
+        if (child == "LOCK" || child.rfind("LOG", 0) == 0) {
+          continue;
+        }
+        uint64_t size = 0;
+        EXPECT_OK(env_->GetFileSize(dbname_ + "/" + child, &size));
+        sizes[child] = size;
+      }
+      return sizes;
+    };
+    const std::map<std::string, uint64_t> before = file_sizes();
+    const Status s = RepairDB(dbname_, options);
+    ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+    EXPECT_NE(std::string::npos, s.ToString().find("wal_partitions"))
+        << s.ToString();
+    EXPECT_EQ(before, file_sizes());
+  }
 }
 
 TEST_F(RepairTest, LostManifestMoreDbFeatures) {

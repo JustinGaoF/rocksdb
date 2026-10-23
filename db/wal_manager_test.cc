@@ -16,12 +16,14 @@
 #include "file/writable_file_writer.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/file_system.h"
+#include "rocksdb/transaction_log.h"
 #include "rocksdb/write_batch.h"
 #include "rocksdb/write_buffer_manager.h"
 #include "table/mock_table.h"
 #include "test_util/mock_time_env.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
+#include "test_util/wal_partitions_test_util.h"
 #include "util/string_util.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -362,6 +364,96 @@ TEST_F(WalManagerTest, WalIteratorNewFileWhileScanning) {
   }
   ASSERT_EQ(i, 300);
   ASSERT_TRUE(iter->status().ok());
+}
+
+// Q1 (G-56, D-G32 (a)): GetUpdatesSince over WALs written at N in {1, 8}.
+// At N=1 the change stream iterates the records. At N=8 the open DB refuses
+// before reading any file, and a WalManager opened over the N=8-written WALs
+// refuses the same way instead of reporting "Gap in sequence numbers" at the
+// first partition boundary.
+class WalManagerPartitionedWalTest
+    : public WalManagerTest,
+      public ::testing::WithParamInterface<uint32_t> {};
+
+INSTANTIATE_TEST_CASE_P(WalManagerPartitions, WalManagerPartitionedWalTest,
+                        ::testing::Values(1U, 8U));
+
+TEST_P(WalManagerPartitionedWalTest, GetUpdatesSinceAtPartitions) {
+  const size_t num_partitions = GetParam();
+  Options options;
+  options.create_if_missing = true;
+  options.create_missing_column_families = true;
+  options.env = env_.get();
+  test::EnableWalPartitionsForTest(&options,
+                                   static_cast<uint32_t>(num_partitions));
+  std::vector<std::string> cf_names;
+  std::vector<int> cf_for_partition;
+  ASSERT_OK(test::WalPartitionCoveringColumnFamilies(num_partitions, &cf_names,
+                                                     &cf_for_partition));
+  std::vector<ColumnFamilyDescriptor> column_families;
+  column_families.emplace_back(kDefaultColumnFamilyName,
+                               ColumnFamilyOptions(options));
+  for (const auto& name : cf_names) {
+    column_families.emplace_back(name, ColumnFamilyOptions(options));
+  }
+  ASSERT_OK(DestroyDB(dbname_, options));
+  std::vector<ColumnFamilyHandle*> handles;
+  std::unique_ptr<DB> db;
+  ASSERT_OK(DB::Open(options, dbname_, column_families, &handles, &db));
+  for (size_t p = 0; p < num_partitions; ++p) {
+    ASSERT_OK(db->Put(WriteOptions(), handles[cf_for_partition[p]],
+                      "key" + std::to_string(p), "value"));
+  }
+  if (num_partitions == 1) {
+    std::unique_ptr<TransactionLogIterator> iter;
+    ASSERT_OK(db->GetUpdatesSince(1, &iter));
+    ASSERT_NE(nullptr, iter.get());
+    int records = 0;
+    for (; iter->Valid(); iter->Next()) {
+      ++records;
+    }
+    ASSERT_OK(iter->status());
+    EXPECT_GE(records, 1);
+  } else {
+    std::unique_ptr<TransactionLogIterator> iter;
+    const Status s = db->GetUpdatesSince(1, &iter);
+    ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+    EXPECT_NE(std::string::npos,
+              s.ToString().find("not supported with wal_partitions > 1"))
+        << s.ToString();
+    EXPECT_EQ(nullptr, iter);
+  }
+  const SequenceNumber last_seq = db->GetLatestSequenceNumber();
+  for (auto* h : handles) {
+    ASSERT_OK(db->DestroyColumnFamilyHandle(h));
+  }
+  db.reset();
+
+  // A WalManager over the same WAL files: at N=1 it iterates them, at N=8 it
+  // refuses naming wal_partitions. The iterator reads only up to the
+  // VersionSet's last sequence, so seed it from the live DB.
+  Init(nullptr /* clock_override */);
+  versions_->SetLastAllocatedSequence(last_seq);
+  versions_->SetLastPublishedSequence(last_seq);
+  versions_->SetLastSequence(last_seq);
+  std::unique_ptr<WalIterator> wal_iter;
+  const Status s = wal_manager_->GetUpdatesSince(
+      0, &wal_iter, WalIterator::ReadOptions(), versions_.get());
+  if (num_partitions == 1) {
+    ASSERT_OK(s) << s.ToString();
+    ASSERT_NE(nullptr, wal_iter.get());
+    int records = 0;
+    for (; wal_iter->Valid(); wal_iter->Next()) {
+      ++records;
+    }
+    ASSERT_OK(wal_iter->status());
+    EXPECT_GE(records, 1);
+  } else {
+    ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+    EXPECT_NE(std::string::npos, s.ToString().find("wal_partitions"))
+        << s.ToString();
+    EXPECT_EQ(std::string::npos, s.ToString().find("Gap")) << s.ToString();
+  }
 }
 
 }  // namespace ROCKSDB_NAMESPACE
