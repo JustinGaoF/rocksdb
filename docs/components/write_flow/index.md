@@ -37,4 +37,4 @@ RocksDB's write path takes application writes through validation, group commit c
 - WAL must be written before memtable insertion (crash recovery correctness)
 - Sequence numbers are monotonically increasing and globally shared across all column families
 - Flush commit order must match memtable creation order (prevents data loss from out-of-order installs)
-- Lock ordering: `mutex_` before `wal_write_mutex_` (deadlock avoidance)
+- Lock ordering: `mutex_` before the WAL write mutexes, which are taken in ascending partition-index order (deadlock avoidance)

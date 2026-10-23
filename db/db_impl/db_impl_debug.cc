@@ -289,8 +289,12 @@ void DBImpl::TEST_EndWrite(void* w) {
 }
 
 size_t DBImpl::TEST_LogsToFreeSize() {
-  InstrumentedMutexLock l(&wal_write_mutex_);
-  return wals_to_free_.size();
+  AllWalWriteMutexesLock l(this);
+  size_t total = 0;
+  for (size_t p = 0; p < NumWalPartitions(); ++p) {
+    total += WalsToFree(p).size();
+  }
+  return total;
 }
 
 uint64_t DBImpl::TEST_LogfileNumber() {

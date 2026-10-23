@@ -382,7 +382,8 @@ void DBImpl::FindObsoleteFiles(JobContext* job_context, bool force,
 
   // The deques are empty when called during recovery, in which case there
   // can't yet be any tracked obsolete logs
-  wal_write_mutex_.Lock();
+  // Accepted cost: all N, once per background job, off the write path.
+  LockWalWriteMutexes();
 
   // Partitions are visited in ascending index order (see the locking notes on
   // alive_wal_files_); a partition with nothing tracked is skipped.
@@ -396,7 +397,7 @@ void DBImpl::FindObsoleteFiles(JobContext* job_context, bool force,
   if (!any_partition_has_wals) {
     mutex_.AssertHeld();
     // We may reach here if the db is DBImplSecondary
-    wal_write_mutex_.Unlock();
+    UnlockWalWriteMutexes();
     return;
   }
 
@@ -437,14 +438,17 @@ void DBImpl::FindObsoleteFiles(JobContext* job_context, bool force,
         assert(AliveWalFiles(p).size());
       }
     }
-    wal_write_mutex_.Unlock();
+    UnlockWalWriteMutexes();
     mutex_.Unlock();
     mutex_unlocked = true;
     TEST_SYNC_POINT_CALLBACK("FindObsoleteFiles::PostMutexUnlock", nullptr);
-    wal_write_mutex_.Lock();
+    // Second phase visits partitions sequentially, holding one partition's
+    // mutex at a time: the wait below must never hold a second partition
+    // mutex (see the LOCK ORDER note).
     for (size_t p = 0; p < NumWalPartitions(); ++p) {
       // Only WalLogs(p) is consulted here: this phase holds only
-      // wal_write_mutex_, and alive_wal_files_ reads require both mutexes.
+      // WalWriteMutex(p), and alive_wal_files_ reads require both mutexes.
+      WalWriteMutexLock wal_lock(&WalWriteMutex(p));
       if (WalLogs(p).empty()) {
         continue;
       }
@@ -452,7 +456,7 @@ void DBImpl::FindObsoleteFiles(JobContext* job_context, bool force,
              WalLogs(p).front().number < min_log_number) {
         auto& log = WalLogs(p).front();
         if (log.IsSyncing()) {
-          wal_sync_cv_.Wait();
+          WalSyncCV(p).Wait();
           // WalLogs(p) could have changed while we were waiting.
           continue;
         }
@@ -460,24 +464,24 @@ void DBImpl::FindObsoleteFiles(JobContext* job_context, bool force,
         // it. If it's already closed, then it's been fully synced. If
         // !background_close_inactive_wals then we need to Close it before
         // removing from WalLogs(p) but not blocking while holding
-        // wal_write_mutex_.
+        // WalWriteMutex(p).
         if (!immutable_db_options_.background_close_inactive_wals &&
             log.writer->file()) {
           // We are taking ownership of and pinning the front entry, so we can
           // expect it to be the same after releasing and re-acquiring the lock
           log.PrepareForSync();
-          wal_write_mutex_.Unlock();
+          WalWriteMutex(p).Unlock();
           // TODO: maybe check the return value of Close.
           // TODO: plumb Env::IOActivity, Env::IOPriority
           auto s = log.writer->file()->Close({});
           s.PermitUncheckedError();
-          wal_write_mutex_.Lock();
+          WalWriteMutex(p).Lock();
           log.writer->PublishIfClosed();
           assert(&log == &WalLogs(p).front());
           log.FinishSync();
-          wal_sync_cv_.SignalAll();
+          WalSyncCV(p).SignalAll();
         }
-        wals_to_free_.push_back(log.ReleaseWriter());
+        WalsToFree(p).push_back(log.ReleaseWriter());
         WalLogs(p).pop_front();
       }
       // Current log cannot be obsolete.
@@ -487,10 +491,17 @@ void DBImpl::FindObsoleteFiles(JobContext* job_context, bool force,
 
   // We're just cleaning up for DB::Write().
   assert(job_context->wals_to_free.empty());
-  job_context->wals_to_free = wals_to_free_;
-
-  wals_to_free_.clear();
-  wal_write_mutex_.Unlock();
+  // Take over each partition's free list under that partition's mutex
+  // alone: every writer of WalsToFree(p) (a sync's finish, the second phase
+  // above) holds WalWriteMutex(p), and appends to the other partitions need
+  // not wait for this.
+  for (size_t p = 0; p < NumWalPartitions(); ++p) {
+    WalWriteMutexLock wal_lock(&WalWriteMutex(p));
+    for (auto* writer : WalsToFree(p)) {
+      job_context->wals_to_free.push_back(writer);
+    }
+    WalsToFree(p).clear();
+  }
   if (mutex_unlocked) {
     mutex_.Lock();
   }
