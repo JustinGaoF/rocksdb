@@ -429,22 +429,40 @@ enum class WALRecoveryMode : char {
   // detected during recovery, this mode will refuse to open the DB. Whereas,
   // `kPointInTimeRecovery` will stop recovery just before the corruption since
   // that is a valid point-in-time to which to recover.
+  //
+  // With a `partition_wal_usage` other than `kNone`, the WAL index shows a
+  // record lost before the last one: a hole, with records above it in the same
+  // or another WAL. This mode refuses to open the DB on a hole even when no
+  // corruption was reported, where with `kNone` such a loss between files
+  // goes unnoticed.
   kTolerateCorruptedTailRecords = 0x00,
   // Recover from clean shutdown
   // We don't expect to find any corruption in the WAL
   // Use case : This is ideal for unit tests and rare applications that
   // can require high consistency guarantee
+  //
+  // With a `partition_wal_usage` other than `kNone`, a hole (see
+  // `kTolerateCorruptedTailRecords`) also fails the open.
   kAbsoluteConsistency = 0x01,
   // Recover to point-in-time consistency (default)
   // We stop the WAL playback on discovering WAL inconsistency
   // Use case : Ideal for systems that have disk controller cache like
   // hard disk, SSD without super capacitor that store related data
+  //
+  // With a `partition_wal_usage` other than `kNone`, playback stops at the
+  // first hole (see `kTolerateCorruptedTailRecords`) and the DB opens with
+  // the records below it.
   kPointInTimeRecovery = 0x02,
   // Recovery after a disaster
   // We ignore any corruption in the WAL and try to salvage as much data as
   // possible
   // Use case : Ideal for last ditch effort to recover data or systems that
   // operate with low grade unrelated data
+  //
+  // With a `partition_wal_usage` other than `kNone`, a hole (see
+  // `kTolerateCorruptedTailRecords`) is skipped and the records above it are
+  // applied, as unreadable records are with `kNone`. Records that an earlier
+  // recovery discarded are still never applied.
   kSkipAnyCorruptedRecords = 0x03,
 };
 
@@ -1634,6 +1652,8 @@ struct DBOptions {
   // (default) keeps the vanilla WAL format for downgrade safety; see
   // `PartitionWALUsage` for the on-disk format change every other value
   // implies. Leaves the per-key sequence number and SST format untouched.
+  // Every other value also lets recovery find a record lost from the middle of
+  // the WAL; see `WALRecoveryMode` for what each mode does then.
   PartitionWALUsage partition_wal_usage = PartitionWALUsage::kNone;
 
   // Set to true to re-instate an old behavior of keeping complete, synced WAL

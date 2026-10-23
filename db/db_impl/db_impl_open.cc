@@ -7,11 +7,13 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #include <cinttypes>
+#include <deque>
 
 #include "db/blob/blob_file_partition_manager.h"
 #include "db/builder.h"
 #include "db/db_impl/db_impl.h"
 #include "db/error_handler.h"
+#include "db/log_merge.h"
 #include "db/periodic_task_scheduler.h"
 #include "db/version_util.h"
 #include "env/composite_env_wrapper.h"
@@ -28,6 +30,7 @@
 #include "rocksdb/table.h"
 #include "rocksdb/wal_filter.h"
 #include "test_util/sync_point.h"
+#include "util/coding.h"
 #include "util/rate_limiter_impl.h"
 #include "util/string_util.h"
 #include "util/udt_util.h"
@@ -1256,10 +1259,23 @@ Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& wal_numbers,
   uint64_t min_wal_number = 0;
   SetupLogFilesRecovery(wal_numbers, &version_edits, &job_id, &min_wal_number);
 
-  Status status =
-      ProcessLogFiles(wal_numbers, read_only, is_retry, min_wal_number, job_id,
-                      next_sequence, &version_edits, corrupted_wal_found,
-                      recovery_ctx, &wal_index_supersessions);
+  Status status;
+  if (log::WALIndexEnabled(immutable_db_options_.partition_wal_usage) &&
+      !immutable_db_options_.track_and_verify_wals) {
+    // Indexed WALs recover through the N-file merge, which reconstructs the
+    // single ordered history across files. Predecessor verification chains
+    // one file's replay into the next, which the merge's concurrent pulls
+    // cannot reproduce, so that combination keeps the sequential path.
+    status = ProcessLogFilesMerged(wal_numbers, read_only, is_retry,
+                                   min_wal_number, job_id, next_sequence,
+                                   &version_edits, corrupted_wal_found,
+                                   recovery_ctx, &wal_index_supersessions);
+  } else {
+    status = ProcessLogFiles(wal_numbers, read_only, is_retry, min_wal_number,
+                             job_id, next_sequence, &version_edits,
+                             corrupted_wal_found, recovery_ctx,
+                             &wal_index_supersessions);
+  }
 
   // A read-only or secondary open has no recovery context because it creates
   // no WAL. It also allocates no wal_index and so reissues nothing, leaving
@@ -1422,6 +1438,663 @@ Status DBImpl::ProcessLogFiles(
     status = MaybeFlushFinalMemtableOrRestoreActiveLogFiles(
         wal_numbers, read_only, job_id, flushed, version_edits, recovery_ctx);
   }
+  return status;
+}
+
+// Projects the witness sequence number from a merged record's payload. The
+// merge checks it strictly increases across indexed emissions; sequence zero
+// (an empty record) skips the check and is dropped by recovery.
+static Status MergedSequenceOf(Slice payload, SequenceNumber* seq) {
+  if (payload.size() < WriteBatchInternal::kHeader) {
+    return Status::Corruption("merged record too small for a sequence");
+  }
+  *seq = DecodeFixed64(payload.data());
+  return Status::OK();
+}
+
+Status DBImpl::ProcessLogFilesMerged(
+    const std::vector<uint64_t>& wal_numbers, bool read_only, bool is_retry,
+    uint64_t min_wal_number, int job_id, SequenceNumber* next_sequence,
+    std::unordered_map<int, VersionEdit>* version_edits,
+    bool* corrupted_wal_found, RecoveryContext* recovery_ctx,
+    std::vector<WALIndexSupersession>* supersessions) {
+  assert(supersessions != nullptr);
+
+  Status status;
+  bool old_log_record = false;
+  bool stop_replay_for_corruption = false;
+  bool stop_replay_by_wal_filter = false;
+  bool flushed = false;
+  uint64_t corrupted_wal_number = kMaxSequenceNumber;
+
+  // One reporter per member, so every warning names its WAL. They share
+  // recovery state: reports accumulate in `status` and are consumed per tail
+  // gap, per passed loss and at the end of the drive, unlike the per-file
+  // status of the sequential path. Members stop at their first observed
+  // report exactly when reports are wired into recovery state, mirroring the
+  // sequential path breaking before processing the record whose read
+  // reported.
+  const bool stop_on_report = immutable_db_options_.paranoid_checks &&
+                              immutable_db_options_.wal_recovery_mode !=
+                                  WALRecoveryMode::kSkipAnyCorruptedRecords;
+  std::deque<std::string> reporter_fnames;
+  std::deque<DBOpenLogRecordReadReporter> reporters;
+  std::unordered_map<uint64_t, DBOpenLogRecordReadReporter*> reporter_of;
+
+  std::vector<std::unique_ptr<log::WALIndexMerger::Member>> members;
+  std::vector<uint64_t> held_wals;
+  std::vector<const log::WALIndexMerger::ReaderMember*> readers;
+  for (uint64_t wal_number : wal_numbers) {
+    if (wal_number < min_wal_number) {
+      ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                     "Skipping log #%" PRIu64
+                     " since it is older than min log to keep #%" PRIu64,
+                     wal_number, min_wal_number);
+      continue;
+    }
+    SetupLogFileProcessing(wal_number);
+    const std::string fname =
+        LogFileName(immutable_db_options_.GetWalDir(), wal_number);
+    std::unique_ptr<FSSequentialFile> file;
+    Status open_status = fs_->NewSequentialFile(
+        fname, fs_->OptimizeForLogRead(file_options_), &file, nullptr);
+    if (!open_status.ok()) {
+      // Indexed recovery fails on an unopenable WAL.
+      return open_status;
+    }
+    std::unique_ptr<SequentialFileReader> file_reader(new SequentialFileReader(
+        std::move(file), fname, immutable_db_options_.log_readahead_size,
+        io_tracer_, /*listeners=*/{},
+        /*rate_limiter=*/nullptr,
+        /*verify_and_reconstruct_read=*/is_retry));
+    reporter_fnames.push_back(fname);
+    reporters.emplace_back();
+    DBOpenLogRecordReadReporter& reporter = reporters.back();
+    reporter.env = env_;
+    reporter.info_log = immutable_db_options_.info_log.get();
+    reporter.fname = reporter_fnames.back().c_str();
+    reporter.status = stop_on_report ? &status : nullptr;
+    reporter.old_log_record = &old_log_record;
+    reporter_of.emplace(wal_number, &reporter);
+    log::WALIndexMerger::ReaderMemberOptions options;
+    options.wal_number = wal_number;
+    options.file = std::move(file_reader);
+    options.checksum = true;
+    // Plain readers only: recovery never uses fragment-buffered readers,
+    // whose tailing semantic reports torn tails as clean ends.
+    options.fragment_buffered = false;
+    options.wal_recovery_mode = immutable_db_options_.wal_recovery_mode;
+    options.track_and_verify_wals = false;
+    // No running stop flag: the single merged pass has no previous file.
+    // (The flag only gates predecessor verification, which is off here.)
+    options.stop_replay_for_corruption = false;
+    options.min_wal_number_to_keep = min_wal_number;
+    options.info_log = immutable_db_options_.info_log;
+    options.outer_reporter = &reporter;
+    options.stop_on_report = stop_on_report;
+    auto member = std::unique_ptr<log::WALIndexMerger::Member>(
+        new log::WALIndexMerger::ReaderMember(std::move(options)));
+    readers.push_back(
+        static_cast<const log::WALIndexMerger::ReaderMember*>(member.get()));
+    members.push_back(std::move(member));
+    held_wals.push_back(wal_number);
+    TEST_SYNC_POINT_CALLBACK("DBImpl::RecoverLogFiles:BeforeReadWal",
+                             /*cb_arg=*/nullptr);
+  }
+
+  // Under skip, superseded-only holes re-trust the earlier recovery's
+  // discard declaration instead of stopping, extracting the surviving
+  // stream; every other mode stops at them.
+  // With MANIFEST WAL tracking, every synced WAL the MANIFEST names at or
+  // above the bound must be held. WALs it does not track (never synced) are
+  // checked only through what the files attest.
+  std::vector<uint64_t> expected_wals = held_wals;
+  if (immutable_db_options_.track_and_verify_wals_in_manifest) {
+    expected_wals.clear();
+    for (const auto& [wal_number, wal_meta] :
+         versions_->GetWalSet().GetWals()) {
+      if (wal_number >= min_wal_number && wal_meta.HasSyncedSize()) {
+        expected_wals.push_back(wal_number);
+      }
+    }
+  }
+  log::WALIndexMerger merger(std::move(members), expected_wals,
+                             MergedSequenceOf,
+                             immutable_db_options_.wal_recovery_mode ==
+                                 WALRecoveryMode::kSkipAnyCorruptedRecords);
+  // Skip mode skips an unexplained hole and applies the records above it, as
+  // it skips unreadable records with one WAL (D-10); every other mode stops
+  // there.
+  merger.SetSkipUnexplainedHoles(immutable_db_options_.wal_recovery_mode ==
+                                 WALRecoveryMode::kSkipAnyCorruptedRecords);
+  // Recovery reads every WAL at or above min_wal_number, so an attested
+  // predecessor there that the merge does not hold is missing from disk.
+  merger.SetRetirementBound(min_wal_number);
+
+  const UnorderedMap<uint32_t, size_t>& running_ts_sz =
+      versions_->GetRunningColumnFamiliesTimestampSize();
+  const WALRecoveryMode wal_recovery_mode =
+      immutable_db_options_.wal_recovery_mode;
+
+  // Highest applied index per WAL, for cuts. Emitted-but-dropped records
+  // (point-in-time or filter drops) do not advance it.
+  std::unordered_map<uint64_t, uint64_t> applied_max;
+  std::unordered_set<uint64_t> superseded;
+  auto record_cut = [&](uint64_t wal_number) {
+    if (!superseded.insert(wal_number).second) {
+      return;
+    }
+    uint64_t first_obsolete = log::kWALIndexStartNumber;
+    for (const auto* reader : readers) {
+      if (reader->wal_number() == wal_number) {
+        first_obsolete = std::max(first_obsolete, reader->FirstIndexed());
+        break;
+      }
+    }
+    const auto it = applied_max.find(wal_number);
+    if (it != applied_max.end()) {
+      first_obsolete = std::max(first_obsolete, it->second + 1);
+    }
+    supersessions->push_back({wal_number, first_obsolete});
+  };
+
+  // WALs whose loss the drive has accounted for: a tail gap consumed it, or a
+  // record from a later WAL passed it with the point-in-time stop armed.
+  std::unordered_set<uint64_t> passed;
+  // A finished member that ended early on a report or on an old-incarnation
+  // record, which nothing has accounted for yet.
+  auto unpassed_loss = [&](const log::WALIndexMerger::ReaderMember* reader) {
+    const uint64_t wal_number = reader->wal_number();
+    return passed.count(wal_number) == 0 &&
+           merger.GetMemberEnd(wal_number) !=
+               log::WALIndexMerger::MemberEnd::kUnfinished &&
+           (reader->SawOldLogRecord() ||
+            (stop_on_report && reader->TailReported()));
+  };
+  // Arms the point-in-time stop at `wal_number`, keeping an earlier WAL only
+  // while a stop is still in effect.
+  auto stop_at = [&](uint64_t wal_number) {
+    corrupted_wal_number = stop_replay_for_corruption
+                               ? std::min(corrupted_wal_number, wal_number)
+                               : wal_number;
+    stop_replay_for_corruption = true;
+    if (corrupted_wal_found != nullptr) {
+      *corrupted_wal_found = true;
+    }
+  };
+
+  auto map_tail_gap = [&](const log::WALIndexMerger::TailGap& gap) {
+    if (!status.ok()) {
+      if (wal_recovery_mode == WALRecoveryMode::kPointInTimeRecovery) {
+        stop_replay_for_corruption = true;
+        if (corrupted_wal_found != nullptr) {
+          *corrupted_wal_found = true;
+        }
+        corrupted_wal_number =
+            *std::min_element(gap.members.begin(), gap.members.end());
+        for (uint64_t wal_number : gap.members) {
+          record_cut(wal_number);
+          passed.insert(wal_number);
+        }
+        // Consumed: later pulls re-set status on fresh reports, so the
+        // per-record and end-of-drive handling sees only what no gap
+        // accounted for.
+        status.PermitUncheckedError();
+        status = Status::OK();
+        return status;
+      }
+      if (wal_recovery_mode == WALRecoveryMode::kSkipAnyCorruptedRecords) {
+        // Unreachable: reports are unwired under skip, so status stays OK.
+        return status;
+      }
+      return status;
+    }
+    // A reported gap stops replay even when its report was already consumed:
+    // a record from a later WAL passed the loss and reset status, and its
+    // continuing sequence resumed the stop before the gap surfaced.
+    if (wal_recovery_mode == WALRecoveryMode::kPointInTimeRecovery &&
+        (old_log_record || (stop_on_report && gap.reported))) {
+      stop_replay_for_corruption = true;
+      if (corrupted_wal_found != nullptr) {
+        *corrupted_wal_found = true;
+      }
+      corrupted_wal_number =
+          *std::min_element(gap.members.begin(), gap.members.end());
+      for (uint64_t wal_number : gap.members) {
+        record_cut(wal_number);
+        passed.insert(wal_number);
+      }
+      return status;
+    }
+    if (wal_recovery_mode == WALRecoveryMode::kTolerateCorruptedTailRecords ||
+        wal_recovery_mode == WALRecoveryMode::kAbsoluteConsistency) {
+      // A tail gap always has members holding records above it: a trailing
+      // gap with every member finished ends the stream instead of surfacing
+      // here. The hole is therefore not a tail and recovery must fail,
+      // even when nothing reported (a silent torn stop). This is the
+      // behavior change R3.2 calls out: opens that previously succeeded by
+      // replaying across the gap now fail. WALRecoveryMode documents it.
+      return Status::Corruption(
+          "WAL index merge: tail gap at wal_index " +
+          std::to_string(gap.index) +
+          " with records above it; cannot replay across the gap");
+    }
+    if (wal_recovery_mode == WALRecoveryMode::kSkipAnyCorruptedRecords) {
+      // Swallowed corruption leaves no cut; torn stops still obsolete
+      // their unseen tails, as in the sequential path.
+      for (uint64_t wal_number : gap.members) {
+        if (merger.GetMemberEnd(wal_number) ==
+            log::WALIndexMerger::MemberEnd::kStop) {
+          record_cut(wal_number);
+        }
+      }
+      return status;
+    }
+    // Point-in-time without a corruption report on the gap: cut the torn
+    // members and resume past them when the sequences continue.
+    for (uint64_t wal_number : gap.members) {
+      record_cut(wal_number);
+    }
+    return status;
+  };
+
+  // Mirrors the sequential path's end-of-file handling for corruption the
+  // filter or the batch parser reported on one record. Returns non-OK when
+  // recovery must fail; on success clears status for point-in-time and
+  // skip so later handling sees only fresh reports.
+  auto handle_fresh_status = [&](uint64_t wal_number) {
+    if (status.IsNotSupported()) {
+      return status;
+    }
+    if (wal_recovery_mode == WALRecoveryMode::kSkipAnyCorruptedRecords) {
+      status.PermitUncheckedError();
+      status = Status::OK();
+      return status;
+    }
+    if (wal_recovery_mode == WALRecoveryMode::kPointInTimeRecovery) {
+      if (status.IsIOError()) {
+        return status;
+      }
+      stop_replay_for_corruption = true;
+      corrupted_wal_number = wal_number;
+      if (corrupted_wal_found != nullptr) {
+        *corrupted_wal_found = true;
+      }
+      status.PermitUncheckedError();
+      status = Status::OK();
+      return status;
+    }
+    return status;
+  };
+
+  SequenceNumber last_seqno_observed = 0;
+  Slice record;
+  log::WALIndexMerger::Result result = log::WALIndexMerger::Result::kWaiting;
+  bool broke_early = false;
+  // Readers below this position have been passed by a later WAL's record.
+  size_t next_to_pass = 0;
+  // For the truncation summary. Zero `cut_index` means no cut.
+  uint64_t cut_index = 0;
+  // A point-in-time frontier at a pending superseded-only index, or zero.
+  uint64_t pending_discard_stop = 0;
+  uint64_t discarded = 0;
+  uint64_t tail_gaps = 0;
+  uint64_t first_tail_gap = 0;
+  while ((result = merger.Next(&record)) ==
+             log::WALIndexMerger::Result::kRecord ||
+         result == log::WALIndexMerger::Result::kTailGap) {
+    if (result == log::WALIndexMerger::Result::kTailGap) {
+      if (tail_gaps++ == 0) {
+        first_tail_gap = merger.GetTailGap().index;
+      }
+      status = map_tail_gap(merger.GetTailGap());
+      if (!status.ok()) {
+        return status;
+      }
+      // Gaps never break the drive: point-in-time resumes past them when
+      // the sequences continue, exactly as across files sequentially.
+      continue;
+    }
+    if (stop_replay_by_wal_filter) {
+      broke_early = true;
+      break;
+    }
+    const log::WALIndexMerger::Member* member = merger.GetLastEmittedMember();
+    assert(member != nullptr);
+    const auto* reader_member =
+        static_cast<const log::WALIndexMerger::ReaderMember*>(member);
+    const uint64_t wal_number = member->wal_number();
+    const uint64_t emitted_index = merger.GetLastEmittedWALIndex();
+    DBOpenLogRecordReadReporter& reporter = *reporter_of.at(wal_number);
+    const std::string fname =
+        LogFileName(immutable_db_options_.GetWalDir(), wal_number);
+    auto log_file_dropped = [this, &fname]() {
+      uint64_t bytes;
+      if (env_->GetFileSize(fname, &bytes).ok()) {
+        auto info_log = immutable_db_options_.info_log.get();
+        ROCKS_LOG_WARN(info_log, "%s: dropping %d bytes", fname.c_str(),
+                       static_cast<int>(bytes));
+      }
+    };
+
+    uint64_t batch_seq = 0;
+    uint32_t batch_count = 0;
+    const bool has_header = record.size() >= WriteBatchInternal::kHeader;
+    if (has_header) {
+      batch_seq = DecodeFixed64(record.data());
+      batch_count = DecodeFixed32(record.data() + 8);
+    }
+    const bool empty_record = has_header && batch_seq == 0 && batch_count == 0;
+    if (wal_recovery_mode == WALRecoveryMode::kPointInTimeRecovery &&
+        !empty_record) {
+      // A record from a later WAL passes every earlier WAL's loss, as the
+      // sequential path moves on to its next file: the stop arms, and replay
+      // resumes only if this record's sequence continues.
+      for (; next_to_pass < readers.size() &&
+             readers[next_to_pass]->wal_number() < wal_number &&
+             merger.GetMemberEnd(readers[next_to_pass]->wal_number()) !=
+                 log::WALIndexMerger::MemberEnd::kUnfinished;
+           ++next_to_pass) {
+        const log::WALIndexMerger::ReaderMember* earlier =
+            readers[next_to_pass];
+        if (unpassed_loss(earlier)) {
+          stop_at(earlier->wal_number());
+          status.PermitUncheckedError();
+          status = Status::OK();
+        }
+        passed.insert(earlier->wal_number());
+      }
+    }
+    const bool stop_before = stop_replay_for_corruption;
+    const bool filter_before = stop_replay_by_wal_filter;
+    const bool status_before_ok = status.ok();
+    const SequenceNumber prev_next_sequence = *next_sequence;
+    uint64_t record_checksum = merger.GetLastEmittedChecksum();
+    bool dropped = true;
+    if (empty_record) {
+      // An empty record reaches the WAL filter like any other record, then
+      // drops before the memtable: there is nothing to insert and
+      // next_sequence must not move.
+      WriteBatch empty_batch;
+      Status empty_status =
+          WriteBatchInternal::SetContents(&empty_batch, record);
+      if (!empty_status.ok()) {
+        return empty_status;
+      }
+      if (InvokeWalFilterIfNeededOnWalRecord(wal_number, fname, reporter,
+                                             status, stop_replay_by_wal_filter,
+                                             empty_batch)) {
+        status.PermitUncheckedError();
+      }
+      if (status_before_ok && !status.ok()) {
+        status = handle_fresh_status(wal_number);
+        if (!status.ok()) {
+          return status;
+        }
+      }
+    } else {
+      Status process_status = ProcessLogRecord(
+          record, reader_member->reader(), running_ts_sz, wal_number, fname,
+          read_only, job_id, log_file_dropped, &reporter, &record_checksum,
+          &last_seqno_observed, next_sequence, &stop_replay_for_corruption,
+          &status, &stop_replay_by_wal_filter, version_edits, &flushed);
+      if (!process_status.ok()) {
+        return process_status;
+      }
+      if (Status seqno_check_status = CheckSeqnoNotSetBackDuringRecovery(
+              prev_next_sequence, *next_sequence);
+          !seqno_check_status.ok()) {
+        return seqno_check_status;
+      }
+      // Applied unless next_sequence stood still on a non-empty batch: the
+      // inserter advances it even for skipped column families, so stillness
+      // means the record never reached the memtable.
+      dropped = (*next_sequence == prev_next_sequence) &&
+                (!has_header || batch_count != 0);
+      if (status_before_ok && !status.ok()) {
+        // The filter or the batch parser reported on this record. Member
+        // reports cannot land here: the merge surfaces their gaps (which
+        // consume status) before any record pulled past them.
+        status = handle_fresh_status(wal_number);
+        if (!status.ok()) {
+          return status;
+        }
+      }
+    }
+    if (!dropped && emitted_index != 0) {
+      auto applied_it = applied_max.find(wal_number);
+      if (applied_it == applied_max.end()) {
+        applied_max.emplace(wal_number, emitted_index);
+      } else {
+        applied_it->second = std::max(applied_it->second, emitted_index);
+      }
+      Status seed_status = SetNextWALIndexAfterRecovery(emitted_index);
+      if (!seed_status.ok()) {
+        return seed_status;
+      }
+    }
+    // Break when the stop survived the record unreset (point-in-time
+    // declined to resume, so the record dropped) or the filter stopped
+    // replay, mirroring the sequential file break.
+    if ((stop_before && stop_replay_for_corruption) ||
+        (!filter_before && stop_replay_by_wal_filter)) {
+      cut_index = dropped ? emitted_index : emitted_index + 1;
+      discarded += dropped ? 1 : 0;
+      broke_early = true;
+      break;
+    }
+  }
+
+  if (broke_early) {
+    // Point-in-time or filter stop: cut every member that did not finish
+    // clean, covering tails the drive never reached, and every member holding
+    // an index at or above the seed. Those records were dropped, and the next
+    // write reissues their indices.
+    bool cut_past_seed = true;
+    TEST_SYNC_POINT_CALLBACK("DBImpl::ProcessLogFilesMerged:CutPastSeed",
+                             &cut_past_seed);
+    for (const auto* reader : readers) {
+      if (merger.GetMemberEnd(reader->wal_number()) !=
+          log::WALIndexMerger::MemberEnd::kClean) {
+        record_cut(reader->wal_number());
+      } else if (cut_past_seed && reader->LastIndexed() >= next_wal_index_) {
+        // A clean member was read to its end, so its records below the seed
+        // were all emitted; the unapplied ones (empty or filter-ignored)
+        // stay live, as the sequential path keeps them. Cutting below the
+        // seed would leave them as holes only supersession explains.
+        record_cut(reader->wal_number());
+        if (supersessions->back().wal_number == reader->wal_number()) {
+          supersessions->back().first_obsolete_wal_index = std::max(
+              supersessions->back().first_obsolete_wal_index, next_wal_index_);
+        }
+      }
+    }
+  } else if (result == log::WALIndexMerger::Result::kError) {
+    return merger.GetError();
+  } else if (result == log::WALIndexMerger::Result::kWaiting) {
+    // Unreachable with plain readers, which never idle: fail closed.
+    return Status::Corruption("WAL index merge stalled waiting for a member");
+  } else if (result == log::WALIndexMerger::Result::kFrontier) {
+    const uint64_t frontier = merger.GetFrontier();
+    if (wal_recovery_mode != WALRecoveryMode::kPointInTimeRecovery) {
+      std::string msg = "WAL index merge: unexplained hole at wal_index " +
+                        std::to_string(frontier) +
+                        " with records above it; cannot bound";
+      if (merger.GetLostPredecessor() != 0) {
+        msg += "; WAL " + std::to_string(merger.GetLostPredecessor()) +
+               " is attested by its successor but missing";
+      }
+      return Status::Corruption(msg);
+    }
+    if (merger.FrontierIsPendingDiscard()) {
+      pending_discard_stop = frontier;
+    }
+    // Seed before cutting: the cuts below clamp to the seed, and the frontier
+    // is the seed. Cutting first would clamp to a stale seed and obsolete
+    // explained records below the frontier (ported from D126568250).
+    if (frontier != 0) {
+      Status seed_status = SetNextWALIndexAfterRecovery(frontier - 1);
+      if (!seed_status.ok()) {
+        return seed_status;
+      }
+    }
+    // Point-in-time opens at the cut, attributed no later than any loss the
+    // drive has not accounted for.
+    cut_index = frontier;
+    uint64_t cut_wal = kMaxSequenceNumber;
+    for (const auto* reader : readers) {
+      const uint64_t wal_number = reader->wal_number();
+      const auto end = merger.GetMemberEnd(wal_number);
+      if (end == log::WALIndexMerger::MemberEnd::kUnfinished ||
+          unpassed_loss(reader)) {
+        cut_wal = std::min(cut_wal, wal_number);
+      }
+      if (end != log::WALIndexMerger::MemberEnd::kClean) {
+        record_cut(wal_number);
+      }
+    }
+    stop_at(cut_wal);
+  } else {
+    assert(result == log::WALIndexMerger::Result::kCleanEnd);
+    const uint64_t frontier = merger.GetFrontier();
+    // The frontier sits one past the highest explained index, covering
+    // trailing voids the per-record seeding below never saw.
+    if (frontier != 0) {
+      Status seed_status = SetNextWALIndexAfterRecovery(frontier - 1);
+      if (!seed_status.ok()) {
+        return seed_status;
+      }
+    }
+    for (const auto* reader : readers) {
+      if (merger.GetMemberEnd(reader->wal_number()) ==
+          log::WALIndexMerger::MemberEnd::kStop) {
+        record_cut(reader->wal_number());
+      }
+    }
+    cut_index = frontier;
+    if (merger.SkippedUnexplainedDiscard()) {
+      // The next write lands above the skipped index, and the next merge
+      // would take it for a live record above a lost reissue. Flush, so the
+      // WALs holding the superseded copies retire first.
+      flushed = true;
+    }
+  }
+
+  if (wal_recovery_mode == WALRecoveryMode::kPointInTimeRecovery) {
+    // Mirror the sequential path's end-of-file handling once for the merged
+    // stream. Only a loss nothing later passed ends it, and the earliest such
+    // WAL is where replay stopped.
+    if (status.IsNotSupported() || status.IsIOError()) {
+      return status;
+    }
+    uint64_t trailing_wal = kMaxSequenceNumber;
+    for (const auto* reader : readers) {
+      if (unpassed_loss(reader)) {
+        trailing_wal = std::min(trailing_wal, reader->wal_number());
+      }
+    }
+    if (trailing_wal != kMaxSequenceNumber) {
+      stop_at(trailing_wal);
+    }
+    status.PermitUncheckedError();
+    status = Status::OK();
+  } else if (!status.ok() || old_log_record) {
+    // Tail reports no gap consumed.
+    if (status.IsNotSupported()) {
+      return status;
+    }
+    if (wal_recovery_mode != WALRecoveryMode::kSkipAnyCorruptedRecords) {
+      return status;
+    }
+    status.PermitUncheckedError();
+    status = Status::OK();
+  }
+
+  if (merger.GetSkippedHoles() > 0) {
+    ROCKS_LOG_WARN(immutable_db_options_.info_log,
+                   "Merged WAL recovery skipped %" PRIu64
+                   " unexplained hole(s) from wal_index %" PRIu64
+                   " under kSkipAnyCorruptedRecords",
+                   merger.GetSkippedHoles(), merger.GetFirstSkippedHole());
+  }
+  if (stop_replay_for_corruption || stop_replay_by_wal_filter ||
+      tail_gaps > 0 || !supersessions->empty()) {
+    std::string superseded_wals;
+    for (const WALIndexSupersession& supersession : *supersessions) {
+      superseded_wals += " #" + std::to_string(supersession.wal_number) +
+                         " from wal_index " +
+                         std::to_string(supersession.first_obsolete_wal_index);
+    }
+    ROCKS_LOG_WARN(immutable_db_options_.info_log,
+                   "Merged WAL recovery truncated: cut at wal_index %" PRIu64
+                   " (0: no cut), %" PRIu64
+                   " tail-gap indices from wal_index %" PRIu64
+                   ", superseded WALs:%s; discarded at least %" PRIu64
+                   " records (records above the cut that recovery never read "
+                   "are not counted)",
+                   cut_index, tail_gaps, first_tail_gap,
+                   superseded_wals.empty() ? " none" : superseded_wals.c_str(),
+                   discarded + tail_gaps);
+  }
+
+  // Writes after this open take next_wal_index_ and up, so a record there
+  // must be cut, or the next open finds two live records at one index.
+  // Indices increase within a file: a cut at the lowest one a WAL can hold at
+  // or above the seed covers them all. Read-only opens write nothing.
+  // A point-in-time stop at a pending superseded-only index (a void burned
+  // after its cut leaves it unexplained) is named: only a read-only open can
+  // read the prefix below it.
+  const std::string pending_stop =
+      pending_discard_stop == 0
+          ? std::string()
+          : "; point-in-time recovery stopped at superseded-only wal_index " +
+                std::to_string(pending_discard_stop) +
+                ", which no void older than its cut explains; open read-only "
+                "to read the prefix below it";
+  if (status.ok() && !read_only) {
+    for (const auto* reader : readers) {
+      const uint64_t wal_number = reader->wal_number();
+      if (reader->LastIndexed() < next_wal_index_ &&
+          merger.GetMemberEnd(wal_number) !=
+              log::WALIndexMerger::MemberEnd::kUnfinished) {
+        continue;
+      }
+      const uint64_t lowest = std::max(next_wal_index_, reader->FirstIndexed());
+      bool cut = false;
+      for (const WALIndexSupersession& supersession : *supersessions) {
+        cut |= supersession.wal_number == wal_number &&
+               supersession.first_obsolete_wal_index <= lowest;
+      }
+      if (!cut) {
+        return Status::Corruption(
+            "WAL index recovery: WAL " + std::to_string(wal_number) +
+            " holds live wal_index " + std::to_string(reader->LastIndexed()) +
+            " at or above the next wal_index " +
+            std::to_string(next_wal_index_) + "; a write would reissue it" +
+            pending_stop);
+      }
+    }
+  }
+
+  if (status.ok()) {
+    status = MaybeHandleStopReplayForCorruptionForInconsistency(
+        stop_replay_for_corruption, corrupted_wal_number);
+  }
+
+  if (status.ok()) {
+    status = MaybeFlushFinalMemtableOrRestoreActiveLogFiles(
+        wal_numbers, read_only, job_id, flushed, version_edits, recovery_ctx);
+  }
+
+  if (!held_wals.empty()) {
+    ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                   "Recovered merged logs #%" PRIu64 " to #%" PRIu64
+                   " next seq #%" PRIu64,
+                   held_wals.front(), held_wals.back(), *next_sequence);
+  }
+
+  FinishLogFileProcessing(status, next_sequence);
+
   return status;
 }
 

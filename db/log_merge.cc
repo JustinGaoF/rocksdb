@@ -16,7 +16,8 @@ namespace log {
 WALIndexMerger::ReaderMember::ReaderMember(ReaderMemberOptions&& options)
     : wal_number_(options.wal_number),
       wal_recovery_mode_(options.wal_recovery_mode),
-      reporter_(options.outer_reporter) {
+      stop_on_report_(options.stop_on_report),
+      reporter_(options.outer_reporter, &reader_) {
   if (options.fragment_buffered) {
     reader_.reset(new FragmentBufferedReader(
         options.info_log, std::move(options.file), &reporter_, options.checksum,
@@ -36,10 +37,28 @@ WALIndexMerger::Member::PulledRecord WALIndexMerger::ReaderMember::PullNext() {
     return terminal_;
   }
   Slice record;
-  if (reader_->ReadRecord(&record, &scratch_, wal_recovery_mode_)) {
+  checksum_ = 0;
+  if (reader_->ReadRecord(&record, &scratch_, wal_recovery_mode_, &checksum_)) {
+    if (stop_on_report_ && reporter_.reported_since_record()) {
+      // The read reported corruption: recovery would break before processing
+      // this record, so the member stops here and drops it. The swallowed
+      // tail accounts for the gap it leaves.
+      done_ = true;
+      terminal_.kind = Member::Pull::kFinishedStop;
+      return terminal_;
+    }
+    const bool swallowed_before = reporter_.reported_since_record();
+    reporter_.NoteRecord();
     if (!seen_first_) {
       seen_first_ = true;
       corrupt_before_first_ = reporter_.saw_corruption();
+      head_floor_ = reader_->GetWALIndexProgressBound();
+    }
+    if (swallowed_before && !swallow_pending_) {
+      // Reports since the previous read: corruption was observed and skipped
+      // on the way to this pull. The next positioned pull closes the span.
+      swallow_pending_ = true;
+      swallow_pending_lo_ = last_positioned_index_;
     }
     NoteProgress();
     const uint64_t idx = reader_->GetLastReadWALIndex();
@@ -49,6 +68,11 @@ WALIndexMerger::Member::PulledRecord WALIndexMerger::ReaderMember::PullNext() {
       pulled.payload = record;
       return pulled;
     }
+    if (swallow_pending_) {
+      swallowed_.emplace_back(swallow_pending_lo_, idx);
+      swallow_pending_ = false;
+    }
+    last_positioned_index_ = idx;
     if (first_indexed_ == 0) {
       first_indexed_ = idx;
     }
@@ -89,10 +113,22 @@ bool WALIndexMerger::ReaderMember::HeadIntact() const {
     return !corrupt_before_progress_;
   }
   if (done_) {
-    // A torn stop before any data is a damaged head even when the reader
-    // reported nothing: recycled torn tails stop silently by design.
-    return !reporter_.saw_corruption() &&
-           !reader_->WALRecoveryStoppedBeforeEndOfFile();
+    // No data record survived. A stop at a truncated end of file, or at a
+    // record from a recycled file's previous use, leaves nothing above it in
+    // this file: a lost tail, whose reports still reach the recovery-mode
+    // mapping. Corruption read past before the stop may have dropped data,
+    // and so may a recycled file's silent stop, which the reader also takes
+    // at a checksum mismatch: both are a damaged head.
+    if (reader_->IsRecycled() && reader_->StoppedAtOldRecord() &&
+        !reader_->MayHaveDroppedOwnRecord()) {
+      // Stopped at the previous use's records, and every report on the way
+      // dropped only bytes of that use: nothing of this file's was lost.
+      return true;
+    }
+    const bool silent_recycled_stop =
+        reader_->WALRecoveryStoppedBeforeEndOfFile() && reader_->IsRecycled() &&
+        !reporter_.saw_corruption() && !reporter_.saw_old();
+    return !reporter_.saw_corruption_before_stop() && !silent_recycled_stop;
   }
   // Unscanned: provisional, the merge never asks yet.
   return true;
@@ -100,6 +136,10 @@ bool WALIndexMerger::ReaderMember::HeadIntact() const {
 
 uint64_t WALIndexMerger::ReaderMember::ProgressBound() const {
   return reader_->GetWALIndexProgressBound();
+}
+
+uint64_t WALIndexMerger::ReaderMember::HeadFloor() const {
+  return seen_first_ ? head_floor_ : reader_->GetWALIndexProgressBound();
 }
 
 bool WALIndexMerger::ReaderMember::VoidCovers(uint64_t index) const {
@@ -125,6 +165,30 @@ void WALIndexMerger::ReaderMember::AttestedSpans(
   }
 }
 
+bool WALIndexMerger::ReaderMember::SwallowedCovers(uint64_t index) const {
+  for (const auto& [lo, hi] : swallowed_) {
+    if (index > lo && index < hi) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool WALIndexMerger::ReaderMember::TailImpure() const {
+  if (!done_ || first_indexed_ == 0) {
+    // A member that never held an index has no tail to lose: corruption
+    // before any indexed pull is head damage, which the lower-bound gate
+    // already failed closed on or the frontier stops at.
+    return false;
+  }
+  return terminal_.kind == Member::Pull::kFinishedStop ||
+         reporter_.reported_since_record() || swallow_pending_;
+}
+
+bool WALIndexMerger::ReaderMember::TailReported() const {
+  return done_ && (reporter_.reported_since_record() || swallow_pending_);
+}
+
 void WALIndexMerger::ReaderMember::NoteProgress() {
   if (!progress_noted_ && reader_->GetWALIndexProgressBound() != 0) {
     progress_noted_ = true;
@@ -135,10 +199,12 @@ void WALIndexMerger::ReaderMember::NoteProgress() {
 WALIndexMerger::WALIndexMerger(
     std::vector<std::unique_ptr<Member>> members,
     std::vector<uint64_t> expected_wals,
-    std::function<Status(Slice, SequenceNumber*)> sequence_of)
+    std::function<Status(Slice, SequenceNumber*)> sequence_of,
+    bool continue_past_discarded_holes)
     : members_(std::move(members)),
       expected_wals_(expected_wals.begin(), expected_wals.end()),
-      sequence_of_(std::move(sequence_of)) {
+      sequence_of_(std::move(sequence_of)),
+      continue_past_discarded_holes_(continue_past_discarded_holes) {
   for (auto& m : members_) {
     states_.emplace_back(m.get());
   }
@@ -200,11 +266,13 @@ Status WALIndexMerger::PullMembers(uint64_t threshold, PullOutcome* outcome) {
               " produced index " + std::to_string(pulled.wal_index) +
               " below expectation " + std::to_string(threshold));
         }
+        s.max_seen = std::max(s.max_seen, pulled.wal_index);
         s.lookahead = pulled;
         s.has_lookahead = true;
         outcome->advanced = true;
       } else if (pulled.kind == Member::Pull::kUnindexed) {
-        unindexed_queue_.push_back(pulled.payload.ToString());
+        unindexed_queue_.push_back({s.member, pulled.payload.ToString(),
+                                    s.member->LastRecordChecksum()});
         outcome->advanced = true;
       } else if (pulled.kind == Member::Pull::kFailedIO) {
         return Status::IOError("WAL index merge: WAL " +
@@ -299,10 +367,14 @@ Status WALIndexMerger::ComputeLowerBound() {
                                 " attested start mismatch");
     }
   }
+  // Max doubles as "nothing anchors the bound" below, so track found-ness
+  // explicitly: Max itself is a reachable (if only physically crafted) index.
   uint64_t lower = std::numeric_limits<uint64_t>::max();
+  bool have_lower = false;
   for (auto& s : states_) {
     if (s.member->FirstIndexed() != 0) {
       lower = std::min(lower, s.member->FirstIndexed());
+      have_lower = true;
     }
   }
   for (const auto& [pred, span] : attested) {
@@ -310,6 +382,7 @@ Status WALIndexMerger::ComputeLowerBound() {
       // A zero start attests an empty predecessor and anchors nothing.
       if (span.first != 0) {
         lower = std::min(lower, span.first);
+        have_lower = true;
       }
       if (FindState(pred) == nullptr && span.first != 0) {
         // Not retired and not held: the file is lost, and so is every index
@@ -321,9 +394,30 @@ Status WALIndexMerger::ComputeLowerBound() {
       }
     } else if (span.second != std::numeric_limits<uint64_t>::max()) {
       lower = std::min(lower, span.second + 1);
+      have_lower = true;
+      if (span.first != 0) {
+        retired_spans_.emplace_back(span.first, span.second);
+      }
     }
   }
-  if (lower == std::numeric_limits<uint64_t>::max()) {
+  if (have_lower && history_floor_ != 0 && attested.empty()) {
+    lower = std::min(lower, history_floor_);
+  }
+  // A head floor bounds the indices allocated since its WAL was created,
+  // whatever lost WAL bore them: a partition's current WAL is attested by no
+  // successor, so a loss below every surviving record surfaces as a hole only
+  // through the floor.
+  bool use_head_floors = true;
+  // Lets the prefix oracle's G-20 self-test drop every lower-bound witness.
+  TEST_SYNC_POINT_CALLBACK("WALIndexMerger::ComputeLowerBound:UseHeadFloors",
+                           &use_head_floors);
+  for (auto& s : states_) {
+    const uint64_t floor = s.member->HeadFloor();
+    if (have_lower && use_head_floors && floor != 0) {
+      lower = std::min(lower, floor);
+    }
+  }
+  if (!have_lower) {
     frontier_ = 0;
     terminal_ = Result::kCleanEnd;
     return Status::OK();
@@ -346,10 +440,19 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
     // Buffered unindexed records drain before any indexed decision so
     // encounter order is preserved.
     if (!unindexed_queue_.empty()) {
-      *record = Slice(unindexed_queue_.front());
+      *record = Slice(unindexed_queue_.front().payload);
       last_emitted_index_ = 0;
+      last_emitted_member_ = unindexed_queue_.front().member;
+      last_emitted_checksum_ = unindexed_queue_.front().checksum;
       queue_outstanding_ = true;
       return Result::kRecord;
+    }
+    if (lower_bound_set_ && expected_ == 0) {
+      // The expectation wrapped past the type limit: only physically crafted
+      // indices reach here, and recovery fails on the Max-valued emission
+      // first. Fail closed rather than re-deciding index zero.
+      return Fail(Status::Corruption(
+          "WAL index merge: wal_index expectation overflowed"));
     }
     if (!membership_checked_) {
       membership_checked_ = true;
@@ -441,6 +544,11 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
                              "index " +
                              std::to_string(expected_)));
     }
+    if (live.size() == 1 && pending_discarded_ != 0) {
+      // A live record above a skipped superseded-only index: writes after the
+      // cut reissue indices in order, so the reissued copy was lost.
+      return StopAtFrontier();
+    }
     if (live.size() == 1) {
       MemberState* winner = live[0];
       SequenceNumber seq = 0;
@@ -450,33 +558,141 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
                                        std::to_string(expected_) + ": " +
                                        s.ToString()));
       }
-      if (seq <= last_sequence_) {
+      if (seq == 0) {
+        // An empty record occupies its index but carries no witness: emit
+        // it without advancing the sequence check. Recovery drops it.
+      } else if (seq < last_sequence_) {
+        // Non-decreasing, not strictly increasing: an empty batch consumes
+        // an index but no sequence, so the recovery dummy and a user-written
+        // empty batch both repeat the sequence the next record reuses.
         return Fail(Status::Corruption("WAL index merge: index " +
                                        std::to_string(expected_) +
                                        " does not advance the sequence"));
+      } else {
+        last_sequence_ = seq;
       }
-      last_sequence_ = seq;
       *record = winner->lookahead.payload;
       last_emitted_index_ = expected_;
+      last_emitted_member_ = winner->member;
+      last_emitted_checksum_ = winner->member->LastRecordChecksum();
       for (auto* h : holders) {
         h->has_lookahead = false;  // superseded copies die silently.
       }
       expected_++;
       return Result::kRecord;
     }
+    const bool had_holders = !holders.empty();
     for (auto* h : holders) {
       h->has_lookahead = false;  // superseded copies explain themselves.
     }
-    if (void_covered) {
+    bool swallowed_covered = false;
+    for (auto& state : states_) {
+      if (state.member->SwallowedCovers(expected_)) {
+        swallowed_covered = true;
+        break;
+      }
+    }
+    if (void_covered || swallowed_covered) {
+      // A void in a WAL older than the declaration predates the cut, and an
+      // open at N=1 seeds past such voids: the pending indices below it were
+      // never reissued.
+      for (auto& state : states_) {
+        if (pending_discarded_ != 0 &&
+            state.member->wal_number() < pending_declarer_ &&
+            state.member->VoidCovers(expected_)) {
+          pending_discarded_ = 0;
+        }
+      }
       expected_++;
       continue;
     }
+    if (expected_ >= lost_floor_ && !skip_unexplained_holes_) {
+      // Possibly borne by the lost file: no torn tail or supersession
+      // explains it. Skip mode goes on below, where the stream ends once
+      // nothing is left above.
+      return StopAtFrontier();
+    }
+    // No live holder, no void cover, and no swallowed span. When every
+    // member finished, the trailing loss ends the stream; the frontier and
+    // the member end states carry it to the recovery-mode mapping.
+    bool any_unfinished = false;
     for (auto& state : states_) {
       if (!state.finished) {
-        frontier_ = expected_;
-        terminal_ = Result::kFrontier;
-        return terminal_;
+        any_unfinished = true;
+        break;
       }
+    }
+    if (!any_unfinished) {
+      frontier_ = expected_;
+      terminal_ = Result::kCleanEnd;
+      return terminal_;
+    }
+    // Members hold records above the index. A finished member whose torn or
+    // swallowed tail covers it explains it as lost tail.
+    TailGap gap;
+    gap.index = expected_;
+    for (auto& state : states_) {
+      if (state.finished && state.member->TailImpure() &&
+          state.max_seen < expected_) {
+        gap.members.push_back(state.member->wal_number());
+        gap.reported = gap.reported || state.member->TailReported();
+      }
+    }
+    if (had_holders) {
+      // The holders were all superseded, so the copies are explained and the
+      // question is the absent live copy. With no torn tail covering the
+      // index, no member lost anything and the index was never reissued
+      // after the cut that discarded it: re-trust that declaration and move
+      // on, unless a live record turns up above it first (see
+      // pending_discarded_). A torn tail over the same index may still hold
+      // its live copy, which stays a frontier. (Under skip, recovery opts out
+      // of even that via continue_past_discarded_holes.)
+      if (continue_past_discarded_holes_) {
+        skipped_discard_ = true;
+        expected_++;
+        continue;
+      }
+      if (gap.members.empty()) {
+        if (pending_discarded_ == 0) {
+          pending_discarded_ = expected_;
+          pending_declarer_ = std::numeric_limits<uint64_t>::max();
+        }
+        // The declaration is written to the lowest-numbered WAL its open
+        // creates, so every WAL below the declarer predates the cut.
+        for (auto* h : holders) {
+          for (auto& state : states_) {
+            if (state.member->Supersedes(h->member->wal_number(), expected_)) {
+              pending_declarer_ =
+                  std::min(pending_declarer_, state.member->wal_number());
+            }
+          }
+        }
+        expected_++;
+        continue;
+      }
+      return StopAtFrontier();
+    }
+    // No holder at all: surface the lost tail for the recovery-mode mapping
+    // and continue past it, or stop at the pristine hole.
+    if (!gap.members.empty()) {
+      tail_gap_ = gap;
+      expected_++;
+      return Result::kTailGap;
+    }
+    // A retired predecessor bore indices in its span, and a held
+    // generation-mate (a WAL a 2PC prepare kept alive) interleaves with
+    // them: the retired file's records left with it, once recovery no longer
+    // needed them.
+    bool retired = false;
+    for (const auto& [first, last] : retired_spans_) {
+      if (first <= expected_ && expected_ <= last) {
+        retired = true;
+        break;
+      }
+    }
+    if (retired) {
+      expected_++;
+      continue;
     }
 #ifndef NDEBUG
     // Lets the prefix oracle's self-test move the stop one index later.
@@ -487,9 +703,10 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
       continue;
     }
 #endif  // NDEBUG
-    frontier_ = expected_;
-    terminal_ = Result::kCleanEnd;
-    return terminal_;
+    if (SkipUnexplainedHole()) {
+      continue;
+    }
+    return StopAtFrontier();
   }
 }
 
