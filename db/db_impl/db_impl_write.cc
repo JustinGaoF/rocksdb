@@ -2458,11 +2458,14 @@ IOStatus DBImpl::CoverBurnedWALIndex(const WriteOptions& write_options,
 // write thread. Otherwise this must be called holding wal_write_mutex_.
 void DBImpl::SelectWalForWrite(WalContext* wal_context) {
   assert(wal_context != nullptr);
-  assert(!WalLogs(0).empty());
-  assert(!AliveWalFiles(0).empty());
+  constexpr size_t wal_partition = 0;
+  assert(!WalLogs(wal_partition).empty());
+  assert(!AliveWalFiles(wal_partition).empty());
 
+  wal_context->wal_partition = wal_partition;
   wal_context->writer = CurrentWal().writer;
-  wal_context->wal_file_number_size = std::addressof(AliveWalFiles(0).back());
+  wal_context->wal_file_number_size =
+      std::addressof(AliveWalFiles(wal_partition).back());
 
   assert(wal_context->writer->get_log_number() ==
          wal_context->wal_file_number_size->number);
@@ -2536,8 +2539,10 @@ IOStatus DBImpl::WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
   size_t write_with_wal = 0;
   WriteBatch* to_be_cached_state = nullptr;
   WriteBatch* merged_batch;
-  io_s = status_to_io_status(MergeBatch(write_group, &tmp_batch_, &merged_batch,
-                                        &write_with_wal, &to_be_cached_state));
+  WriteBatch& merge_buffer = WalMergeBuffer(wal_context.wal_partition);
+  io_s =
+      status_to_io_status(MergeBatch(write_group, &merge_buffer, &merged_batch,
+                                     &write_with_wal, &to_be_cached_state));
   if (UNLIKELY(!io_s.ok())) {
     return io_s;
   }
@@ -2625,8 +2630,10 @@ IOStatus DBImpl::WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
     }
   }
 
-  if (merged_batch == &tmp_batch_) {
-    tmp_batch_.Clear();
+  if (merged_batch == &merge_buffer) {
+    // WriteToWAL's borrowed Slice is no longer live, so this partition can
+    // safely reuse the backing storage for its next write group.
+    merge_buffer.Clear();
   }
   if (io_s.ok()) {
     auto stats = default_cf_internal_stats_;

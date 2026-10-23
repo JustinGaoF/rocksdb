@@ -1509,6 +1509,11 @@ class DBImpl : public DB
 
   size_t TEST_NumWalPartitions() const { return NumWalPartitions(); }
 
+  // Returns the reusable merge buffer for a WAL partition.
+  const WriteBatch* TEST_GetWalMergeBuffer(size_t partition) {
+    return &WalMergeBuffer(partition);
+  }
+
   void TEST_DeleteObsoleteFiles();
 
   const std::unordered_set<uint64_t>& TEST_GetFilesGrabbedForPurge() const {
@@ -2422,6 +2427,7 @@ class DBImpl : public DB
         : need_wal_sync(need_sync), need_wal_dir_sync(need_sync) {}
     bool need_wal_sync = false;
     bool need_wal_dir_sync = false;
+    size_t wal_partition = 0;
     log::Writer* writer = nullptr;
     WalFileNumberSize* wal_file_number_size = nullptr;
     uint64_t prev_size = SIZE_MAX;
@@ -3865,14 +3871,21 @@ class DBImpl : public DB
   std::vector<std::deque<LogWriterNumber>> logs_ =
       std::vector<std::deque<LogWriterNumber>>(1);
 
+  // Each WAL partition reuses its own merge buffer.
+  // WriteBatchInternal::Contents borrows this storage through WriteToWAL(), so
+  // a partition must not clear or reuse its buffer until that append returns.
+  // The two-write-queues path keeps its invocation-local buffer because its
+  // write groups are not partition leaders.
+  std::vector<WriteBatch> wal_merge_buffers_ = std::vector<WriteBatch>(1);
+
   // Partition access. An interim chokepoint, not the container abstraction
   // (that gets extracted once real N-partition usage is known): every use
   // names its partition explicitly so a future change cannot silently mix
-  // partitions, and the asserts pin the layout (both vectors always have one
-  // entry per partition). Do not touch the vectors directly; use these.
-  // Element addresses are stable: deque elements never move, and neither
-  // vector is ever resized, so references and pointers into a partition's
-  // deque (CurrentWal(), WalContext::wal_file_number_size) stay valid.
+  // partitions, and the asserts pin the layout (all three vectors always have
+  // one entry per partition). Do not touch the vectors directly; use these.
+  // Element addresses are stable: deque elements never move, and none of the
+  // vectors is ever resized, so references and pointers into a partition's
+  // state stay valid.
   std::deque<LogWriterNumber>& WalLogs(size_t partition) {
     assert(partition < logs_.size());
     return logs_[partition];
@@ -3889,9 +3902,14 @@ class DBImpl : public DB
     assert(partition < alive_wal_files_.size());
     return alive_wal_files_[partition];
   }
-  // Number of WAL partitions. Both vectors always have this many entries.
+  WriteBatch& WalMergeBuffer(size_t partition) {
+    assert(partition < wal_merge_buffers_.size());
+    return wal_merge_buffers_[partition];
+  }
+  // Number of WAL partitions. All three vectors always have this many entries.
   size_t NumWalPartitions() const {
     assert(logs_.size() == alive_wal_files_.size());
+    assert(logs_.size() == wal_merge_buffers_.size());
     return logs_.size();
   }
 
@@ -3946,7 +3964,6 @@ class DBImpl : public DB
   WriteBufferManager* write_buffer_manager_;
 
   WriteThread write_thread_;
-  WriteBatch tmp_batch_;
   // The write thread when the writers have no memtable write. This will be used
   // in 2PC to batch the prepares separately from the serial commit.
   WriteThread nonmem_write_thread_;
