@@ -3900,10 +3900,13 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
         WriteBatchInternal::SetSequence(&empty_batch, recovered_seq);
         uint64_t wal_used;
         uint64_t log_size;
-        log::Writer* log_writer = impl->logs_.back().writer;
-        WalFileNumberSize& wal_file_number_size = impl->alive_wal_files_.back();
+        WalContext wal_context;
+        wal_context.writer = impl->logs_.back().writer;
+        wal_context.wal_file_number_size =
+            std::addressof(impl->alive_wal_files_.back());
 
-        assert(log_writer->get_log_number() == wal_file_number_size.number);
+        assert(wal_context.writer->get_log_number() ==
+               wal_context.wal_file_number_size->number);
         impl->mutex_.AssertHeld();
         uint64_t wal_index = 0;
         if (log::WALIndexEnabled(
@@ -3918,9 +3921,8 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
           // so the DB never becomes writable and nothing can be acknowledged
           // above the burned index. The file is discarded with the failed
           // open rather than left holding an undeclared hole.
-          s = impl->WriteToWAL(empty_batch, write_options, log_writer,
-                               &wal_used, &log_size, wal_file_number_size,
-                               recovered_seq, wal_index);
+          s = impl->WriteToWAL(empty_batch, write_options, wal_context,
+                               &wal_used, &log_size, recovered_seq, wal_index);
         }
         if (s.ok()) {
           // Need to fsync, otherwise it might get lost after a power reset.
@@ -3932,8 +3934,8 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
           }
           if (s.ok()) {
             s = impl->immutable_db_options_.use_fsync
-                    ? log_writer->file()->Fsync(opts)
-                    : log_writer->file()->Sync(opts);
+                    ? wal_context.writer->file()->Fsync(opts)
+                    : wal_context.writer->file()->Sync(opts);
           }
         }
       }
