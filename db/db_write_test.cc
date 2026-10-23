@@ -42,6 +42,7 @@
 #include "util/write_batch_util.h"
 #include "utilities/fault_injection_env.h"
 #include "utilities/fault_injection_fs.h"
+#include "utilities/latency_injection_fs.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -3886,6 +3887,92 @@ TEST_P(DBWritePartitionTest, LeadershipSyncRecordsWalsBelowClaimHorizon) {
   }
 }
 
+TEST_P(DBWritePartitionTest, GateSyncToleratesCoupledRotation) {
+  // The sync write's claim and fsync run in its completion gate, after its
+  // group left the write queue. The sync write is held in its gate fsync by
+  // slow WAL syncs, and a manual flush (a coupled rotation of every
+  // partition) is started inside that window. D-9: the write is neither
+  // inserted nor published until the fsync, so the rotation's memtable
+  // switch waits for it (WaitForUnpublishedSyncGroups) and its WAL creation
+  // falls after the sync's end. The sync completes correctly: the write is
+  // acknowledged, every partition's deque stays consistent, and no mark is
+  // left behind. Ported from GC17's Muse candidate.
+  // Neuter: no WaitForUnpublishedSyncGroups in WaitForPendingWrites; the
+  // rotation lands inside the sync window.
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS("single-queue path only");
+    return;
+  }
+  constexpr size_t kPartitions = 4;
+  auto latency_fs = std::make_shared<LatencyInjectionFileSystem>(
+      FileSystem::Default(), LatencyInjectionFileSystem::Latency(),
+      /*seed=*/0);
+  std::unique_ptr<Env> latency_env(NewCompositeEnv(latency_fs));
+  Defer close_before_env([this] { Close(); });
+  Options options = CurrentOptions();
+  options.env = latency_env.get();
+  options.avoid_flush_during_shutdown = true;
+  OpenWithPartitions(kPartitions, options);
+  ASSERT_OK(Put(cf_for_partition_[1], "pending", "v"));
+  LatencyInjectionFileSystem::Latency slow_sync;
+  slow_sync.sync_micros = 50000;
+  latency_fs->SetDefaultLatency(slow_sync);
+
+  std::mutex mu;
+  std::condition_variable cv;
+  bool in_gate_sync = false;
+  std::atomic<int> events{0};
+  std::atomic<int> sync_started_at{0};
+  std::atomic<int> rotated_at{0};
+  std::atomic<int> sync_finished_at{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SyncEveryWalPartition:TakesPartitionSyncMutex", [&](void*) {
+        std::lock_guard<std::mutex> lock(mu);
+        in_gate_sync = true;
+        cv.notify_all();
+        int expected = 0;
+        sync_started_at.compare_exchange_strong(expected, ++events);
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SwitchMemtable:AfterCreateWAL", [&](void*) {
+        int expected = 0;
+        rotated_at.compare_exchange_strong(expected, ++events);
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SyncWalsFromCompletionGate:AfterGateSync", [&](void*) {
+        int expected = 0;
+        sync_finished_at.compare_exchange_strong(expected, ++events);
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  WriteOptions sync_wo;
+  sync_wo.sync = true;
+  port::Thread writer(
+      [&] { ASSERT_OK(Put(cf_for_partition_[0], "synced", "v", sync_wo)); });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(30),
+                            [&] { return in_gate_sync; }));
+  }
+  ASSERT_OK(Flush(cf_for_partition_[1]));
+  writer.join();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  latency_fs->SetDefaultLatency(LatencyInjectionFileSystem::Latency());
+
+  // The rotation waited for the gate sync to finish.
+  ASSERT_NE(0, sync_started_at.load());
+  ASSERT_NE(0, rotated_at.load());
+  ASSERT_NE(0, sync_finished_at.load());
+  EXPECT_LT(sync_started_at.load(), sync_finished_at.load());
+  EXPECT_LT(sync_finished_at.load(), rotated_at.load());
+  AssertPartitionDequesConsistent();
+  // The sync completed and left no mark behind: a second sync write, which
+  // would hang on a stuck getting_synced mark, succeeds.
+  ASSERT_OK(Put(cf_for_partition_[0], "synced2", "v", sync_wo));
+  AssertPartitionDequesConsistent();
+}
+
 // The partitioned-WAL histograms (G-50) instrument the single-queue path;
 // with two_write_queues, Open() rejects WAL indexing and so N > 1 outside
 // tests.
@@ -4081,6 +4168,107 @@ TEST_P(DBWritePartitionTest, SyncWalAdvancesOtherPartitionsSyncedSize) {
   options.statistics->histogramData(WAL_SYNC_UNSYNCED_PARTITIONS, &unsynced);
   EXPECT_EQ(1U, unsynced.count);
   EXPECT_EQ(1U, unsynced.sum);
+}
+
+TEST_P(DBWritePartitionTest, SyncWalClaimTimeHorizonExcludesCoupledRotation) {
+  // GC03's claim-time SyncWAL horizon, regressed: a coupled rotation landing
+  // between a SyncWAL's claim and its completion must not mark the
+  // rotated-in WALs synced. SyncWAL holds no WAL mutexes across its fsync
+  // loop, so holding the loop open with slow WAL syncs and firing a coupled
+  // rotation inside (observed via the latency counters) lands the rotation
+  // mid-sync deterministically; sync points prove the order. Ported from
+  // D126193958's CoupledRotationDuringSyncWal, renamed for the GC03 horizon
+  // it pins rather than the leadership fix.
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS("single-queue path only");
+    return;
+  }
+  constexpr size_t kPartitions = 4;
+  auto latency_fs = std::make_shared<LatencyInjectionFileSystem>(
+      FileSystem::Default(), LatencyInjectionFileSystem::Latency(),
+      /*seed=*/0);
+  std::unique_ptr<Env> latency_env(NewCompositeEnv(latency_fs));
+  Defer close_before_env([this] { Close(); });
+  Options options = CurrentOptions();
+  options.env = latency_env.get();
+  options.statistics = CreateDBStatistics();
+  options.avoid_flush_during_shutdown = true;
+  OpenWithPartitions(kPartitions, options);
+  // Non-empty WALs everywhere, so the rotation installs a new generation.
+  for (size_t p = 0; p < kPartitions; ++p) {
+    ASSERT_OK(Put(cf_for_partition_[p], "init", "v"));
+  }
+  const uint64_t wal_before = dbfull()->TEST_CurrentWalNumber(0);
+  LatencyInjectionFileSystem::Latency slow_sync;
+  slow_sync.sync_micros = 100000;
+  latency_fs->SetDefaultLatency(slow_sync);
+
+  auto now_ns = [] {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+  };
+  std::atomic<uint64_t> sync_begin_ns{0};
+  std::atomic<uint64_t> before_mark_ns{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SyncWAL:Begin", [&](void*) { sync_begin_ns.store(now_ns()); });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SyncWAL:BeforeMarkLogsSynced:1",
+      [&](void*) { before_mark_ns.store(now_ns()); });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  Status sync_status;
+  port::Thread syncer([&] { sync_status = db_->SyncWAL(); });
+  // Wait until the SyncWAL is inside its slow fsync loop: the first fsync's
+  // counter lands after its 100ms sleep with three still queued, so no
+  // timing.
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(60);
+  for (;;) {
+    ASSERT_LT(std::chrono::steady_clock::now(), deadline)
+        << "SyncWAL never reached its fsync loop";
+    if (latency_fs->GetAggregateCounters().syncs >= 1) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+  const uint64_t switch_ns = now_ns();
+  // Bytes in the rotated-in WALs, before the SyncWAL completes: its
+  // claim-time horizon leaves them untouched however this interleaves.
+  for (size_t p = 0; p < kPartitions; ++p) {
+    ASSERT_OK(Put(cf_for_partition_[p], "after-rotation", "v"));
+  }
+  syncer.join();
+  ASSERT_OK(sync_status);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  latency_fs->SetDefaultLatency(LatencyInjectionFileSystem::Latency());
+
+  ASSERT_GT(sync_begin_ns.load(), 0u);
+  ASSERT_GT(before_mark_ns.load(), 0u);
+  EXPECT_LT(sync_begin_ns.load(), switch_ns);
+  EXPECT_LT(switch_ns, before_mark_ns.load());
+  EXPECT_NE(wal_before, dbfull()->TEST_CurrentWalNumber(0));
+  for (size_t p = 0; p < kPartitions; ++p) {
+    for (const auto& mark : dbfull()->TEST_WalSyncMarks(p)) {
+      ASSERT_FALSE(mark.second) << "partition " << p << " WAL " << mark.first;
+    }
+  }
+  EXPECT_EQ("v", Get(cf_for_partition_[0], "init"));
+  // The rotated-in WALs were not marked synced by that call: every
+  // partition holds bytes past synced_size, so a sync write counts all
+  // four (its own bytes land post-claim and are the only ones excluded).
+  ASSERT_OK(options.statistics->Reset());
+  WriteOptions sync_wo;
+  sync_wo.sync = true;
+  ASSERT_OK(Put(cf_for_partition_[0], "measured", "v", sync_wo));
+  HistogramData unsynced;
+  options.statistics->histogramData(WAL_SYNC_UNSYNCED_PARTITIONS, &unsynced);
+  EXPECT_EQ(1U, unsynced.count);
+  EXPECT_EQ(kPartitions, unsynced.sum);
+  AssertPartitionDequesConsistent();
 }
 
 TEST_P(DBWritePartitionTest, ImportStallHistogram) {
@@ -9660,6 +9848,52 @@ TEST_P(DBWritePartitionTest, CloseMarkerCoversEveryPartitionsWal) {
         static_cast_with_check<ColumnFamilyHandleImpl>(handle)->cfd();
     EXPECT_GT(cfd->GetLogNumber(), max_current_wal) << cfd->GetName();
   }
+  for (size_t p = 0; p < kPartitions; ++p) {
+    ASSERT_EQ("v", Get(cf_for_partition_[p], "k" + std::to_string(p)));
+  }
+}
+
+// N-3-3: with manual_wal_flush, Open flushes every partition's
+// buffered current WAL and must sync each of them, not only partition 0's;
+// a power loss right after Open then loses nothing.
+TEST_P(DBWritePartitionTest, PostOpenManualFlushSyncsEveryPartition) {
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS("single-queue path only");
+    return;
+  }
+  constexpr size_t kPartitions = 4;
+  std::shared_ptr<FaultInjectionTestFS> fault_fs(
+      new FaultInjectionTestFS(FileSystem::Default()));
+  fault_fs->SetInjectUnsyncedDataLoss(true);
+  auto latency_fs = std::make_shared<LatencyInjectionFileSystem>(
+      fault_fs, LatencyInjectionFileSystem::Latency(), /*seed=*/0);
+  std::unique_ptr<Env> env(NewCompositeEnv(latency_fs));
+  Defer close_before_env([this] { Close(); });
+  Options options = IndexedWalOptions(CurrentOptions());
+  options.env = env.get();
+  options.manual_wal_flush = true;
+  OpenWithPartitions(kPartitions, options);
+  for (size_t p = 0; p < kPartitions; ++p) {
+    ASSERT_OK(Put(cf_for_partition_[p], "k" + std::to_string(p), "v"));
+  }
+  ASSERT_OK(db_->FlushWAL(/*sync=*/true));
+  Close();
+
+  latency_fs->ResetCounters();
+  ReopenWithPartitions(kPartitions, options);
+  for (size_t p = 0; p < kPartitions; ++p) {
+    const uint64_t wal = dbfull()->TEST_CurrentWalNumber(p);
+    EXPECT_GE(latency_fs->GetWalCounters(wal).syncs, 1U)
+        << "partition " << p << " WAL " << wal;
+  }
+
+  // Power loss right after Open.
+  fault_fs->SetFilesystemActive(false);
+  Close();
+  ASSERT_OK(fault_fs->DropUnsyncedFileData());
+  fault_fs->SetFilesystemActive(true);
+  ReopenWithPartitions(kPartitions, options);
+  AssertPartitionDequesConsistent();
   for (size_t p = 0; p < kPartitions; ++p) {
     ASSERT_EQ("v", Get(cf_for_partition_[p], "k" + std::to_string(p)));
   }
