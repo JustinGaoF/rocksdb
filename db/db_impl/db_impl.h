@@ -4052,6 +4052,26 @@ class DBImpl : public DB
     return logs_.size();
   }
 
+  // The partitioned-WAL histograms record only above one partition, so at
+  // N=1 these read no clock and record nothing. WalPartitionStats() is for
+  // StopWatch; WalPartitionTimerStart() returns 0, without reading the clock,
+  // unless timers record, and WalPartitionTimerElapsed(0) is 0.
+  Statistics* WalPartitionStats() const {
+    return NumWalPartitions() > 1 ? stats_ : nullptr;
+  }
+  bool WalPartitionTimersEnabled() const {
+    return NumWalPartitions() > 1 && stats_ != nullptr &&
+           stats_->get_stats_level() > StatsLevel::kExceptTimers;
+  }
+  uint64_t WalPartitionTimerStart() const {
+    return WalPartitionTimersEnabled()
+               ? immutable_db_options_.clock->NowMicros()
+               : 0;
+  }
+  uint64_t WalPartitionTimerElapsed(uint64_t start) const {
+    return start == 0 ? 0 : immutable_db_options_.clock->NowMicros() - start;
+  }
+
   // The WAL partition the current write path binds to, chosen without holding
   // any WAL write mutex so the caller can take exactly that partition's mutex
   // before SelectWalForWrite() binds under it. Today every write targets
@@ -4065,6 +4085,8 @@ class DBImpl : public DB
   // order; see the LOCK ORDER note above. Never wait on a WalSyncCV while
   // holding the result (see the note).
   void LockWalWriteMutexes() {
+    StopWatch sw(immutable_db_options_.clock, WalPartitionStats(),
+                 WAL_WRITE_MUTEX_ALL_WAIT_MICROS);
     for (size_t p = 0; p < NumWalPartitions(); ++p) {
       WalWriteMutex(p).Lock();
     }
