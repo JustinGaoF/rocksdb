@@ -522,6 +522,11 @@ int db_stress_tool(int argc, char** argv) {
         "BytewiseComparator.u64ts.");
   }
 
+  if (FLAGS_wal_partitions < 1) {
+    return ReturnValidationError("wal_partitions must be at least 1, got ",
+                                 FLAGS_wal_partitions);
+  }
+
   if (FLAGS_read_only) {
     if (FLAGS_writepercent != 0 || FLAGS_delpercent != 0 ||
         FLAGS_delrangepercent != 0) {
