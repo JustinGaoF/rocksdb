@@ -3839,12 +3839,7 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
         uint64_t wal_used;
         uint64_t log_size;
         WalContext wal_context;
-        wal_context.writer = impl->logs_.back().writer;
-        wal_context.wal_file_number_size =
-            std::addressof(impl->alive_wal_files_.back());
-
-        assert(wal_context.writer->get_log_number() ==
-               wal_context.wal_file_number_size->number);
+        impl->SelectWalForWrite(&wal_context);
         impl->mutex_.AssertHeld();
         uint64_t wal_index = 0;
         if (log::WALIndexEnabled(

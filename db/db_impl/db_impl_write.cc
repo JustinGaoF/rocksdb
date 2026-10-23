@@ -2329,10 +2329,9 @@ Status DBImpl::PreprocessWrite(const WriteOptions& write_options,
   } else {
     wal_context->need_wal_sync = false;
   }
-  wal_context->writer = logs_.back().writer;
+  SelectWalForWrite(wal_context);
   wal_context->need_wal_dir_sync =
       wal_context->need_wal_dir_sync && !wal_dir_synced_;
-  wal_context->wal_file_number_size = std::addressof(alive_wal_files_.back());
 
   return status;
 }
@@ -2455,6 +2454,18 @@ IOStatus DBImpl::CoverBurnedWALIndex(const WriteOptions& write_options,
 
 // When two_write_queues_ is disabled, this function is called from the only
 // write thread. Otherwise this must be called holding wal_write_mutex_.
+void DBImpl::SelectWalForWrite(WalContext* wal_context) {
+  assert(wal_context != nullptr);
+  assert(!logs_.empty());
+  assert(!alive_wal_files_.empty());
+
+  wal_context->writer = logs_.back().writer;
+  wal_context->wal_file_number_size = std::addressof(alive_wal_files_.back());
+
+  assert(wal_context->writer->get_log_number() ==
+         wal_context->wal_file_number_size->number);
+}
+
 IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
                             const WriteOptions& write_options,
                             WalContext& wal_context, uint64_t* wal_used,
@@ -2652,12 +2663,9 @@ IOStatus DBImpl::ConcurrentWriteGroupToWAL(
   wal_write_mutex_.Lock();
 
   WalContext wal_context;
-  wal_context.writer = logs_.back().writer;
-  wal_context.wal_file_number_size = std::addressof(alive_wal_files_.back());
+  SelectWalForWrite(&wal_context);
 
   WalFileNumberSize& wal_file_number_size = *wal_context.wal_file_number_size;
-
-  assert(wal_context.writer->get_log_number() == wal_file_number_size.number);
 
   if (merged_batch == write_group.leader->batch) {
     write_group.leader->wal_used = wal_file_number_size.number;

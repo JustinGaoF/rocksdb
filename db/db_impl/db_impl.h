@@ -3071,6 +3071,20 @@ class DBImpl : public DB
   IOStatus CoverBurnedWALIndex(const WriteOptions& write_options,
                                log::Writer* log_writer, uint64_t wal_index);
 
+  // Binds `wal_context` to the WAL that writes should be appended to, and to
+  // that WAL's file-number/size accounting.
+  //
+  // There is exactly one WAL, so this unconditionally selects the newest. It
+  // exists as a named seam rather than an inline `logs_.back()` because it is
+  // the single point at which a future `wal_partitions > 1` would choose among
+  // several WALs, and because the three callers were open-coding the same pair
+  // of `.back()` calls plus the same consistency assertion.
+  //
+  // REQUIRES: wal_write_mutex_ held, or called from Open() before the DB is
+  // visible to other threads. See the synchronization notes on logs_ and
+  // alive_wal_files_.
+  void SelectWalForWrite(WalContext* wal_context);
+
   // `wal_context` names the WAL these writes go to and carries the sync
   // requirements for it. It is populated by PreprocessWrite().
   IOStatus WriteToWAL(const WriteBatch& merged_batch,
