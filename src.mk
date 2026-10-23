@@ -306,6 +306,7 @@ LIB_SOURCES =                                                   \
   utilities/fault_injection_env.cc                              \
   utilities/fault_injection_fs.cc                               \
   utilities/fault_injection_secondary_cache.cc                  \
+  utilities/latency_injection_fs.cc                             \
   utilities/leveldb_options/leveldb_options.cc                  \
   utilities/memory/memory_util.cc                               \
   utilities/merge_operators.cc                                  \
@@ -547,6 +548,7 @@ TEST_MAIN_SOURCES =                                                     \
   db/db_test.cc                                                         \
   db/db_logical_block_size_cache_test.cc                                \
   db/db_universal_compaction_test.cc                                    \
+  db/db_wal_oracle_test.cc                                              \
   db/db_wal_test.cc                                                     \
   db/db_with_timestamp_compaction_test.cc                               \
   db/db_write_buffer_manager_test.cc                                    \
@@ -673,6 +675,7 @@ TEST_MAIN_SOURCES =                                                     \
   utilities/sorted_run_builder/sorted_run_builder_test.cc               \
   utilities/env_timed_test.cc                                           \
   utilities/fault_injection_fs_test.cc                                  \
+  utilities/latency_injection_fs_test.cc                                \
   utilities/memory/memory_test.cc                                       \
   utilities/merge_operators/string_append/stringappend_test.cc          \
   utilities/object_registry_test.cc                                     \

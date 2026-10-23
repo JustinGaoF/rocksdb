@@ -101,6 +101,7 @@
 #include "util/xxhash.h"
 #include "utilities/blob_db/blob_db.h"
 #include "utilities/counted_fs.h"
+#include "utilities/latency_injection_fs.h"
 #include "utilities/merge_operators.h"
 #include "utilities/merge_operators/bytesxor.h"
 #include "utilities/merge_operators/sortlist.h"
@@ -1751,6 +1752,23 @@ DEFINE_int64(
     "returning a non-retryable IOError after this many reads. Used to exercise "
     "graceful fatal-shutdown of RocksDB and user callbacks (Env/FileSystem) "
     "under adverse conditions. 0 disables.");
+
+DEFINE_bool(inject_wal_latency, false,
+            "Wrap the FileSystem in a LatencyInjectionFileSystem that delays "
+            "WAL appends and syncs (and no other file), and print its "
+            "counters at the end. Installed even when every latency is 0, so "
+            "the wrapper's own cost can be measured.");
+DEFINE_uint64(wal_append_latency_us, 0,
+              "With --inject_wal_latency, microseconds added to every WAL "
+              "Append and PositionedAppend.");
+DEFINE_uint64(wal_sync_latency_us, 0,
+              "With --inject_wal_latency, microseconds added to every WAL "
+              "Sync, Fsync and RangeSync.");
+DEFINE_uint64(wal_latency_jitter_us, 0,
+              "With --inject_wal_latency, each WAL operation also gets a "
+              "deterministic extra delay in [0, this] derived from "
+              "--wal_latency_seed, the WAL number and the operation index.");
+DEFINE_uint64(wal_latency_seed, 0, "Seed of the WAL latency jitter.");
 
 DEFINE_int64(
     preclude_last_level_data_seconds, 0,
@@ -11980,6 +11998,23 @@ int db_bench_tool(int argc, char** argv, ToolHooks& hooks) {
     FLAGS_env = fault_env.get();
   }
 
+  // Held in a static, like the wrappers above, so the FileSystem/Env
+  // outlives all DB usage; the FileSystem is kept to print its counters.
+  static std::shared_ptr<ROCKSDB_NAMESPACE::LatencyInjectionFileSystem>
+      wal_latency_fs;
+  if (FLAGS_inject_wal_latency) {
+    ROCKSDB_NAMESPACE::LatencyInjectionFileSystem::Latency latency;
+    latency.append_micros = FLAGS_wal_append_latency_us;
+    latency.sync_micros = FLAGS_wal_sync_latency_us;
+    latency.jitter_micros = FLAGS_wal_latency_jitter_us;
+    wal_latency_fs =
+        std::make_shared<ROCKSDB_NAMESPACE::LatencyInjectionFileSystem>(
+            FLAGS_env->GetFileSystem(), latency, FLAGS_wal_latency_seed);
+    static std::shared_ptr<ROCKSDB_NAMESPACE::Env> wal_latency_env =
+        NewCompositeEnv(wal_latency_fs);
+    FLAGS_env = wal_latency_env.get();
+  }
+
   // Let -readonly imply -use_existing_db
   FLAGS_use_existing_db |= FLAGS_readonly;
 
@@ -12053,6 +12088,11 @@ int db_bench_tool(int argc, char** argv, ToolHooks& hooks) {
 
   ROCKSDB_NAMESPACE::Benchmark benchmark;
   benchmark.Run(hooks);
+
+  if (wal_latency_fs) {
+    fprintf(stdout, "WAL latency injection counters:\n%s",
+            wal_latency_fs->PrintCounters().c_str());
+  }
 
   if (FLAGS_print_malloc_stats) {
     std::string stats_string;
