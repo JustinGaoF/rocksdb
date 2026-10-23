@@ -2687,6 +2687,14 @@ class DBImpl : public DB
       bool* corrupted_wal_found, RecoveryContext* recovery_ctx,
       std::vector<WALIndexSupersession>* supersessions);
 
+  // Pre-replay peek at each WAL head: sets *all_indexed unless some live WAL
+  // carries no index, in which case the set must replay sequentially. Fails
+  // fast on indexed data without a marker over an intact head; a damaged
+  // head stays merge-side for the attestation path.
+  Status CheckWALFilesCarryWALIndex(const std::vector<uint64_t>& wal_numbers,
+                                    uint64_t min_wal_number, bool is_retry,
+                                    bool* all_indexed);
+
   Status ProcessLogFile(uint64_t wal_number, uint64_t min_wal_number,
                         bool is_retry, bool read_only, int job_id,
                         SequenceNumber* next_sequence,

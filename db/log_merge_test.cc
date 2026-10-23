@@ -106,6 +106,29 @@ class LogMergeTest : public ::testing::TestWithParam<std::tuple<int, bool>> {
     std::unique_ptr<Writer> writer_;
   };
 
+  // One legacy WAL image: plain records, no marker, no indices. What a
+  // kNone DB leaves behind when the option is enabled later.
+  class PlainFile {
+   public:
+    PlainFile(uint64_t log_number, bool recyclable) : log_number_(log_number) {
+      std::unique_ptr<FSWritableFile> sink(new test::StringSink(&contents_));
+      std::unique_ptr<WritableFileWriter> file_writer(
+          new WritableFileWriter(std::move(sink), "", FileOptions()));
+      writer_.reset(new Writer(std::move(file_writer), log_number, recyclable));
+    }
+    Status Data(const std::string& payload) {
+      return writer_->AddRecord(WriteOptions(), Slice(payload), /*seqno=*/0,
+                                /*wal_index=*/0);
+    }
+    std::string Bytes() const { return contents_.ToString(); }
+    uint64_t log_number() const { return log_number_; }
+
+   private:
+    uint64_t log_number_;
+    Slice contents_;
+    std::unique_ptr<Writer> writer_;
+  };
+
   // Scripted merge member for cases real files cannot produce on demand: a
   // persistently idle member, or head damage with synthetic attestation.
   class ScriptMember : public WALIndexMerger::Member {
@@ -131,11 +154,13 @@ class LogMergeTest : public ::testing::TestWithParam<std::tuple<int, bool>> {
         ++idle_pulls_;
       } else if (step.kind == Pull::kRecord) {
         seen_first_ = true;
+        indexed_pulled++;
         if (first_indexed_ == 0) {
           first_indexed_ = step.wal_index;
         }
       } else if (step.kind == Pull::kUnindexed) {
         seen_first_ = true;
+        unindexed_pulled++;
       } else {
         done_ = true;
       }
@@ -189,7 +214,15 @@ class LogMergeTest : public ::testing::TestWithParam<std::tuple<int, bool>> {
       return done_ && first_indexed_ != 0 && tail_impure;
     }
     bool TailReported() const override { return done_ && tail_reported; }
+    // Coherence simulation for the marker gates. A scripted member is a
+    // coherent indexed file unless the test opts into contradiction.
+    bool SawWALIndexMarker() const override { return saw_marker; }
+    uint64_t IndexedDataPulled() const override { return indexed_pulled; }
+    uint64_t UnindexedDataPulled() const override { return unindexed_pulled; }
 
+    bool saw_marker = true;
+    uint64_t indexed_pulled = 0;
+    uint64_t unindexed_pulled = 0;
     bool head_intact = true;
     bool tail_impure = false;
     bool tail_reported = false;
@@ -230,6 +263,12 @@ class LogMergeTest : public ::testing::TestWithParam<std::tuple<int, bool>> {
     step.kind = WALIndexMerger::Member::Pull::kFinishedStop;
     return step;
   }
+  static ScriptMember::Step Unindexed(const std::string& payload) {
+    ScriptMember::Step step;
+    step.kind = WALIndexMerger::Member::Pull::kUnindexed;
+    step.payload = payload;
+    return step;
+  }
 
   std::unique_ptr<WALIndexMerger::Member> MakeMember(
       const MemberFile& file, const std::string& bytes, int fail_on_read = 0,
@@ -245,6 +284,22 @@ class LogMergeTest : public ::testing::TestWithParam<std::tuple<int, bool>> {
     options.file = std::move(file_reader);
     options.fragment_buffered = fragment_buffered();
     options.wal_recovery_mode = wal_recovery_mode;
+    options.stop_on_report = stop_on_report;
+    return std::unique_ptr<WALIndexMerger::Member>(
+        new WALIndexMerger::ReaderMember(std::move(options)));
+  }
+
+  std::unique_ptr<WALIndexMerger::Member> MakeMember(
+      const PlainFile& file, const std::string& bytes, int fail_on_read = 0,
+      bool stop_on_report = false) {
+    std::unique_ptr<FSSequentialFile> source(
+        new InMemorySource(bytes, fail_on_read));
+    std::unique_ptr<SequentialFileReader> file_reader(
+        new SequentialFileReader(std::move(source), ""));
+    WALIndexMerger::ReaderMemberOptions options;
+    options.wal_number = file.log_number();
+    options.file = std::move(file_reader);
+    options.fragment_buffered = fragment_buffered();
     options.stop_on_report = stop_on_report;
     return std::unique_ptr<WALIndexMerger::Member>(
         new WALIndexMerger::ReaderMember(std::move(options)));
@@ -1479,6 +1534,112 @@ TEST_P(LogMergeTest, DiscardedHoleSkipsWhenForgiving) {
   ASSERT_EQ(std::vector<uint64_t>({1, 2, 3, 6, 7}),
             DrivenIndices(forgiving_driven));
   ASSERT_EQ(8U, forgiving->GetFrontier());
+}
+
+// A merge handed a set containing an unindexed file fails instead of emitting
+// a stream that misplaces that file's records. Nothing is emitted first: the
+// gate runs inside the pull-down, ahead of the unindexed drain.
+TEST_P(LogMergeTest, UnindexedFileFailsMergeBeforeAnyEmission) {
+  MemberFile a(120, recyclable());
+  ASSERT_OK(a.Marker());
+  ASSERT_OK(a.Data("a1", 1, 1));
+  PlainFile b(121, recyclable());
+  ASSERT_OK(b.Data("legacy"));
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(a, a.Bytes()));
+  members.push_back(MakeMember(b, b.Bytes()));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kError, driven.outcome);
+  ASSERT_TRUE(driven.records.empty());
+  ASSERT_NE(std::string::npos, merger->GetError().ToString().find("121"));
+  ASSERT_NE(std::string::npos,
+            merger->GetError().ToString().find("predates partition_wal_usage"));
+}
+
+// Same gate, but the head is damaged: the file may predate the option or its
+// marker may have been lost to the damage, and the error says so instead of
+// picking one. Scripted: a real file cannot put an unindexed pull after a
+// head report on demand (a checksum break drops the whole buffer, an unknown
+// type desynchronizes recyclable headers), so the intact-head case above
+// carries the end-to-end pin and this one pins the evidence clause.
+TEST_P(LogMergeTest, UnindexedFileWithDamagedHeadNamesLostMarker) {
+  MemberFile a(120, recyclable());
+  ASSERT_OK(a.Marker());
+  ASSERT_OK(a.Data("a1", 1, 1));
+  auto legacy = std::unique_ptr<WALIndexMerger::Member>(
+      new ScriptMember(121, {Unindexed("legacy")}));
+  ScriptMember* scripted = static_cast<ScriptMember*>(legacy.get());
+  scripted->saw_marker = false;
+  scripted->head_intact = false;
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(a, a.Bytes()));
+  members.push_back(std::move(legacy));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kError, driven.outcome);
+  ASSERT_TRUE(driven.records.empty());
+  ASSERT_NE(std::string::npos, merger->GetError().ToString().find("121"));
+  ASSERT_NE(std::string::npos, merger->GetError().ToString().find(
+                                   "a lost marker cannot be ruled out"));
+}
+
+// A marker is a promise: a file carrying one whose data records are all
+// unindexed breaks it. The failure lands when the member finishes, which for
+// a small file is still inside the initial pull-down.
+TEST_P(LogMergeTest, MarkerWithoutIndicesFailsAtMemberFinish) {
+  const int hs = header_size();
+  MemberFile a(120, recyclable());
+  MemberFile b(121, recyclable());
+  ASSERT_OK(a.Marker());
+  ASSERT_OK(a.Data("u1", 1, 1));
+  ASSERT_OK(a.Data("u2", 2, 2));
+  ASSERT_OK(b.Marker());
+  ASSERT_OK(b.Data("b3", 3, 3));
+  std::string a_bytes = a.Bytes();
+  const size_t record_size = static_cast<size_t>(hs) + 2 * kWALIndexSize + 2;
+  for (int i = 0; i < 2; ++i) {
+    const size_t header = static_cast<size_t>(hs) + i * record_size;
+    SetByte(&a_bytes, header + 6,
+            static_cast<char>(recyclable() ? kRecyclableFullType : kFullType));
+    FixChecksumAt(&a_bytes, header, 2 * kWALIndexSize + 2, recyclable());
+  }
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(a, a_bytes));
+  members.push_back(MakeMember(b, b.Bytes()));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kError, driven.outcome);
+  ASSERT_TRUE(driven.records.empty());
+  ASSERT_NE(std::string::npos, merger->GetError().ToString().find("120"));
+  ASSERT_NE(std::string::npos,
+            merger->GetError().ToString().find("carry no wal_index"));
+}
+
+// The reverse: indexed data with no marker and an intact head, which the
+// marker would have survived. Damaged heads stay on the attestation path
+// pinned by the head-damage suite above; this is the never-written case.
+TEST_P(LogMergeTest, IndexedDataWithoutMarkerFailsWhenHeadIntact) {
+  MemberFile a(120, recyclable());
+  MemberFile b(121, recyclable());
+  ASSERT_OK(a.Data("a1", 1, 1));
+  ASSERT_OK(a.Data("a2", 2, 2));
+  ASSERT_OK(b.Marker());
+  ASSERT_OK(b.Data("b3", 3, 3));
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(a, a.Bytes()));
+  members.push_back(MakeMember(b, b.Bytes()));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kError, driven.outcome);
+  ASSERT_TRUE(driven.records.empty());
+  ASSERT_NE(std::string::npos, merger->GetError().ToString().find("120"));
+  ASSERT_NE(std::string::npos,
+            merger->GetError().ToString().find("without a WAL index marker"));
 }
 
 // A member whose file holds its marker and then a header cut short at end of

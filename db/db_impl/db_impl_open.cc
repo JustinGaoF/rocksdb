@@ -223,6 +223,21 @@ Status ValidateOptionsByTable(
   }
   return Status::OK();
 }
+
+// Counts head corruption during the pre-replay WAL index peek. The peek
+// reports nothing outward: the chosen recovery path re-reads each file and
+// reports for itself.
+class WALIndexPeekReporter : public log::Reader::Reporter {
+ public:
+  void Corruption(size_t /*bytes*/, const Status& /*status*/,
+                  uint64_t /*log_number*/) override {
+    saw_corruption_ = true;
+  }
+  bool saw_corruption() const { return saw_corruption_; }
+
+ private:
+  bool saw_corruption_ = false;
+};
 }  // namespace
 
 Status DBImpl::ValidateOptions(
@@ -1242,6 +1257,72 @@ void DBOpenLogRecordReadReporter::OldLogRecord(size_t bytes) {
                  static_cast<int>(bytes));
 }
 
+Status DBImpl::CheckWALFilesCarryWALIndex(
+    const std::vector<uint64_t>& wal_numbers, uint64_t min_wal_number,
+    bool is_retry, bool* all_indexed) {
+  assert(all_indexed != nullptr);
+  *all_indexed = true;
+  for (uint64_t wal_number : wal_numbers) {
+    if (wal_number < min_wal_number) {
+      continue;
+    }
+    const std::string fname =
+        LogFileName(immutable_db_options_.GetWalDir(), wal_number);
+    std::unique_ptr<FSSequentialFile> file;
+    Status open_status = fs_->NewSequentialFile(
+        fname, fs_->OptimizeForLogRead(file_options_), &file, nullptr);
+    if (!open_status.ok()) {
+      // Same as the merged path: indexed recovery fails on an unopenable WAL.
+      return open_status;
+    }
+    std::unique_ptr<SequentialFileReader> file_reader(new SequentialFileReader(
+        std::move(file), fname, immutable_db_options_.log_readahead_size,
+        io_tracer_, /*listeners=*/{},
+        /*rate_limiter=*/nullptr,
+        /*verify_and_reconstruct_read=*/is_retry));
+    WALIndexPeekReporter reporter;
+    log::Reader reader(immutable_db_options_.info_log, std::move(file_reader),
+                       &reporter, /*checksum=*/true, wal_number);
+    Slice record;
+    std::string scratch;
+    if (!reader.ReadRecord(&record, &scratch,
+                           immutable_db_options_.wal_recovery_mode)) {
+      // No data: an empty or metadata-only file contributes nothing either
+      // way. A read error surfaces when the chosen path reads the file.
+      continue;
+    }
+    if (reader.SawWALIndexMarker()) {
+      continue;
+    }
+    if (reader.GetLastReadWALIndex() != 0) {
+      if (reporter.saw_corruption()) {
+        // The head is damaged, so the marker may have been lost to the
+        // damage: the merge's attestation path owns that question.
+        ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                       "WAL #%" PRIu64
+                       " bears indexed data without a marker after head "
+                       "damage; merging so attestation can bound the loss",
+                       wal_number);
+        continue;
+      }
+      return Status::Corruption(
+          "WAL " + std::to_string(wal_number) +
+          " bears indexed data without a WAL index marker (detected before "
+          "replay); the marker is the file's first record, so an intact "
+          "head would show it");
+    }
+    // No marker and an unindexed first record: the file has no position in
+    // the merged order, so the set replays sequentially instead.
+    ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                   "WAL #%" PRIu64 " carries no WAL index (%s)", wal_number,
+                   reporter.saw_corruption()
+                       ? "head damaged, a lost marker cannot be ruled out"
+                       : "predates partition_wal_usage");
+    *all_indexed = false;
+  }
+  return Status::OK();
+}
+
 // REQUIRES: wal_numbers are sorted in ascending order
 Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& wal_numbers,
                                SequenceNumber* next_sequence, bool read_only,
@@ -1266,10 +1347,29 @@ Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& wal_numbers,
     // single ordered history across files. Predecessor verification chains
     // one file's replay into the next, which the merge's concurrent pulls
     // cannot reproduce, so that combination keeps the sequential path.
-    status = ProcessLogFilesMerged(wal_numbers, read_only, is_retry,
-                                   min_wal_number, job_id, next_sequence,
-                                   &version_edits, corrupted_wal_found,
-                                   recovery_ctx, &wal_index_supersessions);
+    bool all_indexed = true;
+    status = CheckWALFilesCarryWALIndex(wal_numbers, min_wal_number, is_retry,
+                                        &all_indexed);
+    if (status.ok()) {
+      if (all_indexed) {
+        status = ProcessLogFilesMerged(wal_numbers, read_only, is_retry,
+                                       min_wal_number, job_id, next_sequence,
+                                       &version_edits, corrupted_wal_found,
+                                       recovery_ctx, &wal_index_supersessions);
+      } else {
+        // Both option transitions leave a mixed set on disk, and the files
+        // without indices have no position in the merged order. The set
+        // replays sequentially instead, which is the correct order while
+        // one WAL is written at a time.
+        ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                       "Recovering WALs sequentially: the recovery set mixes "
+                       "indexed and unindexed files");
+        status = ProcessLogFiles(wal_numbers, read_only, is_retry,
+                                 min_wal_number, job_id, next_sequence,
+                                 &version_edits, corrupted_wal_found,
+                                 recovery_ctx, &wal_index_supersessions);
+      }
+    }
   } else {
     status = ProcessLogFiles(wal_numbers, read_only, is_retry, min_wal_number,
                              job_id, next_sequence, &version_edits,
