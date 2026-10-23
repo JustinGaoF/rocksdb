@@ -10598,13 +10598,12 @@ TEST(TransactionPartitionedWalTest, PreparedUnindexedWalSurvivesPartitioning) {
   ASSERT_OK(DestroyDB(dbname, options));
 }
 
-// G-10 (not fixed here; GC07 Not done): CommitAndTryCreateSnapshot publishes
-// its commit sequence from a post-memtable callback
-// (CreateTimestampedSnapshotImpl's SetLastSequence), outside the N>1 applied
-// prefix. With A, the lower sequence on partition 0, held in its append, B's
-// commit on partition 1 makes B's sequence visible above A.
+// G-10: CommitAndTryCreateSnapshot's timestamped snapshot must not publish its
+// commit sequence above the N>1 applied prefix. With A, the lower sequence on
+// partition 0, held in its append, B's commit on partition 1 must leave B's
+// sequence invisible until A is released.
 TEST(TransactionPartitionedWalTest,
-     DISABLED_SnapshotCommitPublishesAboveHeldLowerWrite) {
+     SnapshotCommitPublishesAboveHeldLowerWrite) {
   constexpr size_t kPartitions = 2;
   SyncPoint::GetInstance()->SetCallBack(
       "DBImpl::ValidateOptions:AllowWalPartitions",

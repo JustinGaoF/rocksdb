@@ -157,6 +157,21 @@ class WalDurabilityTracker {
     Recompute(partition, new_pending);
   }
 
+  // Drops [low, high] on partition p as Complete does, if it is still
+  // registered. For a range whose WAL append failed, once recovery from that
+  // failure succeeded: it holds no data, so it must stop holding the frontier
+  // below every later write. Unlike Complete, an absent range is not a bug (a
+  // group whose append landed and whose sync failed completed it already).
+  void Release(size_t partition, uint64_t low, uint64_t high) {
+    assert(partition < inflight_.size());
+    for (const Range& r : inflight_[partition]) {
+      if (r.low == low && r.high == high) {
+        Complete(partition, low, high);
+        return;
+      }
+    }
+  }
+
   // Current durability frontier: every sequence at or below it is durable.
   // Monotonic; 0 before anything completes.
   uint64_t SafePoint() const {

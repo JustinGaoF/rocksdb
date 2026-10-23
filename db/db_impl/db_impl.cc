@@ -2365,6 +2365,7 @@ Status DBImpl::FlushWAL(const FlushWALOptions& options) {
 Status DBImpl::FlushWAL(const WriteOptions& write_options, bool sync) {
   if (manual_wal_flush_) {
     IOStatus io_s;
+    uint64_t failed_wal_number = 0;
     {
       // We need to lock since the WAL writers might change concurrently.
       // Every partition's current WAL is flushed: the application-visible
@@ -2379,6 +2380,7 @@ Status DBImpl::FlushWAL(const WriteOptions& write_options, bool sync) {
         }
         io_s = current_wal->writer->WriteBuffer(write_options);
         if (!io_s.ok()) {
+          failed_wal_number = current_wal->number;
           break;
         }
       }
@@ -2388,7 +2390,7 @@ Status DBImpl::FlushWAL(const WriteOptions& write_options, bool sync) {
                       io_s.ToString().c_str());
       // In case there is a fs error we should set it globally to prevent the
       // future writes
-      WALIOStatusCheck(io_s);
+      WALIOStatusCheck(io_s, failed_wal_number);
       // whether sync or not, we should abort the rest of function upon error
       return static_cast<Status>(io_s);
     }
@@ -2881,7 +2883,8 @@ bool DBImpl::ClaimWalPartitionForSyncWalImpl(
 }
 
 IOStatus DBImpl::SyncWalPartitionFiles(size_t partition,
-                                       const WriteOptions& write_options) {
+                                       const WriteOptions& write_options,
+                                       uint64_t* failed_wal_number) {
   // At N==1 the single-queue leadership sync calls this without the WAL
   // mutex, as before the partitioned path existed (single writer, and the
   // getting_synced marks exclude SyncWAL); every other caller holds it.
@@ -2902,6 +2905,7 @@ IOStatus DBImpl::SyncWalPartitionFiles(size_t partition,
       const uint64_t size = f->GetFileSize();
       io_s = immutable_db_options_.use_fsync ? f->Fsync(opts) : f->Sync(opts);
       if (!io_s.ok()) {
+        *failed_wal_number = log.number;
         break;
       }
       log.synced_size = size;
@@ -5973,7 +5977,12 @@ DBImpl::CreateTimestampedSnapshotImpl(SequenceNumber snapshot_seq, uint64_t ts,
   // number.
   if (need_update_seq) {
     assert(versions_);
-    if (last_seq_same_as_publish_seq_) {
+    if (NumWalPartitions() > 1) {
+      // The write group's completion gate published everything at or below
+      // snapshot_seq before running this; other partitions may have
+      // published past it since.
+      assert(versions_->LastSequence() >= snapshot_seq);
+    } else if (last_seq_same_as_publish_seq_) {
       versions_->SetLastSequence(snapshot_seq);
     } else {
       // TODO: support write-prepared/write-unprepared transactions with two
@@ -8120,6 +8129,8 @@ Status DBImpl::CommitFileIngestionHandles(
     // memtable flush.
     // So wait here to ensure there is no pending write to memtable.
     WaitForPendingWrites();
+    // The jobs below assign sequences from LastSequence() + 1.
+    AssertLastSequenceCoversAllocated();
 
     num_running_ingest_file_ += static_cast<int>(num_jobs);
     TEST_SYNC_POINT("DBImpl::IngestExternalFile:AfterIncIngestFileCounter");
