@@ -1839,8 +1839,7 @@ Status DBImpl::WriteImpl(
         // partition 0 only.
         const size_t bound_partition = wal_context.wal_partition;
         WalWriteMutexLock l(&WalWriteMutex(bound_partition));
-        assert(!WalLogs(bound_partition).empty());
-        LogWriterNumber& current_wal = WalLogs(bound_partition).back();
+        LogWriterNumber& current_wal = CurrentWal(bound_partition);
         if (current_wal.number == wal_context.wal_file_number_size->number) {
           current_wal.SetAttemptTruncateSize(wal_context.prev_size);
         }
@@ -2523,7 +2522,10 @@ void DBImpl::WALIOStatusCheck(const IOStatus& io_status,
     // it through the transition hook in SetBGError above.
     mutex_.Unlock();
   } else {
-    // Force writable file to be continue writable.
+    // Force writable file to be continue writable. No caller holds a WAL
+    // write mutex, so taking partition 0's cannot deadlock or violate the
+    // lock order.
+    WalWriteMutexLock wal_lock(&WalWriteMutex(0));
     CurrentWal().writer->file()->reset_seen_error();
   }
 }
@@ -2684,38 +2686,14 @@ Status DBImpl::PreprocessWrite(const WriteOptions& write_options,
         continue;
       }
       WalWriteMutexLock l(&WalWriteMutex(p));
-      if (WalLogs(p).empty()) {
-        wal_context->wal_sync_claimed[p] = false;
-        continue;
-      }
-      while (WalLogs(p).front().IsSyncing()) {
-        WalSyncCV(p).Wait();
-      }
-      bool unsynced = false;
-      for (auto& log : WalLogs(p)) {
-        unsynced = unsynced || log.HasUnsyncedBytes();
-        log.PrepareForSync();
-      }
-      wal_context->wal_sync_unsynced_partitions += unsynced ? 1 : 0;
-      wal_context->wal_sync_claimed[p] = true;
+      wal_context->wal_sync_claimed[p] = ClaimWalPartitionForLeadershipSync(
+          p, &wal_context->wal_sync_unsynced_partitions);
     }
     {
       WalWriteMutexLock l(&WalWriteMutex(wal_partition));
-      while (WalLogs(wal_partition).front().IsSyncing()) {
-        WalSyncCV(wal_partition).Wait();
-      }
-      bool unsynced = false;
-      for (auto& log : WalLogs(wal_partition)) {
-        unsynced = unsynced || log.HasUnsyncedBytes();
-        // This is just to prevent the logs to be synced by a parallel SyncWAL
-        // call. We will do the actual syncing later after we will write to
-        // the WAL.
-        // Note: there does not seem to be a reason to set this early before
-        // we actually write to the WAL
-        log.PrepareForSync();
-      }
-      wal_context->wal_sync_unsynced_partitions += unsynced ? 1 : 0;
-      wal_context->wal_sync_claimed[wal_partition] = true;
+      wal_context->wal_sync_claimed[wal_partition] =
+          ClaimWalPartitionForLeadershipSync(
+              wal_partition, &wal_context->wal_sync_unsynced_partitions);
       SelectWalForWrite(wal_partition, wal_context);
     }
     wal_context->wal_sync_micros += WalPartitionTimerElapsed(claim_start);
@@ -2904,13 +2882,11 @@ IOStatus DBImpl::CoverBurnedWALIndex(const WriteOptions& write_options,
 // partition's WalWriteMutex.
 void DBImpl::SelectWalForWrite(size_t wal_partition, WalContext* wal_context) {
   assert(wal_context != nullptr);
-  assert(!WalLogs(wal_partition).empty());
-  assert(!AliveWalFiles(wal_partition).empty());
 
   wal_context->wal_partition = wal_partition;
-  wal_context->writer = WalLogs(wal_partition).back().writer;
+  wal_context->writer = CurrentWal(wal_partition).writer;
   wal_context->wal_file_number_size =
-      std::addressof(AliveWalFiles(wal_partition).back());
+      std::addressof(CurrentAliveWal(wal_partition));
 
   assert(wal_context->writer->get_log_number() ==
          wal_context->wal_file_number_size->number);
@@ -2940,11 +2916,15 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
   // this call. Otherwise the mutex is taken here: it guards the file
   // records below against a concurrent FlushWAL by the application
   // (manual_wal_flush_) and, at N > 1, against a concurrent leadership
-  // sync flushing this file's buffers. The take is deliberately after the
-  // log_entry hook so a test holding the append open there pins no mutex.
-  // At N==1 the take applies only under manual flush without two write
-  // queues, exactly as before the partitioned path existed: a default N=1
-  // write takes no WAL mutex here.
+  // sync flushing this file's buffers, and it guards the size bookkeeping
+  // after the append against the WAL-mutex readers of entry sizes. The take
+  // is deliberately after the log_entry hook so a test holding the append
+  // open there pins no mutex. At N==1 the take applies only under manual
+  // flush without two write queues, exactly as before the partitioned path
+  // existed: a default N=1 write takes no WAL mutex here, and its
+  // bookkeeping below is serialized instead by write-thread leadership, or
+  // for Open's post-recovery marker by single-threaded Open under mutex_
+  // (see alive_wal_files_).
   const bool take_lock =
       !wal_mutex_held && (NumWalPartitions() > 1 ||
                           UNLIKELY(manual_wal_flush_ && !two_write_queues_));
@@ -2985,16 +2965,22 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
   (void)sequence_count;
 #endif
 
-  if (take_lock) {
-    WalWriteMutex(wal_context.wal_partition).Unlock();
-  }
-
+  // The WAL mutex, when held, stays held across the bookkeeping: the size
+  // accumulates under it, matching its WAL-mutex readers. A default N==1
+  // write holds none and relies on leadership, or for Open's post-recovery
+  // marker on single-threaded Open (see alive_wal_files_). After
+  // the unlock only the entry's immutable number may be touched through
+  // wal_file_number_size (see CurrentAliveWal's escape rule).
   if (wal_used != nullptr) {
     *wal_used = wal_file_number_size.number;
   }
   wals_total_size_.FetchAddRelaxed(log_entry.size());
   wal_file_number_size.AddSize(*log_size);
   WalEmpty(wal_context.wal_partition) = false;
+
+  if (take_lock) {
+    WalWriteMutex(wal_context.wal_partition).Unlock();
+  }
 
   return io_s;
 }
@@ -3246,12 +3232,12 @@ IOStatus DBImpl::WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
     StopWatch sw(immutable_db_options_.clock, stats_, WAL_FILE_SYNC_MICROS);
     const uint64_t sync_start = WalPartitionTimerStart();
     uint64_t fsynced_partitions = 0;
-    // It's safe to access WalLogs(p) with unlocked mutex_ here because:
+    // It's safe to sync partition p's WALs with unlocked mutex_ here because:
     //  - we've set getting_synced=true for all logs,
-    //    so other threads won't pop from WalLogs(p) while we're here,
-    //  - only writer thread can push to WalLogs(p), and we're in
-    //    writer thread, so no one will push to WalLogs(p),
-    //  - as long as other threads don't modify it, it's safe to read
+    //    so other threads won't retire them while we're here,
+    //  - only writer thread can install a current WAL, and we're in
+    //    writer thread, so no one will install one,
+    //  - as long as other threads don't modify the deque, it's safe to read
     //    from std::deque from multiple threads concurrently.
     //
     // Sync operation should work with locked WAL write mutexes, because:
@@ -3288,25 +3274,7 @@ IOStatus DBImpl::WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
         if (take_partition_locks) {
           WalWriteMutex(p).Lock();
         }
-        for (auto& log : WalLogs(p)) {
-          IOOptions opts;
-          io_s = WritableFileWriter::PrepareIOOptions(write_options, opts);
-          if (!io_s.ok()) {
-            break;
-          }
-          // If last sync failed on a later WAL, this could be a fully synced
-          // and closed WAL that just needs to be recorded as synced in the
-          // manifest.
-          if (auto* f = log.writer->file()) {
-            const uint64_t size = f->GetFileSize();
-            io_s = immutable_db_options_.use_fsync ? f->Fsync(opts)
-                                                   : f->Sync(opts);
-            if (!io_s.ok()) {
-              break;
-            }
-            log.synced_size = size;
-          }
-        }
+        io_s = SyncWalPartitionFiles(p, write_options);
         if (take_partition_locks) {
           WalWriteMutex(p).Unlock();
         }
@@ -3389,7 +3357,7 @@ IOStatus DBImpl::ConcurrentWriteGroupToWAL(
     return io_s;
   }
 
-  // We need to lock since logs_ and alive_wal_files might be pushed back
+  // We need to lock since the partition's WAL deques might change
   // concurrently. Exactly one partition's mutex: the whole group carries the
   // route its leader resolved before group formation.
   const size_t wal_partition = write_group.leader->wal_partition;
@@ -3611,11 +3579,24 @@ Status DBImpl::SwitchWAL(WriteContext* write_context) {
   assert(write_context != nullptr);
   Status status;
 
-  if (AliveWalFiles(0).begin()->getting_flushed) {
+  // With more than one partition the DB's oldest live WAL can be on any of
+  // them: an outstanding prepare can pin a later partition's WAL after
+  // partition 0's older one retired. File numbers are unique across
+  // partitions, so the minimum is unambiguous.
+  size_t oldest_partition = 0;
+  WalFileNumberSize oldest_alive_wal = OldestAliveWal(0);
+  for (size_t p = 1; p < NumWalPartitions(); ++p) {
+    const WalFileNumberSize candidate = OldestAliveWal(p);
+    if (candidate.number < oldest_alive_wal.number) {
+      oldest_partition = p;
+      oldest_alive_wal = candidate;
+    }
+  }
+  if (oldest_alive_wal.getting_flushed) {
     return status;
   }
 
-  auto oldest_alive_log = AliveWalFiles(0).begin()->number;
+  auto oldest_alive_log = oldest_alive_wal.number;
   bool flush_wont_release_oldest_log = false;
   if (allow_2pc()) {
     auto oldest_log_with_uncommitted_prep =
@@ -3645,7 +3626,7 @@ Status DBImpl::SwitchWAL(WriteContext* write_context) {
     // transactions then we cannot flush this log until those transactions are
     // commited.
     unable_to_release_oldest_log_ = false;
-    AliveWalFiles(0).begin()->getting_flushed = true;
+    MarkOldestAliveWalGettingFlushed(oldest_partition);
   }
 
   ROCKS_LOG_INFO(
@@ -4379,19 +4360,20 @@ Status DBImpl::SwitchMemtableImpl(ColumnFamilyData* cfd, WriteContext* context,
       return span;
     }
     WalWriteMutexLock l(&WalWriteMutex(partition));
-    if (!WalLogs(partition).empty()) {
-      log::Writer* cur_log_writer = WalLogs(partition).back().writer;
+    const LogWriterNumber* current_wal = CurrentWalOrNull(partition);
+    if (current_wal != nullptr) {
       span = log::MakeWALIndexPredecessorSpan(
-          cur_log_writer->get_log_number(),
-          cur_log_writer->first_wal_index_recorded(), wal_index_high);
+          current_wal->writer->get_log_number(),
+          current_wal->writer->first_wal_index_recorded(), wal_index_high);
     }
     return span;
   };
   auto predecessor_wal_info = [this](size_t partition) {
     PredecessorWALInfo info;
     WalWriteMutexLock l(&WalWriteMutex(partition));
-    if (!WalLogs(partition).empty()) {
-      log::Writer* cur_log_writer = WalLogs(partition).back().writer;
+    const LogWriterNumber* current_wal = CurrentWalOrNull(partition);
+    if (current_wal != nullptr) {
+      log::Writer* cur_log_writer = current_wal->writer;
       info = PredecessorWALInfo(cur_log_writer->get_log_number(),
                                 cur_log_writer->file()->GetFileSize(),
                                 cur_log_writer->GetLastSeqnoRecorded());
@@ -4490,13 +4472,14 @@ Status DBImpl::SwitchMemtableImpl(ColumnFamilyData* cfd, WriteContext* context,
     AllWalWriteMutexesLock l(this);
     assert(new_log != nullptr);
     for (size_t p = 0; s.ok() && p < NumWalPartitions(); ++p) {
-      if (WalLogs(p).empty()) {
+      const LogWriterNumber* current_wal = CurrentWalOrNull(p);
+      if (current_wal == nullptr) {
         continue;
       }
       // Always flush the buffer of the last log before switching to a new one,
       // except when recovery is replacing a file-scoped failed WAL. Its
       // accepted contents are persisted by the atomic recovery flush.
-      log::Writer* cur_log_writer = WalLogs(p).back().writer;
+      log::Writer* cur_log_writer = current_wal->writer;
       const bool abandon_current_wal =
           recovering_from_wal_write_error_ &&
           cur_log_writer->get_log_number() <= recover_wal_through_number_;
@@ -4544,8 +4527,7 @@ Status DBImpl::SwitchMemtableImpl(ColumnFamilyData* cfd, WriteContext* context,
             p == 0 ? new_log_number : extra_wal_numbers[p - 1];
         assert(p == 0 || number > cur_wal_number_);
         WalEmpty(p) = true;
-        WalLogs(p).emplace_back(number, p == 0 ? new_log : extra_wals[p - 1]);
-        AliveWalFiles(p).emplace_back(number);
+        InstallCurrentWal(p, number, p == 0 ? new_log : extra_wals[p - 1]);
       }
     }
   }
