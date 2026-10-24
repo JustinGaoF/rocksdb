@@ -909,6 +909,12 @@ void DBImpl::CancelAllBackgroundWork(bool wait) {
   }
   shutting_down_.store(true, std::memory_order_release);
   bg_cv_.SignalAll();
+  if (NumWalPartitions() > 1) {
+    // Writes parked in their completion gate return ShutdownInProgress
+    // unless already covered, as a stalled write does.
+    InstrumentedMutexLock seq_lock(&sequence_wal_index_mutex_);
+    wal_durability_cv_.SignalAll();
+  }
   env_->UnSchedule(&bg_async_file_open_state_, Env::Priority::HIGH);
   if (!wait) {
     return;
@@ -1174,6 +1180,18 @@ Status DBImpl::CloseHelper() {
   // marker. After this we do a variant of the waiting and unschedule work
   // (to consider: moving all the waiting into CancelAllBackgroundWork(true))
   CancelAllBackgroundWork(false);
+
+  if (NumWalPartitions() > 1) {
+    // The shutdown marker woke every write parked in its completion gate;
+    // the gate's mutex and cv are freed with this DB, so wait for them to
+    // leave. A write reaching its gate after this point is a write
+    // concurrent with Close(), which is unsupported.
+    InstrumentedMutexLock seq_lock(&sequence_wal_index_mutex_);
+    while (wal_durability_waiters_.load(std::memory_order_relaxed) > 0) {
+      wal_durability_cv_.Wait();
+    }
+  }
+  TEST_SYNC_POINT("DBImpl::CloseHelper:WalDurabilityWaitersLeft");
 
   // Cancel manual compaction if there's any
   if (HasPendingManualCompaction()) {
