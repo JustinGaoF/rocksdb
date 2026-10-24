@@ -290,6 +290,58 @@ class DBSecondaryTest : public DBSecondaryTestBase {
   explicit DBSecondaryTest() : DBSecondaryTestBase("db_secondary_test") {}
 };
 
+class DBSecondaryWalPartitionsTest
+    : public DBSecondaryTest,
+      public testing::WithParamInterface<uint32_t> {};
+
+INSTANTIATE_TEST_CASE_P(WalPartitions1, DBSecondaryWalPartitionsTest,
+                        testing::Values(1U));
+INSTANTIATE_TEST_CASE_P(WalPartitions8, DBSecondaryWalPartitionsTest,
+                        testing::Values(test::kTestWalPartitions));
+
+// A secondary replays the primary's WALs one file at a time, so it refuses
+// WALs written at more than one partition before applying any of them: a
+// catch-up after the primary reopens at N partitions fails and exposes none
+// of its writes, and a new OpenAsSecondary fails. At one partition both
+// succeed. The other tests in this file run at one partition, since at more
+// every secondary open or catch-up meets this refusal.
+TEST_P(DBSecondaryWalPartitionsTest, SecondaryAtWalPartitions) {
+  Options options = CurrentOptions();
+  Options one_partition = options;
+  one_partition.wal_partitions = 1;
+  Reopen(one_partition);
+  ASSERT_OK(Put("before", "value"));
+  Options secondary_options = options;
+  secondary_options.max_open_files = -1;
+  OpenSecondary(secondary_options);
+  std::string value;
+  ASSERT_OK(db_secondary_->Get(ReadOptions(), "before", &value));
+
+  Reopen(options);
+  ASSERT_OK(Put("after", "value"));
+  Status s = db_secondary_->TryCatchUpWithPrimary();
+  if (GetParam() == 1) {
+    ASSERT_OK(s);
+    ASSERT_OK(db_secondary_->Get(ReadOptions(), "after", &value));
+  } else {
+    ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+    ASSERT_NE(std::string::npos, s.ToString().find("wal_partitions > 1"))
+        << s.ToString();
+    ASSERT_TRUE(
+        db_secondary_->Get(ReadOptions(), "after", &value).IsNotFound());
+  }
+
+  CloseSecondary();
+  s = TryOpenSecondary(secondary_options);
+  if (GetParam() == 1) {
+    ASSERT_OK(s);
+  } else {
+    ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+    ASSERT_NE(std::string::npos, s.ToString().find("wal_partitions > 1"))
+        << s.ToString();
+  }
+}
+
 TEST_F(DBSecondaryTest, FailOpenIfLoggerCreationFail) {
   Options options = GetDefaultOptions();
   options.create_if_missing = true;

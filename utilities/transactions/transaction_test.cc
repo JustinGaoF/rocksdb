@@ -78,6 +78,20 @@ INSTANTIATE_TEST_CASE_P(
         WRAP_PARAM(bool, bool, TxnDBWritePolicy, WriteOrdering),
         StackableDBAsBaseDB_TransactionTest_Params)));
 
+// Open rejects two_write_queues and unordered_write at wal_partitions > 1.
+const auto WalPartitions8_TransactionTest_Params =
+    ::testing::Values(std::make_tuple(false, false, WRITE_COMMITTED,
+                                      kOrderedWrite, false, INT64_C(0)),
+                      std::make_tuple(false, false, WRITE_PREPARED,
+                                      kOrderedWrite, false, INT64_C(0)),
+                      std::make_tuple(false, false, WRITE_UNPREPARED,
+                                      kOrderedWrite, false, INT64_C(0)));
+
+INSTANTIATE_TEST_CASE_P(WalPartitions8, TransactionTest,
+                        WalPartitions8_TransactionTest_Params);
+INSTANTIATE_TEST_CASE_P(WalPartitions8, TransactionStressTest,
+                        WalPartitions8_TransactionTest_Params);
+
 // MySQLStyleTransactionTest takes far too long for valgrind to run. Only do it
 // in full mode (`ROCKSDB_FULL_VALGRIND_RUN` compiler flag is set).
 #if !defined(ROCKSDB_VALGRIND_RUN) || defined(ROCKSDB_FULL_VALGRIND_RUN)
@@ -277,7 +291,8 @@ TEST_P(TransactionTest, SuccessTest) {
 }
 
 TEST_P(TransactionTest, DirectWriteCommitPath) {
-  if (options.two_write_queues || options.unordered_write) {
+  if (options.two_write_queues || options.unordered_write ||
+      options.wal_partitions > 1) {
     ROCKSDB_GTEST_BYPASS(
         "Blob direct write v1 only supports the ordered single-write-queue "
         "path");
@@ -1993,6 +2008,11 @@ TEST_P(TransactionTest, TwoPhaseDoubleRecoveryTest) {
 }
 
 TEST_P(TransactionTest, TwoPhaseLogRollingTest) {
+  if (test::WalPartitionsForCurrentTest() > 1) {
+    // It asserts that the prepares land in the one current WAL.
+    ROCKSDB_GTEST_BYPASS("Asserts a single current WAL");
+    return;
+  }
   DBImpl* db_impl = static_cast_with_check<DBImpl>(db->GetRootDB());
 
   Status s;
@@ -2146,6 +2166,11 @@ TEST_P(TransactionTest, TwoPhaseLogRollingTest) {
 }
 
 TEST_P(TransactionTest, TwoPhaseLogRollingTest2) {
+  if (test::WalPartitionsForCurrentTest() > 1) {
+    // It asserts that the prepares land in the one current WAL.
+    ROCKSDB_GTEST_BYPASS("Asserts a single current WAL");
+    return;
+  }
   DBImpl* db_impl = static_cast_with_check<DBImpl>(db->GetRootDB());
 
   Status s;
@@ -6467,7 +6492,8 @@ TEST_P(TransactionTest, DuplicateKeys) {
     }  // do_rollback
   }  // do_prepare
 
-  if (!options.unordered_write) {
+  // Open rejects max_successive_merges > 0 at wal_partitions > 1.
+  if (!options.unordered_write && options.wal_partitions == 1) {
     // Also test with max_successive_merges > 0. max_successive_merges will not
     // affect our algorithm for duplicate key insertion but we add the test to
     // verify that.
@@ -6768,6 +6794,12 @@ TEST_P(TransactionTest, ReseekOptimization) {
 // there. The new log files should be still read succesfully during recovery of
 // the 2nd crash.
 TEST_P(TransactionTest, DoubleCrashInRecovery) {
+  if (test::WalPartitionsForCurrentTest() > 1) {
+    // It corrupts partition 0's current WAL at a fixed offset, but at N > 1
+    // the writes it targets land in another partition's WAL.
+    ROCKSDB_GTEST_BYPASS("Corrupts the single current WAL");
+    return;
+  }
   for (const bool manual_wal_flush : {false, true}) {
     for (const bool write_after_recovery : {false, true}) {
       options.wal_recovery_mode = WALRecoveryMode::kPointInTimeRecovery;
@@ -10202,6 +10234,10 @@ TEST_P(TransactionDBTest, SelfDeadlockBug) {
 
 INSTANTIATE_TEST_CASE_P(
     TransactionDBBasicTest, TransactionDBTest,
+    ::testing::Combine(/*user_per_key_point_lock_manager=*/::testing::Bool(),
+                       /*deadlock_timeout_us=*/::testing::Values(0, 1000)));
+INSTANTIATE_TEST_CASE_P(
+    WalPartitions8, TransactionDBTest,
     ::testing::Combine(/*user_per_key_point_lock_manager=*/::testing::Bool(),
                        /*deadlock_timeout_us=*/::testing::Values(0, 1000)));
 

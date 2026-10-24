@@ -39,6 +39,7 @@ class OptimisticTransactionTest
     options.max_write_buffer_number = 2;
     options.max_write_buffer_size_to_maintain = 2 * Arena::kInlineSize;
     options.merge_operator.reset(new TestPutOperator());
+    test::SetWalPartitions(&options, test::WalPartitionsForCurrentTest());
     occ_opts.validate_policy = GetParam();
     dbname = test::PerThreadDBPath("optimistic_transaction_testdb");
 
@@ -2675,6 +2676,10 @@ INSTANTIATE_TEST_CASE_P(
     InstanceOccGroup, OptimisticTransactionTest,
     testing::Values(OccValidationPolicy::kValidateSerial,
                     OccValidationPolicy::kValidateParallel));
+// Open rejects serial validation at wal_partitions > 1.
+INSTANTIATE_TEST_CASE_P(
+    WalPartitions8, OptimisticTransactionTest,
+    testing::Values(OccValidationPolicy::kValidateParallel));
 
 // Serial validation runs on the write group leader, and N partitions run N
 // leaders, so it is rejected at Open with N > 1. Parallel validation commits.
