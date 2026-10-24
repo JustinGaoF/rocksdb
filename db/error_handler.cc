@@ -297,6 +297,7 @@ void ErrorHandler::CancelErrorRecoveryForShutDown() {
 void ErrorHandler::HandleKnownErrors(const Status& bg_err,
                                      BackgroundErrorReason reason,
                                      const DBRecoverContext& context,
+                                     bool wal_related,
                                      bool allow_auto_recovery) {
   db_mutex_->AssertHeld();
   if (bg_err.ok()) {
@@ -356,6 +357,15 @@ void ErrorHandler::HandleKnownErrors(const Status& bg_err,
     Status s = new_bg_err;
     EventHelpers::NotifyOnBackgroundError(db_options_.listeners, reason, &s,
                                           db_mutex_, &auto_recovery);
+    if (wal_related && reason == BackgroundErrorReason::kWriteCallback &&
+        db_->NumWalPartitions() > 1 &&
+        (s.ok() || s.severity() < new_bg_err.severity())) {
+      // D-1: above one partition a failed WAL write leaves its range pinned
+      // below every later write on every partition, and only recovery from
+      // this error releases it. Listeners are told, but cannot suppress or
+      // soften it.
+      s = new_bg_err;
+    }
     if (!s.ok() && (s.severity() > bg_error_.severity())) {
       // Same store as the severity paths in SetBGError, including the
       // durability wake.
@@ -593,7 +603,8 @@ void ErrorHandler::SetBGErrorImpl(const Status& bg_status,
     StartRecoverFromRetryableBGIOError(bg_io_err);
     return;
   }
-  HandleKnownErrors(new_bg_io_err, reason, context, allow_auto_recovery);
+  HandleKnownErrors(new_bg_io_err, reason, context, wal_related,
+                    allow_auto_recovery);
 }
 
 void ErrorHandler::AddFilesToQuarantine(
@@ -674,12 +685,12 @@ Status ErrorHandler::ClearBGError() {
     Status old_bg_error = bg_error_;
     // old_bg_error is only for notifying listeners, so may not be checked
     old_bg_error.PermitUncheckedError();
+    // Releases the failed WAL ranges and closes their gate fences before the
+    // stopped flag clears, so every write it admits allocates above them.
+    db_->ClearWalDurabilityBGError();
     // Clear and check the recovery IO and BG error
     is_db_stopped_.store(false, std::memory_order_release);
     bg_error_ = Status::OK();
-    // The background error is OK again; parked durability waits (if any
-    // remained) must observe that instead of a stale error leg.
-    db_->ClearWalDurabilityBGError();
     recovery_error_ = IOStatus::OK();
     // Recovery facts belong to one background-error episode. Keeping a
     // retired WAL cutoff or reserved sequence here would attach it to a later,

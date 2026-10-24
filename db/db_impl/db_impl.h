@@ -3315,10 +3315,13 @@ class DBImpl : public DB
 
   // Blocks until LastSequence() covers `target` and, for a group with a WAL
   // record (`wal_record`), the durability frontier covers it too, i.e. every
-  // WAL record at or below it completed. Returns a background error instead
-  // if one arrives while still uncovered: the group must not report OK on a
-  // write the DB has since decided it cannot honour. Called without holding
-  // any mutex; takes sequence_wal_index_mutex_ only to park, never together
+  // WAL record at or below it completed. Its only other exits: the status of
+  // a gate fence holding `target` (a range at or below it failed, so it can
+  // never be acknowledged, even once recovery covers it), and
+  // ShutdownInProgress once shutdown begins while still uncovered. Any other
+  // background error leaves it waiting, as one WAL leaves a group whose
+  // append succeeded. Called without holding any mutex; takes
+  // sequence_wal_index_mutex_ only to check fences and park, never together
   // with mutex_.
   Status WaitForWalDurability(SequenceNumber target, bool wal_record);
 
@@ -3335,18 +3338,51 @@ class DBImpl : public DB
   // publication that stores an error or repeats the recorded severity.
   // Called only from ErrorHandler (CheckAndSetRecoveryAndBGError, and
   // HandleKnownErrors for a repeat) with mutex_ held, never while bg_error_
-  // is OK. Sets the predicate flag first so a waiter checking after the
-  // store observes the error without needing the signal, then always
-  // signals under sequence_wal_index_mutex_ so a waiter already parked is
-  // woken. Either way no waiter can miss the error between its predicate
-  // check and park. Safe with no waiters; takes no WAL or sync-mark mutex.
+  // is OK. Sets the flag, then signals under sequence_wal_index_mutex_.
+  // Woken gates only recheck their exits; an error that fences no gate
+  // (InstallWalGateFence) leaves them parked. Safe with no waiters; takes
+  // no WAL or sync-mark mutex.
   void SignalWalDurabilityWaitersOnBGError();
 
   // Clears the durability park predicate's background-error leg, and
   // releases every range whose append failed (failed_wal_ranges_) from both
-  // trackers: recovery succeeded, and those ranges hold no data. Called only
-  // from ErrorHandler::ClearBGError with mutex_ held.
+  // trackers: recovery succeeded, and those ranges hold no data. Before that,
+  // closes every standing gate fence at the last allocated sequence, so a
+  // write allocated above a released range still fails whenever it reaches
+  // its gate. Called only from ErrorHandler::ClearBGError with mutex_ held,
+  // before it clears the stopped flag, so no write admitted after recovery
+  // falls inside a fence.
   void ClearWalDurabilityBGError();
+
+  // N>1 only. Fences every gate whose target is at or above `low`: a range
+  // starting there failed (its append, or its memtable insert), so nothing
+  // at or above it can ever be acknowledged (D-1). The fence stays open-ended
+  // until recovery releases the range (`released_by_recovery`; a failed
+  // insert's range is never released), and holds `status` (the background
+  // error) for those gates to return. Wakes parked gates.
+  // REQUIRES: mutex_ held.
+  void InstallWalGateFence(SequenceNumber low, const Status& status,
+                           bool released_by_recovery);
+
+  // The status of a fence holding `target`, or OK.
+  // REQUIRES: sequence_wal_index_mutex_ held.
+  Status WalGateFenceStatusLocked(SequenceNumber target) const;
+
+  // As above, without the mutex when no fence can hold `target`.
+  Status WalGateFenceStatus(SequenceNumber target) {
+    if (target < wal_gate_fence_low_.load(std::memory_order_acquire) ||
+        target > wal_gate_fence_high_.load(std::memory_order_acquire)) {
+      return Status::OK();
+    }
+    InstrumentedMutexLock l(&sequence_wal_index_mutex_);
+    return WalGateFenceStatusLocked(target);
+  }
+
+  // The lowest sequence an unreleased fence holds, or kMaxSequenceNumber.
+  // Every memtable entry at or above it belongs to a write that can never be
+  // acknowledged, so a flush drops it.
+  // REQUIRES: mutex_ held.
+  SequenceNumber UnreleasedWalGateFenceLow();
 
   // Runs a write group's completion gate: wait until the durability frontier
   // covers `target`, then, for a sync write whose leadership-time fsync may
@@ -3384,7 +3420,10 @@ class DBImpl : public DB
   void ExtendWALRecoveryCutoff(uint64_t failed_wal_number);
 
   // Used by WriteImpl to update bg_error_ in case of memtable insert error.
-  void HandleMemTableInsertFailure(const Status& nonok_memtable_insert_status);
+  // At N>1 the group's range, starting at `first_sequence`, stays
+  // unpublished for good, so it also fences every gate at or above it.
+  void HandleMemTableInsertFailure(const Status& nonok_memtable_insert_status,
+                                   SequenceNumber first_sequence);
 
   Status CompactFilesImpl(const CompactionOptions& compact_options,
                           ColumnFamilyData* cfd, Version* version,
@@ -4104,26 +4143,35 @@ class DBImpl : public DB
   // Parks completion-gate waiters until the durability frontier advances.
   // Bound to sequence_wal_index_mutex_ because every frontier advance runs
   // under it, so signaling needs no extra locking; a waiter holds it only
-  // while parked, never across the wait's bg-error check (see
+  // to check fences and while parked, never with mutex_ (see
   // WaitForWalDurability), so the leaf rule in the LOCK ORDER note holds.
   InstrumentedCondVar wal_durability_cv_{&sequence_wal_index_mutex_};
-  // Waiters parked in WaitForWalDurability. A test hook first: tests
-  // use it to prove a write is parked before injecting a failure. The
-  // frontier signal also consults it, under sequence_wal_index_mutex_, so
-  // uncontended writes pay one relaxed load; the background-error signal
-  // never consults it (a count checked outside the mutex is what lost
-  // wakes).
+  // Waiters parked in WaitForWalDurability, counted under
+  // sequence_wal_index_mutex_. Tests use it to prove a write is parked
+  // before injecting a failure; the frontier signal consults it under that
+  // mutex, so uncontended writes pay one relaxed load; CloseHelper waits for
+  // it to drain before teardown frees the mutex and cv.
   std::atomic<size_t> wal_durability_waiters_{0};
-  // Background-error leg of the durability park predicate. Set (release)
-  // before every background-error wake, which ErrorHandler issues only
-  // while an error is recorded, and read (acquire) under
-  // sequence_wal_index_mutex_ before parking, so an error published
-  // between the predicate check and the park still wakes the waiter. A
-  // set flag only means "recheck GetBGError under mutex_";
-  // the error itself still lives in the ErrorHandler. Cleared only in
-  // ErrorHandler::ClearBGError, the single transition of the background
-  // error back to OK.
+  // Set on every background-error wake, which ErrorHandler issues only
+  // while an error is recorded, and cleared only in
+  // ErrorHandler::ClearBGError. Such a wake only makes parked gates
+  // recheck: a gate fails on a fence, never on this flag. Tests read it.
   std::atomic<bool> wal_durability_bg_error_{false};
+  // Gate fences (InstallWalGateFence): a gate whose target lies in
+  // [low, high] returns `status`. high is kMaxSequenceNumber until recovery
+  // releases the failed range. Kept for the DB's lifetime, one per failure,
+  // so a write held past recovery still fails. Guarded by
+  // sequence_wal_index_mutex_; the bounds below are stored under it and read
+  // lock-free, so a gate outside every fence pays two loads.
+  struct WalGateFence {
+    SequenceNumber low;
+    SequenceNumber high;
+    Status status;
+    bool released_by_recovery;
+  };
+  std::vector<WalGateFence> wal_gate_fences_;
+  std::atomic<SequenceNumber> wal_gate_fence_low_{kMaxSequenceNumber};
+  std::atomic<SequenceNumber> wal_gate_fence_high_{0};
   uint64_t next_wal_index_ = log::kWALIndexStartNumber;
 
   // If zero, manual compactions are allowed to proceed. If non-zero, manual
