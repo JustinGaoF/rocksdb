@@ -4,6 +4,7 @@
 //  (found in the LICENSE.Apache file in the root directory).
 
 #include <algorithm>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -61,6 +62,61 @@ class RepairTest : public DBTestBase {
     SyncPoint::GetInstance()->DisableProcessing();
   }
 };
+
+class RepairWalPartitionsTest : public RepairTest,
+                                public testing::WithParamInterface<uint32_t> {};
+
+INSTANTIATE_TEST_CASE_P(WalPartitions1, RepairWalPartitionsTest,
+                        testing::Values(1U));
+INSTANTIATE_TEST_CASE_P(WalPartitions8, RepairWalPartitionsTest,
+                        testing::Values(test::kTestWalPartitions));
+
+// RepairDB converts WALs to tables one file at a time, so it refuses WALs
+// written at more than one partition before it writes anything: the DB
+// directory is unchanged and still opens with every write. At one partition
+// it repairs a lost MANIFEST as LostManifest does. The other tests in this
+// file run at one partition, since at more every repair meets this refusal.
+TEST_P(RepairWalPartitionsTest, RepairAtWalPartitions) {
+  Options options = CurrentOptions();
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("flushed", "value"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("unflushed", "value"));
+  const std::string manifest_path =
+      DescriptorFileName(dbname_, dbfull()->TEST_Current_Manifest_FileNo());
+  Close();
+
+  // The DB's files, as opposed to its LOCK and info logs.
+  auto read_dir = [&]() {
+    std::map<std::string, std::string> contents;
+    std::vector<std::string> children;
+    EXPECT_OK(env_->GetChildren(dbname_, &children));
+    for (const std::string& child : children) {
+      uint64_t number = 0;
+      FileType type;
+      if (ParseFileName(child, &number, &type) && type != kInfoLogFile &&
+          type != kDBLockFile) {
+        EXPECT_OK(
+            ReadFileToString(env_, dbname_ + "/" + child, &contents[child]));
+      }
+    }
+    return contents;
+  };
+  if (GetParam() == 1) {
+    ASSERT_OK(env_->DeleteFile(manifest_path));
+    ASSERT_OK(RepairDB(dbname_, options));
+  } else {
+    const std::map<std::string, std::string> before = read_dir();
+    const Status s = RepairDB(dbname_, options);
+    ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+    ASSERT_NE(std::string::npos, s.ToString().find("wal_partitions > 1"))
+        << s.ToString();
+    ASSERT_EQ(before, read_dir());
+  }
+  Reopen(options);
+  ASSERT_EQ("value", Get("flushed"));
+  ASSERT_EQ("value", Get("unflushed"));
+}
 
 TEST_F(RepairTest, SortRepairedDBL0ByEpochNumber) {
   Options options = CurrentOptions();

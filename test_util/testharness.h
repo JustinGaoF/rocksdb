@@ -60,6 +60,7 @@
 
 #include "port/stack_trace.h"
 #include "rocksdb/env.h"
+#include "rocksdb/options.h"
 
 namespace ROCKSDB_NAMESPACE {
 namespace test {
@@ -82,6 +83,22 @@ int RandomSeed();
 // ROCKSDB_BIGMEM_TESTS is set). There should generally be only one "big mem"
 // test per unit test file, to reduce OOM risks in parallel runs.
 bool HasBigMem();
+
+// The WAL partition count that the WAL consumer and transaction suites also
+// run at, besides 1.
+constexpr uint32_t kTestWalPartitions = 8;
+
+// The WAL partition count for the running test: kTestWalPartitions when it is
+// a value-parameterized test instantiated with the name "WalPartitions8",
+// otherwise 1. It is read from the test's name, so a fixture can apply it
+// while it is constructed, without a parameter of its own.
+uint32_t WalPartitionsForCurrentTest();
+
+// Sets options->wal_partitions to `wal_partitions` together with what Open
+// requires for more than one partition: WAL indexing, MANIFEST WAL tracking,
+// no WAL recycling, and the testing opt-in, which works in release builds as
+// well. Leaves `options` unchanged when `wal_partitions` is 1.
+void SetWalPartitions(DBOptions* options, uint32_t wal_partitions);
 
 ::testing::AssertionResult AssertStatus(const char* s_expr, const Status& s);
 

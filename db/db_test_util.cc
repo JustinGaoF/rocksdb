@@ -9,8 +9,11 @@
 
 #include "db/db_test_util.h"
 
+#include <future>
+
 #include "cache/cache_reservation_manager.h"
 #include "db/forward_iterator.h"
+#include "db/write_batch_internal.h"
 #include "env/fs_readonly.h"
 #include "env/mock_env.h"
 #include "file/file_util.h"
@@ -170,6 +173,14 @@ bool DBTestBase::ShouldSkipOptions(int option_config, int skip_mask) {
     return true;
   }
   if ((skip_mask & kSkipRowCache) && option_config == kRowCache) {
+    return true;
+  }
+  if (test::WalPartitionsForCurrentTest() > 1 &&
+      (option_config == kHashSkipList || option_config == kVectorRep ||
+       option_config == kHashLinkList || option_config == kPipelinedWrite ||
+       option_config == kConcurrentWALWrites ||
+       option_config == kUnorderedWrite)) {
+    // Open rejects these at wal_partitions > 1.
     return true;
   }
   return false;
@@ -603,6 +614,7 @@ Options DBTestBase::GetOptions(
       options_override.level_compaction_dynamic_level_bytes;
   options.env = env_;
   options.create_if_missing = true;
+  test::SetWalPartitions(&options, test::WalPartitionsForCurrentTest());
   return options;
 }
 
@@ -1936,6 +1948,136 @@ void VerifySstUniqueIds(const TablePropertiesCollection& props) {
     ASSERT_OK(GetUniqueIdFromTableProperties(*pair.second, &id));
     ASSERT_TRUE(seen.insert(id).second);
   }
+}
+
+std::vector<uint32_t> ColumnFamilyIdsCoveringWalPartitions(
+    size_t num_partitions) {
+  std::vector<uint32_t> cf_ids(num_partitions, 0);
+  size_t num_covered = 0;
+  for (uint32_t cf_id = 1; num_covered < num_partitions; ++cf_id) {
+    WriteBatch batch;
+    EXPECT_OK(WriteBatchInternal::Put(&batch, cf_id, "key", "value"));
+    size_t partition = num_partitions;
+    EXPECT_OK(
+        DBImpl::TEST_WalPartitionForWrite(batch, num_partitions, &partition));
+    if (cf_ids[partition] == 0) {
+      cf_ids[partition] = cf_id;
+      ++num_covered;
+    }
+  }
+  return cf_ids;
+}
+
+std::vector<std::string> ColumnFamilyNamesThrough(
+    const std::vector<uint32_t>& cf_ids) {
+  std::vector<std::string> names = {kDefaultColumnFamilyName};
+  const uint32_t max_id = *std::max_element(cf_ids.begin(), cf_ids.end());
+  for (uint32_t cf_id = 1; cf_id <= max_id; ++cf_id) {
+    names.push_back("cf" + std::to_string(cf_id));
+  }
+  return names;
+}
+
+void AssertKeyPrefixesInEveryRecoveryMode(const Options& options,
+                                          const std::string& dbname,
+                                          const std::vector<uint32_t>& cf_ids,
+                                          const std::vector<uint64_t>& acked,
+                                          uint64_t max_keys) {
+  std::vector<ColumnFamilyDescriptor> column_families;
+  for (const std::string& name : ColumnFamilyNamesThrough(cf_ids)) {
+    column_families.emplace_back(name, options);
+  }
+  for (const WALRecoveryMode mode :
+       {WALRecoveryMode::kTolerateCorruptedTailRecords,
+        WALRecoveryMode::kAbsoluteConsistency,
+        WALRecoveryMode::kPointInTimeRecovery,
+        WALRecoveryMode::kSkipAnyCorruptedRecords}) {
+    SCOPED_TRACE("wal_recovery_mode=" + std::to_string(static_cast<int>(mode)));
+    Options mode_options = options;
+    mode_options.wal_recovery_mode = mode;
+    std::vector<ColumnFamilyHandle*> handles;
+    std::unique_ptr<DB> db;
+    ASSERT_OK(DB::OpenForReadOnly(mode_options, dbname, column_families,
+                                  &handles, &db));
+    for (size_t p = 0; p < cf_ids.size(); ++p) {
+      SCOPED_TRACE("partition=" + std::to_string(p));
+      bool missing = false;
+      for (uint64_t i = 0; i < max_keys; ++i) {
+        std::string value;
+        const Status s = db->Get(ReadOptions(), handles[cf_ids[p]],
+                                 "key" + std::to_string(i), &value);
+        if (s.IsNotFound()) {
+          EXPECT_GE(i, acked[p]);
+          missing = true;
+        } else {
+          EXPECT_OK(s);
+          EXPECT_FALSE(missing) << "key" << i << " present above a missing key";
+          EXPECT_EQ("value" + std::to_string(i), value);
+        }
+      }
+    }
+    for (ColumnFamilyHandle* handle : handles) {
+      EXPECT_OK(db->DestroyColumnFamilyHandle(handle));
+    }
+  }
+}
+
+PartitionWriters::PartitionWriters(
+    DB* db, const std::vector<ColumnFamilyHandle*>& handles,
+    const std::vector<uint32_t>& cf_ids, uint64_t max_keys)
+    : acked_(cf_ids.size()) {
+  for (size_t p = 0; p < cf_ids.size(); ++p) {
+    ColumnFamilyHandle* cf = handles[cf_ids[p]];
+    threads_.emplace_back([this, db, cf, p, max_keys] {
+      for (uint64_t i = 0; i < max_keys && !stop_.load(); ++i) {
+        const Status s = db->Put(WriteOptions(), cf, "key" + std::to_string(i),
+                                 "value" + std::to_string(i));
+        EXPECT_OK(s);
+        if (!s.ok()) {
+          return;
+        }
+        acked_[p].store(i + 1);
+      }
+    });
+  }
+}
+
+void PartitionWriters::WaitForAcked(uint64_t count) {
+  for (const std::atomic<uint64_t>& acked : acked_) {
+    while (acked.load() < count && !stop_.load()) {
+      std::this_thread::yield();
+    }
+  }
+}
+
+std::vector<uint64_t> PartitionWriters::Acked() const {
+  std::vector<uint64_t> acked;
+  for (const std::atomic<uint64_t>& a : acked_) {
+    acked.push_back(a.load());
+  }
+  return acked;
+}
+
+void PartitionWriters::Stop() {
+  stop_.store(true);
+  for (port::Thread& thread : threads_) {
+    thread.join();
+  }
+  threads_.clear();
+}
+
+Status RunWithin(std::chrono::seconds timeout,
+                 const std::function<Status()>& fn) {
+  std::promise<Status> promise;
+  std::future<Status> result = promise.get_future();
+  port::Thread thread([&] { promise.set_value(fn()); });
+  if (result.wait_for(timeout) != std::future_status::ready) {
+    fprintf(stderr, "Did not finish within %d seconds\n",
+            static_cast<int>(timeout.count()));
+    std::abort();
+  }
+  thread.join();
+  return result.get();
 }
 
 template <CacheEntryRole R>
