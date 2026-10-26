@@ -1524,13 +1524,9 @@ TEST_P(CheckpointTest, CheckpointByLockWALHolder) {
 // UnlockWAL, never forever), and each copy is a per-writer prefix that opens
 // in every recovery mode.
 TEST_P(CheckpointTest, CheckpointRacingLockWAL) {
-  if (GetParam() > 1) {
-    // G-30 (new): the quiesce is skipped when another thread holds LockWAL,
-    // and that thread can UnlockWAL before the WAL sizes are read, so the
-    // copy can hold a hole no recovery mode opens.
-    ROCKSDB_GTEST_SKIP("G-30: checkpoint racing UnlockWAL can cut a hole");
-    return;
-  }
+  // Q6 (G-30 residual): re-enabled at N > 1. The checkpoint takes a
+  // nested LockWAL so the quiesce holds across FlushWAL and GetOpenWalSizes
+  // even when another thread unlocks in between, keeping the copy a prefix.
   constexpr uint64_t kMaxKeys = 2000;
   constexpr int kCheckpoints = 5;
   const std::vector<uint32_t> cf_ids =

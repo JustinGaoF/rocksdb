@@ -1080,12 +1080,8 @@ TEST_P(WriteUnpreparedTransactionTest,
   // commit write failure. Previously, CommitInternal() would clear
   // unprep_seqs_ even on failure, making subsequent Rollback() hit
   // assertion `unprep_seqs.size() > 0`.
-  if (test::WalPartitionsForCurrentTest() > 1) {
-    // G-14: at N > 1 the rollback after Resume() parks forever in the
-    // completion gate behind the failed commit's range. GC08 fixes it.
-    ROCKSDB_GTEST_SKIP("G-14: writes hang after Resume() at N > 1");
-    return;
-  }
+  // Q7 (G-14 evidence): re-enabled at N > 1. GC08 releases the failed range
+  // when recovery clears the error, so the rollback after Resume() proceeds.
   options.max_bgerror_resume_count = 0;
   ASSERT_OK(ReOpen());
 

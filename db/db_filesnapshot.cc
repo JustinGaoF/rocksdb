@@ -577,15 +577,28 @@ Status DBImpl::GetLiveFilesStorageInfoImpl(
   // a record above another partition's allocated but not yet appended one,
   // and a copy cut there holds a hole only point-in-time recovery opens past.
   // Holding every write queue lets those groups finish, so the sizes below
-  // cut every WAL at one point of the sequence order. Under LockWAL no group
-  // is in flight, and waiting on its stall would never end.
+  // cut every WAL at one point of the sequence order. A nested LockWAL holds
+  // that quiesce across FlushWAL and GetOpenWalSizes even when another
+  // thread holds LockWAL: our own count keeps writers stalled if it unlocks
+  // in between (G-30). Nesting never waits on a stall (LockWAL only drains
+  // when nothing is locked), so the holder's own checkpoint still returns.
   AllPartitionsWriter quiesce(this, /*nonmem=*/false);
   bool quiesced = false;
+  bool checkpoint_wal_locked = false;
   if (NumWalPartitions() > 1) {
-    InstrumentedMutexLock l(&mutex_);
-    if (lock_wal_owner_thread_id_counts_.empty()) {
-      quiesce.EnterUnbatched();
-      quiesced = true;
+    Status lock_s = LockWAL();
+    if (lock_s.IsNotSupported()) {
+      // Read-only DB or similar: no writers exist, so quiesce only when
+      // nothing is locked, as before.
+      InstrumentedMutexLock l(&mutex_);
+      if (lock_wal_owner_thread_id_counts_.empty()) {
+        quiesce.EnterUnbatched();
+        quiesced = true;
+      }
+    } else if (!lock_s.ok()) {
+      return lock_s;
+    } else {
+      checkpoint_wal_locked = true;
     }
   }
 
@@ -631,6 +644,12 @@ Status DBImpl::GetLiveFilesStorageInfoImpl(
   }
   if (quiesced) {
     quiesce.ExitUnbatched();
+  }
+  if (checkpoint_wal_locked) {
+    Status unlock_s = UnlockWAL();
+    if (s.ok()) {
+      s = unlock_s;
+    }
   }
 
   // [old comment] If we have more than one column family, we also need to get

@@ -2007,6 +2007,104 @@ TEST_P(TransactionTest, TwoPhaseDoubleRecoveryTest) {
   ASSERT_EQ(value, "bar2");
 }
 
+TEST_P(TransactionTest, TwoPhaseCommitRecoversAtomicallyAtWalPartitions) {
+  // Q1 (G-55): at N in {2, 8}, a pessimistic TransactionDB (WriteCommitted,
+  // allow_2pc) crashing before the commit recovers the prepared transaction
+  // with neither key visible; crashing after it recovers both keys
+  // committed; never half. WriteCommitted commits carry their keys, so the
+  // commit always co-routes with the prepare (both by lowest CF id); the
+  // prepare/commit-spanning variant is TwoPhaseCommitSpanningPartitions-
+  // RecoversAtomically in the WritePrepared suite, whose commits are CF-less
+  // markers routed by XID. Runs its own N loop once, under every mode.
+  if (txn_db_options.write_policy != WRITE_COMMITTED || use_stackable_db_ ||
+      options.two_write_queues || test::WalPartitionsForCurrentTest() != 1 ||
+      txn_db_options.use_per_key_point_lock_mgr) {
+    return;
+  }
+  const std::vector<WALRecoveryMode> recovery_modes = {
+      WALRecoveryMode::kAbsoluteConsistency,
+      WALRecoveryMode::kTolerateCorruptedTailRecords,
+      WALRecoveryMode::kPointInTimeRecovery,
+      WALRecoveryMode::kSkipAnyCorruptedRecords,
+  };
+  options.allow_2pc = true;
+  options.two_write_queues = false;
+  options.unordered_write = false;
+  options.avoid_flush_during_shutdown = true;
+  options.avoid_flush_during_recovery = true;
+  WriteOptions write_options;
+  write_options.sync = true;
+  ReadOptions read_options;
+
+  for (const uint32_t num_partitions : {2, 8}) {
+    SCOPED_TRACE("partitions=" + std::to_string(num_partitions));
+    test::SetWalPartitions(&options, num_partitions);
+    ASSERT_OK(ReOpen());
+
+    // The commit carries the keys, so it routes by lowest CF id exactly like
+    // the prepare; every cell below re-checks that co-routing.
+    std::vector<DBImpl::WalAppendOutcome> outcomes;
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::WriteToWAL:AppendOutcome", [&](void* arg) {
+          outcomes.push_back(*static_cast<DBImpl::WalAppendOutcome*>(arg));
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+    const std::string xid = "twophase_q1";
+
+    for (const WALRecoveryMode recovery_mode : recovery_modes) {
+      for (const bool crash_after_commit : {false, true}) {
+        SCOPED_TRACE("mode=" + std::to_string(static_cast<int>(recovery_mode)) +
+                     (crash_after_commit ? " crash-after" : " crash-before"));
+        options.wal_recovery_mode = recovery_mode;
+        ASSERT_OK(ReOpen());
+        TransactionOptions txn_options;
+        Transaction* txn = db->BeginTransaction(write_options, txn_options);
+        ASSERT_NE(nullptr, txn);
+        ASSERT_OK(txn->SetName(xid));
+        ASSERT_OK(txn->Put(Slice("xa"), Slice("va")));
+        ASSERT_OK(txn->Put(Slice("xb"), Slice("vb")));
+        outcomes.clear();
+        ASSERT_OK(txn->Prepare());
+        ASSERT_EQ(1U, outcomes.size());
+        const size_t prepare_partition = outcomes[0].wal_partition;
+        if (crash_after_commit) {
+          ASSERT_OK(txn->Commit());
+          ASSERT_EQ(2U, outcomes.size());
+          ASSERT_EQ(prepare_partition, outcomes[1].wal_partition);
+        }
+        delete txn;
+
+        // ReOpenNoDelete closes, drops unsynced file data and reopens: the
+        // crash. (TEST_Crash is a no-op vestige; existing 2PC tests call it
+        // out of habit.)
+        ASSERT_OK(ReOpenNoDelete());
+
+        std::string value;
+        if (crash_after_commit) {
+          ASSERT_OK(db->Get(read_options, "xa", &value));
+          ASSERT_EQ("va", value);
+          ASSERT_OK(db->Get(read_options, "xb", &value));
+          ASSERT_EQ("vb", value);
+          ASSERT_EQ(nullptr, db->GetTransactionByName(xid));
+        } else {
+          ASSERT_TRUE(db->Get(read_options, "xa", &value).IsNotFound());
+          ASSERT_TRUE(db->Get(read_options, "xb", &value).IsNotFound());
+          Transaction* recovered = db->GetTransactionByName(xid);
+          ASSERT_NE(nullptr, recovered);
+          ASSERT_OK(recovered->Commit());
+          delete recovered;
+          ASSERT_OK(db->Get(read_options, "xa", &value));
+          ASSERT_EQ("va", value);
+          ASSERT_OK(db->Get(read_options, "xb", &value));
+          ASSERT_EQ("vb", value);
+        }
+      }
+    }
+    SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:AppendOutcome");
+    SyncPoint::GetInstance()->DisableProcessing();
+  }
+}
+
 TEST_P(TransactionTest, TwoPhaseLogRollingTest) {
   if (test::WalPartitionsForCurrentTest() > 1) {
     // It asserts that the prepares land in the one current WAL.

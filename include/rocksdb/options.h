@@ -1540,6 +1540,9 @@ struct DBOptions {
   // WAL is byte-for-byte identical to a build without this option. Values
   // above 64 are rejected with Status::InvalidArgument.
   //
+  // manual_wal_flush is supported but not recommended above 1: it re-imposes
+  // coordinated flushing across the partitions.
+  //
   // Default: 1
   uint32_t wal_partitions = 1;
 

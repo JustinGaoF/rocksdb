@@ -4662,6 +4662,13 @@ TEST_F(DBWALIndexTest, DisableWALDoesNotConsumeWALIndex) {
   EXPECT_EQ(log::kWALIndexStartNumber, metadata[0].wal_index);
   EXPECT_EQ(third_sequence, metadata[1].sequence);
   EXPECT_EQ(log::kWALIndexStartNumber + 1, metadata[1].wal_index);
+
+  // Q1 (G-55): the disableWAL sequence gap does not truncate recovery.
+  Reopen(options);
+  EXPECT_EQ("value1", Get("key1"));
+  EXPECT_EQ("value3", Get("key3"));
+  std::string missing;
+  EXPECT_TRUE(db_->Get(ReadOptions(), "key2", &missing).IsNotFound());
 }
 
 TEST_F(DBWALIndexTest, IngestExternalFileDoesNotConsumeWALIndex) {
@@ -4699,6 +4706,12 @@ TEST_F(DBWALIndexTest, IngestExternalFileDoesNotConsumeWALIndex) {
   EXPECT_EQ(log::kWALIndexStartNumber, metadata[0].wal_index);
   EXPECT_EQ(third_sequence, metadata[1].sequence);
   EXPECT_EQ(log::kWALIndexStartNumber + 1, metadata[1].wal_index);
+
+  // Q1 (G-55): the ingestion sequence gap does not truncate recovery.
+  Reopen(options);
+  EXPECT_EQ("value1", Get("key1"));
+  EXPECT_EQ("value2", Get("key2"));
+  EXPECT_EQ("value3", Get("key3"));
 }
 
 TEST_F(DBWALIndexTest, IndexedWALReplaysThroughRecovery) {
