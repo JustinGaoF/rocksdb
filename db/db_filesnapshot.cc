@@ -578,14 +578,21 @@ Status DBImpl::GetLiveFilesStorageInfoImpl(
   // and a copy cut there holds a hole only point-in-time recovery opens past.
   // Holding every write queue lets those groups finish, so the sizes below
   // cut every WAL at one point of the sequence order. Under LockWAL no group
-  // is in flight, and waiting on its stall would never end.
+  // is in flight, and waiting on its stall would never end. Instead this
+  // thread takes one more LockWAL count under the same mutex_ hold, so that
+  // another thread's UnlockWAL cannot let writes resume before the sizes are
+  // read.
   AllPartitionsWriter quiesce(this, /*nonmem=*/false);
   bool quiesced = false;
+  bool wal_lock_pinned = false;
   if (NumWalPartitions() > 1) {
     InstrumentedMutexLock l(&mutex_);
     if (lock_wal_owner_thread_id_counts_.empty()) {
       quiesce.EnterUnbatched();
       quiesced = true;
+    } else {
+      ++lock_wal_owner_thread_id_counts_[env_->GetThreadID()];
+      wal_lock_pinned = true;
     }
   }
 
@@ -631,6 +638,14 @@ Status DBImpl::GetLiveFilesStorageInfoImpl(
   }
   if (quiesced) {
     quiesce.ExitUnbatched();
+  }
+  if (wal_lock_pinned) {
+    Status unlock_status = UnlockWAL();
+    if (s.ok()) {
+      s = unlock_status;
+    } else {
+      unlock_status.PermitUncheckedError();
+    }
   }
 
   // [old comment] If we have more than one column family, we also need to get

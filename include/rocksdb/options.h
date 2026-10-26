@@ -1532,6 +1532,11 @@ struct DBOptions {
   // WAL files allows N concurrent appends. Recovery merges the partitions back
   // into a single sequence-ordered stream, so the logical log is unchanged.
   //
+  // manual_wal_flush is supported but not recommended with more than one
+  // partition: FlushWAL() flushes every partition's buffer while holding every
+  // partition's WAL write lock, which re-imposes the coordinated flushing that
+  // partitions exist to avoid.
+  //
   // Not dynamically changeable via SetOptions().
   //
   // Values greater than 1 are not implemented yet and are rejected at Open()

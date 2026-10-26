@@ -2501,12 +2501,6 @@ TEST_P(WritePreparedTransactionTest, RollbackPreparedAfterCommitWriteFailure) {
   // test injects that commit failure and a retryable rollback failure, then
   // verifies rollback can still be retried to remove the prepared entry before
   // DB teardown.
-  if (test::WalPartitionsForCurrentTest() > 1) {
-    // G-14: at N > 1 the rollback after Resume() parks forever in the
-    // completion gate behind the failed commit's range. GC08 fixes it.
-    ROCKSDB_GTEST_SKIP("G-14: writes hang after Resume() at N > 1");
-    return;
-  }
   options.max_bgerror_resume_count = 0;
   ASSERT_OK(ReOpen());
   fault_fs->SetFileTypesExcludedFromFaultInjection({FileType::kInfoLogFile});
