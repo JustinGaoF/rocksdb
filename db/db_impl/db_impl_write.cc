@@ -2796,8 +2796,11 @@ void DBImpl::WALIOStatusCheck(const IOStatus& io_status,
           failed_wal_number != 0 ? failed_wal_number : cur_wal_number_;
       if (io_status.GetScope() == IOStatus::IOErrorScope::kIOErrorScopeFile) {
         context.failed_wal_number = resolved_failed_wal_number;
+        // Above one partition the release records the gap that covers this
+        // range (ClearWalDurabilityBGError), and GetUpdatesSince is refused.
         if (failed_wal_sequence_start != 0 &&
-            failed_wal_sequence_start <= failed_wal_sequence) {
+            failed_wal_sequence_start <= failed_wal_sequence &&
+            NumWalPartitions() == 1) {
           // Successful live resumption deliberately omits this write from the
           // database even if the physical WAL record is complete. Keep a
           // DB-lifetime fence so TransactionLogIterator does not expose it.
