@@ -4241,11 +4241,10 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
         uint64_t wal_used;
         uint64_t log_size;
         WalContext wal_context;
-        size_t wal_partition = 0;
-        s = impl->WalPartitionForWrite(
+        size_t wal_partition = impl->WalPartitionForWrite(
             empty_batch, /*deferred_put_entities=*/nullptr,
-            impl->NumWalPartitions(), &wal_partition);
-        if (s.ok()) {
+            impl->NumWalPartitions());
+        {
           // SelectWalForWrite requires the partition's WAL write mutex;
           // Open holds mutex_ and nothing else runs yet, so taking it here
           // cannot deadlock or violate the lock order.

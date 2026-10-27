@@ -1471,6 +1471,66 @@ TEST_P(WritePreparedTransactionTest, AdvanceMaxEvictedSeqBasic) {
   }
 }
 
+TEST_P(WritePreparedTransactionTest, AdvanceMaxEvictedSeqOlderListNeverWins) {
+  // Q6: two partition leaders racing AdvanceMaxEvictedSeq. The older
+  // version's UpdateSnapshots runs after the newer one's installed, and must
+  // not overwrite it: concurrent calls equal a serial run ending with the
+  // largest new_max. Dropping the in-lock version check installs the older
+  // list and fails the assertions below.
+  // Raw like AdvanceMaxEvictedSeqBasic: destroying a never-opened DBImpl
+  // crashes, so the mock intentionally leaks.
+  DBImpl* mock_db = new DBImpl(options, dbname);
+  std::unique_ptr<WritePreparedTxnDBMock> wp_db(
+      new WritePreparedTxnDBMock(mock_db, txn_db_options));
+
+  wp_db->SetDBSnapshots({20});
+  std::mutex mu;
+  std::condition_variable cv;
+  std::atomic<int> arrivals{0};
+  bool a_waiting = false;
+  bool release_a = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "WritePreparedTxnDB::AdvanceMaxEvictedSeq:BeforeUpdateSnapshots",
+      [&](void*) {
+        // The older (A) call arrives first and waits; the newer (B) call,
+        // started only after A is waiting, proceeds straight through.
+        if (arrivals.fetch_add(1) == 0) {
+          std::unique_lock<std::mutex> lock(mu);
+          a_waiting = true;
+          cv.notify_all();
+          ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(30),
+                                  [&] { return release_a; }));
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  port::Thread a_thread([&] { wp_db->AdvanceMaxEvictedSeq(0, 100); });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    ASSERT_TRUE(
+        cv.wait_for(lock, std::chrono::seconds(30), [&] { return a_waiting; }));
+  }
+  // A fetched {20} for version 100 and is parked before installing it.
+  // B installs {20, 150} for version 200 first.
+  wp_db->SetDBSnapshots({20, 150});
+  wp_db->AdvanceMaxEvictedSeq(0, 200);
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    release_a = true;
+    cv.notify_all();
+  }
+  a_thread.join();
+  SyncPoint::GetInstance()->ClearCallBack(
+      "WritePreparedTxnDB::AdvanceMaxEvictedSeq:BeforeUpdateSnapshots");
+
+  EXPECT_EQ(200, wp_db->snapshots_version_.load());
+  EXPECT_EQ(200, wp_db->max_evicted_seq_.load());
+  EXPECT_EQ(2u, wp_db->snapshots_total_.load());
+  ASSERT_LT(1u, wp_db->SNAPSHOT_CACHE_SIZE);
+  EXPECT_EQ(20, wp_db->snapshot_cache_[0].load());
+  EXPECT_EQ(150, wp_db->snapshot_cache_[1].load());
+}
+
 // A new snapshot should always be always larger than max_evicted_seq_
 // Otherwise the snapshot does not go through AdvanceMaxEvictedSeq
 TEST_P(WritePreparedTransactionTest, NewSnapshotLargerThanMax) {
@@ -4064,13 +4124,9 @@ TEST_P(WritePreparedTransactionTest, AddPreparedBeforeMax) {
 // that it is published and when it is cleaned up from old_prepared_. This test
 // stresses such cases.
 TEST_P(WritePreparedTransactionTest, CommitOfDelayedPrepared) {
-  if (test::WalPartitionsForCurrentTest() > 1) {
-    // New: at N > 1 partition leaders run AdvanceMaxEvictedSeq concurrently;
-    // it reads snapshots_version_ without snapshots_mutex_, and an older
-    // version can overwrite a newer snapshot list. TSan reports the race.
-    ROCKSDB_GTEST_SKIP("new: snapshots_version_ race between leaders at N > 1");
-    return;
-  }
+  // GC17 Q6 re-enabled this at N > 1: snapshots_version_ is atomic and
+  // UpdateSnapshots never installs an older list, so concurrent partition
+  // leaders neither race nor regress the snapshot cache.
   const size_t snapshot_cache_bits = 7;  // same as default
   for (const size_t commit_cache_bits : {0, 2, 3}) {
     for (const size_t sub_batch_cnt : {1, 2, 3}) {

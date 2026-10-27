@@ -899,8 +899,8 @@ enum Histograms : uint32_t {
   // partitions that sync had to persist. One sample per such group.
   WAL_SYNC_UNSYNCED_PARTITIONS,
   // Time (microseconds) a sync=true write group spends syncing across WAL
-  // partitions: claiming every partition, the fsyncs, and the completion
-  // gate's second sync when it runs. One sample per such group.
+  // partitions: claiming every partition, the fsyncs, and recording the
+  // sync, all in the completion gate. One sample per such group.
   WAL_SYNC_BARRIER_MICROS,
   // Time (microseconds) external file ingestion holds writers out of every
   // WAL partition's write queue. One sample per ingestion.

@@ -265,6 +265,13 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
     last_batch_group_size_ =
         decltype(last_batch_group_size_)(num_wal_partitions);
   }
+  // Over-aligned vector storage keeps every padded entry line-aligned;
+  // without it the padding would only space entries without isolating them.
+  assert(reinterpret_cast<uintptr_t>(wal_write_mutexes_.data()) %
+             CACHE_LINE_SIZE ==
+         0);
+  assert(reinterpret_cast<uintptr_t>(wal_empties_.data()) % CACHE_LINE_SIZE ==
+         0);
   for (size_t p = 0; p < num_wal_partitions; ++p) {
     write_threads_.emplace_back(
         std::make_unique<WriteThread>(immutable_db_options_));
@@ -2909,6 +2916,11 @@ IOStatus DBImpl::SyncWalPartitionFiles(size_t partition,
   if (NumWalPartitions() > 1) {
     WalWriteMutex(partition).AssertHeld();
   }
+  // Fires under the partition's WAL mutex (when held), before its files
+  // sync: tests hold one partition's fsync open here while another
+  // partition writes (D-G11 (c)).
+  TEST_SYNC_POINT_CALLBACK("DBImpl::SyncWalPartitionFiles:BeforeSyncPartition",
+                           &partition);
   IOStatus io_s;
   for (auto& log : logs_[partition]) {
     IOOptions opts;

@@ -545,6 +545,8 @@ class WritePreparedTxnDB : public WritePreparedTxnDBBase {
   friend class WritePreparedTransactionTest_AdvanceMaxEvictedSeqBasic_Test;
   friend class
       WritePreparedTransactionTest_AdvanceMaxEvictedSeqWithDuplicates_Test;
+  friend class
+      WritePreparedTransactionTest_AdvanceMaxEvictedSeqOlderListNeverWins_Test;
   friend class WritePreparedTransactionTest_AdvanceSeqByOne_Test;
   friend class WritePreparedTransactionTest_BasicRecovery_Test;
   friend class WritePreparedTransactionTest_CheckAgainstSnapshots_Test;
@@ -831,7 +833,10 @@ class WritePreparedTxnDB : public WritePreparedTxnDBBase {
   std::vector<SequenceNumber> snapshots_all_;
   // The version of the latest list of snapshots. This can be used to avoid
   // rewriting a list that is concurrently updated with a more recent version.
-  SequenceNumber snapshots_version_ = 0;
+  // Atomic: at N > 1 each partition's leader runs AdvanceMaxEvictedSeq, so
+  // the version check there races another leader's UpdateSnapshots. Relaxed:
+  // writers serialize on snapshots_mutex_; the version only orders lists.
+  std::atomic<SequenceNumber> snapshots_version_{0};
 
   // A heap of prepared transactions. Thread-safety is provided with
   // prepared_mutex_.

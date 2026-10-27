@@ -12,10 +12,25 @@
 #include <limits>
 #include <vector>
 
+#include "port/port.h"
 #include "rocksdb/rocksdb_namespace.h"
 #include "test_util/sync_point.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+// One cache line per partition: pending_low_/durable_upto_ are stored by a
+// partition's leader on every Register/Complete, so adjacent entries would
+// false-share across partitions. The full rescan then touches one line per
+// partition instead of one line per eight entries, but the common case skips
+// the rescan (Recompute), so completion isolation wins.
+struct alignas(CACHE_LINE_SIZE) PaddedPartitionCounter {
+  std::atomic<uint64_t> value;
+  char padding_[CACHE_LINE_SIZE - sizeof(std::atomic<uint64_t>)];
+};
+static_assert(sizeof(PaddedPartitionCounter) == CACHE_LINE_SIZE,
+              "each partition's counter must fill its own cache line");
+static_assert(alignof(PaddedPartitionCounter) == CACHE_LINE_SIZE,
+              "each partition's counter must start its own cache line");
 
 // Tracks per-partition WAL durability so that N independently-failing WAL
 // files cannot leave holes: sequences that are missing but not at the tail,
@@ -50,8 +65,8 @@ class WalDurabilityTracker {
  public:
   // Idle partitions contribute infinity to the minimum. A separate in-flight
   // flag would cost a second array and a branch per entry on the rescan path;
-  // the sentinel keeps the scan a single min over one contiguous array with
-  // one all-idle check at the end.
+  // the sentinel keeps the scan a single min over one padded array with one
+  // all-idle check at the end.
   static constexpr uint64_t kIdle = std::numeric_limits<uint64_t>::max();
 
   // `safe_point_test_hook` exposes the safe point to the prefix oracle's
@@ -64,14 +79,21 @@ class WalDurabilityTracker {
         safe_point_test_hook_(safe_point_test_hook) {
     assert(num_partitions > 0);
     for (size_t p = 0; p < num_partitions; ++p) {
-      pending_low_[p].store(kIdle, std::memory_order_relaxed);
-      durable_upto_[p].store(0, std::memory_order_relaxed);
+      pending_low_[p].value.store(kIdle, std::memory_order_relaxed);
+      durable_upto_[p].value.store(0, std::memory_order_relaxed);
       // In-flight depth is typically one to four groups; reserving up front
       // keeps the hot path allocation-free.
       inflight_[p].reserve(4);
     }
     safe_point_.store(0, std::memory_order_relaxed);
     min_owner_.store(0, std::memory_order_relaxed);
+    // Over-aligned vector storage keeps every entry line-aligned; without
+    // it the padding above would only space entries without isolating them.
+    assert(reinterpret_cast<uintptr_t>(pending_low_.data()) % CACHE_LINE_SIZE ==
+           0);
+    assert(reinterpret_cast<uintptr_t>(durable_upto_.data()) %
+               CACHE_LINE_SIZE ==
+           0);
   }
 
   // No copying or moving: DBImpl owns one instance sized at construction.
@@ -100,10 +122,10 @@ class WalDurabilityTracker {
         new_pending = r.low;
       }
     }
-    pending_low_[partition].store(new_pending, std::memory_order_release);
+    pending_low_[partition].value.store(new_pending, std::memory_order_release);
     // Leaving all-idle: the minimum was infinity, so it is now this range.
     size_t owner = min_owner_.load(std::memory_order_relaxed);
-    if (pending_low_[owner].load(std::memory_order_acquire) == kIdle &&
+    if (pending_low_[owner].value.load(std::memory_order_acquire) == kIdle &&
         new_pending != kIdle) {
       min_owner_.store(partition, std::memory_order_relaxed);
     }
@@ -134,13 +156,13 @@ class WalDurabilityTracker {
       return;
     }
     const uint64_t old_pending =
-        pending_low_[partition].load(std::memory_order_relaxed);
+        pending_low_[partition].value.load(std::memory_order_relaxed);
     fifo[found] = fifo.back();
     fifo.pop_back();
     const uint64_t cur_durable =
-        durable_upto_[partition].load(std::memory_order_relaxed);
+        durable_upto_[partition].value.load(std::memory_order_relaxed);
     if (high > cur_durable) {
-      durable_upto_[partition].store(high, std::memory_order_release);
+      durable_upto_[partition].value.store(high, std::memory_order_release);
     }
     uint64_t new_pending = kIdle;
     for (const Range& r : fifo) {
@@ -148,7 +170,7 @@ class WalDurabilityTracker {
         new_pending = r.low;
       }
     }
-    pending_low_[partition].store(new_pending, std::memory_order_release);
+    pending_low_[partition].value.store(new_pending, std::memory_order_release);
     if (new_pending == old_pending) {
       // Minimum unchanged (a duplicate remains, or several entries shared
       // the old minimum): the global frontier cannot have moved.
@@ -180,12 +202,12 @@ class WalDurabilityTracker {
 
   uint64_t PendingLow(size_t partition) const {
     assert(partition < pending_low_.size());
-    return pending_low_[partition].load(std::memory_order_acquire);
+    return pending_low_[partition].value.load(std::memory_order_acquire);
   }
 
   uint64_t DurableUpto(size_t partition) const {
     assert(partition < durable_upto_.size());
-    return durable_upto_[partition].load(std::memory_order_acquire);
+    return durable_upto_[partition].value.load(std::memory_order_acquire);
   }
 
   // Full rescan ignoring the min-owner shortcut. Tests use it after joining
@@ -196,7 +218,7 @@ class WalDurabilityTracker {
     uint64_t min_pending = kIdle;
     size_t owner = 0;
     for (size_t p = 0; p < pending_low_.size(); ++p) {
-      const uint64_t v = pending_low_[p].load(std::memory_order_acquire);
+      const uint64_t v = pending_low_[p].value.load(std::memory_order_acquire);
       if (v < min_pending) {
         min_pending = v;
         owner = p;
@@ -206,7 +228,8 @@ class WalDurabilityTracker {
     if (min_pending == kIdle) {
       uint64_t max_durable = 0;
       for (size_t p = 0; p < durable_upto_.size(); ++p) {
-        const uint64_t d = durable_upto_[p].load(std::memory_order_acquire);
+        const uint64_t d =
+            durable_upto_[p].value.load(std::memory_order_acquire);
         if (d > max_durable) {
           max_durable = d;
         }
@@ -238,14 +261,14 @@ class WalDurabilityTracker {
   }
 
   // Recomputes W = min(pending_low) after partition p advanced to
-  // new_pending. A linear scan over the contiguous atomic array beats a heap
-  // at N = 4-32 on cache locality; when p does not own the minimum and is
-  // still at or above it, the minimum is unchanged and the scan is skipped.
+  // new_pending. A linear scan over the padded array beats a heap at N =
+  // 4-32; when p does not own the minimum and is still at or above it, the
+  // minimum is unchanged and the scan is skipped.
   void Recompute(size_t completed_partition, uint64_t new_pending) {
     const size_t owner = min_owner_.load(std::memory_order_relaxed);
     if (completed_partition != owner) {
       const uint64_t owner_pending =
-          pending_low_[owner].load(std::memory_order_acquire);
+          pending_low_[owner].value.load(std::memory_order_acquire);
       if (new_pending >= owner_pending) {
         return;
       }
@@ -253,14 +276,16 @@ class WalDurabilityTracker {
     ForceRecalculate();
   }
 
-  // Lowest outstanding low per partition, or kIdle when empty. Contiguous so
-  // the rescan is one cache-friendly pass.
-  std::vector<std::atomic<uint64_t>> pending_low_;
+  // Lowest outstanding low per partition, or kIdle when empty. One cache
+  // line per entry (PaddedPartitionCounter), so partitions completing
+  // concurrently do not false-share; the rescan then costs one line per
+  // partition, but usually does not run at all (Recompute).
+  std::vector<PaddedPartitionCounter> pending_low_;
   // Highest completed high per partition. Only read when all partitions are
   // idle, where the safe point is their maximum: with nothing outstanding,
   // every allocated sequence completed, so the maximum completed is the
   // maximum allocated and everything at or below it is durable.
-  std::vector<std::atomic<uint64_t>> durable_upto_;
+  std::vector<PaddedPartitionCounter> durable_upto_;
   // In-flight ranges per partition, in no particular order; the minimum is
   // recomputed by linear scan on removal, which is O(depth) at depth <= 4.
   // Per-partition rather than shared: a shared structure would serialize all
