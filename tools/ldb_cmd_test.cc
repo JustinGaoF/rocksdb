@@ -5,6 +5,7 @@
 //
 #include "rocksdb/utilities/ldb_cmd.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cinttypes>
 #include <iomanip>
@@ -287,6 +288,117 @@ TEST_F(LdbCmdTest, DumpWalOnPartitionedWals) {
   EXPECT_NE(std::string::npos, output.find("wal_partitions > 1")) << output;
   EXPECT_EQ(std::string::npos, output.find("Prev batch")) << output;
   EXPECT_EQ(std::string::npos, output.find("Checking wal file")) << output;
+  ASSERT_OK(DestroyDB(dbname, opts));
+}
+
+class LdbCmdWalPartitionsTest : public LdbCmdTest,
+                                public testing::WithParamInterface<uint32_t> {};
+
+INSTANTIATE_TEST_CASE_P(WalPartitions1, LdbCmdWalPartitionsTest,
+                        testing::Values(1U));
+INSTANTIATE_TEST_CASE_P(WalPartitions8, LdbCmdWalPartitionsTest,
+                        testing::Values(test::kTestWalPartitions));
+
+// `ldb dump_wal` on each partition's current WAL prints that WAL's records,
+// and names the partition of every file but partition 0's; together the files
+// hold every write exactly once. `--only_print_seqno_gaps` checks partition
+// 0's file and refuses every other one. `dump_live_files`, which opens the
+// DB, lists the WAL at one partition and is refused at more. Ported from
+// D127115188's DumpWalShowsPartitionAndRefusesGapsAtN8.
+TEST_P(LdbCmdWalPartitionsTest, DumpWalAtWalPartitions) {
+  Env* env = TryLoadCustomOrDefaultEnv();
+  const uint32_t num_partitions = GetParam();
+  Options opts;
+  opts.env = env;
+  opts.create_if_missing = true;
+  opts.create_missing_column_families = true;
+  opts.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  opts.avoid_flush_during_shutdown = true;
+  test::SetWalPartitions(&opts, num_partitions);
+  const std::string dbname = test::PerThreadDBPath(env, "ldb_cmd_test");
+  ASSERT_OK(DestroyDB(dbname, opts));
+
+  const std::vector<uint32_t> cf_ids =
+      ColumnFamilyIdsCoveringWalPartitions(num_partitions);
+  std::vector<ColumnFamilyDescriptor> column_families;
+  column_families.emplace_back(kDefaultColumnFamilyName, opts);
+  const uint32_t max_cf_id = *std::max_element(cf_ids.begin(), cf_ids.end());
+  for (uint32_t cf_id = 1; cf_id <= max_cf_id; ++cf_id) {
+    column_families.emplace_back("cf" + std::to_string(cf_id), opts);
+  }
+  std::vector<uint64_t> current_wals(num_partitions);
+  {
+    std::vector<ColumnFamilyHandle*> handles;
+    std::unique_ptr<DB> db;
+    ASSERT_OK(DB::Open(opts, dbname, column_families, &handles, &db));
+    for (uint32_t p = 0; p < num_partitions; ++p) {
+      ASSERT_OK(db->Put(WriteOptions(), handles[cf_ids[p]],
+                        "key" + std::to_string(p), "value"));
+      current_wals[p] =
+          static_cast<DBImpl*>(db.get())->TEST_CurrentWalNumber(p);
+    }
+    for (ColumnFamilyHandle* handle : handles) {
+      ASSERT_OK(db->DestroyColumnFamilyHandle(handle));
+    }
+  }
+
+  auto run = [&](std::vector<std::string> args, std::string* output) {
+    args.insert(args.begin(), "./ldb");
+    std::vector<const char*> argv;
+    for (const std::string& arg : args) {
+      argv.push_back(arg.c_str());
+    }
+    testing::internal::CaptureStdout();
+    testing::internal::CaptureStderr();
+    const int code =
+        LDBCommandRunner::RunCommand(static_cast<int>(argv.size()), argv.data(),
+                                     opts, LDBOptions(), &column_families);
+    *output = testing::internal::GetCapturedStderr();
+    *output += testing::internal::GetCapturedStdout();
+    return code;
+  };
+  std::string output;
+  size_t records = 0;
+  for (uint32_t p = 0; p < num_partitions; ++p) {
+    SCOPED_TRACE("partition=" + std::to_string(p));
+    const std::string wal_arg =
+        "--walfile=" + LogFileName(dbname, current_wals[p]);
+    ASSERT_EQ(0, run({"dump_wal", wal_arg}, &output));
+    std::istringstream lines(output);
+    std::string line;
+    while (std::getline(lines, line)) {
+      if (!line.empty() && std::isdigit(static_cast<unsigned char>(line[0]))) {
+        ++records;
+      }
+    }
+    EXPECT_EQ(p != 0, output.find("WAL partition: " + std::to_string(p)) !=
+                          std::string::npos)
+        << output;
+    const int gaps =
+        run({"dump_wal", wal_arg, "--only_print_seqno_gaps"}, &output);
+    if (p == 0) {
+      EXPECT_EQ(0, gaps) << output;
+    } else {
+      EXPECT_NE(0, gaps) << output;
+      EXPECT_NE(std::string::npos, output.find("wal_partitions > 1")) << output;
+    }
+  }
+  EXPECT_EQ(num_partitions, records);
+
+  const int live_files = run({"dump_live_files", "--db=" + dbname}, &output);
+  if (num_partitions == 1) {
+    ASSERT_EQ(0, live_files) << output;
+    EXPECT_NE(std::string::npos,
+              output.find(LogFileName("", current_wals[0]).substr(1)))
+        << output;
+  } else {
+    // ldb opens the DB with its OPTIONS file, which does not keep the testing
+    // opt-in, so the open is refused like any production open.
+    EXPECT_NE(0, live_files) << output;
+    EXPECT_NE(std::string::npos,
+              output.find("wal_partitions > 1 is not supported yet"))
+        << output;
+  }
   ASSERT_OK(DestroyDB(dbname, opts));
 }
 

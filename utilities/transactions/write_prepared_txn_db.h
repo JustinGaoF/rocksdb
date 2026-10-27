@@ -567,6 +567,8 @@ class WritePreparedTxnDB : public WritePreparedTxnDBBase {
   friend class WritePreparedTransactionTest_OldCommitMapGC_Test;
   friend class WritePreparedTransactionTest_Rollback_Test;
   friend class WritePreparedTransactionTest_SmallestUnCommittedSeq_Test;
+  friend class
+      WritePreparedTransactionTest_TwoPhaseCommitSpanningPartitionsRecoversAtomically_Test;
   friend class WriteUnpreparedTxn;
   friend class WriteUnpreparedTxnDB;
   friend class WriteUnpreparedTransactionTest_RecoveryTest_Test;

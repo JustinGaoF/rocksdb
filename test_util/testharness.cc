@@ -94,6 +94,31 @@ std::string PerThreadDBPath(Env* env, std::string name) {
   return PerThreadDBPath(test::TmpDir(env), name);
 }
 
+uint32_t WalPartitionsForCurrentTest() {
+  const ::testing::TestInfo* info =
+      ::testing::UnitTest::GetInstance()->current_test_info();
+  static const std::string prefix =
+      "WalPartitions" + std::to_string(kTestWalPartitions) + "/";
+  if (info != nullptr &&
+      std::string(info->test_case_name()).rfind(prefix, 0) == 0) {
+    return kTestWalPartitions;
+  }
+  return 1;
+}
+
+void SetWalPartitions(DBOptions* options, uint32_t wal_partitions) {
+  if (wal_partitions <= 1) {
+    return;
+  }
+  options->wal_partitions = wal_partitions;
+  if (options->partition_wal_usage == PartitionWALUsage::kNone) {
+    options->partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  }
+  options->track_and_verify_wals_in_manifest = true;
+  options->recycle_log_file_num = 0;
+  options->experimental_allow_wal_partitions_for_testing = true;
+}
+
 int RandomSeed() {
   const char* env = getenv("TEST_RANDOM_SEED");
   int result = (env != nullptr ? atoi(env) : 301);
