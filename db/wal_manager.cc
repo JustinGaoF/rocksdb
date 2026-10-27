@@ -141,6 +141,27 @@ Status WalManager::GetUpdatesSince(SequenceNumber seq,
   if (!s.ok()) {
     return s;
   }
+  // WALs an earlier instance wrote with wal_partitions > 1 interleave their
+  // sequences across files, so reading them in file order would report gaps
+  // that are not there.
+  for (const auto& wal : *wal_files) {
+    const std::string fname =
+        wal->Type() == kAliveLogFile
+            ? LogFileName(wal_dir_, wal->LogNumber())
+            : ArchivedLogFileName(wal_dir_, wal->LogNumber());
+    uint32_t wal_partition = 0;
+    if (log::ReadWALPartition(fs_.get(), fname,
+                              fs_->OptimizeForLogRead(file_options_),
+                              wal->LogNumber(), &wal_partition)
+            .ok() &&
+        wal_partition != 0) {
+      return Status::NotSupported(
+          "GetUpdatesSince: WAL " + std::to_string(wal->LogNumber()) +
+          " was written by partition " + std::to_string(wal_partition) +
+          " of a DB with wal_partitions > 1, whose sequences interleave "
+          "across files");
+    }
+  }
   iter->reset(new WalIteratorImpl(
       wal_dir_, &db_options_, read_options, file_options_, seq,
       std::move(wal_files), version_set, seq_per_batch_, io_tracer_,

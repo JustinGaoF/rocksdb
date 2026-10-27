@@ -206,6 +206,9 @@ class Repairer {
       return status;
     }
     status = FindFiles();
+    if (status.ok()) {
+      status = CheckWalsNotPartitioned();
+    }
     DBImpl* db_impl = nullptr;
     if (status.ok()) {
       // Discard older manifests and start a fresh one
@@ -339,6 +342,29 @@ class Repairer {
     }
     if (!found_file) {
       return Status::Corruption(dbname_, "repair found no files");
+    }
+    return Status::OK();
+  }
+
+  // Each WAL converts to a table on its own, which drops the cross-file order
+  // of a set written with wal_partitions > 1 and can keep records above a
+  // hole. Checked before anything is changed.
+  Status CheckWalsNotPartitioned() {
+    const auto& fs = env_->GetFileSystem();
+    const auto& wal_dir = immutable_db_options_.GetWalDir();
+    for (uint64_t log : logs_) {
+      uint32_t wal_partition = 0;
+      if (log::ReadWALPartition(fs.get(), LogFileName(wal_dir, log),
+                                fs->OptimizeForLogRead(file_options_), log,
+                                &wal_partition)
+              .ok() &&
+          wal_partition != 0) {
+        return Status::NotSupported(
+            "RepairDB: WAL " + std::to_string(log) +
+            " was written by partition " + std::to_string(wal_partition) +
+            " of a DB with wal_partitions > 1; RepairDB converts each WAL on "
+            "its own and does not support partitioned WALs");
+      }
     }
     return Status::OK();
   }

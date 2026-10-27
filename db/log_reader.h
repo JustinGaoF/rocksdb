@@ -452,5 +452,14 @@ class FragmentBufferedReader : public Reader {
   void operator=(FragmentBufferedReader&&) = delete;
 };
 
+// Reads the head of WAL file `fname` (WAL number `log_number`) and sets
+// *wal_partition to the partition its WAL index marker names: zero when the
+// file has no marker, names none, or is empty. A WAL set written with
+// wal_partitions > 1 holds a file naming a nonzero partition, which consumers
+// that replay files one by one use to tell such a set apart.
+Status ReadWALPartition(FileSystem* fs, const std::string& fname,
+                        const FileOptions& file_options, uint64_t log_number,
+                        uint32_t* wal_partition);
+
 }  // namespace log
 }  // namespace ROCKSDB_NAMESPACE

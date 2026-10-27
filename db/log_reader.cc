@@ -1533,4 +1533,25 @@ bool FragmentBufferedReader::TryReadFragment(Slice* fragment, size_t* drop_size,
   }
 }
 
+Status ReadWALPartition(FileSystem* fs, const std::string& fname,
+                        const FileOptions& file_options, uint64_t log_number,
+                        uint32_t* wal_partition) {
+  *wal_partition = 0;
+  std::unique_ptr<FSSequentialFile> file;
+  Status s = fs->NewSequentialFile(fname, file_options, &file, /*dbg=*/nullptr);
+  if (!s.ok()) {
+    return s;
+  }
+  Reader reader(/*info_log=*/nullptr,
+                std::make_unique<SequentialFileReader>(std::move(file), fname),
+                /*reporter=*/nullptr, /*checksum=*/true, log_number);
+  std::string scratch;
+  Slice record;
+  // The marker is the file's first record, so the first data record (or the
+  // end of a file holding none) comes after it.
+  reader.ReadRecord(&record, &scratch);
+  *wal_partition = reader.WALPartition();
+  return Status::OK();
+}
+
 }  // namespace ROCKSDB_NAMESPACE::log

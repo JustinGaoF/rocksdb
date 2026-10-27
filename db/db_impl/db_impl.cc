@@ -6710,6 +6710,11 @@ Status DBImpl::GetUpdatesSince(SequenceNumber seq,
         "This API is not yet compatible with write-prepared/write-unprepared "
         "transactions");
   }
+  if (NumWalPartitions() > 1) {
+    return Status::NotSupported(
+        "GetUpdatesSince is not supported with wal_partitions > 1: each "
+        "partition's WALs hold an interleaved share of the sequence order");
+  }
   if (seq > versions_->LastSequence()) {
     return Status::NotFound("Requested sequence not yet written in the db");
   }

@@ -3134,6 +3134,16 @@ class InMemoryHandler : public WriteBatch::Handler {
   const std::map<uint32_t, const Comparator*> ucmps_;
 };
 
+// --only_print_seqno_gaps compares each batch with the one before it in file
+// order, which is the sequence order only while one WAL is written at a time.
+std::string PartitionedWalGapsRefusal(const std::string& wal_file,
+                                      uint32_t wal_partition) {
+  return "--only_print_seqno_gaps: " + wal_file + " was written by partition " +
+         std::to_string(wal_partition) +
+         " of a DB with wal_partitions > 1; sequence numbers interleave "
+         "across partitioned WALs, so gaps in file order are not real gaps";
+}
+
 void DumpWalFiles(Options options, const std::string& dir_or_file,
                   bool print_header, bool print_values,
                   bool only_print_seqno_gaps, bool is_write_committed,
@@ -3176,6 +3186,30 @@ void DumpWalFiles(Options options, const std::string& dir_or_file,
             dir_or_file + ": No valid wal logs found");
       }
       return;
+    }
+    // Refused before anything is printed: partition 0's WAL comes first and
+    // would report the other partitions' sequences as gaps.
+    WALFileIterator scan_iter(dir_or_file, filenames);
+    while (only_print_seqno_gaps && scan_iter.Valid()) {
+      const std::string scanned = scan_iter.GetNextWAL();
+      uint64_t log_number = 0;
+      FileType type;
+      if (!ParseFileName(scanned.substr(scanned.rfind(kFilePathSeparator) + 1),
+                         &log_number, &type)) {
+        log_number = 0;
+      }
+      uint32_t wal_partition = 0;
+      if (log::ReadWALPartition(options.env->GetFileSystem().get(), scanned,
+                                FileOptions(options), log_number,
+                                &wal_partition)
+              .ok() &&
+          wal_partition != 0) {
+        if (exec_state) {
+          *exec_state = LDBCommandExecuteResult::Failed(
+              PartitionedWalGapsRefusal(scanned, wal_partition));
+        }
+        return;
+      }
     }
     std::string wal_file = wal_file_iter.GetNextWAL();
     while (!wal_file.empty()) {
@@ -3249,6 +3283,17 @@ void DumpWalFile(Options options, const std::string& wal_file,
     }
     while (status.ok() && reader.ReadRecord(&record, &scratch)) {
       row.str("");
+      if (only_print_seqno_gaps && reader.WALPartition() != 0) {
+        if (exec_state) {
+          *exec_state = LDBCommandExecuteResult::Failed(
+              PartitionedWalGapsRefusal(wal_file, reader.WALPartition()));
+        } else {
+          std::cerr << PartitionedWalGapsRefusal(wal_file,
+                                                 reader.WALPartition())
+                    << std::endl;
+        }
+        break;
+      }
       if (record.size() < WriteBatchInternal::kHeader) {
         reporter.Corruption(record.size(),
                             Status::Corruption("log record too small"));
@@ -3347,6 +3392,9 @@ void DumpWalFile(Options options, const std::string& wal_file,
         row << "\n";
       }
       std::cout << row.str();
+    }
+    if (reader.WALPartition() != 0) {
+      std::cout << "WAL partition: " << reader.WALPartition() << std::endl;
     }
 
     std::stringstream cf_ids_oss;
