@@ -3,6 +3,10 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
+#include <set>
+
+#include "db/write_batch_internal.h"
+#include "file/file_util.h"
 #include "utilities/transactions/transaction_test.h"
 #include "utilities/transactions/write_unprepared_txn.h"
 #include "utilities/transactions/write_unprepared_txn_db.h"
@@ -38,6 +42,13 @@ INSTANTIATE_TEST_CASE_P(
     ::testing::Combine(::testing::Values(false), ::testing::Bool(),
                        ::testing::Values(WRITE_UNPREPARED), ::testing::Bool(),
                        ::testing::Values(0, 1000)));
+// Open rejects two_write_queues at wal_partitions > 1.
+INSTANTIATE_TEST_CASE_P(WalPartitions8, WriteUnpreparedTransactionTest,
+                        ::testing::Combine(::testing::Values(false),
+                                           ::testing::Values(false),
+                                           ::testing::Values(WRITE_UNPREPARED),
+                                           ::testing::Bool(),
+                                           ::testing::Values(0, 1000)));
 
 enum SnapshotAction { NO_SNAPSHOT, RO_SNAPSHOT, REFRESH_SNAPSHOT };
 enum VerificationOperation { VERIFY_GET, VERIFY_NEXT, VERIFY_PREV };
@@ -67,6 +78,13 @@ INSTANTIATE_TEST_CASE_P(
                                          REFRESH_SNAPSHOT),
                        ::testing::Values(VERIFY_GET, VERIFY_NEXT, VERIFY_PREV),
                        ::testing::Bool(), ::testing::Values(0, 1000)));
+INSTANTIATE_TEST_CASE_P(
+    WalPartitions8, WriteUnpreparedSnapshotTest,
+    ::testing::Combine(::testing::Values(false),
+                       ::testing::Values(NO_SNAPSHOT, RO_SNAPSHOT,
+                                         REFRESH_SNAPSHOT),
+                       ::testing::Values(VERIFY_GET, VERIFY_NEXT, VERIFY_PREV),
+                       ::testing::Values(false), ::testing::Values(0)));
 
 TEST_P(WriteUnpreparedTransactionTest, ReadYourOwnWrite) {
   // The following tests checks whether reading your own write for
@@ -495,8 +513,14 @@ TEST_P(WriteUnpreparedTransactionTest, MarkLogWithPrepSection) {
         ASSERT_OK(txn2->Prepare());
       }
 
-      ASSERT_GE(db_impl->TEST_LogfileNumber(), txn1->GetLogNumber());
-      ASSERT_GE(db_impl->TEST_LogfileNumber(), txn2->GetLogNumber());
+      // Each partition has a current WAL; the newest is at least the WAL
+      // holding either transaction's first batch.
+      uint64_t newest_wal = db_impl->TEST_LogfileNumber();
+      for (size_t p = 1; p < db_impl->TEST_NumWalPartitions(); ++p) {
+        newest_wal = std::max(newest_wal, db_impl->TEST_CurrentWalNumber(p));
+      }
+      ASSERT_GE(newest_wal, txn1->GetLogNumber());
+      ASSERT_GE(newest_wal, txn2->GetLogNumber());
 
       ASSERT_EQ(db_impl->TEST_FindMinLogContainingOutstandingPrep(),
                 txn1->GetLogNumber());
@@ -1100,6 +1124,174 @@ TEST_P(WriteUnpreparedTransactionTest,
 
   // Verify the DB is usable after rollback.
   ASSERT_OK(ReOpenNoDelete());
+}
+
+// N-5-4: WriteUnprepared at N=4 with every write flushed as an unprepared
+// batch. Each transaction writes two column families on different partitions,
+// and its prepare and commit markers, routed by its XID, land on a third.
+// From a crash image (every write synced, files copied while open), the
+// committed transaction is recovered, the rolled-back one is gone, and the
+// ones prepared before the crash recover as prepared and can then be
+// committed or rolled back; a second reopen finds nothing prepared.
+TEST(WriteUnpreparedPartitionedWalTest, RecoversAcrossPartitions) {
+  constexpr uint32_t kPartitions = 4;
+  constexpr uint32_t kColumnFamilies = 16;
+  Env* env = Env::Default();
+  const std::string dbname =
+      test::PerThreadDBPath("write_unprepared_partitioned_wal");
+  const std::string crash_dir = dbname + "_crash";
+  Options options;
+  options.create_if_missing = true;
+  options.create_missing_column_families = true;
+  test::SetWalPartitions(&options, kPartitions);
+  ASSERT_OK(DestroyDB(dbname, options));
+  ASSERT_OK(DestroyDB(crash_dir, options));
+
+  // Two column families on different partitions.
+  std::vector<size_t> partition_of_cf(kColumnFamilies + 1);
+  std::vector<ColumnFamilyDescriptor> column_families = {
+      {kDefaultColumnFamilyName, options}};
+  uint32_t cf_a = 0;
+  uint32_t cf_b = 0;
+  for (uint32_t cf_id = 1; cf_id <= kColumnFamilies; ++cf_id) {
+    column_families.emplace_back("cf" + std::to_string(cf_id), options);
+    WriteBatch batch;
+    ASSERT_OK(WriteBatchInternal::Put(&batch, cf_id, "key", "value"));
+    ASSERT_OK(DBImpl::TEST_WalPartitionForWrite(batch, kPartitions,
+                                                &partition_of_cf[cf_id]));
+    if (cf_a == 0) {
+      cf_a = cf_id;
+    } else if (cf_b == 0 && partition_of_cf[cf_id] != partition_of_cf[cf_a]) {
+      cf_b = cf_id;
+    }
+  }
+  ASSERT_NE(0U, cf_b) << "every column family routes to one partition";
+  // XIDs whose markers route to neither column family's partition.
+  int next_xid = 0;
+  auto xid_elsewhere = [&]() {
+    for (int tries = 0; tries < 1000; ++tries) {
+      const std::string xid = "xid" + std::to_string(next_xid++);
+      WriteBatch commit;
+      EXPECT_OK(WriteBatchInternal::MarkCommit(&commit, xid));
+      size_t partition = kPartitions;
+      EXPECT_OK(
+          DBImpl::TEST_WalPartitionForWrite(commit, kPartitions, &partition));
+      if (partition != partition_of_cf[cf_a] &&
+          partition != partition_of_cf[cf_b]) {
+        return xid;
+      }
+    }
+    ADD_FAILURE() << "every XID routes to the column families' partitions";
+    return std::string();
+  };
+
+  TransactionDBOptions txn_db_options;
+  txn_db_options.write_policy = WRITE_UNPREPARED;
+  std::vector<ColumnFamilyHandle*> handles;
+  TransactionDB* db = nullptr;
+  auto open = [&](const std::string& dir) {
+    ASSERT_OK(TransactionDB::Open(options, txn_db_options, dir, column_families,
+                                  &handles, &db));
+  };
+  auto close = [&] {
+    for (ColumnFamilyHandle* handle : handles) {
+      ASSERT_OK(db->DestroyColumnFamilyHandle(handle));
+    }
+    handles.clear();
+    delete db;
+    db = nullptr;
+  };
+  WriteOptions sync;
+  sync.sync = true;
+  TransactionOptions txn_options;
+  txn_options.write_batch_flush_threshold = 1;
+  auto prepare = [&](const std::string& name, const std::string& xid) {
+    Transaction* txn = db->BeginTransaction(sync, txn_options);
+    EXPECT_OK(txn->SetName(xid));
+    EXPECT_OK(txn->Put(handles[cf_a], name + "_a", "v"));
+    EXPECT_OK(txn->Put(handles[cf_b], name + "_b", "v"));
+    EXPECT_OK(txn->Prepare());
+    return txn;
+  };
+  auto value_of = [&](const std::string& name) {
+    std::string a;
+    std::string b;
+    const Status sa = db->Get(ReadOptions(), handles[cf_a], name + "_a", &a);
+    const Status sb = db->Get(ReadOptions(), handles[cf_b], name + "_b", &b);
+    EXPECT_EQ(sa.code(), sb.code()) << name;
+    EXPECT_TRUE(sa.ok() || sa.IsNotFound()) << sa.ToString();
+    return sa.ok() ? a + b : "NOT_FOUND";
+  };
+
+  open(dbname);
+  Transaction* committed = prepare("committed", xid_elsewhere());
+  ASSERT_OK(committed->Commit());
+  delete committed;
+  Transaction* rolled_back = prepare("rolled_back", xid_elsewhere());
+  ASSERT_OK(rolled_back->Rollback());
+  delete rolled_back;
+  const std::string commit_later_xid = xid_elsewhere();
+  Transaction* commit_later = prepare("commit_later", commit_later_xid);
+  const std::string roll_back_later_xid = xid_elsewhere();
+  Transaction* roll_back_later =
+      prepare("roll_back_later", roll_back_later_xid);
+
+  ASSERT_OK(DestroyDir(env, crash_dir));
+  ASSERT_OK(env->CreateDirIfMissing(crash_dir));
+  std::vector<std::string> children;
+  ASSERT_OK(env->GetChildren(dbname, &children));
+  for (const std::string& child : children) {
+    uint64_t number = 0;
+    FileType type;
+    if (ParseFileName(child, &number, &type) && type != kDBLockFile) {
+      std::string contents;
+      ASSERT_OK(ReadFileToString(env, dbname + "/" + child, &contents));
+      ASSERT_OK(WriteStringToFile(env, contents, crash_dir + "/" + child,
+                                  /*should_sync=*/true));
+    }
+  }
+  ASSERT_OK(commit_later->Rollback());
+  ASSERT_OK(roll_back_later->Rollback());
+  delete commit_later;
+  delete roll_back_later;
+  close();
+
+  open(crash_dir);
+  EXPECT_EQ("vv", value_of("committed"));
+  EXPECT_EQ("NOT_FOUND", value_of("rolled_back"));
+  EXPECT_EQ("NOT_FOUND", value_of("commit_later"));
+  EXPECT_EQ("NOT_FOUND", value_of("roll_back_later"));
+  std::vector<Transaction*> recovered;
+  db->GetAllPreparedTransactions(&recovered);
+  std::set<std::string> recovered_xids;
+  for (Transaction* txn : recovered) {
+    recovered_xids.insert(txn->GetName());
+  }
+  EXPECT_EQ((std::set<std::string>{commit_later_xid, roll_back_later_xid}),
+            recovered_xids);
+  Transaction* txn = db->GetTransactionByName(commit_later_xid);
+  ASSERT_NE(nullptr, txn);
+  ASSERT_OK(txn->Commit());
+  delete txn;
+  txn = db->GetTransactionByName(roll_back_later_xid);
+  ASSERT_NE(nullptr, txn);
+  ASSERT_OK(txn->Rollback());
+  delete txn;
+  EXPECT_EQ("vv", value_of("commit_later"));
+  EXPECT_EQ("NOT_FOUND", value_of("roll_back_later"));
+  close();
+
+  open(crash_dir);
+  recovered.clear();
+  db->GetAllPreparedTransactions(&recovered);
+  EXPECT_TRUE(recovered.empty());
+  EXPECT_EQ("vv", value_of("committed"));
+  EXPECT_EQ("NOT_FOUND", value_of("rolled_back"));
+  EXPECT_EQ("vv", value_of("commit_later"));
+  EXPECT_EQ("NOT_FOUND", value_of("roll_back_later"));
+  close();
+  ASSERT_OK(DestroyDB(dbname, options));
+  ASSERT_OK(DestroyDB(crash_dir, options));
 }
 
 }  // namespace ROCKSDB_NAMESPACE

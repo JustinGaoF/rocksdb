@@ -8179,6 +8179,92 @@ TEST_P(DBWritePartitionTest, SyncWriteAboveAsyncWriteSurvivesCrash) {
   EXPECT_EQ("NOT_FOUND", Get(cf_for_partition_[0], "key_control"));
 }
 
+TEST_P(DBWritePartitionTest, AsyncOnSyncingPartitionWaitsForItsFsync) {
+  // Accepted as one-WAL semantics (an append to a file waits for that
+  // file's fsync): with B (sync) held inside its fsync of partition 1, under
+  // partition 1's WAL mutex, E (async) on partition 1 joins its write queue
+  // but cannot bind to the WAL, let alone return, until B's fsync of
+  // partition 1 finishes; then it returns.
+  if (GetParam()) {
+    return;
+  }
+  constexpr size_t kPartitions = 4;
+  Options options = CurrentOptions();
+  options.avoid_flush_during_shutdown = true;
+  OpenWithPartitions(kPartitions, options);
+  const int cf_q = cf_for_partition_[1];
+
+  std::mutex mu;
+  std::condition_variable cv;
+  bool b_in_fsync = false;
+  bool release_b = false;
+  bool e_joined = false;
+  std::atomic<std::thread::id> e_thread_id{std::thread::id()};
+  std::atomic<bool> e_returned{false};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SyncWalPartitionFiles:BeforeSyncPartition", [&](void* arg) {
+        if (*static_cast<size_t*>(arg) != 1) {
+          return;
+        }
+        std::unique_lock<std::mutex> lock(mu);
+        if (b_in_fsync) {
+          return;
+        }
+        b_in_fsync = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return release_b; });
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "WriteThread::JoinBatchGroup:Start", [&](void*) {
+        if (std::this_thread::get_id() == e_thread_id.load()) {
+          std::lock_guard<std::mutex> lock(mu);
+          e_joined = true;
+          cv.notify_all();
+        }
+      });
+
+  WriteOptions sync_wo;
+  sync_wo.sync = true;
+  Status b_status;
+  port::Thread b_thread(
+      [&] { b_status = Put(cf_q, "key_b", "value_b", sync_wo); });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(30),
+                            [&] { return b_in_fsync; }));
+  }
+  Status e_status;
+  port::Thread e_thread([&] {
+    e_thread_id.store(std::this_thread::get_id());
+    e_status = Put(cf_q, "key_e", "value_e");
+    e_returned.store(true);
+  });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    ASSERT_TRUE(
+        cv.wait_for(lock, std::chrono::seconds(30), [&] { return e_joined; }));
+  }
+  // Room for E to (wrongly) return while B's fsync holds partition 1's WAL
+  // mutex.
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  EXPECT_FALSE(e_returned.load());
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    release_b = true;
+    cv.notify_all();
+  }
+  ASSERT_OK(RunWithin(std::chrono::seconds(30), [&] {
+    e_thread.join();
+    return e_status;
+  }));
+  b_thread.join();
+  SyncPoint::GetInstance()->ClearCallBack(
+      "DBImpl::SyncWalPartitionFiles:BeforeSyncPartition");
+  SyncPoint::GetInstance()->ClearCallBack("WriteThread::JoinBatchGroup:Start");
+  ASSERT_OK(b_status);
+  ASSERT_EQ("value_e", Get(cf_q, "key_e"));
+}
+
 TEST_P(DBWritePartitionTest, PartialGateSyncCutLosesHigherAsyncWrite) {
   // D-G11 (c) accepted risk: records in one partition's WAL that follow a
   // lower record never fsynced in another partition's WAL exist on disk
@@ -13627,6 +13713,86 @@ TEST_P(DBWalAppendFailureTest, GateSyncKeepsOtherPartitionsErrorResumable) {
   EXPECT_EQ(Status::Severity::kHardError, bg_after.severity())
       << bg_after.ToString();
   EXPECT_OK(dbfull()->Resume());
+}
+
+// D-9 (superseding GC20 Q5's D-7 for sync failures): a write ordered above
+// a pending sync write neither returns nor becomes visible before that
+// sync's fsync, and fails with the background error when it fails, as at
+// N=1. B (sync, on partition 0) is held inside its fsync of partition 0; C
+// (async, on partition 1, above B) parks behind it, unreturned and absent.
+// B's fsync then fails. Both return the error, and both are absent before
+// and after Resume(), after its flush, and after a reopen.
+// Neuter: B publishes before its fsync (PublishOnGroupExit ignoring
+// sync_first_sequence, RunSyncGate not publishing): C returns OK while B is
+// held, and key_b reads back.
+TEST_P(DBWalAppendFailureTest, FailedGateSyncFailsWritesAbove) {
+  Options options = FailureOptions();
+  OpenWithPartitions(2, options);
+  PutBeforeFailure(this);
+  const int cf_b = cf_for_partition_[0];
+  const int cf_c = cf_for_partition_[1];
+  // Read before B holds partition 0's WAL mutex inside its fsync.
+  const uint64_t wal0 = dbfull()->TEST_CurrentWalNumber(0);
+  std::mutex mu;
+  std::condition_variable cv;
+  bool b_in_fsync = false;
+  bool release_b = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SyncWalPartitionFiles:BeforeSyncPartition", [&](void* arg) {
+        if (*static_cast<size_t*>(arg) != 0) {
+          return;
+        }
+        std::unique_lock<std::mutex> lock(mu);
+        if (b_in_fsync) {
+          return;
+        }
+        b_in_fsync = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return release_b; });
+      });
+  WriteOptions sync_wo;
+  sync_wo.sync = true;
+  Writer b([&] { return Put(cf_b, "key_b", "value_b", sync_wo); });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(30),
+                            [&] { return b_in_fsync; }));
+  }
+  Writer c([&] { return Put(cf_c, "key_c", "value_c"); });
+  ASSERT_TRUE(WaitForDurabilityWaiters(1));
+  EXPECT_EQ("NOT_FOUND", Get(cf_b, "key_b"));
+  EXPECT_EQ("NOT_FOUND", Get(cf_c, "key_c"));
+  fail_fs_->Arm(wal0, Retryable("injected sync error"));
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    release_b = true;
+    cv.notify_all();
+  }
+  const Status b_status = b.Join();
+  const Status c_status = c.Join();
+  fail_fs_->Disarm();
+  SyncPoint::GetInstance()->ClearCallBack(
+      "DBImpl::SyncWalPartitionFiles:BeforeSyncPartition");
+  ASSERT_NOK(b_status);
+  ASSERT_NOK(c_status);
+  EXPECT_EQ(dbfull()->TEST_GetBGError().ToString(), c_status.ToString());
+  EXPECT_EQ("NOT_FOUND", Get(cf_b, "key_b"));
+  EXPECT_EQ("NOT_FOUND", Get(cf_c, "key_c"));
+
+  ASSERT_OK(dbfull()->Resume());
+  EXPECT_EQ("NOT_FOUND", Get(cf_b, "key_b"));
+  EXPECT_EQ("NOT_FOUND", Get(cf_c, "key_c"));
+  ASSERT_OK(Flush(cf_b));
+  ASSERT_OK(Flush(cf_c));
+  EXPECT_EQ("NOT_FOUND", Get(cf_b, "key_b"));
+  EXPECT_EQ("NOT_FOUND", Get(cf_c, "key_c"));
+
+  ReopenWithPartitions(2, options);
+  EXPECT_EQ("NOT_FOUND", Get(cf_b, "key_b"));
+  EXPECT_EQ("NOT_FOUND", Get(cf_c, "key_c"));
+  for (size_t p = 0; p < 2; ++p) {
+    EXPECT_EQ("value", Get(cf_for_partition_[p], "before" + std::to_string(p)));
+  }
 }
 
 // GC20 Q6 (D-8), ported from GC18's Muse candidate (pwal/ab/gc18-muse-PR9,
