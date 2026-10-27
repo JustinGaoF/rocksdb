@@ -153,8 +153,6 @@ void BuildDBOptions(const ImmutableDBOptions& immutable_db_options,
   options.max_write_batch_group_size_bytes =
       immutable_db_options.max_write_batch_group_size_bytes;
   options.wal_partitions = immutable_db_options.wal_partitions;
-  options.experimental_allow_wal_partitions_for_testing =
-      immutable_db_options.experimental_allow_wal_partitions_for_testing;
   options.write_thread_max_yield_usec =
       immutable_db_options.write_thread_max_yield_usec;
   options.write_thread_slow_yield_usec =
