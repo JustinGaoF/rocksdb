@@ -21,6 +21,7 @@
 #include "test_util/testharness.h"
 #include "test_util/transaction_test_util.h"
 #include "util/crc32c.h"
+#include "util/defer.h"
 #include "util/random.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -39,6 +40,7 @@ class OptimisticTransactionTest
     options.max_write_buffer_number = 2;
     options.max_write_buffer_size_to_maintain = 2 * Arena::kInlineSize;
     options.merge_operator.reset(new TestPutOperator());
+    test::SetWalPartitions(&options, test::WalPartitionsForCurrentTest());
     occ_opts.validate_policy = GetParam();
     dbname = test::PerThreadDBPath("optimistic_transaction_testdb");
 
@@ -2671,10 +2673,80 @@ TEST_P(OptimisticTransactionTest, AttributeGroupIteratorSanityChecks) {
   }
 }
 
+// Review-M3 T1: optimistic transactions commit to column families covering
+// every partition, so the WalPartitions8 leg validates and commits on more
+// than one partition; a conflict on one of them is still detected, and every
+// commit survives a reopen.
+TEST_P(OptimisticTransactionTest, CommitsOnEveryWalPartition) {
+  const std::vector<uint32_t> cf_ids =
+      ColumnFamilyIdsCoveringWalPartitions(options.wal_partitions);
+  const std::vector<std::string> cf_names = ColumnFamilyNamesThrough(cf_ids);
+  // Handles indexed by column family id; the ids in cf_ids start at 1, and
+  // the reopen below returns the default one too.
+  std::vector<ColumnFamilyHandle*> handles = {nullptr};
+  auto destroy_handles = [&] {
+    for (ColumnFamilyHandle* handle : handles) {
+      if (handle != nullptr) {
+        EXPECT_OK(txn_db->DestroyColumnFamilyHandle(handle));
+      }
+    }
+    handles.clear();
+  };
+  Defer on_exit(destroy_handles);
+  for (size_t i = 1; i < cf_names.size(); ++i) {
+    ColumnFamilyHandle* handle = nullptr;
+    ASSERT_OK(txn_db->CreateColumnFamily(ColumnFamilyOptions(options),
+                                         cf_names[i], &handle));
+    handles.push_back(handle);
+  }
+  for (uint32_t cf_id : cf_ids) {
+    std::unique_ptr<Transaction> txn(txn_db->BeginTransaction(WriteOptions()));
+    std::string value;
+    ASSERT_TRUE(txn->GetForUpdate(ReadOptions(), handles[cf_id], "key", &value)
+                    .IsNotFound());
+    ASSERT_OK(txn->Put(handles[cf_id], "key", "committed"));
+    ASSERT_OK(txn->Commit());
+  }
+  if (options.wal_partitions > 1) {
+    ASSERT_GE(WalPartitionsAppendedTo(txn_db.get()), 2u);
+  }
+  {
+    // A write outside the transaction after its read fails its commit.
+    std::unique_ptr<Transaction> txn(txn_db->BeginTransaction(WriteOptions()));
+    std::string value;
+    ASSERT_OK(txn->GetForUpdate(ReadOptions(), handles[cf_ids.back()], "key",
+                                &value));
+    ASSERT_OK(
+        txn_db->Put(WriteOptions(), handles[cf_ids.back()], "key", "outside"));
+    ASSERT_OK(txn->Put(handles[cf_ids.back()], "key", "conflicting"));
+    ASSERT_TRUE(txn->Commit().IsBusy());
+  }
+  destroy_handles();
+  txn_db.reset();
+
+  std::vector<ColumnFamilyDescriptor> column_families;
+  for (const std::string& name : cf_names) {
+    column_families.emplace_back(name, ColumnFamilyOptions(options));
+  }
+  OptimisticTransactionDB* raw_txn_db = nullptr;
+  ASSERT_OK(OptimisticTransactionDB::Open(
+      options, occ_opts, dbname, column_families, &handles, &raw_txn_db));
+  txn_db.reset(raw_txn_db);
+  for (uint32_t cf_id : cf_ids) {
+    std::string value;
+    ASSERT_OK(txn_db->Get(ReadOptions(), handles[cf_id], "key", &value));
+    EXPECT_EQ(cf_id == cf_ids.back() ? "outside" : "committed", value);
+  }
+}
+
 INSTANTIATE_TEST_CASE_P(
     InstanceOccGroup, OptimisticTransactionTest,
     testing::Values(OccValidationPolicy::kValidateSerial,
                     OccValidationPolicy::kValidateParallel));
+// Open rejects serial validation at wal_partitions > 1.
+INSTANTIATE_TEST_CASE_P(
+    WalPartitions8, OptimisticTransactionTest,
+    testing::Values(OccValidationPolicy::kValidateParallel));
 
 // Serial validation runs on the write group leader, and N partitions run N
 // leaders, so it is rejected at Open with N > 1. Parallel validation commits.

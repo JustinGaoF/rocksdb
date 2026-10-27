@@ -5,6 +5,7 @@
 //
 #include "rocksdb/utilities/ldb_cmd.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cinttypes>
 #include <iomanip>
@@ -292,6 +293,151 @@ TEST_F(LdbCmdTest, DumpWalOnPartitionedWals) {
   EXPECT_EQ(std::string::npos, output.find("Prev batch")) << output;
   EXPECT_EQ(std::string::npos, output.find("Checking wal file")) << output;
   ASSERT_OK(DestroyDB(dbname, opts));
+}
+
+class LdbCmdWalPartitionsTest : public LdbCmdTest,
+                                public testing::WithParamInterface<uint32_t> {};
+
+INSTANTIATE_TEST_CASE_P(WalPartitions1, LdbCmdWalPartitionsTest,
+                        testing::Values(1U));
+INSTANTIATE_TEST_CASE_P(WalPartitions8, LdbCmdWalPartitionsTest,
+                        testing::Values(test::kTestWalPartitions));
+
+// `ldb dump_wal` on each partition's current WAL prints that WAL's records,
+// and names the partition of every file but partition 0's; together the files
+// hold every write exactly once. `--only_print_seqno_gaps` refuses every one
+// of them, partition 0's included (GC34 Q4): the writes go round-robin across
+// the partitions, so other WALs hold the sequences between partition 0's
+// records, and an indexed DB refuses at N=1 too (the MANIFEST guard), where
+// older WALs may come from an N>1 open. A DB that does not index its WALs
+// gap-checks its WAL as upstream does. `dump_live_files`, which opens the
+// DB, lists the WAL at one partition and is refused at more. Ported from
+// D127115188's DumpWalShowsPartitionAndRefusesGapsAtN8.
+// Neuter (GC34 Q4): drop the single-file refusal in DumpWalFiles; partition
+// 0's gap check exits 0 at N=8 with false "Prev batch" gaps.
+TEST_P(LdbCmdWalPartitionsTest, DumpWalAtWalPartitions) {
+  Env* env = TryLoadCustomOrDefaultEnv();
+  const uint32_t num_partitions = GetParam();
+  Options opts;
+  opts.env = env;
+  opts.create_if_missing = true;
+  opts.create_missing_column_families = true;
+  opts.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  opts.avoid_flush_during_shutdown = true;
+  test::SetWalPartitions(&opts, num_partitions);
+  const std::string dbname = test::PerThreadDBPath(env, "ldb_cmd_test");
+  ASSERT_OK(DestroyDB(dbname, opts));
+
+  const std::vector<uint32_t> cf_ids =
+      ColumnFamilyIdsCoveringWalPartitions(num_partitions);
+  std::vector<ColumnFamilyDescriptor> column_families;
+  column_families.emplace_back(kDefaultColumnFamilyName, opts);
+  const uint32_t max_cf_id = *std::max_element(cf_ids.begin(), cf_ids.end());
+  for (uint32_t cf_id = 1; cf_id <= max_cf_id; ++cf_id) {
+    column_families.emplace_back("cf" + std::to_string(cf_id), opts);
+  }
+  std::vector<uint64_t> current_wals(num_partitions);
+  constexpr int kRounds = 3;
+  {
+    std::vector<ColumnFamilyHandle*> handles;
+    std::unique_ptr<DB> db;
+    ASSERT_OK(DB::Open(opts, dbname, column_families, &handles, &db));
+    for (int round = 0; round < kRounds; ++round) {
+      for (uint32_t p = 0; p < num_partitions; ++p) {
+        ASSERT_OK(db->Put(
+            WriteOptions(), handles[cf_ids[p]],
+            "key" + std::to_string(p) + "_" + std::to_string(round), "value"));
+        current_wals[p] =
+            static_cast<DBImpl*>(db.get())->TEST_CurrentWalNumber(p);
+      }
+    }
+    for (ColumnFamilyHandle* handle : handles) {
+      ASSERT_OK(db->DestroyColumnFamilyHandle(handle));
+    }
+  }
+
+  auto run = [&](std::vector<std::string> args, std::string* output) {
+    args.insert(args.begin(), "./ldb");
+    std::vector<const char*> argv;
+    for (const std::string& arg : args) {
+      argv.push_back(arg.c_str());
+    }
+    testing::internal::CaptureStdout();
+    testing::internal::CaptureStderr();
+    const int code =
+        LDBCommandRunner::RunCommand(static_cast<int>(argv.size()), argv.data(),
+                                     opts, LDBOptions(), &column_families);
+    *output = testing::internal::GetCapturedStderr();
+    *output += testing::internal::GetCapturedStdout();
+    return code;
+  };
+  std::string output;
+  size_t records = 0;
+  for (uint32_t p = 0; p < num_partitions; ++p) {
+    SCOPED_TRACE("partition=" + std::to_string(p));
+    const std::string wal_arg =
+        "--walfile=" + LogFileName(dbname, current_wals[p]);
+    ASSERT_EQ(0, run({"dump_wal", wal_arg}, &output));
+    std::istringstream lines(output);
+    std::string line;
+    while (std::getline(lines, line)) {
+      if (!line.empty() && std::isdigit(static_cast<unsigned char>(line[0]))) {
+        ++records;
+      }
+    }
+    EXPECT_EQ(p != 0, output.find("WAL partition: " + std::to_string(p)) !=
+                          std::string::npos)
+        << output;
+    const int gaps =
+        run({"dump_wal", wal_arg, "--only_print_seqno_gaps"}, &output);
+    EXPECT_NE(0, gaps) << output;
+    EXPECT_NE(std::string::npos, output.find("wal_partitions > 1")) << output;
+    EXPECT_EQ(std::string::npos, output.find("Prev batch")) << output;
+  }
+  EXPECT_EQ(num_partitions * kRounds, records);
+
+  const int live_files = run({"dump_live_files", "--db=" + dbname}, &output);
+  if (num_partitions == 1) {
+    ASSERT_EQ(0, live_files) << output;
+    EXPECT_NE(std::string::npos,
+              output.find(LogFileName("", current_wals[0]).substr(1)))
+        << output;
+  } else {
+    // ldb opens the DB with its OPTIONS file, which does not keep the testing
+    // opt-in, so the open is refused like any production open.
+    EXPECT_NE(0, live_files) << output;
+    EXPECT_NE(std::string::npos,
+              output.find("wal_partitions > 1 is not supported yet"))
+        << output;
+  }
+  ASSERT_OK(DestroyDB(dbname, opts));
+
+  if (num_partitions == 1) {
+    // A DB that does not index its WALs: no refusal, as upstream.
+    SCOPED_TRACE("partition_wal_usage none");
+    opts.partition_wal_usage = PartitionWALUsage::kNone;
+    uint64_t wal = 0;
+    {
+      std::vector<ColumnFamilyHandle*> handles;
+      std::unique_ptr<DB> db;
+      ASSERT_OK(DB::Open(opts, dbname, column_families, &handles, &db));
+      for (int round = 0; round < kRounds; ++round) {
+        ASSERT_OK(db->Put(WriteOptions(), handles[cf_ids[0]],
+                          "key" + std::to_string(round), "value"));
+      }
+      wal = static_cast<DBImpl*>(db.get())->TEST_CurrentWalNumber(0);
+      for (ColumnFamilyHandle* handle : handles) {
+        ASSERT_OK(db->DestroyColumnFamilyHandle(handle));
+      }
+    }
+    EXPECT_EQ(0, run({"dump_wal", "--walfile=" + LogFileName(dbname, wal),
+                      "--only_print_seqno_gaps"},
+                     &output))
+        << output;
+    EXPECT_EQ(std::string::npos, output.find("indexed")) << output;
+    EXPECT_EQ(std::string::npos, output.find("Prev batch")) << output;
+    ASSERT_OK(DestroyDB(dbname, opts));
+  }
 }
 
 // GC27 Q5 (d) (L13, K4; D-GC27b): a WAL whose head cannot be read is of an

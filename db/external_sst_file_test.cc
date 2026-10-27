@@ -362,7 +362,65 @@ class ExternalSSTFileTest
   bool two_phase_ingest_ = false;
 };
 
-TEST_F(ExternalSSTFileTest, IngestionTimingHistogram) {
+// Runs the tests below that use no parameter at 1 and at
+// test::kTestWalPartitions WAL partitions.
+class ExternalSSTFileTestN : public ExternalSSTFileTest {};
+
+INSTANTIATE_TEST_CASE_P(WalPartitions1, ExternalSSTFileTestN,
+                        testing::Values(std::make_tuple(false, false)));
+INSTANTIATE_TEST_CASE_P(WalPartitions8, ExternalSSTFileTestN,
+                        testing::Values(std::make_tuple(false, false)));
+
+// Writers run on every partition while files are ingested into column
+// families on every partition, each file's range overlapping the writers'
+// keys. Ingestion holds every write queue, so after a reopen, in every
+// recovery mode, each writer's keys are a prefix holding every acknowledged
+// write, and every ingested key is present. Ported from D127115188's
+// IngestionConcurrentWritesAtN8.
+TEST_P(ExternalSSTFileTestN, IngestionConcurrentWritesAtWalPartitions) {
+  constexpr uint64_t kMaxKeys = 300;
+  constexpr int kIngestions = 24;
+  Options options = CurrentOptions();
+  const std::vector<uint32_t> cf_ids =
+      ColumnFamilyIdsCoveringWalPartitions(options.wal_partitions);
+  const std::vector<std::string> cf_names = ColumnFamilyNamesThrough(cf_ids);
+  CreateAndReopenWithCF({cf_names.begin() + 1, cf_names.end()}, options);
+  std::vector<uint64_t> acked;
+  {
+    PartitionWriters writers(db_.get(), handles_, cf_ids, kMaxKeys);
+    for (int i = 0; i < kIngestions; ++i) {
+      std::vector<std::pair<std::string, std::string>> data;
+      for (int k = 0; k < 10; ++k) {
+        data.emplace_back(
+            "key" + std::to_string(k * 10) + "_ingest" + std::to_string(i),
+            "ingested");
+      }
+      ASSERT_OK(GenerateAndAddExternalFile(
+          options, data, /*file_id=*/-1, /*allow_global_seqno=*/true,
+          /*verify_checksums_before_ingest=*/true, /*ingest_behind=*/false,
+          /*sort_data=*/true, /*true_data=*/nullptr,
+          handles_[cf_ids[i % cf_ids.size()]]));
+    }
+    writers.Stop();
+    acked = writers.Acked();
+  }
+  if (options.wal_partitions > 1) {
+    EXPECT_EQ(options.wal_partitions, WalPartitionsAppendedTo(db_.get()));
+  }
+  Close();
+  AssertKeyPrefixesInEveryRecoveryMode(options, dbname_, cf_ids, acked,
+                                       kMaxKeys);
+  ReopenWithColumnFamilies(cf_names, options);
+  for (int i = 0; i < kIngestions; ++i) {
+    for (int k = 0; k < 10; ++k) {
+      EXPECT_EQ("ingested", Get(static_cast<int>(cf_ids[i % cf_ids.size()]),
+                                "key" + std::to_string(k * 10) + "_ingest" +
+                                    std::to_string(i)));
+    }
+  }
+}
+
+TEST_P(ExternalSSTFileTestN, IngestionTimingHistogram) {
   Options options = CurrentOptions();
   options.statistics = CreateDBStatistics();
   options.statistics->set_stats_level(StatsLevel::kAll);  // enable timers
@@ -404,7 +462,7 @@ TEST_F(ExternalSSTFileTest, IngestionTimingHistogram) {
   ASSERT_EQ(2, hist(INGEST_EXTERNAL_FILE_RUN_TIME).count);
 }
 
-TEST_F(ExternalSSTFileTest, PrepareThenCommit) {
+TEST_P(ExternalSSTFileTestN, PrepareThenCommit) {
   Options options = CurrentOptions();
   DestroyAndReopen(options);
 
@@ -429,7 +487,7 @@ TEST_F(ExternalSSTFileTest, PrepareThenCommit) {
   ASSERT_EQ("v3", Get("k3"));
 }
 
-TEST_F(ExternalSSTFileTest,
+TEST_P(ExternalSSTFileTestN,
        AtomicReplaceRangeRetriesIfPartialOverlapAppearsAfterPrepare) {
   Options options = CurrentOptions();
   options.compaction_style = kCompactionStyleUniversal;
@@ -470,7 +528,7 @@ TEST_F(ExternalSSTFileTest,
   ASSERT_EQ("new-d", Get("d"));
 }
 
-TEST_F(ExternalSSTFileTest, ParallelFileOpenWithFileOpeningThreads) {
+TEST_P(ExternalSSTFileTestN, ParallelFileOpenWithFileOpeningThreads) {
   // Ingest many non-overlapping files with file_opening_threads > 1 so commit
   // opens table readers with multiple threads. max_open_files == -1 makes
   // commit open every new file.
@@ -504,7 +562,7 @@ TEST_F(ExternalSSTFileTest, ParallelFileOpenWithFileOpeningThreads) {
   }
 }
 
-TEST_F(ExternalSSTFileTest, LmaxPrefetchSkipDoesNotDisableL0Prefetch) {
+TEST_P(ExternalSSTFileTestN, LmaxPrefetchSkipDoesNotDisableL0Prefetch) {
   LRUCacheOptions co;
   co.capacity = 32 << 20;
   std::shared_ptr<Cache> cache = NewLRUCache(co);
@@ -583,7 +641,7 @@ TEST_F(ExternalSSTFileTest, LmaxPrefetchSkipDoesNotDisableL0Prefetch) {
             0);
 }
 
-TEST_F(ExternalSSTFileTest, AbortPreparedIngestion) {
+TEST_P(ExternalSSTFileTestN, AbortPreparedIngestion) {
   Options options = CurrentOptions();
   DestroyAndReopen(options);
 
@@ -609,7 +667,7 @@ TEST_F(ExternalSSTFileTest, AbortPreparedIngestion) {
   ASSERT_EQ("1", Get("x"));
 }
 
-TEST_F(ExternalSSTFileTest, MultiHandleAtomicCommit) {
+TEST_P(ExternalSSTFileTestN, MultiHandleAtomicCommit) {
   Options options = CurrentOptions();
   CreateAndReopenWithCF({"cf1", "cf2", "cf3"}, options);
 
@@ -664,7 +722,7 @@ TEST_F(ExternalSSTFileTest, MultiHandleAtomicCommit) {
   ASSERT_EQ("3", Get(3, "c"));
 }
 
-TEST_F(ExternalSSTFileTest, MultiHandleSameColumnFamilyIncompatibleOptions) {
+TEST_P(ExternalSSTFileTestN, MultiHandleSameColumnFamilyIncompatibleOptions) {
   Options options = CurrentOptions();
   DestroyAndReopen(options);
 
@@ -701,7 +759,7 @@ TEST_F(ExternalSSTFileTest, MultiHandleSameColumnFamilyIncompatibleOptions) {
   ASSERT_EQ("1", Get("a"));
 }
 
-TEST_F(ExternalSSTFileTest, PrepareFileIngestionValidationErrors) {
+TEST_P(ExternalSSTFileTestN, PrepareFileIngestionValidationErrors) {
   Options options = CurrentOptions();
   DestroyAndReopen(options);
 
@@ -733,7 +791,7 @@ TEST_F(ExternalSSTFileTest, PrepareFileIngestionValidationErrors) {
 // IngestExternalFileArg::file_infos skips the open-and-scan path and still
 // produces correct data, including overlapping data that is reassigned a new
 // global sequence number.
-TEST_F(ExternalSSTFileTest, IngestWithFileInfo) {
+TEST_P(ExternalSSTFileTestN, IngestWithFileInfo) {
   Options options = CurrentOptions();
   DestroyAndReopen(options);
   std::map<std::string, std::string> true_data;
@@ -786,7 +844,7 @@ TEST_F(ExternalSSTFileTest, IngestWithFileInfo) {
 // Range deletions are honored on the file_infos fast-path: the writer's
 // range-del bounds are carried in the metadata, so a DeleteRange covering
 // existing keys still shadows them.
-TEST_F(ExternalSSTFileTest, IngestWithFileInfoRangeDeletion) {
+TEST_P(ExternalSSTFileTestN, IngestWithFileInfoRangeDeletion) {
   Options options = CurrentOptions();
   DestroyAndReopen(options);
   ASSERT_OK(db_->Put(WriteOptions(), Key(20), "live20"));
@@ -818,7 +876,7 @@ TEST_F(ExternalSSTFileTest, IngestWithFileInfoRangeDeletion) {
 
 // verify_checksums_before_ingest is honored on the file_infos fast-path: it
 // opens the file just to verify, so corruption is still detected.
-TEST_F(ExternalSSTFileTest, IngestWithFileInfoVerifiesChecksum) {
+TEST_P(ExternalSSTFileTestN, IngestWithFileInfoVerifiesChecksum) {
   Options options = CurrentOptions();
   DestroyAndReopen(options);
 
@@ -841,7 +899,7 @@ TEST_F(ExternalSSTFileTest, IngestWithFileInfoVerifiesChecksum) {
   ASSERT_TRUE(db_->IngestExternalFiles({arg}).IsCorruption());
 }
 
-TEST_F(ExternalSSTFileTest, IngestWithSerializedFileInfo) {
+TEST_P(ExternalSSTFileTestN, IngestWithSerializedFileInfo) {
   Options options = CurrentOptions();
   DestroyAndReopen(options);
 
@@ -866,14 +924,14 @@ TEST_F(ExternalSSTFileTest, IngestWithSerializedFileInfo) {
   ASSERT_EQ(Get(Key(10)), "v10");
 }
 
-TEST_F(ExternalSSTFileTest, PreparedFileInfoRejectsInvalidSerialization) {
+TEST_P(ExternalSSTFileTestN, PreparedFileInfoRejectsInvalidSerialization) {
   std::shared_ptr<const PreparedFileInfo> prepared_file_info;
   ASSERT_TRUE(DeserializePreparedFileInfo("invalid", &prepared_file_info)
                   .IsCorruption());
   ASSERT_EQ(prepared_file_info, nullptr);
 }
 
-TEST_F(ExternalSSTFileTest, PreparedFileInfoDetectsSerializationCorruption) {
+TEST_P(ExternalSSTFileTestN, PreparedFileInfoDetectsSerializationCorruption) {
   Options options = CurrentOptions();
   const std::string file_path = sst_files_dir_ + "file_info_corruption.sst";
   SstFileWriter writer(EnvOptions(), options);
@@ -894,7 +952,7 @@ TEST_F(ExternalSSTFileTest, PreparedFileInfoDetectsSerializationCorruption) {
   ASSERT_EQ(deserialized, nullptr);
 }
 
-TEST_F(ExternalSSTFileTest, GetPreparedFileInfoForExternalSstIngestion) {
+TEST_P(ExternalSSTFileTestN, GetPreparedFileInfoForExternalSstIngestion) {
   Options options = CurrentOptions();
   DestroyAndReopen(options);
 
@@ -963,7 +1021,7 @@ TEST_F(ExternalSSTFileTest, GetPreparedFileInfoForExternalSstIngestion) {
   SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
-TEST_F(ExternalSSTFileTest,
+TEST_P(ExternalSSTFileTestN,
        IngestWithFileInfoRejectsMissingDbGeneratedSeqnoBounds) {
   Options options = CurrentOptions();
   DestroyAndReopen(options);
@@ -992,7 +1050,7 @@ TEST_F(ExternalSSTFileTest,
   ASSERT_NE(s.ToString().find("Unknown largest seqno"), std::string::npos);
 }
 
-TEST_F(ExternalSSTFileTest, IngestWithFileInfoPreparedKeyBoundTypes) {
+TEST_P(ExternalSSTFileTestN, IngestWithFileInfoPreparedKeyBoundTypes) {
   Options options = CurrentOptions();
   DestroyAndReopen(options);
 
@@ -1020,7 +1078,7 @@ TEST_F(ExternalSSTFileTest, IngestWithFileInfoPreparedKeyBoundTypes) {
   ASSERT_EQ(Key(30), largest.user_key.ToString());
 }
 
-TEST_F(ExternalSSTFileTest, ComparatorMismatch) {
+TEST_P(ExternalSSTFileTestN, ComparatorMismatch) {
   Options options = CurrentOptions();
   Options options_diff_ucmp = options;
 
@@ -1039,7 +1097,7 @@ TEST_F(ExternalSSTFileTest, ComparatorMismatch) {
   ASSERT_NOK(DeprecatedAddFile({file}));
 }
 
-TEST_F(ExternalSSTFileTest, NoBlockCache) {
+TEST_P(ExternalSSTFileTestN, NoBlockCache) {
   LRUCacheOptions co;
   co.capacity = 32 << 20;
   std::shared_ptr<Cache> cache = NewLRUCache(co);
@@ -1082,7 +1140,7 @@ TEST_F(ExternalSSTFileTest, NoBlockCache) {
   }
 }
 
-TEST_F(ExternalSSTFileTest, Basic) {
+TEST_P(ExternalSSTFileTestN, Basic) {
   do {
     Options options = CurrentOptions();
 
@@ -1325,7 +1383,7 @@ TEST_F(ExternalSSTFileTest, Basic) {
                          kRangeDelSkipConfigs));
 }
 
-TEST_F(ExternalSSTFileTest, BasicWideColumn) {
+TEST_P(ExternalSSTFileTestN, BasicWideColumn) {
   do {
     Options options = CurrentOptions();
 
@@ -1375,7 +1433,7 @@ TEST_F(ExternalSSTFileTest, BasicWideColumn) {
                          kRangeDelSkipConfigs));
 }
 
-TEST_F(ExternalSSTFileTest, BasicMixed) {
+TEST_P(ExternalSSTFileTestN, BasicMixed) {
   do {
     Options options = CurrentOptions();
 
@@ -1479,7 +1537,7 @@ class SstFileWriterCollectorFactory : public TablePropertiesCollectorFactory {
   uint32_t num_created_;
 };
 
-TEST_F(ExternalSSTFileTest, AddList) {
+TEST_P(ExternalSSTFileTestN, AddList) {
   do {
     Options options = CurrentOptions();
 
@@ -1698,7 +1756,7 @@ TEST_F(ExternalSSTFileTest, AddList) {
                          kRangeDelSkipConfigs));
 }
 
-TEST_F(ExternalSSTFileTest, AddListAtomicity) {
+TEST_P(ExternalSSTFileTestN, AddListAtomicity) {
   do {
     Options options = CurrentOptions();
 
@@ -1740,7 +1798,7 @@ TEST_F(ExternalSSTFileTest, AddListAtomicity) {
 // This test reporduce a bug that can happen in some cases if the DB started
 // purging obsolete files when we are adding an external sst file.
 // This situation may result in deleting the file while it's being added.
-TEST_F(ExternalSSTFileTest, PurgeObsoleteFilesBug) {
+TEST_P(ExternalSSTFileTestN, PurgeObsoleteFilesBug) {
   Options options = CurrentOptions();
   SstFileWriter sst_file_writer(EnvOptions(), options);
 
@@ -1780,7 +1838,7 @@ TEST_F(ExternalSSTFileTest, PurgeObsoleteFilesBug) {
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
 }
 
-TEST_F(ExternalSSTFileTest, SkipSnapshot) {
+TEST_P(ExternalSSTFileTestN, SkipSnapshot) {
   Options options = CurrentOptions();
 
   SstFileWriter sst_file_writer(EnvOptions(), options);
@@ -1850,7 +1908,7 @@ TEST_F(ExternalSSTFileTest, SkipSnapshot) {
   db_->ReleaseSnapshot(s2);
 }
 
-TEST_F(ExternalSSTFileTest, MultiThreaded) {
+TEST_P(ExternalSSTFileTestN, MultiThreaded) {
   env_->skip_fsync_ = true;
   // Bulk load 10 files every file contain 1000 keys
   int num_files = 10;
@@ -1961,7 +2019,7 @@ TEST_F(ExternalSSTFileTest, MultiThreaded) {
   } while (ChangeOptions(kSkipPlainTable | kSkipFIFOCompaction));
 }
 
-TEST_F(ExternalSSTFileTest, OverlappingRanges) {
+TEST_P(ExternalSSTFileTestN, OverlappingRanges) {
   env_->skip_fsync_ = true;
   Random rnd(301);
   SequenceNumber assigned_seqno = 0;
@@ -2163,7 +2221,7 @@ TEST_P(ExternalSSTFileTest, PickedLevel) {
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
 }
 
-TEST_F(ExternalSSTFileTest, IngestNonExistingFile) {
+TEST_P(ExternalSSTFileTestN, IngestNonExistingFile) {
   Options options = CurrentOptions();
   DestroyAndReopen(options);
 
@@ -2198,7 +2256,7 @@ TEST_F(ExternalSSTFileTest, IngestNonExistingFile) {
 }
 
 #if !defined(ROCKSDB_VALGRIND_RUN) || defined(ROCKSDB_FULL_VALGRIND_RUN)
-TEST_F(ExternalSSTFileTest, CompactDuringAddFileRandom) {
+TEST_P(ExternalSSTFileTestN, CompactDuringAddFileRandom) {
   env_->skip_fsync_ = true;
   Options options = CurrentOptions();
   options.disable_auto_compactions = false;
@@ -2258,7 +2316,7 @@ TEST_F(ExternalSSTFileTest, CompactDuringAddFileRandom) {
 }
 #endif  // !defined(ROCKSDB_VALGRIND_RUN) || defined(ROCKSDB_FULL_VALGRIND_RUN)
 
-TEST_F(ExternalSSTFileTest, PickedLevelDynamic) {
+TEST_P(ExternalSSTFileTestN, PickedLevelDynamic) {
   env_->skip_fsync_ = true;
   Options options = CurrentOptions();
   options.disable_auto_compactions = false;
@@ -2364,7 +2422,7 @@ TEST_F(ExternalSSTFileTest, PickedLevelDynamic) {
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
 }
 
-TEST_F(ExternalSSTFileTest, AddExternalSstFileWithCustomCompartor) {
+TEST_P(ExternalSSTFileTestN, AddExternalSstFileWithCustomCompartor) {
   Options options = CurrentOptions();
   options.comparator = ReverseBytewiseComparator();
   DestroyAndReopen(options);
@@ -2420,7 +2478,7 @@ TEST_F(ExternalSSTFileTest, AddExternalSstFileWithCustomCompartor) {
   }
 }
 
-TEST_F(ExternalSSTFileTest, AddFileTrivialMoveBug) {
+TEST_P(ExternalSSTFileTestN, AddFileTrivialMoveBug) {
   Options options = CurrentOptions();
   options.num_levels = 3;
   options.IncreaseParallelism(20);
@@ -2459,7 +2517,7 @@ TEST_F(ExternalSSTFileTest, AddFileTrivialMoveBug) {
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
 }
 
-TEST_F(ExternalSSTFileTest, CompactAddedFiles) {
+TEST_P(ExternalSSTFileTestN, CompactAddedFiles) {
   Options options = CurrentOptions();
   options.num_levels = 3;
   DestroyAndReopen(options);
@@ -2472,7 +2530,7 @@ TEST_F(ExternalSSTFileTest, CompactAddedFiles) {
   ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
 }
 
-TEST_F(ExternalSSTFileTest, SstFileWriterNonSharedKeys) {
+TEST_P(ExternalSSTFileTestN, SstFileWriterNonSharedKeys) {
   Options options = CurrentOptions();
   DestroyAndReopen(options);
   std::string file_path = sst_files_dir_ + "/not_shared";
@@ -2491,7 +2549,7 @@ TEST_F(ExternalSSTFileTest, SstFileWriterNonSharedKeys) {
   ASSERT_OK(DeprecatedAddFile({file_path}));
 }
 
-TEST_F(ExternalSSTFileTest, IngestFlushRequestNotLostBehindQueuedFlush) {
+TEST_P(ExternalSSTFileTestN, IngestFlushRequestNotLostBehindQueuedFlush) {
   // These waits only prevent broken test paths from hanging forever. Keep them
   // large enough to avoid treating slow CI scheduling as a regression.
   constexpr uint64_t kHangGuardMicros = 30 * 1000 * 1000;
@@ -2738,6 +2796,7 @@ TEST_F(ExternalSSTFileTest, IngestFlushRequestNotLostBehindQueuedFlush) {
   cleanup_guard.Disarm();
 }
 
+// Not run at N > 1: Open rejects unordered_write there.
 TEST_F(ExternalSSTFileTest, WithUnorderedWrite) {
   SyncPoint::GetInstance()->DisableProcessing();
   SyncPoint::GetInstance()->LoadDependency(
@@ -3055,7 +3114,7 @@ TEST_P(ExternalSSTFileTest, L0SortingIssue) {
   ASSERT_EQ(Get(Key(8)), "memtable");
 }
 
-TEST_F(ExternalSSTFileTest, CompactionDeadlock) {
+TEST_P(ExternalSSTFileTestN, CompactionDeadlock) {
   Options options = CurrentOptions();
   options.num_levels = 2;
   options.level0_file_num_compaction_trigger = 4;
@@ -3129,7 +3188,7 @@ TEST_F(ExternalSSTFileTest, CompactionDeadlock) {
   bg_block_put.join();
 }
 
-TEST_F(ExternalSSTFileTest, DirtyExit) {
+TEST_P(ExternalSSTFileTestN, DirtyExit) {
   Options options = CurrentOptions();
   DestroyAndReopen(options);
   std::string file_path = sst_files_dir_ + "/dirty_exit";
@@ -3146,7 +3205,7 @@ TEST_F(ExternalSSTFileTest, DirtyExit) {
   ASSERT_NOK(sst_file_writer->Finish());
 }
 
-TEST_F(ExternalSSTFileTest, FileWithCFInfo) {
+TEST_P(ExternalSSTFileTestN, FileWithCFInfo) {
   Options options = CurrentOptions();
   CreateAndReopenWithCF({"koko", "toto"}, options);
 
@@ -3346,7 +3405,7 @@ TEST_P(ExternalSSTFileTest, IngestionListener) {
             "toto");
 }
 
-TEST_F(ExternalSSTFileTest, SnapshotInconsistencyBug) {
+TEST_P(ExternalSSTFileTestN, SnapshotInconsistencyBug) {
   Options options = CurrentOptions();
   DestroyAndReopen(options);
   const int kNumKeys = 10000;
@@ -3503,7 +3562,7 @@ TEST_P(ExternalSSTFileTest, IngestBehind) {
   }
 }
 
-TEST_F(ExternalSSTFileTest, SkipBloomFilter) {
+TEST_P(ExternalSSTFileTestN, SkipBloomFilter) {
   Options options = CurrentOptions();
 
   BlockBasedTableOptions table_options;
@@ -3555,7 +3614,7 @@ TEST_F(ExternalSSTFileTest, SkipBloomFilter) {
   }
 }
 
-TEST_F(ExternalSSTFileTest, IngestFileWrittenWithCompressionDictionary) {
+TEST_P(ExternalSSTFileTestN, IngestFileWrittenWithCompressionDictionary) {
   if (!ZSTD_Supported()) {
     return;
   }
@@ -4014,6 +4073,11 @@ TEST_P(ExternalSSTFileTest, IngestFilesTriggerFlushingWithTwoWriteQueue) {
   // Use large buffer to avoid memtable flush
   options.write_buffer_size = 1024 * 1024;
   options.two_write_queues = true;
+  if (test::WalPartitionsForCurrentTest() > 1) {
+    Destroy(last_options_);
+    ASSERT_TRUE(TryReopen(options).IsNotSupported());
+    return;
+  }
   DestroyAndReopen(options);
 
   ASSERT_OK(dbfull()->Put(WriteOptions(), "1000", "v1"));
@@ -4125,7 +4189,7 @@ TEST_P(ExternalSSTFileTest,
   delete iter;
 }
 
-TEST_F(ExternalSSTFileTest, FIFOCompaction) {
+TEST_P(ExternalSSTFileTestN, FIFOCompaction) {
   // FIFO always ingests SST files to L0 and assign latest sequence number.
   Options options = CurrentOptions();
   options.num_levels = 1;
@@ -4851,6 +4915,8 @@ TEST_F(ExternalSSTFileWithTimestampTest,
 }
 
 INSTANTIATE_TEST_CASE_P(ExternalSSTFileTest, ExternalSSTFileTest,
+                        testing::Combine(testing::Bool(), testing::Bool()));
+INSTANTIATE_TEST_CASE_P(WalPartitions8, ExternalSSTFileTest,
                         testing::Combine(testing::Bool(), testing::Bool()));
 
 class IngestDBGeneratedFileTest

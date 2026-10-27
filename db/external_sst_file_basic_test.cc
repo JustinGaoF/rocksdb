@@ -219,7 +219,49 @@ class ExternalSSTFileBasicTest : public DBTestBase,
   bool random_rwfile_supported_;
 };
 
-TEST_F(ExternalSSTFileBasicTest, ReopenWithoutFinishIsRejected) {
+// Runs the tests below that use no parameter at 1 and at
+// test::kTestWalPartitions WAL partitions.
+class ExternalSSTFileBasicTestN : public ExternalSSTFileBasicTest {};
+
+INSTANTIATE_TEST_CASE_P(WalPartitions1, ExternalSSTFileBasicTestN,
+                        testing::Values(false));
+INSTANTIATE_TEST_CASE_P(WalPartitions8, ExternalSSTFileBasicTestN,
+                        testing::Values(false));
+
+// Review-M3 T1: writes to column families covering every partition, so the
+// WalPartitions8 leg holds unflushed records on more than one partition while
+// a file is ingested into each family; every write and ingested key survives
+// a reopen.
+TEST_P(ExternalSSTFileBasicTestN, IngestBesideWritesOnEveryPartition) {
+  Options options = CurrentOptions();
+  const std::vector<uint32_t> cf_ids =
+      ColumnFamilyIdsCoveringWalPartitions(options.wal_partitions);
+  const std::vector<std::string> cf_names = ColumnFamilyNamesThrough(cf_ids);
+  CreateAndReopenWithCF({cf_names.begin() + 1, cf_names.end()}, options);
+  for (uint32_t cf_id : cf_ids) {
+    ASSERT_OK(Put(static_cast<int>(cf_id), "written", "value"));
+  }
+  if (options.wal_partitions > 1) {
+    ASSERT_GE(WalPartitionsAppendedTo(db_.get()), 2u);
+  }
+  for (uint32_t cf_id : cf_ids) {
+    const std::string file =
+        sst_files_dir_ + "every_partition_" + std::to_string(cf_id) + ".sst";
+    SstFileWriter sst_file_writer(EnvOptions(), options);
+    ASSERT_OK(sst_file_writer.Open(file));
+    ASSERT_OK(sst_file_writer.Put("ingested", "value"));
+    ASSERT_OK(sst_file_writer.Finish());
+    ASSERT_OK(db_->IngestExternalFile(handles_[cf_id], {file},
+                                      IngestExternalFileOptions()));
+  }
+  ReopenWithColumnFamilies(cf_names, options);
+  for (uint32_t cf_id : cf_ids) {
+    EXPECT_EQ("value", Get(static_cast<int>(cf_id), "written"));
+    EXPECT_EQ("value", Get(static_cast<int>(cf_id), "ingested"));
+  }
+}
+
+TEST_P(ExternalSSTFileBasicTestN, ReopenWithoutFinishIsRejected) {
   Options options = CurrentOptions();
   SstFileWriter sst_file_writer(EnvOptions(), options);
 
@@ -237,7 +279,7 @@ TEST_F(ExternalSSTFileBasicTest, ReopenWithoutFinishIsRejected) {
   ASSERT_EQ(file_info.num_entries, 1);
 }
 
-TEST_F(ExternalSSTFileBasicTest, Basic) {
+TEST_P(ExternalSSTFileBasicTestN, Basic) {
   Options options = CurrentOptions();
 
   SstFileWriter sst_file_writer(EnvOptions(), options);
@@ -277,7 +319,7 @@ TEST_F(ExternalSSTFileBasicTest, Basic) {
   DestroyAndRecreateExternalSSTFilesDir();
 }
 
-TEST_F(ExternalSSTFileBasicTest, AlignedBufferedWrite) {
+TEST_P(ExternalSSTFileBasicTestN, AlignedBufferedWrite) {
   class AlignedWriteFS : public FileSystemWrapper {
    public:
     explicit AlignedWriteFS(const std::shared_ptr<FileSystem>& _target)
@@ -402,7 +444,7 @@ class ChecksumVerifyHelper {
   }
 };
 
-TEST_F(ExternalSSTFileBasicTest, BasicWithFileChecksumCrc32c) {
+TEST_P(ExternalSSTFileBasicTestN, BasicWithFileChecksumCrc32c) {
   Options options = CurrentOptions();
   options.file_checksum_gen_factory = GetFileChecksumGenCrc32cFactory();
   ChecksumVerifyHelper checksum_helper(options);
@@ -496,7 +538,7 @@ class VariousFileChecksumGenFactory : public FileChecksumGenFactory {
 };
 }  // namespace
 
-TEST_F(ExternalSSTFileBasicTest, IngestFileWithFileChecksum) {
+TEST_P(ExternalSSTFileBasicTestN, IngestFileWithFileChecksum) {
   Options old_options = CurrentOptions();
   Options options = CurrentOptions();
   options.file_checksum_gen_factory =
@@ -808,7 +850,7 @@ TEST_F(ExternalSSTFileBasicTest, IngestFileWithFileChecksum) {
   ASSERT_EQ(size, 0);
 }
 
-TEST_F(ExternalSSTFileBasicTest, NoCopy) {
+TEST_P(ExternalSSTFileBasicTestN, NoCopy) {
   Options options = CurrentOptions();
   const ImmutableCFOptions ioptions(options);
 
@@ -1254,7 +1296,7 @@ TEST_P(ExternalSSTFileBasicTest, IngestFileWithMixedValueType) {
   } while (ChangeOptionsForFileIngestionTest());
 }
 
-TEST_F(ExternalSSTFileBasicTest, FadviseTrigger) {
+TEST_P(ExternalSSTFileBasicTestN, FadviseTrigger) {
   Options options = CurrentOptions();
   const int kNumKeys = 10000;
 
@@ -1294,6 +1336,7 @@ TEST_F(ExternalSSTFileBasicTest, FadviseTrigger) {
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
 }
 
+// Not run at N > 1: it builds its own Options, at one WAL partition.
 TEST_F(ExternalSSTFileBasicTest, SyncFailure) {
   Options options;
   options.create_if_missing = true;
@@ -1355,6 +1398,7 @@ TEST_F(ExternalSSTFileBasicTest, SyncFailure) {
   }
 }
 
+// Not run at N > 1: it builds its own Options, at one WAL partition.
 TEST_F(ExternalSSTFileBasicTest, SyncFileNotSupported) {
   Options options;
   options.create_if_missing = true;
@@ -1390,6 +1434,7 @@ TEST_F(ExternalSSTFileBasicTest, SyncFileNotSupported) {
   Destroy(options);
 }
 
+// Not run at N > 1: it builds its own Options, at one WAL partition.
 TEST_F(ExternalSSTFileBasicTest, VerifyChecksumReadahead) {
   Options options;
   options.create_if_missing = true;
@@ -1442,7 +1487,7 @@ TEST_F(ExternalSSTFileBasicTest, VerifyChecksumReadahead) {
   Destroy(options);
 }
 
-TEST_F(ExternalSSTFileBasicTest, ReadOldValueOfIngestedKeyBug) {
+TEST_P(ExternalSSTFileBasicTestN, ReadOldValueOfIngestedKeyBug) {
   Options options = CurrentOptions();
   options.compaction_style = kCompactionStyleUniversal;
   options.disable_auto_compactions = true;
@@ -1516,7 +1561,7 @@ TEST_F(ExternalSSTFileBasicTest, ReadOldValueOfIngestedKeyBug) {
   ASSERT_EQ(value, "new_value");
 }
 
-TEST_F(ExternalSSTFileBasicTest, IngestRangeDeletionTombstoneWithGlobalSeqno) {
+TEST_P(ExternalSSTFileBasicTestN, IngestRangeDeletionTombstoneWithGlobalSeqno) {
   for (int i = 5; i < 25; i++) {
     ASSERT_OK(db_->Put(WriteOptions(), db_->DefaultColumnFamily(), Key(i),
                        Key(i) + "_val"));
@@ -1641,7 +1686,7 @@ TEST_P(ExternalSSTFileBasicTest, IngestionWithRangeDeletions) {
   VerifyDBFromMap(true_data);
 }
 
-TEST_F(ExternalSSTFileBasicTest, AdjacentRangeDeletionTombstones) {
+TEST_P(ExternalSSTFileBasicTestN, AdjacentRangeDeletionTombstones) {
   Options options = CurrentOptions();
   SstFileWriter sst_file_writer(EnvOptions(), options);
 
@@ -1683,7 +1728,7 @@ TEST_F(ExternalSSTFileBasicTest, AdjacentRangeDeletionTombstones) {
   DestroyAndRecreateExternalSSTFilesDir();
 }
 
-TEST_F(ExternalSSTFileBasicTest, UnorderedRangeDeletions) {
+TEST_P(ExternalSSTFileBasicTestN, UnorderedRangeDeletions) {
   int kNumLevels = 7;
   Options options = CurrentOptions();
   options.disable_auto_compactions = true;
@@ -1739,7 +1784,7 @@ TEST_F(ExternalSSTFileBasicTest, UnorderedRangeDeletions) {
   db_->ReleaseSnapshot(snapshot);
 }
 
-TEST_F(ExternalSSTFileBasicTest, RangeDeletionEndComesBeforeStart) {
+TEST_P(ExternalSSTFileBasicTestN, RangeDeletionEndComesBeforeStart) {
   Options options = CurrentOptions();
   SstFileWriter sst_file_writer(EnvOptions(), options);
 
@@ -1919,7 +1964,7 @@ TEST_P(ExternalSSTFileBasicTest, IngestExternalFileWithCorruptedPropsBlock) {
   } while (ChangeOptionsForFileIngestionTest());
 }
 
-TEST_F(ExternalSSTFileBasicTest, OverlappingFiles) {
+TEST_P(ExternalSSTFileBasicTestN, OverlappingFiles) {
   Options options = CurrentOptions();
 
   std::vector<std::string> files;
@@ -2040,7 +2085,8 @@ class CompactionJobStatsCheckerForFilteredFiles : public EventListener {
   uint64_t expected_compaction_skipped_file_size_ = 0;
 };
 
-TEST_F(ExternalSSTFileBasicTest, AtomicReplaceDataWithStandaloneRangeDeletion) {
+TEST_P(ExternalSSTFileBasicTestN,
+       AtomicReplaceDataWithStandaloneRangeDeletion) {
   Options options = CurrentOptions();
   options.compaction_style = CompactionStyle::kCompactionStyleUniversal;
   int kCompactionNumInputFiles = 1;
@@ -2171,7 +2217,7 @@ TEST_F(ExternalSSTFileBasicTest, AtomicReplaceDataWithStandaloneRangeDeletion) {
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
 }
 
-TEST_F(ExternalSSTFileBasicTest,
+TEST_P(ExternalSSTFileBasicTestN,
        PartiallyReplaceDataWithOneStandaloneRangeDeletion) {
   Options options = CurrentOptions();
   options.compaction_style = CompactionStyle::kCompactionStyleUniversal;
@@ -2284,7 +2330,7 @@ TEST_F(ExternalSSTFileBasicTest,
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
 }
 
-TEST_F(ExternalSSTFileBasicTest,
+TEST_P(ExternalSSTFileBasicTestN,
        AtomicReplaceRangeGeneratesTombstoneForPartialOverlap) {
   Options options = CurrentOptions();
   options.compaction_style = CompactionStyle::kCompactionStyleUniversal;
@@ -2364,7 +2410,7 @@ TEST_F(ExternalSSTFileBasicTest,
   ASSERT_EQ("old-f", Get("f"));
 }
 
-TEST_F(ExternalSSTFileBasicTest,
+TEST_P(ExternalSSTFileBasicTestN,
        PartiallyReplaceDataWithMultipleStandaloneRangeDeletions) {
   Options options = CurrentOptions();
   options.compaction_style = CompactionStyle::kCompactionStyleUniversal;
@@ -2482,7 +2528,7 @@ TEST_F(ExternalSSTFileBasicTest,
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
 }
 
-TEST_F(ExternalSSTFileBasicTest, StandaloneRangeDeletionEndKeyIsExclusive) {
+TEST_P(ExternalSSTFileBasicTestN, StandaloneRangeDeletionEndKeyIsExclusive) {
   Options options = CurrentOptions();
   options.compaction_style = CompactionStyle::kCompactionStyleUniversal;
   int kCompactionNumInputFiles = 2;
@@ -2565,7 +2611,7 @@ TEST_F(ExternalSSTFileBasicTest, StandaloneRangeDeletionEndKeyIsExclusive) {
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
 }
 
-TEST_F(ExternalSSTFileBasicTest, IngestFileAfterDBPut) {
+TEST_P(ExternalSSTFileBasicTestN, IngestFileAfterDBPut) {
   // Repro https://github.com/facebook/rocksdb/issues/6245.
   // Flush three files to L0. Ingest one more file to trigger L0->L1 compaction
   // via trivial move. The bug happened when L1 files were incorrectly sorted
@@ -2603,7 +2649,7 @@ TEST_F(ExternalSSTFileBasicTest, IngestFileAfterDBPut) {
   ASSERT_EQ(Get("k"), "b");
 }
 
-TEST_F(ExternalSSTFileBasicTest, IngestWithTemperature) {
+TEST_P(ExternalSSTFileBasicTestN, IngestWithTemperature) {
   // Rather than doubling the running time of this test, this boolean
   // field gets a random starting value and then alternates between
   // true and false.
@@ -2774,6 +2820,7 @@ TEST_F(ExternalSSTFileBasicTest, IngestWithTemperature) {
 
 // This tests an internal user's exact usage and expectation of the
 // IngestExternalFiles APIs to bulk load and replace files.
+// Not run at N > 1: it builds its own Options, at one WAL partition.
 TEST_F(ExternalSSTFileBasicTest,
        AtomicReplaceColumnFamilyWithIngestedVersionKey) {
   Options options = GetDefaultOptions();
@@ -2847,6 +2894,7 @@ TEST_F(ExternalSSTFileBasicTest,
   Close();
 }
 
+// Not run at N > 1: it builds its own Options, at one WAL partition.
 TEST_F(ExternalSSTFileBasicTest, FailIfNotBottommostLevelAndDisallowMemtable) {
   for (bool disallow_memtable : {false, true}) {
     Options options = GetDefaultOptions();
@@ -3122,7 +3170,7 @@ TEST_F(ExternalSSTFileBasicTest, FailIfNotBottommostLevelAndDisallowMemtable) {
   }
 }
 
-TEST_F(ExternalSSTFileBasicTest, VerifyChecksum) {
+TEST_P(ExternalSSTFileBasicTestN, VerifyChecksum) {
   const std::string kPutVal = "put_val";
   const std::string kIngestedVal = "ingested_val";
 
@@ -3144,7 +3192,7 @@ TEST_F(ExternalSSTFileBasicTest, VerifyChecksum) {
   ASSERT_OK(db_->VerifyChecksum());
 }
 
-TEST_F(ExternalSSTFileBasicTest, VerifySstUniqueId) {
+TEST_P(ExternalSSTFileBasicTestN, VerifySstUniqueId) {
   const std::string kPutVal = "put_val";
   const std::string kIngestedVal = "ingested_val";
 
@@ -3214,7 +3262,7 @@ TEST_F(ExternalSSTFileBasicTest, VerifySstUniqueId) {
   ASSERT_EQ(passed, 2);
 }
 
-TEST_F(ExternalSSTFileBasicTest, StableSnapshotWhileLoggingToManifest) {
+TEST_P(ExternalSSTFileBasicTestN, StableSnapshotWhileLoggingToManifest) {
   const std::string kPutVal = "put_val";
   const std::string kIngestedVal = "ingested_val";
 
@@ -3268,7 +3316,7 @@ TEST_F(ExternalSSTFileBasicTest, StableSnapshotWhileLoggingToManifest) {
   ASSERT_EQ(db_->GetLatestSequenceNumber(), ingested_file_seqno + 1);
 }
 
-TEST_F(ExternalSSTFileBasicTest, ConcurrentIngestionAndDropColumnFamily) {
+TEST_P(ExternalSSTFileBasicTestN, ConcurrentIngestionAndDropColumnFamily) {
   int kNumCFs = 10;
   Options options = CurrentOptions();
   CreateColumnFamilies({"cf_0", "cf_1", "cf_2", "cf_3", "cf_4", "cf_5", "cf_6",
@@ -3320,6 +3368,8 @@ TEST_F(ExternalSSTFileBasicTest, ConcurrentIngestionAndDropColumnFamily) {
 }
 
 INSTANTIATE_TEST_CASE_P(ExternalSSTFileBasicTest, ExternalSSTFileBasicTest,
+                        testing::Bool());
+INSTANTIATE_TEST_CASE_P(WalPartitions8, ExternalSSTFileBasicTest,
                         testing::Bool());
 
 namespace {
@@ -3398,7 +3448,7 @@ class CountingDiscardFileSystem : public FileSystemWrapper {
 // Uses anonymous mmap (lazy-zeroed) so the large input itself doesn't consume
 // physical memory. Table construction still needs substantial working memory,
 // so the test retains the big-memory guard.
-TEST_F(ExternalSSTFileBasicTest, LargeSizeSstFileWriter) {
+TEST_P(ExternalSSTFileBasicTestN, LargeSizeSstFileWriter) {
   if (!test::HasBigMem()) {
     ROCKSDB_GTEST_BYPASS("insufficient memory for reliable continuous testing");
     return;
