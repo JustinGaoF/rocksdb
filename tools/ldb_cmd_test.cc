@@ -11,9 +11,11 @@
 #include <memory>
 #include <sstream>
 
+#include "db/db_impl/db_impl.h"
 #include "db/db_test_util.h"
 #include "db/version_edit.h"
 #include "db/version_set.h"
+#include "db/write_batch_internal.h"
 #include "env/composite_env_wrapper.h"
 #include "file/filename.h"
 #include "port/stack_trace.h"
@@ -186,6 +188,105 @@ TEST_F(LdbCmdTest, DumpWalPrintsIndexedRecords) {
   ASSERT_EQ(0, dump("--only_print_seqno_gaps", &out, &err));
   EXPECT_EQ("", err);
   EXPECT_EQ("", out);
+  ASSERT_OK(DestroyDB(dbname, opts));
+}
+
+// `ldb dump_wal` on WALs written with wal_partitions > 1 (G-36): dumping one
+// file shows its partition, and --only_print_seqno_gaps refuses the directory
+// before printing anything, instead of reporting every partition boundary as a
+// gap. One partition's file is refused the same way. At N=1 a real gap is
+// still reported. Neuter: drop the scan; partition 0's WAL is dumped first and
+// "Checking wal file" is printed before the per-file check refuses.
+TEST_F(LdbCmdTest, DumpWalOnPartitionedWals) {
+  Env* env = TryLoadCustomOrDefaultEnv();
+  Options opts;
+  opts.env = env;
+  opts.create_if_missing = true;
+  opts.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  opts.track_and_verify_wals_in_manifest = true;
+  opts.avoid_flush_during_shutdown = true;
+  const std::string dbname = test::PerThreadDBPath(env, "ldb_cmd_test");
+  ASSERT_OK(DestroyDB(dbname, opts));
+  auto dump = [&](const std::string& walfile, const char* flag,
+                  std::string* output) {
+    const std::string wal_arg = "--walfile=" + walfile;
+    const char* argv[] = {"./ldb", "dump_wal", wal_arg.c_str(), flag};
+    testing::internal::CaptureStdout();
+    testing::internal::CaptureStderr();
+    const int code = LDBCommandRunner::RunCommand(flag ? 4 : 3, argv, opts,
+                                                  LDBOptions(), nullptr);
+    *output = testing::internal::GetCapturedStderr();
+    *output += testing::internal::GetCapturedStdout();
+    return code;
+  };
+  std::string output;
+
+  {
+    std::unique_ptr<DB> db;
+    ASSERT_OK(DB::Open(opts, dbname, &db));
+    ASSERT_OK(db->Put(WriteOptions(), "key1", "value"));
+    WriteOptions disable_wal;
+    disable_wal.disableWAL = true;
+    ASSERT_OK(db->Put(disable_wal, "key2", "value"));
+    ASSERT_OK(db->Put(WriteOptions(), "key3", "value"));
+  }
+  ASSERT_EQ(0, dump(dbname, "--only_print_seqno_gaps", &output));
+  EXPECT_NE(std::string::npos,
+            output.find("Prev batch sequence number: 1, prev batch count: 1, "
+                        "3,1,"))
+      << output;
+  EXPECT_EQ(std::string::npos, output.find("WAL partition"));
+  ASSERT_OK(DestroyDB(dbname, opts));
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::ValidateOptions:AllowWalPartitions",
+      [](void* arg) { *static_cast<bool*>(arg) = true; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  constexpr size_t kPartitions = 8;
+  opts.wal_partitions = kPartitions;
+  std::vector<uint64_t> current_wals(kPartitions);
+  {
+    std::unique_ptr<DB> db;
+    ASSERT_OK(DB::Open(opts, dbname, &db));
+    std::vector<std::unique_ptr<ColumnFamilyHandle>> handles;
+    std::vector<bool> covered(kPartitions, false);
+    size_t num_covered = 0;
+    for (uint32_t cf_id = 1; num_covered < kPartitions; ++cf_id) {
+      ColumnFamilyHandle* handle = nullptr;
+      ASSERT_OK(
+          db->CreateColumnFamily(opts, "cf" + std::to_string(cf_id), &handle));
+      handles.emplace_back(handle);
+      WriteBatch batch;
+      ASSERT_OK(WriteBatchInternal::Put(&batch, cf_id, "key", "value"));
+      size_t partition = kPartitions;
+      ASSERT_OK(
+          DBImpl::TEST_WalPartitionForWrite(batch, kPartitions, &partition));
+      if (!covered[partition]) {
+        covered[partition] = true;
+        ++num_covered;
+        ASSERT_OK(db->Put(WriteOptions(), handle, "key", "value"));
+      }
+    }
+    for (size_t p = 0; p < kPartitions; ++p) {
+      current_wals[p] =
+          static_cast<DBImpl*>(db.get())->TEST_CurrentWalNumber(p);
+    }
+    for (auto& handle : handles) {
+      ASSERT_OK(db->DestroyColumnFamilyHandle(handle.release()));
+    }
+  }
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_EQ(0, dump(LogFileName(dbname, current_wals[3]), nullptr, &output));
+  EXPECT_NE(std::string::npos, output.find("WAL partition: 3")) << output;
+  EXPECT_NE(0, dump(LogFileName(dbname, current_wals[3]),
+                    "--only_print_seqno_gaps", &output));
+  EXPECT_NE(std::string::npos, output.find("wal_partitions > 1")) << output;
+  EXPECT_NE(0, dump(dbname, "--only_print_seqno_gaps", &output));
+  EXPECT_NE(std::string::npos, output.find("wal_partitions > 1")) << output;
+  EXPECT_EQ(std::string::npos, output.find("Prev batch")) << output;
+  EXPECT_EQ(std::string::npos, output.find("Checking wal file")) << output;
   ASSERT_OK(DestroyDB(dbname, opts));
 }
 

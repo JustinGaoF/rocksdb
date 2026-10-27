@@ -29,6 +29,18 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+namespace {
+// Secondary instances replay WALs one file at a time in number order, which
+// is the write order only while one WAL is written at a time.
+Status PartitionedWalNotSupported(uint64_t log_number, uint32_t wal_partition) {
+  return Status::NotSupported(
+      "WAL " + std::to_string(log_number) + " was written by partition " +
+      std::to_string(wal_partition) +
+      " of a DB with wal_partitions > 1; secondary instances replay WALs one "
+      "file at a time and do not support partitioned WALs");
+}
+}  // namespace
+
 DBImplSecondary::DBImplSecondary(const DBOptions& db_options,
                                  const std::string& dbname,
                                  std::string secondary_path)
@@ -380,6 +392,19 @@ Status DBImplSecondary::MaybeInitLogReader(
                    "Recovering log #%" PRIu64 " mode %d", log_number,
                    static_cast<int>(immutable_db_options_.wal_recovery_mode));
 
+    // Checked before any of the set is replayed: partition 0's WAL comes
+    // first in number order and would be applied without the other
+    // partitions' records interleaved with it.
+    uint32_t wal_partition = 0;
+    if (log::ReadWALPartition(fs_.get(), fname,
+                              fs_->OptimizeForLogRead(file_options_),
+                              log_number, &wal_partition)
+            .ok() &&
+        wal_partition != 0) {
+      *log_reader = nullptr;
+      return PartitionedWalNotSupported(log_number, wal_partition);
+    }
+
     std::unique_ptr<SequentialFileReader> file_reader;
     {
       std::unique_ptr<FSSequentialFile> file;
@@ -452,6 +477,11 @@ Status DBImplSecondary::RecoverLogFiles(
     while (reader->ReadRecord(&record, &scratch,
                               immutable_db_options_.wal_recovery_mode) &&
            wal_read_status->ok() && status.ok()) {
+      if (reader->WALPartition() != 0) {
+        // The file was still empty when its reader was created.
+        status = PartitionedWalNotSupported(log_number, reader->WALPartition());
+        break;
+      }
       if (record.size() < WriteBatchInternal::kHeader) {
         reader->GetReporter()->Corruption(
             record.size(), Status::Corruption("log record too small"));
