@@ -688,6 +688,7 @@ Status ErrorHandler::ClearBGError() {
     // Releases the failed WAL ranges and closes their gate fences before the
     // stopped flag clears, so every write it admits allocates above them.
     db_->ClearWalDurabilityBGError();
+    TEST_SYNC_POINT("ErrorHandler::ClearBGError:BeforeClearStopped");
     // Clear and check the recovery IO and BG error
     is_db_stopped_.store(false, std::memory_order_release);
     bg_error_ = Status::OK();

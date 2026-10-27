@@ -260,7 +260,8 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
     alive_wal_files_ = decltype(alive_wal_files_)(num_wal_partitions);
     wal_merge_buffers_ = decltype(wal_merge_buffers_)(num_wal_partitions);
     wal_write_mutexes_ = decltype(wal_write_mutexes_)(num_wal_partitions);
-    wal_empties_ = decltype(wal_empties_)(num_wal_partitions, 1);
+    wal_empties_ = decltype(wal_empties_)(num_wal_partitions,
+                                          CacheAlignedWrapper<uint8_t>{1});
     wals_to_free_ = decltype(wals_to_free_)(num_wal_partitions);
     last_batch_group_size_ =
         decltype(last_batch_group_size_)(num_wal_partitions);

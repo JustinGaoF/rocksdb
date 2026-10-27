@@ -1471,6 +1471,69 @@ TEST_P(WritePreparedTransactionTest, AdvanceMaxEvictedSeqBasic) {
   }
 }
 
+// Leaders of different WAL partitions run AdvanceMaxEvictedSeq concurrently.
+// X advances to a smaller max and reads the older snapshot list, then pauses
+// before storing it; Y advances to a larger max and stores the newer list.
+// When X resumes, its older list must not replace Y's. Dropping the version
+// check in UpdateSnapshots stores X's list, and this fails.
+TEST_P(WritePreparedTransactionTest, OlderSnapshotListNeverWins) {
+  DBImpl* mock_db = new DBImpl(options, dbname);
+  std::unique_ptr<WritePreparedTxnDBMock> wp_db(
+      new WritePreparedTxnDBMock(mock_db, txn_db_options));
+  const std::vector<SequenceNumber> older_snapshots = {20};
+  const std::vector<SequenceNumber> newer_snapshots = {20, 150};
+  constexpr SequenceNumber kOlderMax = 100;
+  constexpr SequenceNumber kNewerMax = 200;
+
+  std::mutex mu;
+  std::condition_variable cv;
+  std::thread::id x_id;
+  bool x_paused = false;
+  bool release_x = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "WritePreparedTxnDB::UpdateSnapshots:p:start", [&](void*) {
+        std::unique_lock<std::mutex> lock(mu);
+        if (std::this_thread::get_id() == x_id) {
+          x_paused = true;
+          cv.notify_all();
+          cv.wait(lock, [&] { return release_x; });
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  wp_db->SetDBSnapshots(older_snapshots);
+  port::Thread x([&] {
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      x_id = std::this_thread::get_id();
+    }
+    wp_db->AdvanceMaxEvictedSeq(0, kOlderMax);
+  });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    ASSERT_TRUE(
+        cv.wait_for(lock, std::chrono::seconds(30), [&] { return x_paused; }));
+  }
+  wp_db->SetDBSnapshots(newer_snapshots);
+  wp_db->AdvanceMaxEvictedSeq(0, kNewerMax);
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    release_x = true;
+    cv.notify_all();
+  }
+  x.join();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearCallBack(
+      "WritePreparedTxnDB::UpdateSnapshots:p:start");
+
+  ASSERT_EQ(kNewerMax, wp_db->snapshots_version_.load());
+  ASSERT_EQ(newer_snapshots.size(), wp_db->snapshots_total_.load());
+  for (size_t i = 0; i < newer_snapshots.size(); ++i) {
+    ASSERT_EQ(newer_snapshots[i], wp_db->snapshot_cache_[i].load());
+  }
+  ASSERT_EQ(kNewerMax, wp_db->max_evicted_seq_.load());
+}
+
 // A new snapshot should always be always larger than max_evicted_seq_
 // Otherwise the snapshot does not go through AdvanceMaxEvictedSeq
 TEST_P(WritePreparedTransactionTest, NewSnapshotLargerThanMax) {
@@ -4064,13 +4127,6 @@ TEST_P(WritePreparedTransactionTest, AddPreparedBeforeMax) {
 // that it is published and when it is cleaned up from old_prepared_. This test
 // stresses such cases.
 TEST_P(WritePreparedTransactionTest, CommitOfDelayedPrepared) {
-  if (test::WalPartitionsForCurrentTest() > 1) {
-    // New: at N > 1 partition leaders run AdvanceMaxEvictedSeq concurrently;
-    // it reads snapshots_version_ without snapshots_mutex_, and an older
-    // version can overwrite a newer snapshot list. TSan reports the race.
-    ROCKSDB_GTEST_SKIP("new: snapshots_version_ race between leaders at N > 1");
-    return;
-  }
   const size_t snapshot_cache_bits = 7;  // same as default
   for (const size_t commit_cache_bits : {0, 2, 3}) {
     for (const size_t sub_batch_cnt : {1, 2, 3}) {
