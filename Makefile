@@ -1859,6 +1859,9 @@ db_wal_test: $(OBJ_DIR)/db/db_wal_test.o $(TOOLS_LIBRARY) $(TEST_LIBRARY) $(LIBR
 db_wal_oracle_test: $(OBJ_DIR)/db/db_wal_oracle_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
+db_wal_partitions_open_test: $(OBJ_DIR)/db/db_wal_partitions_open_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
 db_io_failure_test: $(OBJ_DIR)/db/db_io_failure_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 

@@ -10421,10 +10421,6 @@ TEST(TransactionPartitionedWalTest, SwitchWALFindsOldestWalAcrossPartitions) {
   // pinned by the outstanding prepare and give up on releasing it, as at
   // N=1, instead of comparing against partition 0's newer WAL.
   constexpr size_t kPartitions = 2;
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
   const std::string dbname =
       test::PerThreadDBPath("transaction_partitioned_wal_switch");
   Options options;
@@ -10516,8 +10512,6 @@ TEST(TransactionPartitionedWalTest, SwitchWALFindsOldestWalAcrossPartitions) {
   handles.clear();
   delete db;
   db = nullptr;
-  SyncPoint::GetInstance()->DisableProcessing();
-  SyncPoint::GetInstance()->ClearAllCallBacks();
   ASSERT_OK(DestroyDB(dbname, options));
 }
 
@@ -10554,10 +10548,6 @@ TEST(TransactionPartitionedWalTest,
       delete db;
     }
   });
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
   ASSERT_OK(TransactionDB::Open(options, TransactionDBOptions(), dbname, &db));
   DBImpl* db_impl = static_cast_with_check<DBImpl>(db->GetRootDB());
   ASSERT_EQ(kPartitions, db_impl->TEST_NumWalPartitions());
@@ -10652,10 +10642,6 @@ TEST(TransactionPartitionedWalTest,
 // the commit written after the upgrade finds its prepare.
 TEST(TransactionPartitionedWalTest, PreparedUnindexedWalSurvivesPartitioning) {
   constexpr size_t kPartitions = 2;
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
   const std::string dbname =
       test::PerThreadDBPath("transaction_prepare_across_partitioning");
   Options options;
@@ -10752,8 +10738,6 @@ TEST(TransactionPartitionedWalTest, PreparedUnindexedWalSurvivesPartitioning) {
                       "indexed" + std::to_string(p), &value));
   }
   close();
-  SyncPoint::GetInstance()->DisableProcessing();
-  SyncPoint::GetInstance()->ClearAllCallBacks();
   ASSERT_OK(DestroyDB(dbname, options));
 }
 
@@ -10764,10 +10748,6 @@ TEST(TransactionPartitionedWalTest, PreparedUnindexedWalSurvivesPartitioning) {
 TEST(TransactionPartitionedWalTest,
      SnapshotCommitPublishesAboveHeldLowerWrite) {
   constexpr size_t kPartitions = 2;
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
   const std::string dbname =
       test::PerThreadDBPath("transaction_partitioned_wal_snapshot_commit");
   Options options;
@@ -10831,6 +10811,7 @@ TEST(TransactionPartitionedWalTest,
         cv.notify_all();
         cv.wait(lock, [&] { return release_a; });
       });
+  SyncPoint::GetInstance()->EnableProcessing();
   port::Thread a([&] {
     ASSERT_OK(db->Put(WriteOptions(), cf_for_partition[0], "a", "v"));
   });
@@ -10877,9 +10858,6 @@ TEST(TransactionPartitionedWalTest,
 // prepared.
 TEST(TransactionPartitionedWalTest, SyncPrepareAfterSyncCommitSurvivesCrash) {
   constexpr size_t kPartitions = 2;
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
   SyncPoint::GetInstance()->EnableProcessing();
   const std::string dbname =
       test::PerThreadDBPath("transaction_partitioned_wal_sync_prepare");
@@ -11003,10 +10981,6 @@ TEST(TransactionPartitionedWalTest, FailedSyncPrepareLeavesNoStaleFence) {
     delete txn;
     delete db;
   });
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
   ASSERT_OK(TransactionDB::Open(options, txn_db_options, dbname, &db));
   DBImpl* db_impl = static_cast_with_check<DBImpl>(db->GetRootDB());
   ASSERT_EQ(kPartitions, db_impl->TEST_NumWalPartitions());
@@ -11088,9 +11062,6 @@ struct FU14SnapshotRace {
   ~FU14SnapshotRace() { Close(); }
 
   void Open(const std::string& name) {
-    SyncPoint::GetInstance()->SetCallBack(
-        "DBImpl::ValidateOptions:AllowWalPartitions",
-        [](void* arg) { *static_cast<bool*>(arg) = true; });
     SyncPoint::GetInstance()->EnableProcessing();
     dbname = test::PerThreadDBPath(name);
     options.create_if_missing = true;
@@ -11550,10 +11521,6 @@ TEST(TransactionPartitionedWalTest, GC23SnapshotReservationInProperties) {
 // change after the final compaction.
 TEST(TransactionPartitionedWalTest,
      GC23TimestampedSnapshotsSurviveFlushStress) {
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
   for (const size_t num_partitions : {size_t{2}, size_t{8}}) {
     SCOPED_TRACE("wal_partitions=" + std::to_string(num_partitions));
     const std::string dbname =
@@ -11567,10 +11534,6 @@ TEST(TransactionPartitionedWalTest,
     options.max_write_buffer_number = 8;
     ASSERT_OK(DestroyDB(dbname, options));
     TransactionDB* db = nullptr;
-    SyncPoint::GetInstance()->SetCallBack(
-        "DBImpl::ValidateOptions:AllowWalPartitions",
-        [](void* arg) { *static_cast<bool*>(arg) = true; });
-    SyncPoint::GetInstance()->EnableProcessing();
     std::vector<ColumnFamilyHandle*> handles;
     // Releases what the test holds on every exit, including an early
     // return from a failed assertion.

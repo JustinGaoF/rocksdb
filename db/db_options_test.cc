@@ -2063,13 +2063,19 @@ TEST_F(DBOptionsTest, WalPartitionsValidation) {
   ASSERT_TRUE(
       std::strstr(s.getState(), "wal_partitions must be greater than 0"));
 
-  // More than one partition is configurable but not implemented yet, so it is
-  // rejected rather than silently ignored.
+  // More than one partition needs an indexing partition_wal_usage, so with
+  // the default kNone it is rejected rather than silently ignored.
   options.wal_partitions = 4;
   s = TryReopen(options);
   ASSERT_TRUE(s.IsNotSupported());
-  ASSERT_TRUE(
-      std::strstr(s.getState(), "wal_partitions > 1 is not supported yet"));
+  ASSERT_TRUE(std::strstr(
+      s.getState(),
+      "wal_partitions > 1 requires partition_wal_usage other than kNone"));
+
+  // With indexing it opens.
+  options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  options.track_and_verify_wals_in_manifest = true;
+  ASSERT_OK(TryReopen(options));
 
   options.wal_partitions = 1;
   ASSERT_OK(TryReopen(options));
@@ -2093,11 +2099,12 @@ TEST_F(DBOptionsTest, WalPartitionsRoundTrip) {
   ASSERT_EQ(8U, parsed.wal_partitions);
 }
 
-static constexpr const char* kWalPartitionsRejection =
-    "wal_partitions > 1 is not supported yet (for any partition_wal_usage)";
+static constexpr const char* kUnindexedWalPartitionsRejection =
+    "wal_partitions > 1 requires partition_wal_usage other than kNone";
 
-// Every (partition_wal_usage, wal_partitions) cell reachable without the test
-// hook: one partition opens under either usage, four are rejected under both.
+// Every (partition_wal_usage, wal_partitions) cell, with no test hook: one
+// partition opens under either usage; four open under an indexing usage and
+// are rejected under kNone.
 TEST_F(DBOptionsTest, WalPartitionsUsageMatrix) {
   for (const PartitionWALUsage usage :
        {PartitionWALUsage::kNone,
@@ -2108,15 +2115,19 @@ TEST_F(DBOptionsTest, WalPartitionsUsageMatrix) {
       Options options = CurrentOptions();
       options.partition_wal_usage = usage;
       options.wal_partitions = partitions;
+      // Required at N > 1 (checked after the kNone rejection), so the kNone
+      // cell is rejected for kNone alone.
+      options.track_and_verify_wals_in_manifest = true;
       Destroy(options);
       const Status s = TryReopen(options);
-      if (partitions == 1) {
+      if (partitions == 1 || usage != PartitionWALUsage::kNone) {
         ASSERT_OK(s);
+        ASSERT_EQ(partitions, dbfull()->GetDBOptions().wal_partitions);
         ASSERT_OK(Put("key", "value"));
         Close();
       } else {
         ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
-        ASSERT_STREQ(kWalPartitionsRejection, s.getState());
+        ASSERT_STREQ(kUnindexedWalPartitionsRejection, s.getState());
       }
     }
   }
@@ -2148,8 +2159,9 @@ TEST_F(DBOptionsTest, SetDBOptionsRejectsPartitionWALUsage) {
             dbfull()->GetDBOptions().partition_wal_usage);
 }
 
-// An OPTIONS file carrying an illegal pair loads unchanged, and opening with
-// what it loads fails with a message naming both options.
+// An OPTIONS file carrying the illegal pair (kNone, 4) loads unchanged, and
+// opening with what it loads fails with a message naming both options. The
+// legal pair (indexed, 4) opens from its OPTIONS file.
 TEST_F(DBOptionsTest, IllegalWalPartitionsPairInOptionsFileFailsOpen) {
   for (const PartitionWALUsage usage :
        {PartitionWALUsage::kNone,
@@ -2163,6 +2175,7 @@ TEST_F(DBOptionsTest, IllegalWalPartitionsPairInOptionsFileFailsOpen) {
     DBOptions illegal(options);
     illegal.partition_wal_usage = usage;
     illegal.wal_partitions = 4;
+    illegal.track_and_verify_wals_in_manifest = true;
     ConfigOptions config_options;
     config_options.env = env_;
     ASSERT_OK(PersistRocksDBOptions(
@@ -2180,10 +2193,18 @@ TEST_F(DBOptionsTest, IllegalWalPartitionsPairInOptionsFileFailsOpen) {
     std::vector<ColumnFamilyHandle*> handles;
     std::unique_ptr<DB> db;
     const Status s = DB::Open(loaded, dbname_, cf_descs, &handles, &db);
+    if (usage != PartitionWALUsage::kNone) {
+      ASSERT_OK(s);
+      ASSERT_EQ(4U, db->GetDBOptions().wal_partitions);
+      for (ColumnFamilyHandle* handle : handles) {
+        ASSERT_OK(db->DestroyColumnFamilyHandle(handle));
+      }
+      continue;
+    }
     ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
     ASSERT_NE(nullptr, std::strstr(s.getState(), "wal_partitions"));
     ASSERT_NE(nullptr, std::strstr(s.getState(), "partition_wal_usage"));
-    ASSERT_STREQ(kWalPartitionsRejection, s.getState());
+    ASSERT_STREQ(kUnindexedWalPartitionsRejection, s.getState());
   }
 }
 

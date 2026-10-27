@@ -309,7 +309,6 @@ TEST_F(LatencyInjectionFSTest, OneSlowPartitionAtTwoPartitions) {
   options.wal_partitions = 2;
   options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
   options.track_and_verify_wals_in_manifest = true;
-  options.experimental_allow_wal_partitions_for_testing = true;
   options.create_missing_column_families = true;
   // Column families 1 and 2 route to different partitions or the search
   // below creates more until both partitions are covered.
