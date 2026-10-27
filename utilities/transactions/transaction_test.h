@@ -76,6 +76,7 @@ class TransactionTestBase : public ::testing::Test {
     env.reset(new CompositeEnvWrapper(&special_env, fault_fs));
     options.env = env.get();
     options.two_write_queues = two_write_queue;
+    test::SetWalPartitions(&options, test::WalPartitionsForCurrentTest());
     dbname = test::PerThreadDBPath("transaction_testdb");
 
     EXPECT_OK(DestroyDB(dbname, options));

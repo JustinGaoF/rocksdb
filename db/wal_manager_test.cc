@@ -28,7 +28,7 @@ namespace ROCKSDB_NAMESPACE {
 
 // TODO(icanadi) mock out VersionSet
 // TODO(icanadi) move other WalManager-specific tests from db_test here
-class WalManagerTest : public testing::Test {
+class WalManagerTest : public testing::TestWithParam<uint32_t> {
  public:
   WalManagerTest()
       : dbname_(test::PerThreadDBPath("wal_manager_test")),
@@ -78,7 +78,8 @@ class WalManagerTest : public testing::Test {
     ASSERT_OK(batch.Put(key, value));
     WriteBatchInternal::SetSequence(&batch, seq);
     ASSERT_OK(current_log_writer_->AddRecord(
-        WriteOptions(), WriteBatchInternal::Contents(&batch)));
+        WriteOptions(), WriteBatchInternal::Contents(&batch), seq,
+        current_log_writer_->WALIndexEnabled() ? seq : 0));
     versions_->SetLastAllocatedSequence(seq);
     versions_->SetLastPublishedSequence(seq);
     versions_->SetLastSequence(seq);
@@ -94,6 +95,16 @@ class WalManagerTest : public testing::Test {
                                          nullptr));
     current_log_writer_.reset(
         new log::Writer(std::move(file_writer), 0, false));
+    // Spread the WALs over the partitions, as a DB with that many would.
+    const uint32_t wal_partitions = test::WalPartitionsForCurrentTest();
+    if (wal_partitions > 1) {
+      current_log_writer_->SetPartitionWALUsage(
+          PartitionWALUsage::kPartitionByColumnFamily);
+      current_log_writer_->SetWALPartition(current_log_number_ %
+                                           wal_partitions);
+      ASSERT_OK(
+          current_log_writer_->MaybeAddWALIndexMarkerRecord(WriteOptions()));
+    }
   }
 
   void CreateArchiveLogs(int num_logs, int entries_per_log) {
@@ -222,7 +233,7 @@ int CountRecords(WalIterator* iter) {
 }
 }  // anonymous namespace
 
-TEST_F(WalManagerTest, WALArchivalSizeLimit) {
+TEST_P(WalManagerTest, WALArchivalSizeLimit) {
   db_options_.WAL_ttl_seconds = 0;
   db_options_.WAL_size_limit_MB = 1000;
   Init(nullptr /* clock_override */);
@@ -260,7 +271,7 @@ TEST_F(WalManagerTest, WALArchivalSizeLimit) {
   ASSERT_TRUE(log_files.empty());
 }
 
-TEST_F(WalManagerTest, WALArchivalTtl) {
+TEST_P(WalManagerTest, WALArchivalTtl) {
   db_options_.WAL_ttl_seconds = 1000;
   Init(nullptr /* clock_override */);
 
@@ -286,7 +297,7 @@ TEST_F(WalManagerTest, WALArchivalTtl) {
   ASSERT_TRUE(log_files.empty());
 }
 
-TEST_F(WalManagerTest, WALArchivalTtlClockGoesBackwards) {
+TEST_P(WalManagerTest, WALArchivalTtlClockGoesBackwards) {
   // This test used to trigger an unsigned underflow bug, where WAL files were
   // incorrectly deleted when the system time moved backwards between writing
   // to a WAL and running `WalManager::PurgeObsoleteWALFiles()`.
@@ -317,6 +328,31 @@ TEST_F(WalManagerTest, WALArchivalTtlClockGoesBackwards) {
   // All files must still be present because TTL has not elapsed.
   ASSERT_EQ(kNumLogs,
             ListSpecificFiles(env_.get(), archive_dir, kWalFile).size());
+}
+
+INSTANTIATE_TEST_CASE_P(WalPartitions1, WalManagerTest, testing::Values(1U));
+INSTANTIATE_TEST_CASE_P(WalPartitions8, WalManagerTest,
+                        testing::Values(test::kTestWalPartitions));
+
+// GetUpdatesSince iterates over files written at one partition, and refuses
+// WALs a DB with more partitions wrote, whose sequences interleave across
+// files, before building an iterator (D-G32 (a)). The WAL iterator tests below
+// run at one partition.
+TEST_P(WalManagerTest, GetUpdatesSinceAtWalPartitions) {
+  Init(nullptr /* clock_override */);
+  CreateArchiveLogs(3, 10);
+  std::unique_ptr<WalIterator> iter;
+  const Status s = wal_manager_->GetUpdatesSince(
+      0, &iter, WalIterator::ReadOptions(), versions_.get());
+  if (GetParam() == 1) {
+    ASSERT_OK(s);
+    ASSERT_EQ(30, CountRecords(iter.get()));
+  } else {
+    ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+    ASSERT_NE(std::string::npos, s.ToString().find("wal_partitions > 1"))
+        << s.ToString();
+    ASSERT_EQ(nullptr, iter);
+  }
 }
 
 TEST_F(WalManagerTest, WalIteratorMoveOverZeroFiles) {
