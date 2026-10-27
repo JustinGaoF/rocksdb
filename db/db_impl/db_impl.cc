@@ -2910,6 +2910,11 @@ IOStatus DBImpl::SyncWalPartitionFiles(size_t partition,
   if (NumWalPartitions() > 1) {
     WalWriteMutex(partition).AssertHeld();
   }
+  // Fires under the partition's WAL mutex (when held), before its files
+  // sync: tests hold one partition's fsync open here while other partitions
+  // write.
+  TEST_SYNC_POINT_CALLBACK("DBImpl::SyncWalPartitionFiles:BeforeSyncPartition",
+                           &partition);
   IOStatus io_s;
   for (auto& log : logs_[partition]) {
     IOOptions opts;

@@ -549,6 +549,7 @@ TEST_MAIN_SOURCES =                                                     \
   db/db_logical_block_size_cache_test.cc                                \
   db/db_universal_compaction_test.cc                                    \
   db/db_wal_oracle_test.cc                                              \
+  db/db_wal_partitions_open_test.cc                                     \
   db/db_wal_test.cc                                                     \
   db/db_with_timestamp_compaction_test.cc                               \
   db/db_write_buffer_manager_test.cc                                    \

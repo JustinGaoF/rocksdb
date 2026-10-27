@@ -2684,10 +2684,6 @@ INSTANTIATE_TEST_CASE_P(
 // Serial validation runs on the write group leader, and N partitions run N
 // leaders, so it is rejected at Open with N > 1. Parallel validation commits.
 TEST(OptimisticTransactionWalPartitionsTest, ValidatePolicyAtNPartitions) {
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
   Options options;
   options.create_if_missing = true;
   options.wal_partitions = 2;
@@ -2725,8 +2721,6 @@ TEST(OptimisticTransactionWalPartitionsTest, ValidatePolicyAtNPartitions) {
   txn.reset();
   ASSERT_OK(txn_db->Close());
   txn_db.reset();
-  SyncPoint::GetInstance()->DisableProcessing();
-  SyncPoint::GetInstance()->ClearAllCallBacks();
   ASSERT_OK(DestroyDB(dbname, options));
 }
 

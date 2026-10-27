@@ -28,7 +28,7 @@
 // fails like any other.
 //
 // The cycle's seed fixes its configuration: N, the crash kind, the crash
-// point (the n-th acknowledgement, WAL append, leadership sync or gate park),
+// point (the n-th acknowledgement, WAL append, gate sync or gate park),
 // the writers' schedules and the slow partition. Thread interleaving is not
 // controlled, so a failure reproduces from its seed with the same configuration
 // and crash point, but may need reruns to hit the same interleaving.
@@ -117,8 +117,9 @@ enum class CrashTrigger {
   kAck,
   // A WAL append starts (before the record is written).
   kAppend,
-  // A sync write's leadership sync completed, before its completion gate.
-  kLeadershipSync,
+  // A sync write's gate sync (its fsync of every partition, run from its
+  // completion gate) completed, before the gate's wait.
+  kGateSync,
   // A completion gate parks, waiting for a lower record on another partition.
   kPark,
 };
@@ -129,8 +130,8 @@ const char* CrashTriggerName(CrashTrigger trigger) {
       return "ack";
     case CrashTrigger::kAppend:
       return "append";
-    case CrashTrigger::kLeadershipSync:
-      return "leadership_sync";
+    case CrashTrigger::kGateSync:
+      return "gate_sync";
     case CrashTrigger::kPark:
       return "park";
   }
@@ -147,8 +148,8 @@ const char* CrashTriggerSyncPoint(CrashTrigger trigger) {
       return nullptr;
     case CrashTrigger::kAppend:
       return kAppendSyncPoint;
-    case CrashTrigger::kLeadershipSync:
-      return "DBImpl::WriteGroupToWAL:AfterLeadershipSync";
+    case CrashTrigger::kGateSync:
+      return "DBImpl::SyncWalsFromCompletionGate:AfterGateSync";
     case CrashTrigger::kPark:
       return "DBImpl::WaitForWalDurability:BeforePark";
   }
@@ -220,7 +221,7 @@ CycleConfig ConfigForSeed(uint64_t seed) {
     case CrashTrigger::kAppend:
       config.crash_at = 1 + rnd.Uniform(writes);
       break;
-    case CrashTrigger::kLeadershipSync:
+    case CrashTrigger::kGateSync:
       config.crash_at = 1 + rnd.Uniform(writes / config.sync_one_in + 1);
       break;
     case CrashTrigger::kPark:
@@ -371,7 +372,6 @@ CycleResult DBWalOracleTest::RunCycle(const CycleConfig& config) {
   Options options = CurrentOptions();
   options.env = env.get();
   options.wal_partitions = static_cast<uint32_t>(config.partitions);
-  options.experimental_allow_wal_partitions_for_testing = true;
   options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
   options.track_and_verify_wals_in_manifest = true;
   options.wal_recovery_mode = WALRecoveryMode::kPointInTimeRecovery;
@@ -793,11 +793,11 @@ TEST_F(DBWalOracleTest, CatchesMergeStopOffByOne) {
   // hole, treating the hole as explained and replaying the record above it.
   const uint64_t seed = EnvU64("ROCKSDB_WAL_ORACLE_SEED", kDefaultSeed);
   // A hole needs a record synced above an unsynced lower one on another
-  // partition: crash right after a sync write's leadership sync while a
+  // partition: crash right after a sync write's gate sync while a
   // lower write is held between its allocation and its append.
   auto power_loss = [](CycleConfig* config) {
     config->crash = CrashKind::kPowerLoss;
-    config->trigger = CrashTrigger::kLeadershipSync;
+    config->trigger = CrashTrigger::kGateSync;
     config->crash_at = 1 + config->seed % 8;
     config->sync_one_in = 2;
     config->threads = std::max(config->threads, 4);

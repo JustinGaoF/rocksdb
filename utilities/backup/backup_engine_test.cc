@@ -1633,6 +1633,72 @@ TEST_P(BackupEngineTest, BackupWithoutFlushDuringWritesIsPrefix) {
                                        kMaxKeys);
 }
 
+// Backups without a flush race another thread's LockWAL/UnlockWAL loop while
+// writers run on every partition (the backup analogue of CheckpointTest's
+// CheckpointRacingLockWAL). Each one finishes within the bound, and each
+// restores to a per-writer prefix holding every write acknowledged before it
+// started, which opens in every recovery mode.
+TEST_P(BackupEngineTest, BackupWithoutFlushRacingLockWAL) {
+  constexpr uint64_t kMaxKeys = 2000;
+  constexpr int kBackups = 5;
+  const std::vector<uint32_t> cf_ids =
+      ColumnFamilyIdsCoveringWalPartitions(GetParam());
+  std::vector<ColumnFamilyDescriptor> column_families;
+  for (const std::string& name : ColumnFamilyNamesThrough(cf_ids)) {
+    column_families.emplace_back(name, options_);
+  }
+  options_.create_missing_column_families = true;
+  DestroyDBWithoutCheck(dbname_, options_);
+  std::vector<ColumnFamilyHandle*> handles;
+  ASSERT_OK(DB::Open(options_, dbname_, column_families, &handles, &db_));
+  OpenBackupEngine(/*destroy_old_data=*/true);
+  // Widens the window between the LockWAL check and the WAL size read, so a
+  // backup that does not hold LockWAL across it lets writes resume inside.
+  SyncPoint::GetInstance()->SetCallBack(
+      "CheckpointImpl::CreateCustomCheckpoint:AfterGetLive1",
+      [](void*) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); });
+  SyncPoint::GetInstance()->EnableProcessing();
+  std::vector<std::vector<uint64_t>> acked_before(kBackups);
+  {
+    PartitionWriters writers(db_.get(), handles, cf_ids, kMaxKeys);
+    std::atomic<bool> stop_locking{false};
+    port::Thread locker([&] {
+      while (!stop_locking.load()) {
+        ASSERT_OK(db_->LockWAL());
+        std::this_thread::yield();
+        ASSERT_OK(db_->UnlockWAL());
+      }
+    });
+    for (int b = 0; b < kBackups; ++b) {
+      writers.WaitForAcked(static_cast<uint64_t>(b + 1) * 10);
+      acked_before[b] = writers.Acked();
+      ASSERT_OK(RunWithin(std::chrono::seconds(30), [&] {
+        return backup_engine_->CreateNewBackup(db_.get(),
+                                               /*flush_before_backup=*/false);
+      }));
+    }
+    stop_locking.store(true);
+    locker.join();
+  }
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearCallBack(
+      "CheckpointImpl::CreateCustomCheckpoint:AfterGetLive1");
+  for (ColumnFamilyHandle* handle : handles) {
+    ASSERT_OK(db_->DestroyColumnFamilyHandle(handle));
+  }
+  CloseDBAndBackupEngine();
+  for (int b = 0; b < kBackups; ++b) {
+    SCOPED_TRACE("backup " + std::to_string(b));
+    DestroyDBWithoutCheck(dbname_, options_);
+    OpenBackupEngine();
+    ASSERT_OK(backup_engine_->RestoreDBFromBackup(static_cast<BackupID>(b + 1),
+                                                  dbname_, dbname_));
+    CloseBackupEngine();
+    AssertKeyPrefixesInEveryRecoveryMode(options_, dbname_, cf_ids,
+                                         acked_before[b], kMaxKeys);
+  }
+}
+
 // this will make sure that backup does not copy the same file twice
 TEST_P(BackupEngineTest, NoDoubleCopy_And_AutoGC) {
   OpenDBAndBackupEngine(true, true);

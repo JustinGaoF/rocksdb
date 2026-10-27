@@ -34,6 +34,16 @@
       "kind": "removed",
       "function": "rocksdb_table_properties_external_sst_file_global_seqno_offset",
       "reason": "Removed after write_global_seqno was removed because RocksDB no longer mutates the global sequence number stored in external SST files during ingestion."
+    },
+    {
+      "kind": "removed",
+      "function": "rocksdb_options_set_experimental_allow_wal_partitions_for_testing",
+      "reason": "Generated accessor for DBOptions::experimental_allow_wal_partitions_for_testing, a testing-only opt-in that let wal_partitions > 1 open before indexed partitioned WALs were supported. Indexed wal_partitions > 1 now opens without it, so the option and its accessors are removed before they appear in any release."
+    },
+    {
+      "kind": "removed",
+      "function": "rocksdb_options_get_experimental_allow_wal_partitions_for_testing",
+      "reason": "Generated accessor for DBOptions::experimental_allow_wal_partitions_for_testing, a testing-only opt-in that let wal_partitions > 1 open before indexed partitioned WALs were supported. Indexed wal_partitions > 1 now opens without it, so the option and its accessors are removed before they appear in any release."
     }
   ]
 }

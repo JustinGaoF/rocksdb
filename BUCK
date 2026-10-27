@@ -5132,6 +5132,12 @@ cpp_unittest_wrapper(name="db_wal_oracle_test",
             extra_compiler_flags=[])
 
 
+cpp_unittest_wrapper(name="db_wal_partitions_open_test",
+            srcs=["db/db_wal_partitions_open_test.cc"],
+            deps=[":rocksdb_test_lib"],
+            extra_compiler_flags=[])
+
+
 cpp_unittest_wrapper(name="db_wal_test",
             srcs=["db/db_wal_test.cc"],
             deps=[":rocksdb_test_lib"],

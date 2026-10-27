@@ -239,10 +239,6 @@ TEST_F(LdbCmdTest, DumpWalOnPartitionedWals) {
   EXPECT_EQ(std::string::npos, output.find("WAL partition"));
   ASSERT_OK(DestroyDB(dbname, opts));
 
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
   constexpr size_t kPartitions = 8;
   opts.wal_partitions = kPartitions;
   std::vector<uint64_t> current_wals(kPartitions);
@@ -276,8 +272,6 @@ TEST_F(LdbCmdTest, DumpWalOnPartitionedWals) {
       ASSERT_OK(db->DestroyColumnFamilyHandle(handle.release()));
     }
   }
-  SyncPoint::GetInstance()->DisableProcessing();
-  SyncPoint::GetInstance()->ClearAllCallBacks();
 
   ASSERT_EQ(0, dump(LogFileName(dbname, current_wals[3]), nullptr, &output));
   EXPECT_NE(std::string::npos, output.find("WAL partition: 3")) << output;
@@ -303,7 +297,7 @@ INSTANTIATE_TEST_CASE_P(WalPartitions8, LdbCmdWalPartitionsTest,
 // and names the partition of every file but partition 0's; together the files
 // hold every write exactly once. `--only_print_seqno_gaps` checks partition
 // 0's file and refuses every other one. `dump_live_files`, which opens the
-// DB, lists the WAL at one partition and is refused at more. Ported from
+// DB, lists every partition's current WAL. Ported from
 // D127115188's DumpWalShowsPartitionAndRefusesGapsAtN8.
 TEST_P(LdbCmdWalPartitionsTest, DumpWalAtWalPartitions) {
   Env* env = TryLoadCustomOrDefaultEnv();
@@ -392,12 +386,14 @@ TEST_P(LdbCmdWalPartitionsTest, DumpWalAtWalPartitions) {
               output.find(LogFileName("", current_wals[0]).substr(1)))
         << output;
   } else {
-    // ldb opens the DB with its OPTIONS file, which does not keep the testing
-    // opt-in, so the open is refused like any production open.
-    EXPECT_NE(0, live_files) << output;
-    EXPECT_NE(std::string::npos,
-              output.find("wal_partitions > 1 is not supported yet"))
-        << output;
+    // ldb opens the DB with its OPTIONS file, which keeps wal_partitions and
+    // the indexing partition_wal_usage, so the open succeeds and every
+    // partition's current WAL is live.
+    ASSERT_EQ(0, live_files) << output;
+    for (const uint64_t wal : current_wals) {
+      EXPECT_NE(std::string::npos, output.find(LogFileName("", wal).substr(1)))
+          << output;
+    }
   }
   ASSERT_OK(DestroyDB(dbname, opts));
 }

@@ -56,7 +56,6 @@ struct ImmutableDBOptions {
   uint64_t WAL_size_limit_MB;
   uint64_t max_write_batch_group_size_bytes;
   uint32_t wal_partitions;
-  bool experimental_allow_wal_partitions_for_testing;
   bool allow_mmap_reads;
   bool allow_mmap_writes;
   bool use_direct_reads;

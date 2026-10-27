@@ -10022,16 +10022,6 @@ uint32_t rocksdb_options_get_wal_partitions(rocksdb_options_t* opt) {
   return opt->rep.wal_partitions;
 }
 
-void rocksdb_options_set_experimental_allow_wal_partitions_for_testing(
-    rocksdb_options_t* opt, unsigned char v) {
-  opt->rep.experimental_allow_wal_partitions_for_testing = v;
-}
-
-unsigned char rocksdb_options_get_experimental_allow_wal_partitions_for_testing(
-    rocksdb_options_t* opt) {
-  return opt->rep.experimental_allow_wal_partitions_for_testing;
-}
-
 void rocksdb_options_set_write_thread_max_yield_usec(rocksdb_options_t* opt,
                                                      uint64_t v) {
   opt->rep.write_thread_max_yield_usec = v;
