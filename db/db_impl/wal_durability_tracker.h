@@ -12,6 +12,7 @@
 #include <limits>
 #include <vector>
 
+#include "port/port.h"
 #include "rocksdb/rocksdb_namespace.h"
 #include "test_util/sync_point.h"
 
@@ -42,7 +43,7 @@ namespace ROCKSDB_NAMESPACE {
 // synchronized (in DBImpl, sequence_wal_index_mutex_ serializes every tracker
 // op, which also orders each registration before any later scan so no scan
 // can miss an outstanding range). Cross-partition concurrency is lock-free:
-// pending_low_/durable_upto_ use release stores on the completing writer and
+// pending_low/durable_upto use release stores on the completing writer and
 // acquire loads on the scanner, so observing an advanced frontier observes
 // the WAL append that advanced it. min_owner_ is a relaxed hint; a stale read
 // only costs an extra rescan or a conservatively delayed advance, both safe.
@@ -58,17 +59,15 @@ class WalDurabilityTracker {
   // off-by-one self-test, which targets the WAL durability watermark only.
   explicit WalDurabilityTracker(size_t num_partitions = 1,
                                 bool safe_point_test_hook = true)
-      : pending_low_(num_partitions),
-        durable_upto_(num_partitions),
-        inflight_(num_partitions),
+      : partitions_(num_partitions),
         safe_point_test_hook_(safe_point_test_hook) {
     assert(num_partitions > 0);
     for (size_t p = 0; p < num_partitions; ++p) {
-      pending_low_[p].store(kIdle, std::memory_order_relaxed);
-      durable_upto_[p].store(0, std::memory_order_relaxed);
+      partitions_[p].pending_low.store(kIdle, std::memory_order_relaxed);
+      partitions_[p].durable_upto.store(0, std::memory_order_relaxed);
       // In-flight depth is typically one to four groups; reserving up front
       // keeps the hot path allocation-free.
-      inflight_[p].reserve(4);
+      partitions_[p].inflight.reserve(4);
     }
     safe_point_.store(0, std::memory_order_relaxed);
     min_owner_.store(0, std::memory_order_relaxed);
@@ -78,7 +77,7 @@ class WalDurabilityTracker {
   WalDurabilityTracker(const WalDurabilityTracker&) = delete;
   void operator=(const WalDurabilityTracker&) = delete;
 
-  size_t num_partitions() const { return pending_low_.size(); }
+  size_t num_partitions() const { return partitions_.size(); }
 
   // Records [low, high] as outstanding on partition p. Must be called before
   // the allocation's counter advance is visible to other partitions' scans;
@@ -89,10 +88,10 @@ class WalDurabilityTracker {
   // also unchanged). Updates min_owner_ on that leaving-all-idle transition
   // so a later Complete by another partition does not skip its rescan.
   void Register(size_t partition, uint64_t low, uint64_t high) {
-    assert(partition < inflight_.size());
+    assert(partition < partitions_.size());
     assert(low <= high);
     assert(high != kIdle);
-    std::vector<Range>& fifo = inflight_[partition];
+    std::vector<Range>& fifo = partitions_[partition].inflight;
     fifo.push_back({low, high});
     uint64_t new_pending = kIdle;
     for (const Range& r : fifo) {
@@ -100,10 +99,12 @@ class WalDurabilityTracker {
         new_pending = r.low;
       }
     }
-    pending_low_[partition].store(new_pending, std::memory_order_release);
+    partitions_[partition].pending_low.store(new_pending,
+                                             std::memory_order_release);
     // Leaving all-idle: the minimum was infinity, so it is now this range.
     size_t owner = min_owner_.load(std::memory_order_relaxed);
-    if (pending_low_[owner].load(std::memory_order_acquire) == kIdle &&
+    if (partitions_[owner].pending_low.load(std::memory_order_acquire) ==
+            kIdle &&
         new_pending != kIdle) {
       min_owner_.store(partition, std::memory_order_relaxed);
     }
@@ -118,8 +119,8 @@ class WalDurabilityTracker {
   // marker strands its transaction. Recomputes the safe point unless the
   // partition's minimum is provably unchanged and unowned.
   void Complete(size_t partition, uint64_t low, uint64_t high) {
-    assert(partition < inflight_.size());
-    std::vector<Range>& fifo = inflight_[partition];
+    assert(partition < partitions_.size());
+    std::vector<Range>& fifo = partitions_[partition].inflight;
     size_t found = fifo.size();
     for (size_t i = 0; i < fifo.size(); ++i) {
       if (fifo[i].low == low && fifo[i].high == high) {
@@ -134,13 +135,14 @@ class WalDurabilityTracker {
       return;
     }
     const uint64_t old_pending =
-        pending_low_[partition].load(std::memory_order_relaxed);
+        partitions_[partition].pending_low.load(std::memory_order_relaxed);
     fifo[found] = fifo.back();
     fifo.pop_back();
     const uint64_t cur_durable =
-        durable_upto_[partition].load(std::memory_order_relaxed);
+        partitions_[partition].durable_upto.load(std::memory_order_relaxed);
     if (high > cur_durable) {
-      durable_upto_[partition].store(high, std::memory_order_release);
+      partitions_[partition].durable_upto.store(high,
+                                                std::memory_order_release);
     }
     uint64_t new_pending = kIdle;
     for (const Range& r : fifo) {
@@ -148,7 +150,8 @@ class WalDurabilityTracker {
         new_pending = r.low;
       }
     }
-    pending_low_[partition].store(new_pending, std::memory_order_release);
+    partitions_[partition].pending_low.store(new_pending,
+                                             std::memory_order_release);
     if (new_pending == old_pending) {
       // Minimum unchanged (a duplicate remains, or several entries shared
       // the old minimum): the global frontier cannot have moved.
@@ -163,8 +166,8 @@ class WalDurabilityTracker {
   // below every later write. Unlike Complete, an absent range is not a bug (a
   // group whose append landed and whose sync failed completed it already).
   void Release(size_t partition, uint64_t low, uint64_t high) {
-    assert(partition < inflight_.size());
-    for (const Range& r : inflight_[partition]) {
+    assert(partition < partitions_.size());
+    for (const Range& r : partitions_[partition].inflight) {
       if (r.low == low && r.high == high) {
         Complete(partition, low, high);
         return;
@@ -179,13 +182,13 @@ class WalDurabilityTracker {
   }
 
   uint64_t PendingLow(size_t partition) const {
-    assert(partition < pending_low_.size());
-    return pending_low_[partition].load(std::memory_order_acquire);
+    assert(partition < partitions_.size());
+    return partitions_[partition].pending_low.load(std::memory_order_acquire);
   }
 
   uint64_t DurableUpto(size_t partition) const {
-    assert(partition < durable_upto_.size());
-    return durable_upto_[partition].load(std::memory_order_acquire);
+    assert(partition < partitions_.size());
+    return partitions_[partition].durable_upto.load(std::memory_order_acquire);
   }
 
   // Full rescan ignoring the min-owner shortcut. Tests use it after joining
@@ -195,8 +198,9 @@ class WalDurabilityTracker {
   void ForceRecalculate() {
     uint64_t min_pending = kIdle;
     size_t owner = 0;
-    for (size_t p = 0; p < pending_low_.size(); ++p) {
-      const uint64_t v = pending_low_[p].load(std::memory_order_acquire);
+    for (size_t p = 0; p < partitions_.size(); ++p) {
+      const uint64_t v =
+          partitions_[p].pending_low.load(std::memory_order_acquire);
       if (v < min_pending) {
         min_pending = v;
         owner = p;
@@ -205,8 +209,9 @@ class WalDurabilityTracker {
     min_owner_.store(owner, std::memory_order_relaxed);
     if (min_pending == kIdle) {
       uint64_t max_durable = 0;
-      for (size_t p = 0; p < durable_upto_.size(); ++p) {
-        const uint64_t d = durable_upto_[p].load(std::memory_order_acquire);
+      for (size_t p = 0; p < partitions_.size(); ++p) {
+        const uint64_t d =
+            partitions_[p].durable_upto.load(std::memory_order_acquire);
         if (d > max_durable) {
           max_durable = d;
         }
@@ -245,7 +250,7 @@ class WalDurabilityTracker {
     const size_t owner = min_owner_.load(std::memory_order_relaxed);
     if (completed_partition != owner) {
       const uint64_t owner_pending =
-          pending_low_[owner].load(std::memory_order_acquire);
+          partitions_[owner].pending_low.load(std::memory_order_acquire);
       if (new_pending >= owner_pending) {
         return;
       }
@@ -253,19 +258,28 @@ class WalDurabilityTracker {
     ForceRecalculate();
   }
 
-  // Lowest outstanding low per partition, or kIdle when empty. Contiguous so
-  // the rescan is one cache-friendly pass.
-  std::vector<std::atomic<uint64_t>> pending_low_;
-  // Highest completed high per partition. Only read when all partitions are
-  // idle, where the safe point is their maximum: with nothing outstanding,
-  // every allocated sequence completed, so the maximum completed is the
-  // maximum allocated and everything at or below it is durable.
-  std::vector<std::atomic<uint64_t>> durable_upto_;
-  // In-flight ranges per partition, in no particular order; the minimum is
-  // recomputed by linear scan on removal, which is O(depth) at depth <= 4.
-  // Per-partition rather than shared: a shared structure would serialize all
-  // partitions' completions and mix unrelated head-of-line blocking.
-  std::vector<std::vector<Range>> inflight_;
+  // One partition's state, written by that partition's leader on every
+  // register and complete. Each starts its own cache line, so leaders of
+  // different partitions never write a shared line (no false sharing); the
+  // rescan reads one line per partition.
+  struct ALIGN_AS(CACHE_LINE_SIZE) Partition {
+    // Lowest outstanding low, or kIdle when empty.
+    std::atomic<uint64_t> pending_low{kIdle};
+    // Highest completed high. Only read when all partitions are idle, where
+    // the safe point is their maximum: with nothing outstanding, every
+    // allocated sequence completed, so the maximum completed is the maximum
+    // allocated and everything at or below it is durable.
+    std::atomic<uint64_t> durable_upto{0};
+    // In-flight ranges, in no particular order; the minimum is recomputed by
+    // linear scan on removal, which is O(depth) at depth <= 4. Per-partition
+    // rather than shared: a shared structure would serialize all
+    // partitions' completions and mix unrelated head-of-line blocking.
+    std::vector<Range> inflight;
+  };
+  static_assert(alignof(Partition) >= CACHE_LINE_SIZE);
+  static_assert(sizeof(Partition) % CACHE_LINE_SIZE == 0);
+
+  std::vector<Partition> partitions_;
   std::atomic<uint64_t> safe_point_{0};
   std::atomic<size_t> min_owner_{0};
   const bool safe_point_test_hook_;
