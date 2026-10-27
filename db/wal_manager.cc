@@ -116,6 +116,41 @@ Status WalManager::GetSortedWalFiles(VectorWalPtr& files, bool need_seqnos,
   return s;
 }
 
+Status WalManager::CheckWalsReadableAndUnpartitioned(
+    const VectorWalPtr& wal_files, VersionSet* version_set) {
+  // WALs an earlier instance wrote with wal_partitions > 1 interleave their
+  // sequences across files, so reading them in file order would report gaps
+  // that are not there.
+  for (const auto& wal : wal_files) {
+    const std::string fname =
+        wal->Type() == kAliveLogFile
+            ? LogFileName(wal_dir_, wal->LogNumber())
+            : ArchivedLogFileName(wal_dir_, wal->LogNumber());
+    uint32_t wal_partition = 0;
+    const Status head = log::ReadWALPartition(
+        fs_.get(), fname, fs_->OptimizeForLogRead(file_options_),
+        wal->LogNumber(), &wal_partition);
+    if (!head.ok() && !head.IsNotFound() &&
+        (db_options_.wal_partitions > 1 ||
+         (version_set != nullptr && version_set->wal_index_guard() != 0))) {
+      // An indexed DB: which partition wrote it is unknown.
+      return Status::NotSupported(
+          "GetUpdatesSince: WAL " + std::to_string(wal->LogNumber()) + ": " +
+          head.ToString() +
+          "; it may be a partitioned WAL, whose sequences interleave across "
+          "files");
+    }
+    if (head.ok() && wal_partition != 0) {
+      return Status::NotSupported(
+          "GetUpdatesSince: WAL " + std::to_string(wal->LogNumber()) +
+          " was written by partition " + std::to_string(wal_partition) +
+          " of a DB with wal_partitions > 1, whose sequences interleave "
+          "across files");
+    }
+  }
+  return Status::OK();
+}
+
 Status WalManager::GetUpdatesSince(SequenceNumber seq,
                                    std::unique_ptr<WalIterator>* iter,
                                    const WalIterator::ReadOptions& read_options,
@@ -134,10 +169,26 @@ Status WalManager::GetUpdatesSince(SequenceNumber seq,
   std::unique_ptr<VectorWalPtr> wal_files(new VectorWalPtr);
   Status s = GetSortedWalFiles(*wal_files);
   if (!s.ok()) {
+    // A damaged head fails the seqno pass above; in an indexed DB that is a
+    // refusal naming the WAL, not a Corruption. Re-list without seqnos to
+    // find it. Any other listing failure returns as before.
+    VectorWalPtr unscanned;
+    if (GetSortedWalFiles(unscanned, /*need_seqnos=*/false).ok()) {
+      const Status check =
+          CheckWalsReadableAndUnpartitioned(unscanned, version_set);
+      if (!check.ok()) {
+        s.PermitUncheckedError();
+        return check;
+      }
+    }
     return s;
   }
 
   s = RetainProbableWalFiles(*wal_files, seq);
+  if (!s.ok()) {
+    return s;
+  }
+  s = CheckWalsReadableAndUnpartitioned(*wal_files, version_set);
   if (!s.ok()) {
     return s;
   }

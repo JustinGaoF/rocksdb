@@ -288,6 +288,13 @@ class DBImplSecondary : public DBImpl {
   Status MaybeInitLogReader(uint64_t log_number,
                             log::FragmentBufferedReader** log_reader);
 
+  // Refuses a catch-up round, before any of it is replayed, that may include
+  // a partitioned WAL set: a WAL whose marker names a partition other than 0,
+  // or, when some WAL in the round carries the WAL index, one whose head is
+  // empty or lacks the marker. Partition 0's WAL comes first in number order
+  // and would otherwise be applied without the other partitions' records.
+  Status CheckNoPartitionedWal(const std::vector<uint64_t>& log_numbers);
+
 #ifndef NDEBUG
   Status TEST_CompactWithoutInstallation(const OpenAndCompactOptions& options,
                                          ColumnFamilyHandle* cfh,
