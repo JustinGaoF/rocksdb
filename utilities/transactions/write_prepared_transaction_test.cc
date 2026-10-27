@@ -4835,9 +4835,6 @@ class WritePreparedPartitionedWalTest : public testing::Test {
     options_.track_and_verify_wals_in_manifest = true;
     options_.two_write_queues = false;
     txn_db_options_.write_policy = WRITE_PREPARED;
-    SyncPoint::GetInstance()->SetCallBack(
-        "DBImpl::ValidateOptions:AllowWalPartitions",
-        [](void* arg) { *static_cast<bool*>(arg) = true; });
     SyncPoint::GetInstance()->EnableProcessing();
     EXPECT_OK(DestroyDB(dbname_, options_));
   }

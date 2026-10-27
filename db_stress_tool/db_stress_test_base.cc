@@ -2629,7 +2629,10 @@ void StressTest::OperateDb(ThreadState* thread) {
           // And also that WAL is not changed during LockWAL()
           std::unique_ptr<WalFile> old_wal;
           s = db_->GetCurrentWalFile(&old_wal);
-          if (!s.ok()) {
+          if (s.IsNotSupported() && FLAGS_wal_partitions > 1) {
+            // Each partition has its own current WAL, so there is no single
+            // one to compare; the sequence number check below still runs.
+          } else if (!s.ok()) {
             fprintf(stderr, "GetCurrentWalFile() failed: %s\n",
                     s.ToString().c_str());
           } else {
@@ -4680,9 +4683,6 @@ Status StressTest::PrepareOptionsForRestoredDB(Options* options) {
   }
 
   *options = Options(db_options, cf_options);
-  // Not serialized, so the string round trip above drops it.
-  options->experimental_allow_wal_partitions_for_testing =
-      options_.experimental_allow_wal_partitions_for_testing;
   options->best_efforts_recovery = false;
   options->listeners.clear();
   // Avoid dangling/shared file descriptors, for reliable destroy
@@ -7184,8 +7184,6 @@ void InitializeOptionsFromFlags(
     options.partition_wal_usage = parsed_db_options.partition_wal_usage;
   }
   options.wal_partitions = FLAGS_wal_partitions;
-  options.experimental_allow_wal_partitions_for_testing =
-      FLAGS_wal_partitions > 1;
 
   options.last_level_temperature =
       StringToTemperature(FLAGS_last_level_temperature.c_str());

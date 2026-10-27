@@ -372,7 +372,6 @@ CycleResult DBWalOracleTest::RunCycle(const CycleConfig& config) {
   Options options = CurrentOptions();
   options.env = env.get();
   options.wal_partitions = static_cast<uint32_t>(config.partitions);
-  options.experimental_allow_wal_partitions_for_testing = true;
   options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
   options.track_and_verify_wals_in_manifest = true;
   options.wal_recovery_mode = WALRecoveryMode::kPointInTimeRecovery;
