@@ -5938,54 +5938,73 @@ DBImpl::CreateTimestampedSnapshotImpl(SequenceNumber snapshot_seq, uint64_t ts,
     snapshot_seq = GetLastPublishedSequence();
   }
 
-  std::shared_ptr<const SnapshotImpl> latest =
-      timestamped_snapshots_.GetSnapshot(std::numeric_limits<uint64_t>::max());
-
-  // If there is already a latest timestamped snapshot, then we need to do
-  // some checks.
-  if (latest) {
-    uint64_t latest_snap_ts = latest->GetTimestamp();
-    SequenceNumber latest_snap_seq = latest->GetSequenceNumber();
-    assert(latest_snap_seq <= snapshot_seq);
-    bool needs_create_snap = true;
-    Status status;
-    std::shared_ptr<const SnapshotImpl> ret;
-    if (latest_snap_ts > ts) {
-      // A snapshot created later cannot have smaller timestamp than a
-      // previous timestamped snapshot.
-      needs_create_snap = false;
-      std::ostringstream oss;
-      oss << "snapshot exists with larger timestamp " << latest_snap_ts << " > "
-          << ts;
-      status = Status::InvalidArgument(oss.str());
-    } else if (latest_snap_ts == ts) {
-      if (latest_snap_seq == snapshot_seq) {
-        // We are requesting the same sequence number and timestamp, thus can
-        // safely reuse (share) the current latest timestamped snapshot.
-        needs_create_snap = false;
-        ret = latest;
-      } else if (latest_snap_seq < snapshot_seq) {
-        // There may have been writes to the database since the latest
-        // timestamped snapshot, yet we are still requesting the same
-        // timestamp. In this case, we cannot create the new timestamped
-        // snapshot.
-        needs_create_snap = false;
-        std::ostringstream oss;
-        oss << "Allocated seq is " << snapshot_seq
-            << ", while snapshot exists with smaller seq " << latest_snap_seq
-            << " but same timestamp " << ts;
-        status = Status::InvalidArgument(oss.str());
-      }
-    }
-    if (!needs_create_snap) {
+  // Timestamped snapshots arrive in commit order at N=1, but at N>1 each
+  // commit's creation callback runs after its own completion gate, so a
+  // smaller timestamp can arrive after a larger one. Check the newcomer
+  // against its timestamp neighbors instead of only the latest: creation
+  // fails only when the (timestamp, sequence) pair contradicts an existing
+  // one, never merely because a cross-partition commit finished first.
+  std::shared_ptr<const SnapshotImpl> existing =
+      timestamped_snapshots_.GetSnapshot(ts);
+  if (existing) {
+    SequenceNumber existing_seq = existing->GetSequenceNumber();
+    if (existing_seq == snapshot_seq) {
+      // We are requesting the same sequence number and timestamp, thus can
+      // safely reuse (share) the existing timestamped snapshot.
       if (lock) {
         mutex_.Unlock();
       }
       delete s;
-      return std::make_pair(status, ret);
-    } else {
-      status.PermitUncheckedError();
+      return std::make_pair(Status::OK(), existing);
     }
+    // There may have been writes to the database since the recorded
+    // timestamped snapshot, yet we are still requesting the same timestamp.
+    // In this case, we cannot create the new timestamped snapshot.
+    std::ostringstream oss;
+    oss << "Allocated seq is " << snapshot_seq
+        << ", while snapshot exists with "
+        << (existing_seq < snapshot_seq ? "smaller" : "larger") << " seq "
+        << existing_seq << " but same timestamp " << ts;
+    if (lock) {
+      mutex_.Unlock();
+    }
+    delete s;
+    return std::make_pair(Status::InvalidArgument(oss.str()),
+                          std::shared_ptr<const SnapshotImpl>());
+  }
+  std::shared_ptr<const SnapshotImpl> below =
+      timestamped_snapshots_.GetSnapshotBelow(ts);
+  if (below && below->GetSequenceNumber() > snapshot_seq) {
+    // A snapshot created earlier carries a smaller timestamp but a larger
+    // sequence number; the pair contradicts it.
+    std::ostringstream oss;
+    oss << "snapshot exists with smaller timestamp " << below->GetTimestamp()
+        << " but larger seq " << below->GetSequenceNumber() << " > "
+        << snapshot_seq;
+    if (lock) {
+      mutex_.Unlock();
+    }
+    delete s;
+    return std::make_pair(Status::InvalidArgument(oss.str()),
+                          std::shared_ptr<const SnapshotImpl>());
+  }
+  std::shared_ptr<const SnapshotImpl> above =
+      timestamped_snapshots_.GetSnapshotAbove(ts);
+  if (above && above->GetSequenceNumber() <= snapshot_seq) {
+    // A snapshot created earlier carries a larger timestamp but no larger
+    // sequence number; the pair contradicts it. The equal-sequence case is a
+    // same-group commit pair asking out of timestamp order, which fails as
+    // before.
+    std::ostringstream oss;
+    oss << "snapshot exists with larger timestamp " << above->GetTimestamp()
+        << " but no larger seq " << above->GetSequenceNumber()
+        << " <= " << snapshot_seq;
+    if (lock) {
+      mutex_.Unlock();
+    }
+    delete s;
+    return std::make_pair(Status::InvalidArgument(oss.str()),
+                          std::shared_ptr<const SnapshotImpl>());
   }
 
   SnapshotImpl* snapshot =

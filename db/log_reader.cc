@@ -1524,10 +1524,10 @@ bool FragmentBufferedReader::TryReadFragment(Slice* fragment, size_t* drop_size,
   }
 }
 
-Status ReadWALPartition(FileSystem* fs, const std::string& fname,
-                        const FileOptions& file_options, uint64_t log_number,
-                        uint32_t* wal_partition) {
-  *wal_partition = 0;
+Status ReadWALPartitionHead(FileSystem* fs, const std::string& fname,
+                            const FileOptions& file_options,
+                            uint64_t log_number, WALPartitionHeadInfo* head) {
+  *head = WALPartitionHeadInfo();
   std::unique_ptr<FSSequentialFile> file;
   Status s = fs->NewSequentialFile(fname, file_options, &file, /*dbg=*/nullptr);
   if (!s.ok()) {
@@ -1540,9 +1540,21 @@ Status ReadWALPartition(FileSystem* fs, const std::string& fname,
   Slice record;
   // The marker is the file's first record, so the first data record (or the
   // end of a file holding none) comes after it.
-  reader.ReadRecord(&record, &scratch);
-  *wal_partition = reader.WALPartition();
+  head->has_data_record = reader.ReadRecord(&record, &scratch);
+  head->saw_wal_index_marker = reader.SawWALIndexMarker();
+  head->wal_partition = reader.WALPartition();
+  head->first_record_indexed =
+      head->has_data_record && reader.GetLastReadWALIndex() != 0;
   return Status::OK();
+}
+
+Status ReadWALPartition(FileSystem* fs, const std::string& fname,
+                        const FileOptions& file_options, uint64_t log_number,
+                        uint32_t* wal_partition) {
+  WALPartitionHeadInfo head;
+  Status s = ReadWALPartitionHead(fs, fname, file_options, log_number, &head);
+  *wal_partition = head.wal_partition;
+  return s;
 }
 
 }  // namespace ROCKSDB_NAMESPACE::log

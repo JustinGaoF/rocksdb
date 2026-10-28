@@ -39,6 +39,33 @@ Status PartitionedWalNotSupported(uint64_t log_number, uint32_t wal_partition) {
       " of a DB with wal_partitions > 1; secondary instances replay WALs one "
       "file at a time and do not support partitioned WALs");
 }
+
+// A WAL whose head shows no marker and no data while another WAL in the same
+// round carries a WAL index marker: under manual_wal_flush its marker may
+// still be buffered, so its partition is unknown rather than 0, and the set
+// may belong to a DB with wal_partitions > 1.
+Status UnknownWALPartitionNotSupported(uint64_t log_number,
+                                       uint64_t indexed_log_number) {
+  return Status::NotSupported(
+      "WAL " + std::to_string(log_number) +
+      " has no WAL index marker or data on disk while WAL " +
+      std::to_string(indexed_log_number) +
+      " in the same catch-up round carries a WAL index marker; the WAL set "
+      "may belong to a DB with wal_partitions > 1 whose marker is not yet "
+      "durable, and secondary instances replay WALs one file at a time and "
+      "do not support partitioned WALs");
+}
+
+// A WAL whose head shows indexed data but no WAL index marker: the marker is
+// the file's first record, so no healthy writer produces this head, and the
+// file's position in the WAL set cannot be trusted.
+Status MarkerlessIndexedWALNotSupported(uint64_t log_number) {
+  return Status::NotSupported(
+      "WAL " + std::to_string(log_number) +
+      " bears indexed data without a WAL index marker; secondary instances "
+      "replay WALs one file at a time and cannot place a WAL whose head "
+      "attests no partition");
+}
 }  // namespace
 
 DBImplSecondary::DBImplSecondary(const DBOptions& db_options,
@@ -432,6 +459,46 @@ Status DBImplSecondary::MaybeInitLogReader(
   return Status::OK();
 }
 
+// Reads every WAL head in the round before any of them is replayed, so a
+// partitioned set is refused before partition 0's records are applied: a
+// nonzero marker names one outright, and an empty head (no marker and no
+// data) is unknown rather than partition 0 once another WAL in the round
+// shows the set is indexed. A WAL with no marker at all in an unindexed
+// round still replays, as does an empty tail WAL there: refusing those
+// would stall non-partitioned secondaries, whose empty tail WAL simply
+// yields no records.
+Status DBImplSecondary::RefusePossiblyPartitionedRound(
+    const std::vector<uint64_t>& log_numbers) {
+  uint64_t indexed_log_number = 0;
+  uint64_t empty_head_log_number = 0;
+  for (uint64_t log_number : log_numbers) {
+    const std::string fname =
+        LogFileName(immutable_db_options_.GetWalDir(), log_number);
+    log::WALPartitionHeadInfo head;
+    Status s = log::ReadWALPartitionHead(fs_.get(), fname,
+                                         fs_->OptimizeForLogRead(file_options_),
+                                         log_number, &head);
+    if (!s.ok()) {
+      return s;
+    }
+    if (head.wal_partition != 0) {
+      return PartitionedWalNotSupported(log_number, head.wal_partition);
+    }
+    if (head.saw_wal_index_marker) {
+      indexed_log_number = log_number;
+    } else if (!head.has_data_record) {
+      empty_head_log_number = log_number;
+    } else if (head.first_record_indexed) {
+      return MarkerlessIndexedWALNotSupported(log_number);
+    }
+  }
+  if (indexed_log_number != 0 && empty_head_log_number != 0) {
+    return UnknownWALPartitionNotSupported(empty_head_log_number,
+                                           indexed_log_number);
+  }
+  return Status::OK();
+}
+
 // After manifest recovery, replay WALs and refresh log_readers_ if necessary
 // REQUIRES: log_numbers are sorted in ascending order
 Status DBImplSecondary::RecoverLogFiles(
@@ -442,6 +509,10 @@ Status DBImplSecondary::RecoverLogFiles(
   assert(nullptr != job_context);
   mutex_.AssertHeld();
   Status status;
+  status = RefusePossiblyPartitionedRound(log_numbers);
+  if (!status.ok()) {
+    return status;
+  }
   for (auto log_number : log_numbers) {
     log::FragmentBufferedReader* reader = nullptr;
     status = MaybeInitLogReader(log_number, &reader);

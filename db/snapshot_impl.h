@@ -86,6 +86,11 @@ class SnapshotList {
     return list_.prev_;
   }
 
+  // Inserts `s` in sequence order. Plain snapshots always carry the latest
+  // published sequence, so they still land at the tail; a timestamped
+  // snapshot created after its commit's completion gate (N>1) can predate
+  // live snapshots and is spliced before them, keeping GetAll()'s ascending
+  // order (and the compaction iterator's ordering assert) intact.
   SnapshotImpl* New(SnapshotImpl* s, SequenceNumber seq, uint64_t unix_time,
                     bool is_write_conflict_boundary,
                     uint64_t ts = std::numeric_limits<uint64_t>::max()) {
@@ -94,8 +99,12 @@ class SnapshotList {
     s->timestamp_ = ts;
     s->is_write_conflict_boundary_ = is_write_conflict_boundary;
     s->list_ = this;
-    s->next_ = &list_;
-    s->prev_ = list_.prev_;
+    SnapshotImpl* pos = list_.prev_;
+    while (pos != &list_ && pos->number_ > seq) {
+      pos = pos->prev_;
+    }
+    s->next_ = pos->next_;
+    s->prev_ = pos;
     s->prev_->next_ = s;
     s->next_->prev_ = s;
     count_++;
@@ -201,6 +210,24 @@ class TimestampedSnapshotList {
       return it->second;
     }
     auto it = snapshots_.find(ts);
+    if (it == snapshots_.end()) {
+      return std::shared_ptr<const SnapshotImpl>();
+    }
+    return it->second;
+  }
+
+  // Neighbors of `ts` for out-of-order creation: at N>1 a smaller timestamp
+  // can arrive after a larger one, so the newcomer is checked against both.
+  std::shared_ptr<const SnapshotImpl> GetSnapshotBelow(uint64_t ts) const {
+    auto it = snapshots_.lower_bound(ts);
+    if (it == snapshots_.begin()) {
+      return std::shared_ptr<const SnapshotImpl>();
+    }
+    return std::prev(it)->second;
+  }
+
+  std::shared_ptr<const SnapshotImpl> GetSnapshotAbove(uint64_t ts) const {
+    auto it = snapshots_.upper_bound(ts);
     if (it == snapshots_.end()) {
       return std::shared_ptr<const SnapshotImpl>();
     }

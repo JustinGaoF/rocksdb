@@ -10849,6 +10849,91 @@ TEST(TransactionPartitionedWalTest, FU14TimestampedSnapshotSurvivesCompaction) {
   ASSERT_NO_FATAL_FAILURE(race.Close());
 }
 
+// GC22 Q1: two timestamped commits on different partitions finish in reverse
+// order (T1 commits first at ts 10 but its completion gate is held; T2
+// commits at ts 11 and runs its creation callback first). Both snapshots
+// must be created - T1's smaller timestamp arriving later is
+// cross-partition skew, not a contradiction - and the list stays sorted.
+TEST(TransactionPartitionedWalTest, TimestampedSnapshotsTolerateReverseFinish) {
+  FU14SnapshotRace race;
+  ASSERT_NO_FATAL_FAILURE(race.Open("ts_snapshot_reverse_finish"));
+
+  std::mutex mu;
+  std::condition_variable cv;
+  bool armed = false;
+  bool t1_held = false;
+  bool release_t1 = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::RunCompletionGate:BeforeWait", [&](void*) {
+        std::unique_lock<std::mutex> lock(mu);
+        if (!armed || t1_held) {
+          return;
+        }
+        t1_held = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return release_t1; });
+      });
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    armed = true;
+  }
+  std::shared_ptr<const Snapshot> t2_snapshot;
+  SequenceNumber t2_seq = 0;
+  port::Thread t1([&] {
+    std::unique_ptr<Transaction> txn(race.db->BeginTransaction(WriteOptions()));
+    ASSERT_OK(txn->SetName("t1"));
+    ASSERT_OK(txn->Put(race.cf_for_partition[0], "t1", "v"));
+    ASSERT_OK(
+        txn->CommitAndTryCreateSnapshot(nullptr, /*ts=*/10, &race.t1_snapshot));
+  });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    cv.wait(lock, [&] { return t1_held; });
+  }
+  race.t1_seq = race.db->GetLatestSequenceNumber();
+  {
+    std::unique_ptr<Transaction> txn(race.db->BeginTransaction(WriteOptions()));
+    ASSERT_OK(txn->SetName("t2"));
+    ASSERT_OK(txn->Put(race.cf_for_partition[1], "t2", "v"));
+    ASSERT_OK(
+        txn->CommitAndTryCreateSnapshot(nullptr, /*ts=*/11, &t2_snapshot));
+  }
+  t2_seq = race.db->GetLatestSequenceNumber();
+  EXPECT_GT(t2_seq, race.t1_seq);
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    release_t1 = true;
+    cv.notify_all();
+  }
+  t1.join();
+  // T2's callback ran first; T1's smaller timestamp still creates.
+  ASSERT_NE(nullptr, t2_snapshot);
+  EXPECT_EQ(t2_seq, t2_snapshot->GetSequenceNumber());
+  ASSERT_NE(nullptr, race.t1_snapshot);
+  EXPECT_EQ(race.t1_seq, race.t1_snapshot->GetSequenceNumber());
+  std::vector<SequenceNumber> snaps;
+  race.db_impl->LoadSnapshots(&snaps, nullptr, kMaxSequenceNumber);
+  ASSERT_EQ(2u, snaps.size());
+  EXPECT_LT(snaps[0], snaps[1]);
+  EXPECT_EQ(race.t1_seq, snaps[0]);
+  EXPECT_EQ(t2_seq, snaps[1]);
+  // Same (timestamp, sequence) pair reuses the snapshot; a contradicting
+  // pair still fails.
+  auto reuse = race.db_impl->CreateTimestampedSnapshot(race.t1_seq, 10);
+  ASSERT_OK(reuse.first);
+  ASSERT_EQ(race.t1_snapshot.get(), reuse.second.get());
+  auto clash = race.db_impl->CreateTimestampedSnapshot(t2_seq, 10);
+  ASSERT_TRUE(clash.first.IsInvalidArgument());
+  ASSERT_EQ(nullptr, clash.second);
+  // Release the extra shared reference before Close: Close drops the DB and
+  // asserts a clean shutdown, which fails while snapshots are held.
+  reuse.second.reset();
+  t2_snapshot.reset();
+  SyncPoint::GetInstance()->ClearCallBack(
+      "DBImpl::RunCompletionGate:BeforeWait");
+  ASSERT_NO_FATAL_FAILURE(race.Close());
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

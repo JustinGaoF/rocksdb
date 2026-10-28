@@ -432,11 +432,32 @@ class FragmentBufferedReader : public Reader {
   void operator=(FragmentBufferedReader&&) = delete;
 };
 
+// What one head read of WAL file `fname` (WAL number `log_number`) observes:
+// the partition its WAL index marker names (zero when the file has no
+// marker, names none, or is empty), whether a marker was consumed, and
+// whether a first data record followed it (and carried a wal_index). A WAL
+// set written with wal_partitions > 1 holds a file naming a nonzero
+// partition; a file with no marker and no data may be one whose marker is
+// still buffered, so consumers that replay files one by one treat it as
+// unknown rather than partition 0 when the set is otherwise indexed.
+struct WALPartitionHeadInfo {
+  uint32_t wal_partition = 0;
+  bool saw_wal_index_marker = false;
+  bool has_data_record = false;
+  bool first_record_indexed = false;
+};
+
+Status ReadWALPartitionHead(FileSystem* fs, const std::string& fname,
+                            const FileOptions& file_options,
+                            uint64_t log_number, WALPartitionHeadInfo* head);
+
 // Reads the head of WAL file `fname` (WAL number `log_number`) and sets
 // *wal_partition to the partition its WAL index marker names: zero when the
 // file has no marker, names none, or is empty. A WAL set written with
 // wal_partitions > 1 holds a file naming a nonzero partition, which consumers
-// that replay files one by one use to tell such a set apart.
+// that replay files one by one use to tell such a set apart. Prefer
+// ReadWALPartitionHead when an empty or markerless head must not read as
+// partition 0.
 Status ReadWALPartition(FileSystem* fs, const std::string& fname,
                         const FileOptions& file_options, uint64_t log_number,
                         uint32_t* wal_partition);

@@ -403,6 +403,11 @@ class DBImplSecondary : public DBImpl {
                          SequenceNumber* next_sequence,
                          std::unordered_set<ColumnFamilyData*>* cfds_changed,
                          JobContext* job_context);
+  // Refuses a catch-up round whose WAL heads may belong to a partitioned set
+  // (a nonzero marker, or an empty head in an otherwise indexed round)
+  // before anything is replayed. Returns OK when the round may proceed.
+  Status RefusePossiblyPartitionedRound(
+      const std::vector<uint64_t>& log_numbers);
 
   // Records `log_number` as the newest WAL whose entries `cf_id`'s active
   // memtable may hold, never lowering what is already recorded. Returns what
