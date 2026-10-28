@@ -32,7 +32,8 @@ namespace log {
 // absent index it decides: covered by a burn cover (skip), below nothing
 // (the merge derives its lower bound, so below-bound cannot occur), swallowed
 // between two positioned pulls of one member (skip), superseded-only with no
-// torn tail covering it (skip: never reissued after the cut), covered by a
+// torn tail covering it and no live record above it before a pre-cut void
+// (skip: never reissued after the cut), covered by a
 // finished member's torn or swallowed tail (a tail gap, surfaced for the
 // recovery-mode mapping, then skipped), or the frontier (stop). A record
 // covered by a supersession for its bearer is consumed silently and never
@@ -347,9 +348,12 @@ class WALIndexMerger {
   // anchors was allocated before `wal_number` was created). A loss in a
   // bounded head surfaces as a hole instead of raising the bound. Valid once
   // the lower bound is set.
+  // With no attestation anywhere, the history floor bounds every head: the
+  // lower bound sits at the floor, below which no index was ever allocated.
   bool HeadBounded(uint64_t wal_number) const {
     return attested_wals_.count(wal_number) != 0 ||
-           wal_number >= min_anchoring_wal_;
+           wal_number >= min_anchoring_wal_ ||
+           (history_floor_ != 0 && attested_wals_.empty());
   }
 
   // How a member finished, for the recovery-mode mapping: after kCleanEnd,
@@ -380,6 +384,15 @@ class WALIndexMerger {
   Result Fail(const Status& status) {
     error_ = status;
     terminal_ = Result::kError;
+    return terminal_;
+  }
+
+  // Stops at expected_ with members holding records above it, or at the
+  // pending superseded-only index below it, which those records leave
+  // unexplained.
+  Result StopAtFrontier() {
+    frontier_ = pending_discarded_ != 0 ? pending_discarded_ : expected_;
+    terminal_ = Result::kFrontier;
     return terminal_;
   }
 
@@ -427,6 +440,11 @@ class WALIndexMerger {
   const Member* last_emitted_member_ = nullptr;
   uint64_t last_emitted_checksum_ = 0;
   TailGap tail_gap_;
+  // First superseded-only index skipped since the last void that a WAL older
+  // than its declaration holds, or zero. A live record above it makes it the
+  // frontier. `pending_declarer_` is the lowest WAL declaring it.
+  uint64_t pending_discarded_ = 0;
+  uint64_t pending_declarer_ = 0;
   uint64_t frontier_ = 0;
   Status error_ = Status::OK();
   uint64_t retirement_bound_ = std::numeric_limits<uint64_t>::max();
