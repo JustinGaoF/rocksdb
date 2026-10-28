@@ -2859,11 +2859,12 @@ class DBImpl : public DB
   // WAL that carries no index (zero when none), and *indexed_low to the lowest
   // live WAL carrying a marker or indexed data (UINT64_MAX when none). Fails
   // fast on indexed data without a marker over an intact head; a damaged
-  // head stays merge-side for the attestation path.
+  // head stays merge-side for the attestation path. Sets *superseding when a
+  // head declares a supersession for a WAL in the set.
   Status CheckWALFilesCarryWALIndex(const std::vector<uint64_t>& wal_numbers,
                                     uint64_t min_wal_number, bool is_retry,
                                     uint64_t* unindexed_high,
-                                    uint64_t* indexed_low);
+                                    uint64_t* indexed_low, bool* superseding);
 
   Status ProcessLogFile(uint64_t wal_number, uint64_t min_wal_number,
                         bool is_retry, bool read_only, int job_id,

@@ -585,6 +585,11 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
                              "index " +
                              std::to_string(expected_)));
     }
+    if (live.size() == 1 && pending_discarded_ != 0) {
+      // A live record above a skipped superseded-only index: writes after the
+      // cut reissue indices in order, so the reissued copy was lost.
+      return StopAtFrontier();
+    }
     if (live.size() == 1) {
       MemberState* winner = live[0];
       SequenceNumber seq = 0;
@@ -629,15 +634,23 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
       }
     }
     if (void_covered || swallowed_covered) {
+      // A void in a WAL older than the declaration predates the cut, and an
+      // open at N=1 seeds past such voids: the pending indices below it were
+      // never reissued.
+      for (auto& state : states_) {
+        if (pending_discarded_ != 0 &&
+            state.member->wal_number() < pending_declarer_ &&
+            state.member->VoidCovers(expected_)) {
+          pending_discarded_ = 0;
+        }
+      }
       expected_++;
       continue;
     }
     if (expected_ >= lost_floor_) {
       // Possibly borne by the lost file: no torn tail or supersession
       // explains it.
-      frontier_ = expected_;
-      terminal_ = Result::kFrontier;
-      return terminal_;
+      return StopAtFrontier();
     }
     // No live holder, no void cover, and no swallowed span. When every
     // member finished, the trailing loss ends the stream; the frontier and
@@ -670,16 +683,33 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
       // question is the absent live copy. With no torn tail covering the
       // index, no member lost anything and the index was never reissued
       // after the cut that discarded it: re-trust that declaration and move
-      // on. A torn tail over the same index may still hold its live copy,
-      // which stays a frontier. (Under skip, recovery opts out of even that
-      // via continue_past_discarded_holes.)
-      if (gap.members.empty() || continue_past_discarded_holes_) {
+      // on, unless a live record turns up above it first (see
+      // pending_discarded_). A torn tail over the same index may still hold
+      // its live copy, which stays a frontier. (Under skip, recovery opts out
+      // of even that via continue_past_discarded_holes.)
+      if (continue_past_discarded_holes_) {
         expected_++;
         continue;
       }
-      frontier_ = expected_;
-      terminal_ = Result::kFrontier;
-      return terminal_;
+      if (gap.members.empty()) {
+        if (pending_discarded_ == 0) {
+          pending_discarded_ = expected_;
+          pending_declarer_ = std::numeric_limits<uint64_t>::max();
+        }
+        // The declaration is written to the lowest-numbered WAL its open
+        // creates, so every WAL below the declarer predates the cut.
+        for (auto* h : holders) {
+          for (auto& state : states_) {
+            if (state.member->Supersedes(h->member->wal_number(), expected_)) {
+              pending_declarer_ =
+                  std::min(pending_declarer_, state.member->wal_number());
+            }
+          }
+        }
+        expected_++;
+        continue;
+      }
+      return StopAtFrontier();
     }
     // No holder at all: surface the lost tail for the recovery-mode mapping
     // and continue past it, or stop at the pristine hole.
@@ -712,9 +742,7 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
       continue;
     }
 #endif  // NDEBUG
-    frontier_ = expected_;
-    terminal_ = Result::kFrontier;
-    return terminal_;
+    return StopAtFrontier();
   }
 }
 

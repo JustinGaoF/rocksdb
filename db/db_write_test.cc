@@ -15409,6 +15409,195 @@ TEST_P(DBWalPartitionCoverageTest, FU14H6TornFirstRecordInBrandNewNTwoDb) {
   }
 }
 
+// GC19 Q1: a reported tail gap stops point-in-time replay whichever
+// partition's WAL tore. With the lower-numbered WAL torn this is H3's shape
+// (an earlier pass consumed the report); with the higher-numbered one the
+// report is still pending when the gap surfaces. Tolerate and absolute fail
+// at the gap as before. Neuter: ignore TailGap::reported in map_tail_gap; the
+// lower-numbered case recovers i4 above the gap.
+TEST_P(DBWalPartitionCoverageTest, GC19ReportedTailGapStopsPITEitherPartition) {
+  for (const bool torn_lower : {true, false}) {
+    SCOPED_TRACE(torn_lower ? "torn WAL numbered lower"
+                            : "torn WAL numbered higher");
+    Options options = IndexedWalOptions(CurrentOptions());
+    options.paranoid_checks = true;
+    DestroyAndReopen(options);
+    writes_.clear();
+    OpenWithPartitions(2, options);
+    const bool zero_lower =
+        dbfull()->TEST_CurrentWalNumber(0) < dbfull()->TEST_CurrentWalNumber(1);
+    const size_t torn = zero_lower == torn_lower ? 0 : 1;
+    const size_t other = 1 - torn;
+    LoggedPut(cf_for_partition_[torn], "i1");
+    LoggedPut(cf_for_partition_[other], "i2");
+    LoggedPut(cf_for_partition_[torn], "i3");
+    LoggedPut(cf_for_partition_[other], "i4");
+    ASSERT_EQ(writes_[0].wal, writes_[2].wal);
+    ASSERT_EQ(writes_[1].wal, writes_[3].wal);
+    ASSERT_EQ(torn_lower, writes_[0].wal < writes_[1].wal);
+    const std::string image = dbname_ + "_image";
+    CopyDBAsCrashImage(image);
+    Close();
+
+    const LoggedWrite& i3 = writes_[IndexOf("i3")];
+    TruncateImageWal(image, i3.wal, (i3.begin + i3.end) / 2);
+    AssertCells(image, 2, options,
+                {{kPointInTime, Status::kOk, IndexOf("i3"),
+                  "point-in-time stops at the reported tail gap"},
+                 {kTolerate, Status::kCorruption, 0, "records above the gap"},
+                 {kAbsolute, Status::kCorruption, 0, "records above the gap"}},
+                {});
+  }
+}
+
+// GC19 Q3: an unindexed prefix replayed ahead of the merge leaves indexed
+// WALs demanded. A MANIFEST-tracked mid-chain indexed WAL deleted after the
+// upgrade still fails every mode, naming it: WalSet::CheckWals refuses first,
+// and the merge's expected set backs it ("named but not held").
+TEST_P(DBWalPartitionCoverageTest, GC19MissingIndexedWalAfterPrefixFails) {
+  if (GetParam()) {
+    return;
+  }
+  Options options = IndexedWalOptions(CurrentOptions());
+  DestroyAndReopen(options);
+  OpenWithPartitions(2, options);
+  FlushAllColumnFamilies();
+  const int cf_flushed = cf_for_partition_[0];
+  const int cf_kept = cf_for_partition_[1];
+  Options none = options;
+  none.partition_wal_usage = PartitionWALUsage::kNone;
+  ReopenWithPartitions(1, none);
+  ASSERT_OK(Put(cf_flushed, "unindexed_flushed", "value"));
+  ASSERT_OK(Put(cf_kept, "unindexed_kept", "value"));
+  const uint64_t unindexed_wal = dbfull()->TEST_CurrentWalNumber(0);
+  ASSERT_OK(Flush(cf_flushed));
+  ReopenWithPartitions(2, options);
+  ASSERT_OK(env_->FileExists(LogFileName(dbname_, unindexed_wal)));
+  for (size_t p = 0; p < 2; ++p) {
+    ASSERT_OK(Put(cf_for_partition_[p], "indexed" + std::to_string(p), "v"));
+  }
+  const uint64_t missing = dbfull()->TEST_CurrentWalNumber(1);
+  ASSERT_GT(missing, unindexed_wal);
+  Rotate();
+  for (size_t p = 0; p < 2; ++p) {
+    ASSERT_OK(Put(cf_for_partition_[p], "rotated" + std::to_string(p), "v"));
+  }
+  ASSERT_NE(missing, dbfull()->TEST_CurrentWalNumber(1));
+  ASSERT_OK(db_->SyncWAL());
+  Close();
+  ASSERT_OK(env_->DeleteFile(LogFileName(dbname_, missing)));
+
+  std::vector<std::string> cf_names;
+  ASSERT_OK(DB::ListColumnFamilies(options, dbname_, &cf_names));
+  for (const WALRecoveryMode mode :
+       {kTolerate, kAbsolute, kPointInTime, kSkip}) {
+    SCOPED_TRACE(static_cast<int>(mode));
+    Options reopen = options;
+    reopen.wal_partitions = 2;
+    reopen.wal_recovery_mode = mode;
+    const Status s = TryReopenWithColumnFamilies(cf_names, reopen);
+    ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+    EXPECT_NE(std::string::npos, s.ToString().find(std::to_string(missing)))
+        << s.ToString();
+  }
+}
+
+// GC19 Q4: a DB created directly at N = 2 with partition 1's first record
+// torn. The history floor bounds the head, so absolute fails on the torn
+// tail as for any other and skip opens with idx 1 (point-in-time and
+// tolerate are H6). Neuter: drop the floor from HeadBounded; every mode
+// fails with "head damaged and unattested".
+TEST_P(DBWalPartitionCoverageTest, GC19TornFirstRecordInBrandNewNTwoDbModes) {
+  if (GetParam()) {
+    return;
+  }
+  constexpr size_t kPartitions = 2;
+  Options options = IndexedWalOptions(CurrentOptions());
+  Close();
+  ASSERT_OK(DestroyDB(dbname_, options));
+  std::vector<std::string> cf_names = {kDefaultColumnFamilyName};
+  cf_for_partition_.assign(kPartitions, -1);
+  size_t covered = 0;
+  for (uint32_t cf_id = 1; covered < kPartitions; ++cf_id) {
+    WriteBatch batch;
+    ASSERT_OK(WriteBatchInternal::Put(&batch, cf_id, "key", "value"));
+    size_t partition = kPartitions;
+    ASSERT_OK(
+        DBImpl::TEST_WalPartitionForWrite(batch, kPartitions, &partition));
+    cf_names.push_back("cf" + std::to_string(cf_id));
+    if (cf_for_partition_[partition] < 0) {
+      cf_for_partition_[partition] = static_cast<int>(cf_id);
+      ++covered;
+    }
+  }
+  options.create_if_missing = true;
+  options.create_missing_column_families = true;
+  options.wal_partitions = kPartitions;
+  ASSERT_OK(TryReopenWithColumnFamilies(cf_names, options));
+  ASSERT_EQ(0U, dbfull()->GetVersionSet()->LastSequence());
+  writes_.clear();
+  LoggedPut(cf_for_partition_[0], "k1");
+  LoggedPut(cf_for_partition_[1], "k2");
+  ASSERT_NE(writes_[0].wal, writes_[1].wal);
+  const std::string image = dbname_ + "_image";
+  CopyDBAsCrashImage(image);
+  Close();
+  const LoggedWrite& k2 = writes_[IndexOf("k2")];
+  TruncateImageWal(image, k2.wal, (k2.begin + k2.end) / 2);
+  options.create_if_missing = false;
+  AssertCells(image, kPartitions, options,
+              {{kAbsolute, Status::kCorruption, 0, "torn tail"},
+               {kSkip, Status::kOk, 1, "idx 2 is a torn tail"}},
+              {});
+}
+
+// GC19 Q4 negative: once a flush persisted a sequence the history floor is
+// off, and with spans suppressed nothing else bounds a partition WAL's head.
+// A torn first record there may hide a loss below it, so every mode still
+// fails with "head damaged and unattested". Neuter: let HeadBounded take the
+// floor whatever the open's conditions; the opens succeed.
+TEST_P(DBWalPartitionCoverageTest, GC19TornFirstRecordAfterFlushStaysDamaged) {
+  if (GetParam()) {
+    return;
+  }
+  constexpr size_t kPartitions = 2;
+  Options options = IndexedWalOptions(CurrentOptions());
+  DestroyAndReopen(options);
+  OpenWithPartitions(kPartitions, options);
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::StartWALFile:WriteSpan",
+      [](void* arg) { *static_cast<bool*>(arg) = false; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  for (size_t p = 0; p < kPartitions; ++p) {
+    ASSERT_OK(Put(cf_for_partition_[p], "flushed", "value"));
+  }
+  FlushAllColumnFamilies();
+  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+  writes_.clear();
+  LoggedPut(cf_for_partition_[0], "live0");
+  LoggedPut(cf_for_partition_[1], "live1");
+  ASSERT_NE(writes_[0].wal, writes_[1].wal);
+  const std::string image = dbname_ + "_image";
+  CopyDBAsCrashImage(image);
+  Close();
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::StartWALFile:WriteSpan");
+  const LoggedWrite& live1 = writes_[IndexOf("live1")];
+  TruncateImageWal(image, live1.wal, (live1.begin + live1.end) / 2);
+  const std::string copy = image + "_open";
+  for (const WALRecoveryMode mode :
+       {kTolerate, kAbsolute, kPointInTime, kSkip}) {
+    SCOPED_TRACE(static_cast<int>(mode));
+    CopyDir(image, copy);
+    std::vector<ColumnFamilyHandle*> handles;
+    std::unique_ptr<DB> db;
+    const Status s = OpenCopy(copy, kPartitions, options, mode, &handles, &db);
+    ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+    EXPECT_NE(std::string::npos,
+              s.ToString().find("head damaged and unattested"))
+        << s.ToString();
+  }
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
