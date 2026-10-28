@@ -12818,6 +12818,151 @@ TEST_P(DBWalAppendFailureTest, WriteAdmittedByRecoveryAllocatesAboveFences) {
   EXPECT_EQ("NOT_FOUND", Get(cf_for_partition_[0], "failed"));
 }
 
+// FU14 H7: at N>1 with 2PC, a retryable append failure whose record never
+// reaches the file burns its WAL index. The void cover is attempted on the
+// writer that just failed (seen_error), so it fails too; a live Resume() then
+// rotates every partition, writing only progress records, so the burned
+// index is never covered on disk. An outstanding prepare keeps every WAL from
+// its own onward live for recovery (MinLogNumberToKeep under allow_2pc),
+// including the WAL with the hole. Correct behaviour: a crash image taken
+// after acknowledged post-resume writes (some sync=true) opens in every
+// recovery mode, recovers every acknowledged write and the prepared
+// transaction.
+TEST_P(DBWalAppendFailureTest, ResumedTwoPCHoleKeepsAckedWritesAfterCrash) {
+  constexpr size_t kPartitions = 2;
+  Options options = FailureOptions();
+  options.disable_auto_compactions = true;
+  OpenWithPartitions(kPartitions, options);
+  Close();
+  auto open_txn_db = [&](const std::string& dir,
+                         std::vector<ColumnFamilyHandle*>* handles,
+                         Status* open_status) {
+    std::vector<std::string> cf_names;
+    EXPECT_OK(DB::ListColumnFamilies(options, dir, &cf_names));
+    std::vector<ColumnFamilyDescriptor> column_families;
+    for (const std::string& name : cf_names) {
+      column_families.emplace_back(name, options);
+    }
+    Options open_options = options;
+    open_options.wal_partitions = static_cast<uint32_t>(kPartitions);
+    open_options.two_write_queues = false;
+    TransactionDBOptions txn_db_options;
+    txn_db_options.write_policy = TxnDBWritePolicy::WRITE_COMMITTED;
+    TransactionDB* txn_db = nullptr;
+    *open_status = TransactionDB::Open(open_options, txn_db_options, dir,
+                                       column_families, handles, &txn_db);
+    return std::unique_ptr<TransactionDB>(txn_db);
+  };
+  std::vector<ColumnFamilyHandle*> handles;
+  Status open_status;
+  std::unique_ptr<TransactionDB> db =
+      open_txn_db(dbname_, &handles, &open_status);
+  ASSERT_OK(open_status);
+  ASSERT_NE(nullptr, db);
+  DBImpl* db_impl = static_cast_with_check<DBImpl>(db->GetRootDB());
+  ASSERT_EQ(kPartitions, db_impl->TEST_NumWalPartitions());
+  auto close = [&] {
+    for (ColumnFamilyHandle* handle : handles) {
+      ASSERT_OK(db->DestroyColumnFamilyHandle(handle));
+    }
+    handles.clear();
+    db.reset();
+  };
+
+  std::vector<std::pair<size_t, std::string>> acknowledged;
+  for (size_t p = 0; p < kPartitions; ++p) {
+    const std::string key = "before" + std::to_string(p);
+    ASSERT_OK(db->Put(WriteOptions(), handles[cf_for_partition_[p]], key, "v"));
+    acknowledged.emplace_back(p, key);
+  }
+  // The prepare goes to the partition with the older WAL, so the failing
+  // partition's WAL is numbered above the prepare's and stays live for
+  // recovery.
+  const size_t prep_partition =
+      db_impl->TEST_CurrentWalNumber(0) < db_impl->TEST_CurrentWalNumber(1) ? 0
+                                                                            : 1;
+  const size_t fail_partition = 1 - prep_partition;
+  Transaction* txn = db->BeginTransaction(WriteOptions());
+  ASSERT_OK(txn->SetName("xid"));
+  ASSERT_OK(
+      txn->Put(handles[cf_for_partition_[prep_partition]], "prepared", "v"));
+  ASSERT_OK(txn->Prepare());
+  const uint64_t prep_log = txn->GetLogNumber();
+  const uint64_t failed_wal = db_impl->TEST_CurrentWalNumber(fail_partition);
+  ASSERT_LT(prep_log, failed_wal);
+
+  // The append fails in the FS: WritableFileWriter drops its buffer, so the
+  // record never lands, and the writer is poisoned, so the cover fails too.
+  fail_fs_->Arm(failed_wal, Retryable("injected"));
+  ASSERT_NOK(db->Put(WriteOptions(), handles[cf_for_partition_[fail_partition]],
+                     "failed", "v"));
+  fail_fs_->Disarm();
+  const Status bg = db_impl->TEST_GetBGError();
+  ASSERT_EQ(Status::Severity::kHardError, bg.severity()) << bg.ToString();
+  ASSERT_OK(db->Resume());
+  ASSERT_OK(db_impl->TEST_GetBGError());
+
+  WriteOptions sync_wo;
+  sync_wo.sync = true;
+  for (int round = 0; round < 3; ++round) {
+    for (size_t p = 0; p < kPartitions; ++p) {
+      const std::string key =
+          "after" + std::to_string(round) + "_p" + std::to_string(p);
+      ASSERT_OK(db->Put(round == 2 ? sync_wo : WriteOptions(),
+                        handles[cf_for_partition_[p]], key, "v"));
+      acknowledged.emplace_back(p, key);
+    }
+  }
+  // Precondition evidence: the cover of the burned index failed.
+  std::string info_log;
+  ASSERT_OK(ReadFileToString(env_, dbname_ + "/LOG", &info_log));
+  EXPECT_NE(std::string::npos,
+            info_log.find("Failed to cover burned WAL index"));
+
+  ASSERT_OK(db->DisableFileDeletions());
+  const std::vector<WALRecoveryMode> recovery_modes = {
+      WALRecoveryMode::kPointInTimeRecovery,
+      WALRecoveryMode::kAbsoluteConsistency,
+      WALRecoveryMode::kTolerateCorruptedTailRecords,
+      WALRecoveryMode::kSkipAnyCorruptedRecords};
+  for (const WALRecoveryMode recovery_mode : recovery_modes) {
+    CopyDBAsCrashImage(dbname_ + "_crash" +
+                       std::to_string(static_cast<int>(recovery_mode)));
+  }
+  ASSERT_OK(db->EnableFileDeletions());
+  ASSERT_OK(txn->Rollback());
+  delete txn;
+  close();
+
+  for (const WALRecoveryMode recovery_mode : recovery_modes) {
+    SCOPED_TRACE("wal_recovery_mode=" +
+                 std::to_string(static_cast<int>(recovery_mode)));
+    options.wal_recovery_mode = recovery_mode;
+    const std::string crash_dir =
+        dbname_ + "_crash" + std::to_string(static_cast<int>(recovery_mode));
+    db = open_txn_db(crash_dir, &handles, &open_status);
+    EXPECT_OK(open_status);
+    if (!open_status.ok() || db == nullptr) {
+      handles.clear();
+      db.reset();
+      continue;
+    }
+    Transaction* recovered = db->GetTransactionByName("xid");
+    EXPECT_NE(nullptr, recovered);
+    if (recovered != nullptr) {
+      ASSERT_OK(recovered->Rollback());
+      delete recovered;
+    }
+    for (const auto& [p, key] : acknowledged) {
+      std::string value;
+      EXPECT_OK(
+          db->Get(ReadOptions(), handles[cf_for_partition_[p]], key, &value))
+          << key;
+    }
+    close();
+  }
+}
+
 // FU14 M-a: partition 1's append fails with a retryable IOError (a hard,
 // resumable error) and poisons its writer. A sync=true write on partition 0,
 // allocated below the failed range and held between its append and its
