@@ -731,6 +731,11 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
     mutex_.Lock();
   }
 
+  if (s.ok() && NumWalPartitions() > 1) {
+    // Before ClearBGError admits writes above a burned index.
+    s = ExplainBurnedWALIndices(write_options);
+  }
+
   JobContext job_context(0);
   FindObsoleteFiles(&job_context, true);
   mutex_.Unlock();
@@ -5539,14 +5544,16 @@ Iterator* DBImpl::NewIterator(const ReadOptions& _read_options,
 
     auto iter = new ForwardIterator(this, read_options, cfd, sv,
                                     /* allow_unprepared_value */ true);
+    ReadCallback* gate_read_mask = NewTailingWalGateReadMask();
     // TODO(cbi): Add support for `memtable_op_scan_flush_trigger` for tailing
     // iterator. This requires refreshing DBIter's pointer to active_mem when
     // tailing iterator refreshes to new memtable internally.
     result = DBIter::NewIter(env_, read_options, cfd->ioptions(),
                              sv->mutable_cf_options, cfd->user_comparator(),
                              iter, sv->current, kMaxSequenceNumber,
-                             /*read_callback=*/nullptr, /*active_mem=*/nullptr,
-                             cfh, /*expose_blob_index=*/false);
+                             gate_read_mask, /*active_mem=*/nullptr, cfh,
+                             /*expose_blob_index=*/false);
+    RegisterTailingWalGateReadMaskCleanup(result, gate_read_mask);
   } else {
     // Note: no need to consider the special case of
     // last_seq_same_as_publish_seq_==false since NewIterator is overridden in
@@ -5558,6 +5565,25 @@ Iterator* DBImpl::NewIterator(const ReadOptions& _read_options,
                              nullptr /* read_callback */);
   }
   return result;
+}
+
+ReadCallback* DBImpl::NewTailingWalGateReadMask() {
+  if (NumWalPartitions() == 1) {
+    return nullptr;
+  }
+  return new LiveWalGateReadMask(&wal_gate_read_mask_version_,
+                                 [this]() { return WalGateReadMaskRanges(); });
+}
+
+void DBImpl::RegisterTailingWalGateReadMaskCleanup(Iterator* iter,
+                                                   ReadCallback* mask) {
+  if (mask != nullptr) {
+    iter->RegisterCleanup(
+        [](void* arg1, void* /*arg2*/) {
+          delete static_cast<LiveWalGateReadMask*>(arg1);
+        },
+        mask, nullptr);
+  }
 }
 
 ArenaWrappedDBIter* DBImpl::NewIteratorImpl(
@@ -5846,13 +5872,15 @@ Status DBImpl::NewIterators(
       auto* iter = new ForwardIterator(this, options, cf_sv_pair.cfd,
                                        cf_sv_pair.super_version,
                                        /* allow_unprepared_value */ true);
+      ReadCallback* gate_read_mask = NewTailingWalGateReadMask();
       iterators->push_back(DBIter::NewIter(
           env_, options, cf_sv_pair.cfd->ioptions(),
           cf_sv_pair.super_version->mutable_cf_options,
           cf_sv_pair.cfd->user_comparator(), iter,
-          cf_sv_pair.super_version->current, kMaxSequenceNumber,
-          nullptr /* read_callback */, /* active_mem */ nullptr, cf_sv_pair.cfh,
+          cf_sv_pair.super_version->current, kMaxSequenceNumber, gate_read_mask,
+          /* active_mem */ nullptr, cf_sv_pair.cfh,
           /* expose_blob_index */ false, /* arena */ nullptr));
+      RegisterTailingWalGateReadMaskCleanup(iterators->back(), gate_read_mask);
     }
   } else {
     for (size_t i = 0; i < cf_sv_pairs.size(); ++i) {

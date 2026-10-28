@@ -2626,6 +2626,20 @@ void DBImpl::WALIOStatusCheck(const IOStatus& io_status,
       InstallFailedGateSyncFence(gate_sync_fence_intent->low,
                                  gate_sync_fence_intent->high, io_status);
       gate_sync_fence_intent->installed = true;
+      // So does every group queued on this sync: each shares its failure.
+      std::vector<std::pair<SequenceNumber, SequenceNumber>> queued;
+      {
+        InstrumentedMutexLock l(&wal_gate_sync_mutex_);
+        for (WalGateSyncWaiter* waiter : wal_gate_sync_waiters_) {
+          if (!waiter->fenced) {
+            waiter->fenced = true;
+            queued.emplace_back(waiter->low, waiter->target);
+          }
+        }
+      }
+      for (const auto& [low, high] : queued) {
+        InstallFailedGateSyncFence(low, high, io_status);
+      }
     }
     mutex_.Unlock();
   } else {
@@ -2987,6 +3001,13 @@ IOStatus DBImpl::CoverBurnedWALIndex(const WriteOptions& write_options,
     // was burned. A void here would trail the reader's index order mark.
     return IOStatus::OK();
   }
+  if (NumWalPartitions() > 1) {
+    // The cover below usually fails on the writer that just failed, and is
+    // never synced when it lands. Recovery explains the index again, durably,
+    // before it admits writes above it (ExplainBurnedWALIndices).
+    InstrumentedMutexLock l(&sequence_wal_index_mutex_);
+    burned_wal_indices_.push_back({log_writer->get_log_number(), wal_index});
+  }
 
   IOStatus io_s =
       log_writer->AddWALIndexVoidRecord(write_options, wal_index, wal_index);
@@ -3302,6 +3323,99 @@ void DBImpl::ClearWalDurabilityBGError() {
   }
 }
 
+Status DBImpl::ExplainBurnedWALIndices(const WriteOptions& write_options) {
+  mutex_.AssertHeld();
+  assert(NumWalPartitions() > 1);
+  std::vector<BurnedWalIndex> burned;
+  {
+    InstrumentedMutexLock l(&sequence_wal_index_mutex_);
+    burned = burned_wal_indices_;
+  }
+  if (burned.empty()) {
+    return Status::OK();
+  }
+  // A file's void lower bounds must ascend.
+  std::sort(burned.begin(), burned.end(),
+            [](const BurnedWalIndex& a, const BurnedWalIndex& b) {
+              return a.wal_index < b.wal_index;
+            });
+  uint64_t newest_burning_wal = 0;
+  for (const BurnedWalIndex& b : burned) {
+    newest_burning_wal = std::max(newest_burning_wal, b.wal_number);
+  }
+  mutex_.Unlock();
+  IOStatus io_s;
+  {
+    // Recovery's rotation installed partition 0's current WAL above every WAL
+    // that burned an index, so any recovery that reads such a WAL reads this
+    // one too, and writes stay stopped until ClearBGError, so it holds no
+    // data above them. The WAL mutex, held across the sync, excludes a gate
+    // sync; waiting out a claim excludes SyncWAL.
+    WalWriteMutexLock wal_lock(&WalWriteMutex(0));
+    while (CurrentWalOrNull(0) != nullptr && CurrentWalOrNull(0)->IsSyncing()) {
+      WalSyncCV(0).Wait();
+    }
+    LogWriterNumber* target = CurrentWalOrNull(0);
+    if (target == nullptr || target->number <= newest_burning_wal ||
+        target->writer->file() == nullptr ||
+        target->writer->file()->seen_error() ||
+        target->writer->last_wal_index_recorded() >= burned.front().wal_index) {
+      io_s = IOStatus::Corruption(
+          "WAL recovery found no healthy WAL to explain burned WAL index " +
+          std::to_string(burned.front().wal_index));
+    } else {
+      uint64_t last_voided = 0;
+      for (const BurnedWalIndex& b : burned) {
+        if (b.wal_index == last_voided) {
+          continue;
+        }
+        io_s = target->writer->AddWALIndexVoidRecord(write_options, b.wal_index,
+                                                     b.wal_index);
+        if (!io_s.ok()) {
+          break;
+        }
+        last_voided = b.wal_index;
+      }
+      // A later recovery rotates past this WAL rather than reusing it.
+      WalEmpty(0) = false;
+      if (io_s.ok()) {
+        io_s = target->writer->WriteBuffer(write_options);
+      }
+      IOOptions opts;
+      if (io_s.ok()) {
+        io_s = WritableFileWriter::PrepareIOOptions(write_options, opts);
+      }
+      if (io_s.ok()) {
+        bool seen_error = false;
+        io_s = target->writer->file()->Sync(
+            opts, immutable_db_options_.use_fsync, &seen_error);
+      }
+    }
+    TEST_SYNC_POINT_CALLBACK("DBImpl::ExplainBurnedWALIndices:io_s", &io_s);
+  }
+  if (io_s.ok()) {
+    // The rotation left the new WAL's directory entry unsynced.
+    io_s = directories_.GetWalDir()->FsyncWithDirOptions(
+        IOOptions(), nullptr,
+        DirFsyncOptions(DirFsyncOptions::FsyncReason::kNewFileSynced));
+  }
+  mutex_.Lock();
+  if (!io_s.ok()) {
+    ROCKS_LOG_ERROR(immutable_db_options_.info_log,
+                    "[WAL recovery] Failed to explain %" ROCKSDB_PRIszt
+                    " burned WAL index(es); DB remains write-stopped: %s",
+                    burned.size(), io_s.ToString().c_str());
+    return io_s;
+  }
+  {
+    // Only what was copied above: a failure since may have burned more.
+    InstrumentedMutexLock l(&sequence_wal_index_mutex_);
+    burned_wal_indices_.erase(burned_wal_indices_.begin(),
+                              burned_wal_indices_.begin() + burned.size());
+  }
+  return Status::OK();
+}
+
 void DBImpl::InstallWalGateFence(SequenceNumber low, const Status& status,
                                  bool released_by_recovery,
                                  SequenceNumber high) {
@@ -3580,8 +3694,18 @@ Status DBImpl::RunCoalescedGateSync(SequenceNumber low, SequenceNumber target,
   assert(NumWalPartitions() > 1);
   uint64_t epoch = 0;
   Status shared_failure;
+  WalGateSyncWaiter waiter{low, target, /*fenced=*/false};
   {
     InstrumentedMutexLock l(&wal_gate_sync_mutex_);
+    bool queued = false;
+    auto dequeue = [&]() {
+      if (queued) {
+        wal_gate_sync_waiters_.erase(std::find(wal_gate_sync_waiters_.begin(),
+                                               wal_gate_sync_waiters_.end(),
+                                               &waiter));
+        queued = false;
+      }
+    };
     // The group's append completed before this call, so any sync that starts
     // from here on covers its record, whatever its count.
     const uint64_t needed_epoch = wal_gate_sync_started_epoch_ + 1;
@@ -3601,6 +3725,7 @@ Status DBImpl::RunCoalescedGateSync(SequenceNumber low, SequenceNumber target,
       // such a sync may have read before the record existed.
       if (wal_gate_synced_epoch_ >= needed_epoch ||
           (low <= target && wal_gate_synced_upto_ >= target)) {
+        dequeue();
         *covered = wal_gate_synced_upto_;
         return Status::OK();
       }
@@ -3609,10 +3734,16 @@ Status DBImpl::RunCoalescedGateSync(SequenceNumber low, SequenceNumber target,
       }
       // Group commit: the sync that starts after this one finishes covers
       // every record written meanwhile, so the writes that queue here share
-      // it instead of each fsyncing every partition in turn.
+      // it instead of each fsyncing every partition in turn. Queued, the
+      // group is fenced with the running sync's failure, should it fail.
+      if (!queued) {
+        wal_gate_sync_waiters_.push_back(&waiter);
+        queued = true;
+      }
       TEST_SYNC_POINT("DBImpl::RunCoalescedGateSync:BeforeWait");
       wal_gate_sync_cv_.Wait();
     }
+    dequeue();
     if (shared_failure.ok()) {
       wal_gate_sync_running_ = true;
       epoch = ++wal_gate_sync_started_epoch_;
@@ -3620,8 +3751,17 @@ Status DBImpl::RunCoalescedGateSync(SequenceNumber low, SequenceNumber target,
   }
   if (!shared_failure.ok()) {
     // Coalesced into a failed sync: fails with it, fenced and hidden as that
-    // sync's own group is (D-7).
-    FenceFailedGateSync(low, target, shared_failure);
+    // sync's own group is (D-7). Normally the failure's own mutex_ section
+    // fenced it already, while it was queued.
+    TEST_SYNC_POINT("DBImpl::RunCoalescedGateSync:SharedFailure");
+    bool fenced;
+    {
+      InstrumentedMutexLock l(&wal_gate_sync_mutex_);
+      fenced = waiter.fenced;
+    }
+    if (!fenced) {
+      FenceFailedGateSync(low, target, shared_failure);
+    }
     *covered = 0;
     return shared_failure;
   }
@@ -3688,8 +3828,37 @@ void DBImpl::InstallFailedGateSyncFence(SequenceNumber low, SequenceNumber high,
           ? std::make_shared<WalGateReadMask::Ranges>(*wal_gate_read_masks_)
           : std::make_shared<WalGateReadMask::Ranges>();
   ranges->emplace_back(low, high);
+  // The range's entries, its range tombstones included, are in one of the
+  // memtables live now; each hides those tombstones itself, and the mask is
+  // retired once all of them are gone (MaybeRetireWalGateReadMasks). A copy:
+  // only memtables may keep it alive.
+  auto memtable_ranges =
+      std::make_shared<const ReadOnlyMemTable::MaskedSequenceRanges>(*ranges);
+  for (ColumnFamilyData* cfd : *versions_->GetColumnFamilySet()) {
+    if (!cfd->IsDropped()) {
+      cfd->mem()->SetMaskedSequenceRanges(memtable_ranges);
+      cfd->imm()->SetMaskedSequenceRanges(memtable_ranges);
+    }
+  }
+  wal_gate_masked_memtables_ = memtable_ranges;
   wal_gate_read_masks_ = std::move(ranges);
   wal_gate_read_masked_.store(true, std::memory_order_release);
+  wal_gate_read_mask_version_.fetch_add(1, std::memory_order_release);
+}
+
+void DBImpl::MaybeRetireWalGateReadMasks() {
+  mutex_.AssertHeld();
+  if (!wal_gate_read_masked_.load(std::memory_order_relaxed) ||
+      !wal_gate_masked_memtables_.expired()) {
+    return;
+  }
+  // No memtable that held a masked range is left, not even in a superversion
+  // a read still holds, and flushes dropped those ranges: nothing a new read
+  // can reach holds one.
+  MutexLock l(&wal_gate_read_mask_mutex_);
+  wal_gate_read_masks_.reset();
+  wal_gate_read_masked_.store(false, std::memory_order_release);
+  wal_gate_read_mask_version_.fetch_add(1, std::memory_order_release);
 }
 
 Status DBImpl::SyncWalsFromCompletionGate(

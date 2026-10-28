@@ -6,6 +6,9 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
+#include <functional>
+#include <limits>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -95,6 +98,46 @@ class WalGateReadMask : public ReadCallback {
 
   const std::shared_ptr<const Ranges> ranges_;
   ReadCallback* const inner_;
+};
+
+// As WalGateReadMask, for a tailing iterator, which reads at the latest
+// sequence and so must hide ranges masked after it was created. Every
+// sequence takes the full check, which reloads the ranges from `source`
+// only when `version` has moved since the last load.
+class LiveWalGateReadMask : public ReadCallback {
+ public:
+  using Ranges = WalGateReadMask::Ranges;
+
+  LiveWalGateReadMask(const std::atomic<uint64_t>* version,
+                      std::function<std::shared_ptr<const Ranges>()> source)
+      : ReadCallback(kMaxSequenceNumber, kMinUnCommittedSeq),
+        version_(version),
+        source_(std::move(source)) {}
+
+  bool IsVisibleFullCheck(SequenceNumber seq) override {
+    const uint64_t version = version_->load(std::memory_order_acquire);
+    if (version != loaded_version_) {
+      ranges_ = source_();
+      loaded_version_ = version;
+    }
+    if (ranges_ == nullptr) {
+      return true;
+    }
+    for (const auto& range : *ranges_) {
+      if (range.first <= seq && seq <= range.second) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void Refresh(SequenceNumber /*seq*/) override {}
+
+ private:
+  const std::atomic<uint64_t>* const version_;
+  const std::function<std::shared_ptr<const Ranges>()> source_;
+  uint64_t loaded_version_ = std::numeric_limits<uint64_t>::max();
+  std::shared_ptr<const Ranges> ranges_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -67,6 +67,9 @@ class WalManager {
 
   Status GetLiveWalFile(uint64_t number, std::unique_ptr<WalFile>* log_file);
 
+  // Whether any indeterminate write sequence is recorded.
+  bool TEST_HasIndeterminateWriteSequence() const;
+
   Status TEST_ReadFirstRecord(const WalFileType type, const uint64_t number,
                               SequenceNumber* sequence) {
     return ReadFirstRecord(type, number, sequence);

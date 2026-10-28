@@ -277,6 +277,16 @@ class ReadOnlyMemTable {
   // operations on the same MemTable (unless this Memtable is immutable).
   virtual uint64_t NumRangeDeletion() const = 0;
 
+  // Sequence ranges whose range tombstones are hidden from every range
+  // tombstone iterator, the flush's included (at N>1, writes whose WAL sync
+  // failed after they were inserted). Set with the DB mutex held; each call
+  // passes a superset of the last. A no-op by default.
+  using MaskedSequenceRanges =
+      std::vector<std::pair<SequenceNumber, SequenceNumber>>;
+  virtual void SetMaskedSequenceRanges(
+      std::shared_ptr<const MaskedSequenceRanges> /*ranges*/) {}
+  virtual bool HasMaskedSequenceRanges() const { return false; }
+
   virtual uint64_t GetDataSize() const = 0;
 
   // Returns the sequence number of the first element that was inserted
@@ -790,6 +800,16 @@ class MemTable final : public ReadOnlyMemTable {
     return num_range_deletes_.LoadRelaxed();
   }
 
+  void SetMaskedSequenceRanges(
+      std::shared_ptr<const MaskedSequenceRanges> ranges) override {
+    AtomicSharedPtrStore(&masked_ranges_, std::move(ranges),
+                         std::memory_order_release);
+    has_masked_ranges_.store(true, std::memory_order_release);
+  }
+  bool HasMaskedSequenceRanges() const override {
+    return has_masked_ranges_.load(std::memory_order_acquire);
+  }
+
   uint64_t GetDataSize() const override { return data_size_.LoadRelaxed(); }
 
   size_t write_buffer_size() const { return write_buffer_size_.LoadRelaxed(); }
@@ -1052,6 +1072,11 @@ class MemTable final : public ReadOnlyMemTable {
   // user-defined timestamps in memtable only feature is enabled.
   std::unique_ptr<FragmentedRangeTombstoneList>
       timestamp_stripping_fragmented_range_tombstone_list_;
+
+  // See SetMaskedSequenceRanges(). The flag spares unmasked reads the
+  // shared_ptr load.
+  std::shared_ptr<const MaskedSequenceRanges> masked_ranges_;
+  std::atomic<bool> has_masked_ranges_{false};
 
   // makes sure there is a single range tombstone writer to invalidate cache
   std::mutex range_del_mutex_;

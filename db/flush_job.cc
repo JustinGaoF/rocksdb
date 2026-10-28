@@ -1034,6 +1034,15 @@ Status FlushJob::WriteLevel0Table() {
         range_del_iters.emplace_back(range_del_iter);
       }
       total_num_input_entries += m->NumEntries();
+      if (range_del_iter != nullptr && m->HasMaskedSequenceRanges()) {
+        // Masked tombstones (failed sync writes) are hidden from the
+        // iterator, as SequenceFloorIterator hides their point entries.
+        assert(m->NumRangeDeletion() >=
+               range_del_iter->num_unfragmented_tombstones());
+        total_num_input_entries -=
+            m->NumRangeDeletion() -
+            range_del_iter->num_unfragmented_tombstones();
+      }
       total_num_deletes += m->NumDeletion();
       total_data_size += m->GetDataSize();
       total_memory_usage += m->ApproximateMemoryUsage();

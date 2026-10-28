@@ -910,6 +910,13 @@ class DBImpl : public DB
                                SequenceNumber snapshot_seq, const Slice& key,
                                LazyWideColumns* result);
 
+  // N>1: a read mask for a tailing iterator (LiveWalGateReadMask), which
+  // RegisterTailingWalGateReadMaskCleanup ties to the iterator; nullptr at
+  // one partition.
+  ReadCallback* NewTailingWalGateReadMask();
+  void RegisterTailingWalGateReadMaskCleanup(Iterator* iter,
+                                             ReadCallback* mask);
+
   // If `snapshot` == kMaxSequenceNumber, set a recent one inside the file.
   ArenaWrappedDBIter* NewIteratorImpl(const ReadOptions& options,
                                       ColumnFamilyHandleImpl* cfh,
@@ -1586,6 +1593,19 @@ class DBImpl : public DB
       fences.emplace_back(fence.low, fence.high);
     }
     return fences;
+  }
+
+  // Whether the WAL manager recorded any indeterminate write. Tests use it to
+  // prove a failure fenced nothing.
+  bool TEST_HasIndeterminateWriteSequence() const {
+    return wal_manager_.TEST_HasIndeterminateWriteSequence();
+  }
+
+  // The read mask's ranges, or null once none are left. Tests use it to
+  // prove the mask retires.
+  std::shared_ptr<const WalGateReadMask::Ranges> TEST_WalGateReadMaskRanges()
+      const {
+    return WalGateReadMaskRanges();
   }
 
   // Partition p's lowest registered, not yet completed sequence, or
@@ -3371,6 +3391,14 @@ class DBImpl : public DB
   // falls inside a fence.
   void ClearWalDurabilityBGError();
 
+  // N>1 only. Writes a void cover for every index in burned_wal_indices_ into
+  // partition 0's current WAL, which recovery's rotation installed, and syncs
+  // it and the WAL directory, so no later recovery reads the burned index as
+  // an unexplained hole below writes admitted after it. Called by ResumeImpl,
+  // with mutex_ held, before ClearBGError; releases mutex_ around the I/O. On
+  // failure the indices stay pending and the DB stays write-stopped.
+  Status ExplainBurnedWALIndices(const WriteOptions& write_options);
+
   // N>1 only. Fences every gate whose target is at or above `low`: a range
   // starting there failed (its append, or its memtable insert), so nothing
   // at or above it can ever be acknowledged (D-1). The fence stays open-ended
@@ -3395,6 +3423,12 @@ class DBImpl : public DB
   // REQUIRES: mutex_ held.
   void InstallFailedGateSyncFence(SequenceNumber low, SequenceNumber high,
                                   const Status& status);
+
+  // Drops every read mask once no memtable that held a masked range is left:
+  // flushes, recovery's included, dropped the ranges, so the read path
+  // returns to no mask. Called after each flush frees its memtables.
+  // REQUIRES: mutex_ held.
+  void MaybeRetireWalGateReadMasks();
 
   // The ranges InstallFailedGateSyncFence hid, or null when there are none
   // (always at one partition). One acquire load when null.
@@ -3469,8 +3503,8 @@ class DBImpl : public DB
   // at or below which every record is now synced (when `sync` ran, the
   // durability safe point read just before it). Takes only
   // wal_gate_sync_mutex_, never across `sync`. A gate that queued on a sync
-  // that fails returns that sync's status and fences its own group. If `sync`
-  // fails, fences the group, [low, target] (InstallFailedGateSyncFence), in the
+  // that fails returns that sync's status. If `sync` fails, fences the group,
+  // [low, target] (InstallFailedGateSyncFence), and every queued group, in the
   // mutex_ section that records the failure, before any waiter rechecks.
   Status RunCoalescedGateSync(SequenceNumber low, SequenceNumber target,
                               SequenceNumber* covered,
@@ -4112,8 +4146,9 @@ class DBImpl : public DB
   //     standard and pipelined write paths take it with no other mutex held,
   //     for both allocation and completion, as do the WAL-only path's
   //     disableWAL allocation and a parked durability waiter. Only
-  //     ConcurrentWriteGroupToWAL takes it under a WAL write mutex (the
-  //     partition's). The background-error signal takes it under mutex_;
+  //     ConcurrentWriteGroupToWAL and CoverBurnedWALIndex (to note a burned
+  //     index) take it under a WAL write mutex (the partition's). The
+  //     background-error signal takes it under mutex_;
   //     the frontier signal runs with it already held by the completion
   //     site. Nothing acquired under it takes mutex_ or a WAL write mutex. It
   //     stays global because it guards the one LastAllocatedSequence counter
@@ -4136,6 +4171,7 @@ class DBImpl : public DB
   //     with no other mutex held, only to cache the recoverable state.
   //  8. wal_gate_sync_mutex_ is a leaf: a completion gate takes it with no
   //     other mutex held, and releases it before its sync takes any.
+  //     WALIOStatusCheck takes it under mutex_ to fence the queued gates.
   // A write's resolve step (SelectWalForWrite) and append (WriteToWAL) hold
   // exactly its partition's mutex, but the write path does take all N in
   // several places, always in index order through rule 2's implementation:
@@ -4259,6 +4295,15 @@ class DBImpl : public DB
   uint64_t wal_gate_synced_epoch_ = 0;
   uint64_t wal_gate_sync_failed_epoch_ = 0;
   Status wal_gate_sync_failed_status_;
+  // Gates queued on the running sync, each of which shares its failure.
+  // WALIOStatusCheck fences them (and sets `fenced`) in the mutex_ section
+  // that records that failure.
+  struct WalGateSyncWaiter {
+    SequenceNumber low;
+    SequenceNumber target;
+    bool fenced;
+  };
+  std::vector<WalGateSyncWaiter*> wal_gate_sync_waiters_;
 
   // Serializes sequence-block and WAL-index allocation across all WAL
   // partitions. It is never held across batch merging or I/O.
@@ -4301,11 +4346,17 @@ class DBImpl : public DB
   // (InstallFailedGateSyncFence). Copy-on-write under
   // wal_gate_read_mask_mutex_, a leaf taken below mutex_ and
   // sequence_wal_index_mutex_; the flag is set once the first range is in.
-  // Kept for the DB's lifetime: an iterator or a flush may still hold a
-  // memtable with the range.
+  // Kept until no memtable that may hold a range is left
+  // (MaybeRetireWalGateReadMasks): an iterator or a flush may still hold
+  // one. The version moves whenever the ranges change.
   mutable port::Mutex wal_gate_read_mask_mutex_;
   std::shared_ptr<const WalGateReadMask::Ranges> wal_gate_read_masks_;
   std::atomic<bool> wal_gate_read_masked_{false};
+  std::atomic<uint64_t> wal_gate_read_mask_version_{0};
+  // The ranges as the memtables live at the last install hold them; expires
+  // once every one of those memtables is freed. Guarded by mutex_.
+  std::weak_ptr<const ReadOnlyMemTable::MaskedSequenceRanges>
+      wal_gate_masked_memtables_;
   uint64_t next_wal_index_ = log::kWALIndexStartNumber;
 
   // If zero, manual compactions are allowed to proceed. If non-zero, manual
@@ -4939,6 +4990,14 @@ class DBImpl : public DB
     SequenceNumber high;
   };
   std::vector<FailedWalRange> failed_wal_ranges_;
+  // N>1 WAL indices whose append failed before the record landed, with the
+  // WAL that burned each, until ExplainBurnedWALIndices covers them durably.
+  // Guarded by sequence_wal_index_mutex_.
+  struct BurnedWalIndex {
+    uint64_t wal_number;
+    uint64_t wal_index;
+  };
+  std::vector<BurnedWalIndex> burned_wal_indices_;
 
   // See CloseMemTableSwitchGate().
   std::atomic<size_t> leaders_past_switch_gate_{0};
