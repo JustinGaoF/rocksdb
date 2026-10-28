@@ -1742,11 +1742,28 @@ Status DBImpl::WriteImpl(
       // A post-memtable callback (CommitAndTryCreateSnapshot's timestamped
       // snapshot) runs once the gate has published every sequence at or below
       // the group's, never from inside the group; the exits below skip it.
+      // Once the group publishes, a higher snapshot, or a flush that drops a
+      // version the callback's snapshot must see, can come before the
+      // callback, so reserve that snapshot's place in snapshots_ now: the
+      // group's range is unapplied, so no published sequence reaches it yet.
+      // Released with the group, after the callback has created its own.
+      int64_t unix_time = 0;
+      immutable_db_options_.clock->GetCurrentTime(&unix_time)
+          .PermitUncheckedError();  // Ignore error
+      SnapshotImpl* reserved = new SnapshotImpl;
+      {
+        InstrumentedMutexLock l(&mutex_);
+        snapshots_.New(reserved, last_sequence, unix_time,
+                       /*is_write_conflict_boundary=*/true);
+      }
+      std::shared_ptr<const Snapshot> reserved_snapshot(
+          reserved, [this](const Snapshot* s) { ReleaseSnapshot(s); });
       std::function<Status()> gate = std::move(write_group.completion_gate);
       const WriteThread::WriteGroup* const group = &write_group;
       const SequenceNumber group_last_sequence = last_sequence;
       write_group.completion_gate = [gate = std::move(gate), group,
-                                     group_last_sequence, disable_memtable]() {
+                                     group_last_sequence, disable_memtable,
+                                     reserved_snapshot]() {
         Status s = gate();
         if (s.ok()) {
           for (auto* writer : *group) {
