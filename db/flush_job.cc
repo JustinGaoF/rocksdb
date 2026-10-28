@@ -53,12 +53,15 @@ namespace ROCKSDB_NAMESPACE {
 
 namespace {
 // Forward-only view of a flush's input that hides entries at or above
-// `floor` and counts them, so the flush can still check that it read every
+// `floor` and entries inside any of `*ranges` (closed N>1 gate fences),
+// and counts them, so the flush can still check that it read every
 // memtable entry.
 class SequenceFloorIterator : public InternalIterator {
  public:
-  SequenceFloorIterator(InternalIterator* input, SequenceNumber floor)
-      : input_(input), floor_(floor) {}
+  SequenceFloorIterator(
+      InternalIterator* input, SequenceNumber floor,
+      const std::vector<std::pair<SequenceNumber, SequenceNumber>>* ranges)
+      : input_(input), floor_(floor), ranges_(ranges) {}
 
   bool Valid() const override { return input_->Valid(); }
   void SeekToFirst() override {
@@ -86,14 +89,27 @@ class SequenceFloorIterator : public InternalIterator {
 
  private:
   void SkipHidden() {
-    while (input_->Valid() && GetInternalKeySeqno(input_->key()) >= floor_) {
+    while (input_->Valid() && Hidden(GetInternalKeySeqno(input_->key()))) {
       ++num_hidden_;
       input_->Next();
     }
   }
 
+  bool Hidden(SequenceNumber seq) const {
+    if (seq >= floor_) {
+      return true;
+    }
+    for (const auto& range : *ranges_) {
+      if (range.first <= seq && seq <= range.second) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   InternalIterator* const input_;
   const SequenceNumber floor_;
+  const std::vector<std::pair<SequenceNumber, SequenceNumber>>* const ranges_;
   uint64_t num_hidden_ = 0;
 };
 }  // namespace
@@ -1056,14 +1072,15 @@ Status FlushJob::WriteLevel0Table() {
                              static_cast<int>(memtables.size()), &arena));
       std::unique_ptr<SequenceFloorIterator> floor_iter;
       InternalIterator* input = iter.get();
-      if (drop_entries_at_or_above_ != kMaxSequenceNumber) {
+      if (drop_entries_at_or_above_ != kMaxSequenceNumber ||
+          !drop_entry_ranges_.empty()) {
         ROCKS_LOG_WARN(db_options_.info_log,
                        "[%s] [JOB %d] Flush drops entries at or above "
-                       "sequence %" PRIu64,
+                       "sequence %" PRIu64 " and in %zu fenced ranges",
                        cfd_->GetName().c_str(), job_context_->job_id,
-                       drop_entries_at_or_above_);
-        floor_iter.reset(
-            new SequenceFloorIterator(iter.get(), drop_entries_at_or_above_));
+                       drop_entries_at_or_above_, drop_entry_ranges_.size());
+        floor_iter.reset(new SequenceFloorIterator(
+            iter.get(), drop_entries_at_or_above_, &drop_entry_ranges_));
         input = floor_iter.get();
       }
       ROCKS_LOG_INFO(db_options_.info_log,

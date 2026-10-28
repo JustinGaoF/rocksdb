@@ -1555,6 +1555,13 @@ struct DBOptions {
   // partition's WAL write lock, which re-imposes the coordinated flushing that
   // partitions exist to avoid.
   //
+  // At more than one partition a sync write is inserted and published before
+  // its fsync runs. If that fsync fails, the write's range is fenced and
+  // hidden from every read, snapshot and iterator taken after the failure is
+  // returned, but readers that took a snapshot in the window between the
+  // write's publication and the failure may have seen it. As with a failed
+  // append, that window is a documented N>1 limit.
+  //
   // Enabling more than one partition is a rollout step: every binary that may
   // read these WAL files (the DB itself on reopen or rollback, ldb, backup and
   // checkpoint restore, RepairDB, secondary instances) must first be upgraded

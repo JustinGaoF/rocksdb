@@ -2381,7 +2381,9 @@ Status DBImpl::FlushWAL(const FlushWALOptions& options) {
   return FlushWAL(write_options, options.sync);
 }
 
-Status DBImpl::FlushWAL(const WriteOptions& write_options, bool sync) {
+Status DBImpl::FlushWAL(const WriteOptions& write_options, bool sync,
+                        SequenceNumber gate_fence_low,
+                        SequenceNumber gate_fence_high) {
   if (manual_wal_flush_) {
     IOStatus io_s;
     uint64_t failed_wal_number = 0;
@@ -2409,7 +2411,9 @@ Status DBImpl::FlushWAL(const WriteOptions& write_options, bool sync) {
                       io_s.ToString().c_str());
       // In case there is a fs error we should set it globally to prevent the
       // future writes
-      WALIOStatusCheck(io_s, failed_wal_number);
+      WALIOStatusCheck(io_s, failed_wal_number, /*failed_wal_sequence=*/0,
+                       /*failed_wal_sequence_start=*/0, kNoPinnedWalRange,
+                       gate_fence_low, gate_fence_high);
       // whether sync or not, we should abort the rest of function upon error
       return static_cast<Status>(io_s);
     }
@@ -2423,7 +2427,7 @@ Status DBImpl::FlushWAL(const WriteOptions& write_options, bool sync) {
   }
   // sync = true
   ROCKS_LOG_DEBUG(immutable_db_options_.info_log, "FlushWAL sync=true");
-  return SyncWAL();
+  return SyncWALWithGateFence(gate_fence_low, gate_fence_high);
 }
 
 bool DBImpl::WALBufferIsEmpty() {
@@ -2450,12 +2454,21 @@ Status DBImpl::GetOpenWalSizes(std::map<uint64_t, uint64_t>& number_to_size) {
 }
 
 Status DBImpl::SyncWAL() {
+  return SyncWALWithGateFence(kMaxSequenceNumber, /*gate_fence_high=*/0);
+}
+
+Status DBImpl::SyncWALWithGateFence(SequenceNumber gate_fence_low,
+                                    SequenceNumber gate_fence_high) {
+  // Fires for SyncWAL(), FlushWAL(sync=true), and the completion gate's
+  // post-wait sync alike: all three went through SyncWAL() before the gate
+  // fence parameters were threaded through.
   TEST_SYNC_POINT("DBImpl::SyncWAL:Begin");
   WriteOptions write_options;
   VersionEdit synced_wals;
   Status s = SyncWalImpl(/*include_current_wal=*/true, write_options,
                          /*job_context=*/nullptr, &synced_wals,
-                         /*error_recovery_in_prog=*/false);
+                         /*error_recovery_in_prog=*/false, gate_fence_low,
+                         gate_fence_high);
 
   if (s.ok() && synced_wals.IsWalAddition()) {
     InstrumentedMutexLock l(&mutex_);
@@ -2505,7 +2518,9 @@ void DBImpl::WalWriteMutexType::NoteReleased() {
 IOStatus DBImpl::SyncWalImpl(bool include_current_wal,
                              const WriteOptions& write_options,
                              JobContext* job_context, VersionEdit* synced_wals,
-                             bool error_recovery_in_prog) {
+                             bool error_recovery_in_prog,
+                             SequenceNumber gate_fence_low,
+                             SequenceNumber gate_fence_high) {
   // The claimed logs and whether each was its partition's current WAL when
   // claimed. Currency selects SyncWithoutFlush (active WAL, whose user-space
   // buffers a manual-flush SyncWAL must not sync) versus Sync; it cannot be
@@ -2672,7 +2687,9 @@ IOStatus DBImpl::SyncWalImpl(bool include_current_wal,
     // paranoid checks disabled, WALIOStatusCheck() instead preserves the
     // legacy behavior of resetting the writer so a later operation can retry.
     if (!failed_with_previous_error || !immutable_db_options_.paranoid_checks) {
-      WALIOStatusCheck(io_s, failed_wal_number);
+      WALIOStatusCheck(io_s, failed_wal_number, /*failed_wal_sequence=*/0,
+                       /*failed_wal_sequence_start=*/0, kNoPinnedWalRange,
+                       gate_fence_low, gate_fence_high);
     }
   }
   if (io_s.ok() && need_wal_dir_sync) {
@@ -2903,7 +2920,8 @@ bool DBImpl::ClaimWalPartitionForSyncWalImpl(
 
 IOStatus DBImpl::SyncWalPartitionFiles(size_t partition,
                                        const WriteOptions& write_options,
-                                       uint64_t* failed_wal_number) {
+                                       uint64_t* failed_wal_number,
+                                       bool* failed_with_previous_error) {
   // At N==1 the single-queue leadership sync calls this without the WAL
   // mutex, as before the partitioned path existed (single writer, and the
   // getting_synced marks exclude SyncWAL); every other caller holds it.
@@ -2917,6 +2935,11 @@ IOStatus DBImpl::SyncWalPartitionFiles(size_t partition,
                            &partition);
   IOStatus io_s;
   for (auto& log : logs_[partition]) {
+    if (log.number <= wal_recovery_cutoff_.load(std::memory_order_acquire)) {
+      // Abandoned by recovery (SyncWalImpl skips these too): its handle is
+      // unusable, so touching it would only surface a stale failure.
+      continue;
+    }
     IOOptions opts;
     io_s = WritableFileWriter::PrepareIOOptions(write_options, opts);
     if (!io_s.ok()) {
@@ -2927,7 +2950,8 @@ IOStatus DBImpl::SyncWalPartitionFiles(size_t partition,
     // manifest.
     if (auto* f = log.writer->file()) {
       const uint64_t size = f->GetFileSize();
-      io_s = immutable_db_options_.use_fsync ? f->Fsync(opts) : f->Sync(opts);
+      io_s = f->Sync(opts, immutable_db_options_.use_fsync,
+                     failed_with_previous_error);
       if (!io_s.ok()) {
         *failed_wal_number = log.number;
         break;
@@ -5604,10 +5628,28 @@ ArenaWrappedDBIter* DBImpl::NewIteratorImpl(
   // Laying out the iterators in the order of being accessed makes it more
   // likely that any iterator pointer is close to the iterator it points to so
   // that they are likely to be in the same cache line and/or page.
-  return NewArenaWrappedDbIterator(env_, read_options, cfh, sv, snapshot,
-                                   read_callback, this, expose_blob_index,
-                                   allow_refresh,
-                                   /*allow_mark_memtable_for_flush=*/true);
+  // Hide failed writes' sequences (N>1 gate fences) from this iterator.
+  // No-op unless a fence was ever installed; the mask's ranges are snapshotted
+  // here and owned by the iterator.
+  WalGateFenceReadCallback* fence_callback = nullptr;
+  std::vector<std::pair<SequenceNumber, SequenceNumber>> fence_ranges;
+  if (WalGateFenceRangesForRead(&fence_ranges)) {
+    fence_callback = new WalGateFenceReadCallback(snapshot, read_callback,
+                                                  std::move(fence_ranges));
+    read_callback = fence_callback;
+  }
+  ArenaWrappedDBIter* result = NewArenaWrappedDbIterator(
+      env_, read_options, cfh, sv, snapshot, read_callback, this,
+      expose_blob_index, allow_refresh,
+      /*allow_mark_memtable_for_flush=*/true);
+  if (fence_callback != nullptr) {
+    result->RegisterCleanup(
+        [](void* arg1, void* /*arg2*/) {
+          delete static_cast<WalGateFenceReadCallback*>(arg1);
+        },
+        fence_callback, nullptr);
+  }
+  return result;
 }
 
 std::unique_ptr<Iterator> DBImpl::NewCoalescingIterator(

@@ -10757,6 +10757,82 @@ TEST(TransactionPartitionedWalTest, SyncPrepareAfterSyncCommitSurvivesCrash) {
   delete db;
   SyncPoint::GetInstance()->DisableProcessing();
   SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+TEST(TransactionPartitionedWalTest, FailedSyncPrepareLeavesNoStaleFence) {
+  // Q8: a sync=true WriteCommitted Prepare consumes no sequence, so its gate
+  // has low = L + 1 > target = L. When its gate fsync fails, the write fails
+  // with the error but installs no fence; after Resume() the next write,
+  // which takes L + 1, succeeds and is neither fenced nor indeterminate.
+  // Neuter: GC18's unconditional fence; the next write fails at the stale
+  // [L + 1, L + 1] fence.
+  constexpr size_t kPartitions = 2;
+  SyncPoint::GetInstance()->EnableProcessing();
+  const std::string dbname =
+      test::PerThreadDBPath("transaction_partitioned_wal_q8_nofence");
+  Options options;
+  options.create_if_missing = true;
+  options.wal_partitions = kPartitions;
+  options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  options.track_and_verify_wals_in_manifest = true;
+  options.avoid_flush_during_recovery = true;
+  options.avoid_flush_during_shutdown = true;
+  options.paranoid_checks = true;
+  options.max_bgerror_resume_count = 0;
+  ASSERT_OK(DestroyDB(dbname, options));
+  TransactionDBOptions txn_db_options;
+  txn_db_options.write_policy = WRITE_COMMITTED;
+  TransactionDB* db = nullptr;
+  ASSERT_OK(TransactionDB::Open(options, txn_db_options, dbname, &db));
+  auto* db_impl = static_cast_with_check<DBImpl>(db->GetRootDB());
+  ASSERT_EQ(kPartitions, db_impl->TEST_NumWalPartitions());
+
+  WriteOptions sync_wo;
+  sync_wo.sync = true;
+  Transaction* txn1 = db->BeginTransaction(sync_wo);
+  ASSERT_OK(txn1->SetName("xid1"));
+  ASSERT_OK(txn1->Put("k1", "v1"));
+  ASSERT_OK(txn1->Prepare());
+  ASSERT_OK(txn1->Commit());
+  delete txn1;
+
+  bool fail_gate_sync = true;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SyncWalsFromCompletionGate:AfterGateSync", [&](void* arg) {
+        if (fail_gate_sync) {
+          fail_gate_sync = false;
+          // Retryable, so Resume() can recover from it.
+          IOStatus error = IOStatus::IOError("injected gate sync error");
+          error.SetRetryable(true);
+          *static_cast<IOStatus*>(arg) = error;
+        }
+      });
+
+  // A sync=true Prepare consumes no sequence; its gate fsync fails.
+  Transaction* txn2 = db->BeginTransaction(sync_wo);
+  ASSERT_OK(txn2->SetName("xid2"));
+  ASSERT_OK(txn2->Put("k2", "v2"));
+  const Status prepare_status = txn2->Prepare();
+  EXPECT_TRUE(prepare_status.IsIOError()) << prepare_status.ToString();
+  // The Prepare failed, so there is nothing to roll back.
+  delete txn2;
+  SyncPoint::GetInstance()->ClearCallBack(
+      "DBImpl::SyncWalsFromCompletionGate:AfterGateSync");
+
+  // The failed zero-count group fenced nothing.
+  ASSERT_NOK(db_impl->TEST_GetBGError());
+  EXPECT_TRUE(db_impl->TEST_WalGateFences().empty());
+
+  ASSERT_OK(db_impl->Resume());
+  // The next write takes L + 1, the sequence a stale fence would hold.
+  ASSERT_OK(db->Put(WriteOptions(), "after", "v"));
+  std::string value;
+  ASSERT_OK(db->Get(ReadOptions(), "after", &value));
+  ASSERT_EQ("v", value);
+
+  delete db;
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
   options.env = Env::Default();
   ASSERT_OK(DestroyDB(dbname, options));
 }

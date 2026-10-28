@@ -31,6 +31,15 @@ namespace ROCKSDB_NAMESPACE {
 // it never drags the minimum down; when all partitions are idle the safe
 // point is the maximum durable sequence instead.
 //
+// A write that consumes no sequence (a WAL-only marker stamped with
+// last_allocated + 1 without consuming it) registers the empty range
+// [low, low - 1]: it pins `low` like any entry, but is durable or applied
+// only through `low - 1`, so no safe point or published sequence ever
+// exceeds an in-flight range's low minus one. Registering it as [low, low]
+// instead would let an all-idle completion advance the monotonic safe point
+// past a sequence nobody owns yet, publishing over the range that later
+// takes it.
+//
 // The safe point lives in this tracker's own atomic and is exposed through a
 // single DBImpl accessor. It deliberately shares no field with
 // last_published_sequence_, which ingestion and recovery legitimately jump
@@ -87,9 +96,13 @@ class WalDurabilityTracker {
   // from infinity to low - 1 == old maximum when leaving all-idle, which is
   // also unchanged). Updates min_owner_ on that leaving-all-idle transition
   // so a later Complete by another partition does not skip its rescan.
+  // `high` may be `low - 1` for a write that consumes no sequence (an empty
+  // range, pinning `low` while durable only through `low - 1`); `low` is then
+  // an allocated-plus-one sequence, never 0.
   void Register(size_t partition, uint64_t low, uint64_t high) {
     assert(partition < partitions_.size());
-    assert(low <= high);
+    assert(low <= high + 1);
+    assert(low > 0 || low <= high);
     assert(high != kIdle);
     std::vector<Range>& fifo = partitions_[partition].inflight;
     fifo.push_back({low, high});
@@ -111,13 +124,14 @@ class WalDurabilityTracker {
   }
 
   // Marks one occurrence of [low, high] on partition p durable after its
-  // write() completed. Duplicate lows (a WAL-only marker stamped with
-  // last_allocated + 1 without consuming it shares its value with the next
-  // real write) are stored as separate entries: the minimum is indifferent
-  // to duplicates and does not advance past the shared value until every
-  // entry carrying it completes, which is correct since an undurable commit
-  // marker strands its transaction. Recomputes the safe point unless the
-  // partition's minimum is provably unchanged and unowned.
+  // write() completed. Duplicate entries (concurrent WAL-only markers stamped
+  // with the same last_allocated + 1) are stored separately: the minimum is
+  // indifferent to duplicates and does not advance past the shared value
+  // until every entry carrying it completes, which is correct since an
+  // undurable commit marker strands its transaction. Completing an empty
+  // [low, low - 1] range advances durable_upto only to low - 1. Recomputes
+  // the safe point unless the partition's minimum is provably unchanged and
+  // unowned.
   void Complete(size_t partition, uint64_t low, uint64_t high) {
     assert(partition < partitions_.size());
     std::vector<Range>& fifo = partitions_[partition].inflight;

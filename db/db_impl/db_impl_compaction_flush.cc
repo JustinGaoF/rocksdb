@@ -301,6 +301,11 @@ Status DBImpl::FlushMemTableToOutputFile(
 
   if (s.ok()) {
     flush_job.DropEntriesAtOrAbove(UnreleasedWalGateFenceLow());
+    std::vector<std::pair<SequenceNumber, SequenceNumber>> fenced_ranges;
+    ClosedWalGateFenceRanges(&fenced_ranges);
+    for (const auto& range : fenced_ranges) {
+      flush_job.DropEntriesInRange(range.first, range.second);
+    }
     flush_job.PickMemTable();
     need_cancel = true;
   }
@@ -682,8 +687,13 @@ Status DBImpl::AtomicFlushMemTablesToOutputFiles(
 
   if (s.ok()) {
     const SequenceNumber drop_floor = UnreleasedWalGateFenceLow();
+    std::vector<std::pair<SequenceNumber, SequenceNumber>> fenced_ranges;
+    ClosedWalGateFenceRanges(&fenced_ranges);
     for (int i = 0; i != num_cfs; ++i) {
       jobs[i]->DropEntriesAtOrAbove(drop_floor);
+      for (const auto& range : fenced_ranges) {
+        jobs[i]->DropEntriesInRange(range.first, range.second);
+      }
       jobs[i]->PickMemTable();
       pick_status[i] = true;
     }

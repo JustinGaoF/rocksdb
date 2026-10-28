@@ -326,6 +326,16 @@ DEFINE_SYNC_AND_ASYNC(Status, DBImpl::GetImpl)
     read_cb.EnableNewerVersionTracking(snapshot, newer_version_upper_bound_seq,
                                        get_impl_options.newer_version_present);
   }
+  // Hide failed writes' sequences (N>1 gate fences) from this read. No-op
+  // unless a fence was ever installed; the SaveAndRestore above still
+  // restores the caller's callback on return.
+  std::optional<WalGateFenceReadCallback> fence_callback;
+  std::vector<std::pair<SequenceNumber, SequenceNumber>> fence_ranges;
+  if (WalGateFenceRangesForRead(&fence_ranges)) {
+    fence_callback.emplace(snapshot, get_impl_options.callback,
+                           std::move(fence_ranges));
+    get_impl_options.callback = &*fence_callback;
+  }
   TEST_SYNC_POINT("DBImpl::GetImpl:3");
   TEST_SYNC_POINT("DBImpl::GetImpl:4");
 
@@ -588,6 +598,14 @@ DEFINE_SYNC_AND_ASYNC(Status, DBImpl::MultiGetImpl)
   assert(start_key + num_keys <= sorted_keys->size());
   if (num_keys == 0) {
     CO_RETURN Status::OK();
+  }
+  // Hide failed writes' sequences (N>1 gate fences) from this read. No-op
+  // unless a fence was ever installed.
+  std::optional<WalGateFenceReadCallback> fence_callback;
+  std::vector<std::pair<SequenceNumber, SequenceNumber>> fence_ranges;
+  if (WalGateFenceRangesForRead(&fence_ranges)) {
+    fence_callback.emplace(snapshot, callback, std::move(fence_ranges));
+    callback = &*fence_callback;
   }
   auto* cfh = static_cast_with_check<ColumnFamilyHandleImpl>(
       (*sorted_keys)[start_key]->column_family);

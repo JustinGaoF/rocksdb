@@ -29,18 +29,23 @@ INSTANTIATE_TEST_CASE_P(CrashOrCleanClose, DBWalPartitionsOpenTest,
 
 // Indexed N=4 opens with wal_partitions and partition_wal_usage alone. Writes
 // spread over several column families, so several partitions' WALs are live,
-// with every fifth write synced. With the parameter set, the DB is closed and
-// every byte that was never synced is dropped (a crash): every write up to and
-// including the last acknowledged sync write comes back, and what comes back
-// is a prefix of the write order. A clean close and reopen recovers every
-// write. Neuter: restore the wal_partitions > 1 gate; Open returns
-// NotSupported.
+// with every fifth write synced, followed by an async tail after the last
+// sync write. With the parameter set, the DB is closed and every byte that
+// was never synced is dropped (a crash): every write up to and including the
+// last acknowledged sync write comes back, what comes back is a prefix of
+// the write order, and part of the async tail may be lost. A clean close and
+// reopen recovers every write. Neuter: restore the wal_partitions > 1 gate;
+// Open returns NotSupported.
 TEST_P(DBWalPartitionsOpenTest, IndexedOpensWithoutHookAndRecoversPrefix) {
   const bool crash = GetParam();
   constexpr uint32_t kPartitions = 4;
   constexpr int kColumnFamilies = 8;
   constexpr int kWrites = 200;
   constexpr int kSyncEvery = 5;
+  // Async writes after the last sync write, so the crash leg can observe a
+  // partial prefix instead of requiring full recovery.
+  constexpr int kAsyncTail = 7;
+  constexpr int kTotal = kWrites + kAsyncTail;
 
   auto env = std::make_unique<FaultInjectionTestEnv>(Env::Default());
   const std::string dbname = test::PerThreadDBPath(
@@ -79,6 +84,10 @@ TEST_P(DBWalPartitionsOpenTest, IndexedOpensWithoutHookAndRecoversPrefix) {
         last_synced = i;
       }
     }
+    for (int i = kWrites; i < kTotal; ++i) {
+      ASSERT_OK(db->Put(WriteOptions(), handles[i % kColumnFamilies], key(i),
+                        "value" + std::to_string(i)));
+    }
     // Several partitions hold records.
     std::vector<std::string> children;
     ASSERT_OK(env->GetChildren(dbname, &children));
@@ -107,7 +116,7 @@ TEST_P(DBWalPartitionsOpenTest, IndexedOpensWithoutHookAndRecoversPrefix) {
   std::unique_ptr<DB> db;
   ASSERT_OK(DB::Open(options, dbname, cf_descs, &handles, &db));
   int recovered = 0;
-  for (int i = 0; i < kWrites; ++i) {
+  for (int i = 0; i < kTotal; ++i) {
     std::string value;
     const Status s =
         db->Get(ReadOptions(), handles[i % kColumnFamilies], key(i), &value);
@@ -123,7 +132,7 @@ TEST_P(DBWalPartitionsOpenTest, IndexedOpensWithoutHookAndRecoversPrefix) {
   if (crash) {
     ASSERT_GE(recovered, last_synced + 1);
   } else {
-    ASSERT_EQ(kWrites, recovered);
+    ASSERT_EQ(kTotal, recovered);
   }
   for (ColumnFamilyHandle* handle : handles) {
     ASSERT_OK(db->DestroyColumnFamilyHandle(handle));

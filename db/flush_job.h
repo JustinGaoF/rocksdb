@@ -134,6 +134,15 @@ class FlushJob {
     drop_entries_at_or_above_ = sequence;
   }
 
+  // Leaves every point entry with a sequence in [`low`, `high`] out of the
+  // flush output. Closed N>1 gate fences (failed gate-sync groups) hold no
+  // acknowledged data, so every flush drops them; entries above the highest
+  // one are kept. May be called more than once; set before PickMemTable()
+  // with the DB mutex held.
+  void DropEntriesInRange(SequenceNumber low, SequenceNumber high) {
+    drop_entry_ranges_.emplace_back(low, high);
+  }
+
  private:
   friend class FlushJobTest_GetRateLimiterPriorityForWrite_Test;
 
@@ -254,6 +263,7 @@ class FlushJob {
   BlobFileCompletionCallback* blob_callback_;
   bool fast_sst_open_;
   SequenceNumber drop_entries_at_or_above_ = kMaxSequenceNumber;
+  std::vector<std::pair<SequenceNumber, SequenceNumber>> drop_entry_ranges_;
   // Write-path blob files that should be committed with this flush.
   std::vector<BlobFileAddition> external_blob_file_additions_;
   // Initial garbage for write-path blob files that were partially abandoned

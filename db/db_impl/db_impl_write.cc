@@ -1600,8 +1600,9 @@ Status DBImpl::WriteImpl(
           // before the error escapes, so the hole is declared rather than
           // looking like data that was written and lost. Keep the write
           // error: it is what the caller has to see.
-          const IOStatus cover_io_s =
-              CoverBurnedWALIndex(write_options, wal_context.writer, wal_index);
+          const IOStatus cover_io_s = CoverBurnedWALIndex(
+              write_options, wal_context.writer, wal_index,
+              wal_context.wal_partition, /*wal_mutex_held=*/false);
           cover_io_s.PermitUncheckedError();
         }
       }
@@ -1702,8 +1703,15 @@ Status DBImpl::WriteImpl(
       const bool gate_sync = write_options.sync;
       const Env::IOPriority gate_io_priority =
           write_group.leader->rate_limiter_priority;
+      // After this group's append completed: a coalesced sync covers it only
+      // if the sync started after this capture (see wal_gate_sync_started_).
+      uint64_t gate_sync_epoch = 0;
+      if (gate_sync) {
+        InstrumentedMutexLock l(&wal_gate_sync_mutex_);
+        gate_sync_epoch = wal_gate_sync_started_;
+      }
       write_group.completion_gate = [this, gate_low, gate_target, gate_sync,
-                                     gate_io_priority]() {
+                                     gate_io_priority, gate_sync_epoch]() {
         // D-G11 (c): a sync write fsyncs every partition here, after its
         // group published, so no write on any partition waits for it. An
         // async write never syncs; its gate waits only for every record at
@@ -1713,8 +1721,11 @@ Status DBImpl::WriteImpl(
         if (gate_sync) {
           const uint64_t sync_start = WalPartitionTimerStart();
           Status s = RunCoalescedGateSync(
-              gate_low, gate_target, &pre_sync_safe_point,
-              [&]() { return SyncWalsFromCompletionGate(gate_io_priority); });
+              gate_low, gate_target, &pre_sync_safe_point, gate_sync_epoch,
+              [&]() {
+                return SyncWalsFromCompletionGate(gate_io_priority, gate_low,
+                                                  gate_target);
+              });
           sync_micros += WalPartitionTimerElapsed(sync_start);
           if (!s.ok()) {
             return s;
@@ -2078,8 +2089,9 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
                              /*complete_durability=*/track_durability);
       if (!io_s.ok()) {
         // As in WriteImpl: declare the burned index before the error escapes.
-        const IOStatus cover_io_s =
-            CoverBurnedWALIndex(write_options, wal_context.writer, wal_index);
+        const IOStatus cover_io_s = CoverBurnedWALIndex(
+            write_options, wal_context.writer, wal_index,
+            wal_context.wal_partition, /*wal_mutex_held=*/false);
         cover_io_s.PermitUncheckedError();
       }
       w.status = io_s;
@@ -2548,7 +2560,9 @@ void DBImpl::WALIOStatusCheck(const IOStatus& io_status,
                               uint64_t failed_wal_number,
                               SequenceNumber failed_wal_sequence,
                               SequenceNumber failed_wal_sequence_start,
-                              size_t pinned_wal_partition) {
+                              size_t pinned_wal_partition,
+                              SequenceNumber gate_fence_low,
+                              SequenceNumber gate_fence_high) {
   // Is setting bg_error_ enough here?  This will at least stop
   // compaction and fail any further writes.
   // Above one partition every failure stops the DB (D-1), Busy and Incomplete
@@ -2561,11 +2575,13 @@ void DBImpl::WALIOStatusCheck(const IOStatus& io_status,
     mutex_.Lock();
     if (pinned_wal_partition != kNoPinnedWalRange) {
       // Under the same mutex_ hold as the error below, so recovery from an
-      // earlier error cannot release this range before the error is set.
+      // earlier error cannot release this range before the error is set. A
+      // count-0 group pins the empty [start, start - 1], exactly as
+      // registered, so recovery's release matches it.
       assert(NumWalPartitions() > 1);
-      failed_wal_ranges_.push_back(
-          {pinned_wal_partition, failed_wal_sequence_start,
-           std::max(failed_wal_sequence_start, failed_wal_sequence)});
+      failed_wal_ranges_.push_back({pinned_wal_partition,
+                                    failed_wal_sequence_start,
+                                    failed_wal_sequence});
     }
     // Maybe change the return status to void?
     if (io_status.IsIOError() && !io_status.IsIOFenced()) {
@@ -2601,9 +2617,28 @@ void DBImpl::WALIOStatusCheck(const IOStatus& io_status,
       // above the failed range with it.
       Status bg_error = error_handler_.GetBGError();
       assert(!bg_error.ok());
-      InstallWalGateFence(failed_wal_sequence_start,
+      InstallWalGateFence(failed_wal_sequence_start, kMaxSequenceNumber,
                           bg_error.ok() ? Status(io_status) : bg_error,
                           /*released_by_recovery=*/true);
+    }
+    if (gate_fence_low <= gate_fence_high) {
+      // A failed gate sync fences exactly its own range here, in the same
+      // mutex_ section that records the background error, so no recovery
+      // flush (manual or auto-resume) can pick a memtable between the error
+      // and the fence and persist the failed group. A zero-count group
+      // (low > high) installs no fence. The coalescer's FenceFailedGateSync
+      // afterwards is a fallback for paths that bypass this check (a
+      // previously seen error) and skips an already-installed range.
+      assert(NumWalPartitions() > 1);
+      Status bg_error = error_handler_.GetBGError();
+      assert(!bg_error.ok());
+      InstallWalGateFence(gate_fence_low, gate_fence_high,
+                          bg_error.ok() ? Status(io_status) : bg_error,
+                          /*released_by_recovery=*/true);
+      // The failed record may lie in any partition's WAL, so the gap names
+      // the lowest WAL number and stops every iterator.
+      wal_manager_.RecordIndeterminateWriteSequence(
+          /*wal_number=*/1, gate_fence_low, gate_fence_high);
     }
     mutex_.Unlock();
   } else {
@@ -2640,7 +2675,8 @@ void DBImpl::HandleMemTableInsertFailure(const Status& status,
   error_handler_.SetBGError(status, BackgroundErrorReason::kMemTable);
   if (NumWalPartitions() > 1) {
     Status bg_error = error_handler_.GetBGError();
-    InstallWalGateFence(first_sequence, bg_error.ok() ? status : bg_error,
+    InstallWalGateFence(first_sequence, kMaxSequenceNumber,
+                        bg_error.ok() ? status : bg_error,
                         /*released_by_recovery=*/false);
   }
   mutex_.Unlock();
@@ -2868,11 +2904,12 @@ IOStatus DBImpl::AllocateSequenceAndWALIndex(
   *wal_index = wal_index_enabled && write_wal ? next_wal_index_++ : 0;
   if (register_durability && write_wal) {
     // A WAL-only marker with count 0 is stamped with last_allocated + 1
-    // without consuming it; it shares its value with the next real write and
-    // both entries pin the minimum until both are durable.
+    // without consuming it; it registers the empty range [low, low - 1],
+    // which pins `low` but is durable only through `low - 1`, so the safe
+    // point never advances past a sequence nobody owns yet.
     const SequenceNumber low = *last_sequence_before + 1;
     const SequenceNumber high =
-        sequence_count == 0 ? low : *last_sequence_before + sequence_count;
+        sequence_count == 0 ? low - 1 : *last_sequence_before + sequence_count;
     assert(wal_partition < NumWalPartitions());
     wal_durability_tracker_->Register(wal_partition, low, high);
   }
@@ -2884,7 +2921,7 @@ IOStatus DBImpl::AllocateSequenceAndWALIndex(
       (write_wal || sequence_count > 0)) {
     const SequenceNumber low = *last_sequence_before + 1;
     const SequenceNumber high =
-        sequence_count == 0 ? low : *last_sequence_before + sequence_count;
+        sequence_count == 0 ? low - 1 : *last_sequence_before + sequence_count;
     applied_tracker_->Register(wal_partition, low, high);
   }
   return IOStatus::OK();
@@ -2899,8 +2936,10 @@ void DBImpl::PublishAppliedPrefix(size_t wal_partition,
     // Consumed no sequence and wrote no record: never registered.
     return;
   }
+  // A record that consumed no sequence registered the empty
+  // [first_sequence, first_sequence - 1]; complete exactly that.
   const SequenceNumber high =
-      first_sequence > last_sequence ? first_sequence : last_sequence;
+      first_sequence > last_sequence ? first_sequence - 1 : last_sequence;
   InstrumentedMutexLock l(&sequence_wal_index_mutex_);
   applied_tracker_->Complete(wal_partition, first_sequence, high);
   PublishAppliedFrontierLocked();
@@ -2908,9 +2947,11 @@ void DBImpl::PublishAppliedPrefix(size_t wal_partition,
 
 void DBImpl::PublishAppliedFrontierLocked() {
   sequence_wal_index_mutex_.AssertHeld();
-  // A record that consumes no sequence is tracked at the next unallocated
-  // one, which the idle safe point may then report; never publish past what
-  // was allocated.
+  // Count-0 entries complete only through low - 1, so the safe point is at
+  // or below the last allocated sequence by construction; the clamp stays
+  // as defense in depth (ingestion and recovery move LastSequence, and a
+  // future allocator change must not publish past what was allocated).
+  assert(applied_tracker_->SafePoint() <= versions_->LastAllocatedSequence());
   SequenceNumber frontier = std::min(applied_tracker_->SafePoint(),
                                      versions_->LastAllocatedSequence());
   // Nor into an open gate fence: no write there is ever acknowledged. A
@@ -2944,21 +2985,37 @@ void DBImpl::AssertLastSequenceCoversAllocated() {
 
 IOStatus DBImpl::CoverBurnedWALIndex(const WriteOptions& write_options,
                                      log::Writer* log_writer,
-                                     uint64_t wal_index) {
+                                     uint64_t wal_index, size_t wal_partition,
+                                     bool wal_mutex_held) {
   if (wal_index == 0) {
     // disableWAL writes and the sequence-only path never take an index.
     return IOStatus::OK();
   }
   assert(log::WALIndexEnabled(immutable_db_options_.partition_wal_usage));
   assert(log_writer != nullptr);
+  // The void is a WAL append like any other: run it under the partition's
+  // WAL mutex whenever WriteToWAL would take it, so it cannot race a FlushWAL
+  // (manual_wal_flush_) or another partition's gate sync flushing this
+  // partition's buffer.
+  const bool take_lock =
+      !wal_mutex_held && (NumWalPartitions() > 1 ||
+                          UNLIKELY(manual_wal_flush_ && !two_write_queues_));
+  if (take_lock) {
+    WalWriteMutex(wal_partition).Lock();
+  } else if (wal_mutex_held) {
+    WalWriteMutex(wal_partition).AssertHeld();
+  }
+  IOStatus io_s;
   if (wal_index <= log_writer->last_wal_index_recorded()) {
     // The record reached the file and only a later sync failed, so nothing
     // was burned. A void here would trail the reader's index order mark.
-    return IOStatus::OK();
+  } else {
+    io_s =
+        log_writer->AddWALIndexVoidRecord(write_options, wal_index, wal_index);
   }
-
-  IOStatus io_s =
-      log_writer->AddWALIndexVoidRecord(write_options, wal_index, wal_index);
+  if (take_lock) {
+    WalWriteMutex(wal_partition).Unlock();
+  }
   if (!io_s.ok()) {
     // No retry loop, no blocking, no swallowing. The index stays uncovered, so
     // nothing above it may be acknowledged.
@@ -3263,22 +3320,26 @@ void DBImpl::ClearWalDurabilityBGError() {
   }
   failed_wal_ranges_.clear();
   if (closed_fence) {
-    // A failed gate sync fences ranges that already applied, so closing its
-    // fence above may have freed the frontier without any range to release.
+    // Closing a fence above may have freed the frontier without any range
+    // to release (failed gate-sync fences, closed at install, never held
+    // it: only open-ended fences cap publication).
     InstrumentedMutexLock l(&sequence_wal_index_mutex_);
     PublishAppliedFrontierLocked();
   }
 }
 
-void DBImpl::InstallWalGateFence(SequenceNumber low, const Status& status,
+void DBImpl::InstallWalGateFence(SequenceNumber low, SequenceNumber high,
+                                 const Status& status,
                                  bool released_by_recovery) {
   mutex_.AssertHeld();
   assert(NumWalPartitions() > 1);
   assert(!status.ok());
+  assert(low <= high);
   InstrumentedMutexLock l(&sequence_wal_index_mutex_);
-  wal_gate_fences_.push_back(
-      {low, kMaxSequenceNumber, status, released_by_recovery});
-  wal_gate_fence_high_.store(kMaxSequenceNumber, std::memory_order_release);
+  wal_gate_fences_.push_back({low, high, status, released_by_recovery});
+  if (high > wal_gate_fence_high_.load(std::memory_order_relaxed)) {
+    wal_gate_fence_high_.store(high, std::memory_order_release);
+  }
   if (low < wal_gate_fence_low_.load(std::memory_order_relaxed)) {
     wal_gate_fence_low_.store(low, std::memory_order_release);
   }
@@ -3302,6 +3363,36 @@ SequenceNumber DBImpl::UnreleasedWalGateFenceLow() {
   }
   InstrumentedMutexLock l(&sequence_wal_index_mutex_);
   return OpenWalGateFenceLowLocked();
+}
+
+void DBImpl::ClosedWalGateFenceRanges(
+    std::vector<std::pair<SequenceNumber, SequenceNumber>>* ranges) {
+  mutex_.AssertHeld();
+  if (NumWalPartitions() == 1) {
+    return;
+  }
+  InstrumentedMutexLock l(&sequence_wal_index_mutex_);
+  for (const WalGateFence& fence : wal_gate_fences_) {
+    if (fence.high != kMaxSequenceNumber) {
+      ranges->emplace_back(fence.low, fence.high);
+    }
+  }
+}
+
+bool DBImpl::WalGateFenceRangesForRead(
+    std::vector<std::pair<SequenceNumber, SequenceNumber>>* ranges) {
+  // wal_gate_fence_high_ is nonzero once any fence is installed (every
+  // fence's high is at least its low, an allocated sequence), stored under
+  // sequence_wal_index_mutex_, so a nonzero observation plus the mutex
+  // below snapshots every fence installed before this read started.
+  if (wal_gate_fence_high_.load(std::memory_order_acquire) == 0) {
+    return false;
+  }
+  InstrumentedMutexLock l(&sequence_wal_index_mutex_);
+  for (const WalGateFence& fence : wal_gate_fences_) {
+    ranges->emplace_back(fence.low, fence.high);
+  }
+  return !ranges->empty();
 }
 
 SequenceNumber DBImpl::OpenWalGateFenceLowLocked() const {
@@ -3334,11 +3425,24 @@ Status DBImpl::RunCompletionGate(SequenceNumber low, SequenceNumber target,
     // Waiting on a tracked "synced" frontier instead would hang: async
     // predecessors never publish one, so nothing would advance it past them.
     // Manual flush buffers in user space, so flush there like the write path.
+    // Capture after the wait above: every predecessor's append completed
+    // before it returned, so only a sync that started after this capture
+    // covers them all.
     const uint64_t sync_start = WalPartitionTimerStart();
     SequenceNumber covered = 0;
-    s = RunCoalescedGateSync(low, target, &covered, [this]() {
-      return manual_wal_flush_ ? FlushWAL(true) : SyncWAL();
-    });
+    uint64_t post_wait_epoch = 0;
+    {
+      InstrumentedMutexLock l(&wal_gate_sync_mutex_);
+      post_wait_epoch = wal_gate_sync_started_;
+    }
+    s = RunCoalescedGateSync(
+        low, target, &covered, post_wait_epoch, [this, low, target]() {
+          // FlushWAL(WriteOptions(), true) is what
+          // FlushWAL(true) forwards to (same default
+          // rate-limiter priority).
+          return manual_wal_flush_ ? FlushWAL(WriteOptions(), true, low, target)
+                                   : SyncWALWithGateFence(low, target);
+        });
     sync_micros += WalPartitionTimerElapsed(sync_start);
     // No WALIOStatusCheck here: SyncWAL/FlushWAL already route an I/O
     // failure to it (which wakes other parked gates); the coalescer fences
@@ -3397,9 +3501,10 @@ IOStatus DBImpl::WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
                     /*wal_mutex_held=*/false);
   if (io_s.ok() && complete_durability) {
     // write() completed (not fsync): the range is durable at sync=false.
-    // A failed append stays pinned per the burned-index rule.
+    // A failed append stays pinned per the burned-index rule. A count-0
+    // record registered the empty [sequence, sequence - 1].
     const SequenceNumber high =
-        sequence_count == 0 ? sequence : sequence + sequence_count - 1;
+        sequence_count == 0 ? sequence - 1 : sequence + sequence_count - 1;
     InstrumentedMutexLock seq_lock(&sequence_wal_index_mutex_);
     wal_durability_tracker_->Complete(wal_context.wal_partition, sequence,
                                       high);
@@ -3435,9 +3540,13 @@ IOStatus DBImpl::WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
     //  - as long as other threads don't modify the deque, it's safe to read
     //    from std::deque from multiple threads concurrently.
     uint64_t fsynced_partitions = 0;
-    io_s = SyncEveryWalPartition(write_options,
-                                 &wal_context.sync_failed_wal_number,
-                                 &fsynced_partitions);
+    // N==1 only here: a poisoned writer stops the DB before any later group
+    // reaches this sync, so a previous error is not expected; report it
+    // through the normal path unchanged if one ever surfaces.
+    bool failed_with_previous_error = false;
+    io_s = SyncEveryWalPartition(
+        write_options, &wal_context.sync_failed_wal_number, &fsynced_partitions,
+        &failed_with_previous_error);
     // Fires after the leadership-time fsync above, before the directory
     // sync: tests override io_s here to fail exactly this sync, which then
     // follows the normal WAL error path (WALIOStatusCheck).
@@ -3484,7 +3593,8 @@ IOStatus DBImpl::WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
 
 IOStatus DBImpl::SyncEveryWalPartition(const WriteOptions& write_options,
                                        uint64_t* failed_wal_number,
-                                       uint64_t* fsynced_partitions) {
+                                       uint64_t* fsynced_partitions,
+                                       bool* failed_with_previous_error) {
   // Sync operation should work with locked WAL write mutexes, because:
   //   when DBOptions.manual_wal_flush_ is set,
   //   FlushWAL function will be invoked by another thread.
@@ -3516,7 +3626,8 @@ IOStatus DBImpl::SyncEveryWalPartition(const WriteOptions& write_options,
     if (take_partition_locks) {
       WalWriteMutex(p).Lock();
     }
-    io_s = SyncWalPartitionFiles(p, write_options, failed_wal_number);
+    io_s = SyncWalPartitionFiles(p, write_options, failed_wal_number,
+                                 failed_with_previous_error);
     if (take_partition_locks) {
       WalWriteMutex(p).Unlock();
     }
@@ -3533,13 +3644,21 @@ IOStatus DBImpl::SyncEveryWalPartition(const WriteOptions& write_options,
 
 Status DBImpl::RunCoalescedGateSync(SequenceNumber low, SequenceNumber target,
                                     SequenceNumber* covered,
+                                    uint64_t append_sync_epoch,
                                     const std::function<Status()>& sync) {
   assert(NumWalPartitions() > 1);
+  uint64_t sync_epoch = 0;
+  uint64_t wait_epoch = 0;
+  Status shared_error;
+  bool share_failure = false;
   {
     InstrumentedMutexLock l(&wal_gate_sync_mutex_);
     while (true) {
-      if (wal_gate_synced_upto_ >= target) {
-        // A sync that completed after `target` was written covers it.
+      if (wal_gate_synced_upto_ >= target &&
+          wal_gate_synced_epoch_ > append_sync_epoch) {
+        // A sync that started after this write's append (first round) or
+        // durability wait (second round) and completed covers it: its fsync
+        // ran after every record at or below `target` was written.
         *covered = wal_gate_synced_upto_;
         return Status::OK();
       }
@@ -3549,25 +3668,51 @@ Status DBImpl::RunCoalescedGateSync(SequenceNumber low, SequenceNumber target,
       // Group commit: the sync that starts after this one finishes covers
       // every record written meanwhile, so the writes that queue here share
       // it instead of each fsyncing every partition in turn.
+      wait_epoch = wal_gate_sync_started_;
       TEST_SYNC_POINT("DBImpl::RunCoalescedGateSync:BeforeWait");
       wal_gate_sync_cv_.Wait();
+      if (wal_gate_sync_failed_epoch_ == wait_epoch) {
+        // The sync this waiter queued for failed: share its failure (and
+        // fence this group's own range, like the runner, below) instead of
+        // retrying.
+        share_failure = true;
+        shared_error = wal_gate_sync_last_error_;
+        break;
+      }
     }
-    wal_gate_sync_running_ = true;
+    if (!share_failure) {
+      wal_gate_sync_running_ = true;
+      sync_epoch = ++wal_gate_sync_started_;
+    }
+  }
+  if (share_failure) {
+    assert(!shared_error.ok());
+    FenceFailedGateSync(low, target);
+    *covered = 0;
+    return shared_error;
   }
   // Read before the sync claims anything: every record at or below it is
   // written, so the sync covers it.
   const SequenceNumber covers = wal_durability_tracker_->SafePoint();
   const Status s = sync();
   if (!s.ok()) {
-    // Before any waiter can start its own sync: one that succeeds must still
-    // find this fence at its gate when it lies above this group.
-    FenceFailedGateSync(low);
+    // Before any waiter can start its own sync: one whose target lies in
+    // this group's range must still find this fence at its gate. The fence
+    // itself is usually already installed, atomically with the error inside
+    // the sync above; this call is a fallback for paths that bypass that
+    // check.
+    TEST_SYNC_POINT("DBImpl::RunCoalescedGateSync:BeforeFenceFailedGateSync");
+    FenceFailedGateSync(low, target);
   }
   {
     InstrumentedMutexLock l(&wal_gate_sync_mutex_);
     wal_gate_sync_running_ = false;
     if (s.ok()) {
       wal_gate_synced_upto_ = std::max(wal_gate_synced_upto_, covers);
+      wal_gate_synced_epoch_ = sync_epoch;
+    } else {
+      wal_gate_sync_failed_epoch_ = sync_epoch;
+      wal_gate_sync_last_error_ = s;
     }
     wal_gate_sync_cv_.SignalAll();
   }
@@ -3575,23 +3720,44 @@ Status DBImpl::RunCoalescedGateSync(SequenceNumber low, SequenceNumber target,
   return s;
 }
 
-void DBImpl::FenceFailedGateSync(SequenceNumber low) {
+void DBImpl::FenceFailedGateSync(SequenceNumber low, SequenceNumber high) {
   assert(NumWalPartitions() > 1);
   InstrumentedMutexLock l(&mutex_);
   const Status bg_error = error_handler_.GetBGError();
   if (bg_error.ok()) {
     // Recovery already ran (its flush kept the group), or the failure never
-    // became the background error; an open fence would then never close.
+    // became the background error; a fence would then never be released.
     return;
   }
-  // As for a failed append: the group, and everything above it, never becomes
-  // visible (PublishAppliedFrontierLocked), recovery's flush drops it, and
-  // every gate in the fence returns the background error.
-  InstallWalGateFence(low, bg_error, /*released_by_recovery=*/true);
+  if (low > high) {
+    // A zero-count group owns no sequence: the write still fails with the
+    // error, but there is no range to fence, hide, or drop.
+    return;
+  }
+  {
+    // WALIOStatusCheck usually installs this range atomically with the error
+    // above; this call is then a fallback for paths that bypass that check
+    // (a previously seen error) and must not fence twice.
+    InstrumentedMutexLock seq_lock(&sequence_wal_index_mutex_);
+    for (const WalGateFence& fence : wal_gate_fences_) {
+      if (fence.low == low && fence.high == high) {
+        return;
+      }
+    }
+  }
+  // Unlike a failed append, only the failed sync group's own range is fenced:
+  // the group fails at its gate, reads hide it, recovery's flush drops it,
+  // and the WAL iterator stops before its record, while writes outside keep
+  // their outcomes.
+  InstallWalGateFence(low, high, bg_error, /*released_by_recovery=*/true);
+  // The failed record may lie in any partition's WAL, so the gap names the
+  // lowest WAL number and stops every iterator.
+  wal_manager_.RecordIndeterminateWriteSequence(/*wal_number=*/1, low, high);
 }
 
-Status DBImpl::SyncWalsFromCompletionGate(
-    Env::IOPriority rate_limiter_priority) {
+Status DBImpl::SyncWalsFromCompletionGate(Env::IOPriority rate_limiter_priority,
+                                          SequenceNumber gate_low,
+                                          SequenceNumber gate_target) {
   assert(NumWalPartitions() > 1);
   bool need_wal_dir_sync = false;
   uint64_t up_to = 0;
@@ -3625,11 +3791,13 @@ Status DBImpl::SyncWalsFromCompletionGate(
   write_options.rate_limiter_priority = rate_limiter_priority;
   uint64_t failed_wal_number = 0;
   uint64_t fsynced_partitions = 0;
+  bool failed_with_previous_error = false;
   IOStatus io_s;
   {
     StopWatch sw(immutable_db_options_.clock, stats_, WAL_FILE_SYNC_MICROS);
-    io_s = SyncEveryWalPartition(write_options, &failed_wal_number,
-                                 &fsynced_partitions);
+    io_s =
+        SyncEveryWalPartition(write_options, &failed_wal_number,
+                              &fsynced_partitions, &failed_with_previous_error);
     // Tests override io_s here to fail exactly this sync, which then
     // follows the WAL error path below.
     TEST_SYNC_POINT_CALLBACK("DBImpl::SyncWalsFromCompletionGate:AfterGateSync",
@@ -3655,9 +3823,22 @@ Status DBImpl::SyncWalsFromCompletionGate(
   if (!io_s.ok()) {
     // The group is already inserted, so, as for a failed SyncWAL(), only the
     // WAL is named here: the failure stops the DB (D-1) and the write reports
-    // it. Nothing is pinned, since the append completed; the coalescer then
-    // fences the group's range (FenceFailedGateSync).
-    WALIOStatusCheck(io_s, failed_wal_number);
+    // it. Nothing is pinned, since the append completed; the check below
+    // fences the group's range in the same critical section as the error.
+    if (failed_with_previous_error) {
+      // Another partition's writer already carries a failure that its own
+      // operation classified and stored (SyncWalImpl applies the same rule):
+      // return the stored background error without re-classifying the
+      // synthetic status, which has lost the original scope and severity.
+      const Status stored_error = error_handler_.GetBGError();
+      if (!stored_error.ok()) {
+        return stored_error;
+      }
+    } else {
+      WALIOStatusCheck(io_s, failed_wal_number, /*failed_wal_sequence=*/0,
+                       /*failed_wal_sequence_start=*/0, kNoPinnedWalRange,
+                       gate_low, gate_target);
+    }
     return io_s;
   }
   default_cf_internal_stats_->AddDBStats(InternalStats::kIntStatsWalFileSynced,
@@ -3727,7 +3908,8 @@ IOStatus DBImpl::ConcurrentWriteGroupToWAL(
     InstrumentedMutexLock seq_lock(&sequence_wal_index_mutex_);
     *last_sequence = versions_->FetchAddLastAllocatedSequence(seq_inc);
     const SequenceNumber low = *last_sequence + 1;
-    const SequenceNumber high = seq_inc == 0 ? low : *last_sequence + seq_inc;
+    const SequenceNumber high =
+        seq_inc == 0 ? low - 1 : *last_sequence + seq_inc;
     wal_durability_tracker_->Register(wal_partition, low, high);
   } else {
     *last_sequence = versions_->FetchAddLastAllocatedSequence(seq_inc);
@@ -3751,8 +3933,9 @@ IOStatus DBImpl::ConcurrentWriteGroupToWAL(
     // later cannot silently reintroduce an uncovered hole. Still under the
     // selected partition's WalWriteMutex, which is where WAL appends on this
     // path belong.
-    const IOStatus cover_io_s =
-        CoverBurnedWALIndex(write_options, wal_context.writer, wal_index);
+    const IOStatus cover_io_s = CoverBurnedWALIndex(
+        write_options, wal_context.writer, wal_index, wal_context.wal_partition,
+        /*wal_mutex_held=*/true);
     cover_io_s.PermitUncheckedError();
   } else if (track_durability) {
     // write() completed (not fsync). Still under the partition's WAL write
@@ -3760,7 +3943,7 @@ IOStatus DBImpl::ConcurrentWriteGroupToWAL(
     // registration above: only complete what was registered, so at N==1
     // this completion (and its mutex acquisition) goes away with it.
     const SequenceNumber high =
-        seq_inc == 0 ? sequence : sequence + seq_inc - 1;
+        seq_inc == 0 ? sequence - 1 : sequence + seq_inc - 1;
     InstrumentedMutexLock seq_lock(&sequence_wal_index_mutex_);
     wal_durability_tracker_->Complete(wal_partition, sequence, high);
     SignalWalDurabilityWaiters();
