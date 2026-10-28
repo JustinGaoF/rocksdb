@@ -419,11 +419,6 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct ImmutableDBOptions, wal_partitions),
           OptionType::kUInt32T, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
-        {"experimental_allow_wal_partitions_for_testing",
-         {offsetof(struct ImmutableDBOptions,
-                   experimental_allow_wal_partitions_for_testing),
-          OptionType::kBoolean, OptionVerificationType::kNormal,
-          OptionTypeFlags::kDontSerialize | OptionTypeFlags::kCompareNever}},
         {"write_thread_max_yield_usec",
          {offsetof(struct ImmutableDBOptions, write_thread_max_yield_usec),
           OptionType::kUInt64T, OptionVerificationType::kNormal,
@@ -845,8 +840,6 @@ ImmutableDBOptions::ImmutableDBOptions(const DBOptions& options)
       max_write_batch_group_size_bytes(
           options.max_write_batch_group_size_bytes),
       wal_partitions(options.wal_partitions),
-      experimental_allow_wal_partitions_for_testing(
-          options.experimental_allow_wal_partitions_for_testing),
       allow_mmap_reads(options.allow_mmap_reads),
       allow_mmap_writes(options.allow_mmap_writes),
       use_direct_reads(options.use_direct_reads),
@@ -1011,9 +1004,6 @@ void ImmutableDBOptions::Dump(Logger* log) const {
   ROCKS_LOG_HEADER(log,
                    "                         Options.wal_partitions: %" PRIu32,
                    wal_partitions);
-  ROCKS_LOG_HEADER(log,
-                   "Options.experimental_allow_wal_partitions_for_testing: %d",
-                   experimental_allow_wal_partitions_for_testing);
   ROCKS_LOG_HEADER(log, "                    Options.is_fd_close_on_exec: %d",
                    is_fd_close_on_exec);
   ROCKS_LOG_HEADER(log, "                  Options.advise_random_on_open: %d",

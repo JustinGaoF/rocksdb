@@ -239,10 +239,6 @@ TEST_F(LdbCmdTest, DumpWalOnPartitionedWals) {
   EXPECT_EQ(std::string::npos, output.find("WAL partition"));
   ASSERT_OK(DestroyDB(dbname, opts));
 
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
   constexpr size_t kPartitions = 8;
   opts.wal_partitions = kPartitions;
   std::vector<uint64_t> current_wals(kPartitions);
@@ -276,8 +272,6 @@ TEST_F(LdbCmdTest, DumpWalOnPartitionedWals) {
       ASSERT_OK(db->DestroyColumnFamilyHandle(handle.release()));
     }
   }
-  SyncPoint::GetInstance()->DisableProcessing();
-  SyncPoint::GetInstance()->ClearAllCallBacks();
 
   ASSERT_EQ(0, dump(LogFileName(dbname, current_wals[3]), nullptr, &output));
   EXPECT_NE(std::string::npos, output.find("WAL partition: 3")) << output;
@@ -392,12 +386,15 @@ TEST_P(LdbCmdWalPartitionsTest, DumpWalAtWalPartitions) {
               output.find(LogFileName("", current_wals[0]).substr(1)))
         << output;
   } else {
-    // ldb opens the DB with its OPTIONS file, which does not keep the testing
-    // opt-in, so the open is refused like any production open.
-    EXPECT_NE(0, live_files) << output;
-    EXPECT_NE(std::string::npos,
-              output.find("wal_partitions > 1 is not supported yet"))
-        << output;
+    // The flip (Q1-Q5): indexed N>1 opens in production, so ldb opens the
+    // DB from its OPTIONS file and lists every partition's WAL.
+    ASSERT_EQ(0, live_files) << output;
+    for (uint32_t p = 0; p < num_partitions; ++p) {
+      SCOPED_TRACE("partition=" + std::to_string(p));
+      EXPECT_NE(std::string::npos,
+                output.find(LogFileName("", current_wals[p]).substr(1)))
+          << output;
+    }
   }
   ASSERT_OK(DestroyDB(dbname, opts));
 }

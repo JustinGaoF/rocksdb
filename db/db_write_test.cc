@@ -2097,10 +2097,9 @@ TEST_F(DBWriteTestUnparameterized, WalPartitionHistogramsSilentAtN1) {
   }
 }
 
-TEST_F(DBWriteTestUnparameterized, WalPartitionsTestingOptIn) {
-  // Uses no sync point, so it also runs in release builds: there the
-  // testing-only opt-in is the only way to open wal_partitions > 1, and it
-  // admits indexed WALs only.
+TEST_F(DBWriteTestUnparameterized, IndexedWalPartitionsOpenWithoutHook) {
+  // Q1 (G-01): indexed wal_partitions > 1 opens with no sync point and no
+  // opt-in. Uses no sync point, so it also runs in release builds.
   constexpr uint32_t kPartitions = 4;
   Options options = CurrentOptions();
   options.wal_partitions = kPartitions;
@@ -2109,20 +2108,8 @@ TEST_F(DBWriteTestUnparameterized, WalPartitionsTestingOptIn) {
   options.avoid_flush_during_shutdown = true;
   options.avoid_flush_during_recovery = true;
   DestroyDB(dbname_, options).PermitUncheckedError();
-  Status s = TryReopen(options);
-  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
-  ASSERT_NE(nullptr, std::strstr(s.getState(),
-                                 "wal_partitions > 1 is not supported yet"));
-
-  options.experimental_allow_wal_partitions_for_testing = true;
-  options.partition_wal_usage = PartitionWALUsage::kNone;
-  s = TryReopen(options);
-  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
-  ASSERT_NE(nullptr, std::strstr(s.getState(),
-                                 "wal_partitions > 1 is not supported yet"));
-
-  options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
   ASSERT_OK(TryReopen(options));
+  ASSERT_EQ(kPartitions, dbfull()->TEST_NumWalPartitions());
   std::vector<std::string> children;
   ASSERT_OK(env_->GetChildren(dbname_, &children));
   size_t num_wals = 0;
@@ -2142,8 +2129,7 @@ TEST_F(DBWriteTestUnparameterized, WalPartitionsTestingOptIn) {
   ASSERT_EQ("v1", Get("k1"));
   ASSERT_EQ("v2", Get("k2"));
 
-  // The OPTIONS file keeps wal_partitions but not the opt-in, so reopening
-  // from it is rejected.
+  // The OPTIONS file keeps wal_partitions, and reopening from it opens.
   DBOptions loaded_db_options;
   std::vector<ColumnFamilyDescriptor> loaded_cfs;
   ConfigOptions config_options;
@@ -2151,34 +2137,25 @@ TEST_F(DBWriteTestUnparameterized, WalPartitionsTestingOptIn) {
   ASSERT_OK(LoadLatestOptions(config_options, dbname_, &loaded_db_options,
                               &loaded_cfs));
   ASSERT_EQ(kPartitions, loaded_db_options.wal_partitions);
-  ASSERT_FALSE(loaded_db_options.experimental_allow_wal_partitions_for_testing);
   Close();
-  s = TryReopen(Options(loaded_db_options, loaded_cfs[0].options));
-  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+  ASSERT_OK(TryReopen(Options(loaded_db_options, loaded_cfs[0].options)));
+  ASSERT_EQ("v1", Get("k1"));
+  ASSERT_EQ("v2", Get("k2"));
 }
 
-// Unindexed WALs cannot be merged at recovery, so kNone with N > 1 is rejected
-// with and without the test hook, naming both options.
+// Unindexed WALs cannot be merged at recovery, so kNone with N > 1 is rejected,
+// naming both options.
 TEST_F(DBWriteTestUnparameterized, UnindexedWalPartitionsAlwaysRejected) {
-  for (const bool hook : {false, true}) {
-    if (hook) {
-      SyncPoint::GetInstance()->SetCallBack(
-          "DBImpl::ValidateOptions:AllowWalPartitions",
-          [](void* arg) { *static_cast<bool*>(arg) = true; });
-      SyncPoint::GetInstance()->EnableProcessing();
-    }
-    for (const uint32_t partitions : {2U, 4U}) {
-      SCOPED_TRACE("hook=" + std::to_string(hook) +
-                   " partitions=" + std::to_string(partitions));
-      Options options = CurrentOptions();
-      options.wal_partitions = partitions;
-      options.partition_wal_usage = PartitionWALUsage::kNone;
-      Destroy(options);
-      const Status s = TryReopen(options);
-      ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
-      EXPECT_NE(nullptr, std::strstr(s.getState(), "wal_partitions"));
-      EXPECT_NE(nullptr, std::strstr(s.getState(), "partition_wal_usage"));
-    }
+  for (const uint32_t partitions : {2U, 4U}) {
+    SCOPED_TRACE("partitions=" + std::to_string(partitions));
+    Options options = CurrentOptions();
+    options.wal_partitions = partitions;
+    options.partition_wal_usage = PartitionWALUsage::kNone;
+    Destroy(options);
+    const Status s = TryReopen(options);
+    ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+    EXPECT_NE(nullptr, std::strstr(s.getState(), "wal_partitions"));
+    EXPECT_NE(nullptr, std::strstr(s.getState(), "partition_wal_usage"));
   }
   Options options = CurrentOptions();
   options.wal_partitions = 4;
@@ -2192,8 +2169,8 @@ TEST_F(DBWriteTestUnparameterized, UnindexedWalPartitionsAlwaysRejected) {
   ASSERT_EQ("value", Get("key"));
 }
 
-// wal_partitions above kMaxWalPartitions is rejected with and without the
-// test hook; kMaxWalPartitions itself opens with the hook.
+// wal_partitions above kMaxWalPartitions is rejected; kMaxWalPartitions
+// itself opens.
 TEST_F(DBWriteTestUnparameterized, WalPartitionsUpperBound) {
   Options options = CurrentOptions();
   options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
@@ -2201,21 +2178,12 @@ TEST_F(DBWriteTestUnparameterized, WalPartitionsUpperBound) {
   options.wal_partitions = DBImpl::kMaxWalPartitions + 1;
   options.track_and_verify_wals_in_manifest = true;
   Destroy(options);
-  for (const bool hook : {false, true}) {
-    SCOPED_TRACE("hook=" + std::to_string(hook));
-    if (hook) {
-      SyncPoint::GetInstance()->SetCallBack(
-          "DBImpl::ValidateOptions:AllowWalPartitions",
-          [](void* arg) { *static_cast<bool*>(arg) = true; });
-      SyncPoint::GetInstance()->EnableProcessing();
-    }
-    const Status s = TryReopen(options);
-    ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
-    EXPECT_NE(nullptr, std::strstr(s.getState(), "wal_partitions"));
-    EXPECT_NE(nullptr,
-              std::strstr(s.getState(),
-                          std::to_string(DBImpl::kMaxWalPartitions).c_str()));
-  }
+  const Status s = TryReopen(options);
+  ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+  EXPECT_NE(nullptr, std::strstr(s.getState(), "wal_partitions"));
+  EXPECT_NE(nullptr,
+            std::strstr(s.getState(),
+                        std::to_string(DBImpl::kMaxWalPartitions).c_str()));
   options.wal_partitions = DBImpl::kMaxWalPartitions;
   ASSERT_OK(TryReopen(options));
   ASSERT_EQ(DBImpl::kMaxWalPartitions, dbfull()->TEST_NumWalPartitions());
@@ -2223,15 +2191,11 @@ TEST_F(DBWriteTestUnparameterized, WalPartitionsUpperBound) {
   ASSERT_EQ("value", Get("key"));
 }
 
-// Every rejection of wal_partitions > 1, with the test hook on: each names
+// Every rejection of wal_partitions > 1, with no test hook: each names
 // wal_partitions and its conflicting option, and the two M1.5 cells (kNone,
 // and two_write_queues, which rejects indexing) also name partition_wal_usage.
 // The runtime rejections follow on a DB that opens.
 TEST_F(DBWriteTestUnparameterized, WalPartitionsRejectionsNameTheirOptions) {
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
   struct Case {
     const char* name;
     std::function<void(Options*)> tweak;
@@ -2374,9 +2338,8 @@ class DBWritePartitionTest : public DBTestBase,
       : DBTestBase("db_write_partition_test", /*env_do_fsync=*/false) {}
 
   void OpenWithPartitions(size_t num_partitions, Options options) {
-    SyncPoint::GetInstance()->SetCallBack(
-        "DBImpl::ValidateOptions:AllowWalPartitions",
-        [](void* arg) { *static_cast<bool*>(arg) = true; });
+    // Processing stays enabled for the sync points the tests set below; the
+    // open itself needs none.
     SyncPoint::GetInstance()->EnableProcessing();
 
     // Column family ids are assigned in creation order, so cf_id is also the
@@ -2549,9 +2512,8 @@ class DBWritePartitionTest : public DBTestBase,
   // Reopens the column families OpenWithPartitions created, with
   // `num_partitions` WAL partitions, and recomputes cf_for_partition_ for it.
   void ReopenWithPartitions(size_t num_partitions, Options options) {
-    SyncPoint::GetInstance()->SetCallBack(
-        "DBImpl::ValidateOptions:AllowWalPartitions",
-        [](void* arg) { *static_cast<bool*>(arg) = true; });
+    // Processing stays enabled for the sync points the tests set; the open
+    // itself needs none.
     SyncPoint::GetInstance()->EnableProcessing();
     // Listed in id order, which is also handle order.
     std::vector<std::string> cf_names;
@@ -2817,6 +2779,83 @@ class IgnoreFoundRecords : public WalFilter {
   int records_found_ = 0;
 };
 
+// Q1 (G-01): indexed N=4 opens with no sync point and no opt-in, and a
+// crash dropping unsynced data recovers every sync-acknowledged write plus
+// everything below it, as a prefix. The same writes with a clean close
+// recover everything. Neuter: restore the old gate; the opens fail with
+// NotSupported.
+TEST_P(DBWritePartitionTest, IndexedN4CrashRecoversSyncedPrefixWithoutHook) {
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS("two_write_queues rejects N>1");
+    return;
+  }
+  constexpr size_t kPartitions = 4;
+  constexpr int kKeys = 40;
+  std::unique_ptr<FaultInjectionTestEnv> fault_env(
+      new FaultInjectionTestEnv(env_));
+  // Close before `fault_env` goes out of scope on every exit path, including
+  // a fatal assertion's early return.
+  Defer close_before_env([this] { Close(); });
+  Options options = IndexedWalOptions(CurrentOptions());
+  options.env = fault_env.get();
+  options.paranoid_checks = true;
+  OpenWithPartitions(kPartitions, options);
+  ASSERT_EQ(kPartitions, dbfull()->TEST_NumWalPartitions());
+
+  // Mixed sync writes round-robin over every partition; every fourth write
+  // is synced, except the last four, which stay async above the last sync.
+  WriteOptions sync_wo;
+  sync_wo.sync = true;
+  auto write_all = [&](int last_key) {
+    int last_synced = -1;
+    for (int i = 0; i <= last_key; ++i) {
+      const int cf = cf_for_partition_[i % kPartitions];
+      const std::string key = "q1_" + std::to_string(i);
+      if (i % 4 == 3 && i + 4 <= last_key) {
+        EXPECT_OK(Put(cf, key, "v", sync_wo));
+        last_synced = i;
+      } else {
+        EXPECT_OK(Put(cf, key, "v"));
+      }
+    }
+    return last_synced;
+  };
+  const int last_synced = write_all(kKeys - 1);
+  ASSERT_EQ(kKeys - 5, last_synced);
+
+  // The crash: unsynced file data is dropped, then the DB reopens.
+  Close();
+  ASSERT_OK(fault_env->DropUnsyncedFileData());
+  ReopenWithPartitions(kPartitions, options);
+
+  // Every sync-acknowledged write and everything below it survived, and the
+  // recovered set is a prefix of the write order.
+  bool missing_seen = false;
+  for (int i = 0; i < kKeys; ++i) {
+    const int cf = cf_for_partition_[i % kPartitions];
+    const std::string key = "q1_" + std::to_string(i);
+    const std::string value = Get(cf, key);
+    if (i <= last_synced) {
+      ASSERT_EQ("v", value) << key;
+    } else if (value == "v") {
+      ASSERT_FALSE(missing_seen) << key;
+    } else {
+      missing_seen = true;
+    }
+  }
+
+  // The same writes with a clean close recover everything.
+  DestroyAndReopen(options);
+  OpenWithPartitions(kPartitions, options);
+  write_all(kKeys - 1);
+  Close();
+  ReopenWithPartitions(kPartitions, options);
+  for (int i = 0; i < kKeys; ++i) {
+    const int cf = cf_for_partition_[i % kPartitions];
+    ASSERT_EQ("v", Get(cf, "q1_" + std::to_string(i)));
+  }
+}
+
 TEST_P(DBWritePartitionTest, MemtableDecisionEnforcedAtOpen) {
   if (GetParam()) {
     ROCKSDB_GTEST_BYPASS(
@@ -2824,10 +2863,6 @@ TEST_P(DBWritePartitionTest, MemtableDecisionEnforcedAtOpen) {
         "rejects");
     return;
   }
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
   Options options = CurrentOptions();
   options.wal_partitions = 4;
   options.track_and_verify_wals_in_manifest = true;
@@ -3146,10 +3181,6 @@ TEST_P(DBWritePartitionTest, ConcurrentUnsafeConfigsRejectedAtOpen) {
   // allow_concurrent_memtable_write on); the merge-counting and non-SkipList
   // rejections are new. Reverting either new guard opens successfully and
   // fails its case below; the last case is the allowed-config control.
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
 
   auto try_open =
       [](const std::string& name,
@@ -3267,10 +3298,6 @@ TEST_F(DBWriteTestUnparameterized, RejectsSeqPerBatchTwoQueues) {
   // (WriteUnprepared shares seq_per_batch=true, so the same gate covers it.)
   // Two queues are rejected at N > 1 with or without seq_per_batch, ahead of
   // the seq_per_batch check, since they reject the WAL indexing N > 1 needs.
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
 
   auto try_open = [](const std::string& name, bool seq_per_batch,
                      bool two_write_queues) {
@@ -3476,12 +3503,12 @@ TEST_P(DBWritePartitionTest, CompletionWaitsForPriorPartitionAppend) {
 }
 
 TEST_P(DBWritePartitionTest, SyncWriteSyncsAgainOnlyAfterWait) {
-  // M2.6: a sync write's leadership-time fsync covers only what was written
+  // M2.6: a sync write's gate-time first fsync covers only what was written
   // before it. When predecessors land after it, the gate syncs again once the
   // whole prefix is written; when nothing was outstanding, the second sync is
-  // skipped. SyncWAL runs only on the post-wait path (leadership syncs inline
-  // on the standard path, through SyncWAL on the two-queues path), so its
-  // count observes the mechanism directly.
+  // skipped. SyncWAL runs only on the post-wait path (the gate's first sync
+  // runs inline on the standard path, through SyncWAL on the two-queues
+  // path), so its count observes the mechanism directly.
   if (GetParam()) {
     ROCKSDB_GTEST_BYPASS(
         "N > 1 needs indexed WALs, which two_write_queues "
@@ -3500,10 +3527,10 @@ TEST_P(DBWritePartitionTest, SyncWriteSyncsAgainOnlyAfterWait) {
                                         [&](void*) { ++sync_wal_count; });
 
   // Phase 1: uncontended sync writes never wait, so no post-wait sync runs.
-  // Standard path: leadership syncs inline, so zero SyncWAL calls. Two-queues
-  // path: exactly one SyncWAL per put (leadership only); any post-wait sync
-  // would show up as extra calls, which also validates the snapshot runs
-  // after the append.
+  // Standard path: the gate's first sync runs inline, so zero SyncWAL calls.
+  // Two-queues path: exactly one SyncWAL per put (first sync only); any
+  // post-wait sync would show up as extra calls, which also validates the
+  // snapshot runs after the append.
   WriteOptions sync_wo;
   sync_wo.sync = true;
   for (int i = 0; i < 3; ++i) {
@@ -3557,10 +3584,10 @@ TEST_P(DBWritePartitionTest, SyncWriteSyncsAgainOnlyAfterWait) {
                                             cv.notify_all();
                                           }
                                         });
-  // B's leadership sync starts after its pre-sync snapshot; releasing A
+  // B's gate sync starts after its pre-sync snapshot; releasing A
   // earlier could let A complete before that snapshot, which then covers A.
   SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::WriteGroupToWAL:TakesPartitionSyncMutex", [&](void*) {
+      "DBImpl::SyncEveryWalPartition:TakesPartitionSyncMutex", [&](void*) {
         std::lock_guard<std::mutex> lock(mu);
         if (!release_a) {
           b_took_snapshot = true;
@@ -3595,7 +3622,7 @@ TEST_P(DBWritePartitionTest, SyncWriteSyncsAgainOnlyAfterWait) {
   SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:log_entry");
   SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:AfterAddRecord");
   SyncPoint::GetInstance()->ClearCallBack(
-      "DBImpl::WriteGroupToWAL:TakesPartitionSyncMutex");
+      "DBImpl::SyncEveryWalPartition:TakesPartitionSyncMutex");
   SyncPoint::GetInstance()->ClearCallBack("DBImpl::SyncWAL:Begin");
 
   ASSERT_OK(b_status);
@@ -3854,54 +3881,65 @@ TEST_P(DBWritePartitionTest, LeadershipSyncRecordsWalsBelowClaimHorizon) {
   }
 }
 
-TEST_P(DBWritePartitionTest, LeadershipSyncExcludesCoupledRotation) {
-  // The premise that makes the leadership claim record and claim-time
-  // horizon defence in depth: no WAL is installed between a leadership
-  // sync's claim and its completion. The sync write is held in its
-  // leadership fsync by slow WAL syncs, and a manual flush (a coupled
-  // rotation of every partition) is started inside that window. The new WALs
-  // must be created only after the sync write's completion (its completion
-  // gate is installed after MarkLogsSynced, before its group exits).
+TEST_P(DBWritePartitionTest, GateSyncToleratesCoupledRotation) {
+  // D-G11 (c) plus Q8: the sync write's claim and fsync run in its
+  // completion gate, after publication, and its memtable insert is deferred
+  // there too. A coupled rotation (seal) issued inside the gate-sync window
+  // cannot land between the group's append and its deferred insert: the
+  // seal waits for the insert, then rotates. The sync write is parked in
+  // its gate fsync, a manual flush (a coupled rotation of every partition)
+  // is started inside that window, the test observes the seal parked in
+  // the wait, and only then releases the gate. The rotation provably
+  // waited (its WAL creation lands after the sync finished), and the sync
+  // still completes correctly: the write is acknowledged, every live WAL
+  // is recorded, and no mark is left behind.
   if (GetParam()) {
     ROCKSDB_GTEST_BYPASS("single-queue path only");
     return;
   }
   constexpr size_t kPartitions = 4;
-  auto latency_fs = std::make_shared<LatencyInjectionFileSystem>(
-      FileSystem::Default(), LatencyInjectionFileSystem::Latency(),
-      /*seed=*/0);
-  std::unique_ptr<Env> latency_env(NewCompositeEnv(latency_fs));
-  Defer close_before_env([this] { Close(); });
-  Options options = CurrentOptions();
-  options.env = latency_env.get();
-  options.avoid_flush_during_shutdown = true;
-  OpenWithPartitions(kPartitions, options);
+  OpenWithPartitions(kPartitions, CurrentOptions());
   ASSERT_OK(Put(cf_for_partition_[1], "pending", "v"));
-  LatencyInjectionFileSystem::Latency slow_sync;
-  slow_sync.sync_micros = 50000;
-  latency_fs->SetDefaultLatency(slow_sync);
 
   std::mutex mu;
   std::condition_variable cv;
-  bool in_leadership_sync = false;
+  bool gate_entered = false;
+  bool seal_waiting = false;
+  bool release_gate = false;
   std::atomic<int> events{0};
-  std::atomic<int> completed_at{0};
+  std::atomic<int> sync_started_at{0};
+  std::atomic<int> seal_waited_at{0};
   std::atomic<int> rotated_at{0};
+  std::atomic<int> sync_finished_at{0};
   SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::WriteGroupToWAL:TakesPartitionSyncMutex", [&](void*) {
-        std::lock_guard<std::mutex> lock(mu);
-        in_leadership_sync = true;
+      "DBImpl::SyncWalPartitionFiles:BeforeSyncPartition", [&](void*) {
+        int expected = 0;
+        if (!sync_started_at.compare_exchange_strong(expected, ++events)) {
+          return;
+        }
+        std::unique_lock<std::mutex> lock(mu);
+        gate_entered = true;
         cv.notify_all();
+        EXPECT_TRUE(cv.wait_for(lock, std::chrono::seconds(30),
+                                [&] { return release_gate; }));
       });
   SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::InstallCompletionGate", [&](void*) {
+      "DBImpl::SwitchMemtableImpl:WaitForDeferredGateInsert", [&](void*) {
         int expected = 0;
-        completed_at.compare_exchange_strong(expected, ++events);
+        seal_waited_at.compare_exchange_strong(expected, ++events);
+        std::lock_guard<std::mutex> lock(mu);
+        seal_waiting = true;
+        cv.notify_all();
       });
   SyncPoint::GetInstance()->SetCallBack(
       "DBImpl::SwitchMemtable:AfterCreateWAL", [&](void*) {
         int expected = 0;
         rotated_at.compare_exchange_strong(expected, ++events);
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SyncWalsFromCompletionGate:AfterGateSync", [&](void*) {
+        int expected = 0;
+        sync_finished_at.compare_exchange_strong(expected, ++events);
       });
   SyncPoint::GetInstance()->EnableProcessing();
 
@@ -3911,18 +3949,55 @@ TEST_P(DBWritePartitionTest, LeadershipSyncExcludesCoupledRotation) {
       [&] { ASSERT_OK(Put(cf_for_partition_[0], "synced", "v", sync_wo)); });
   {
     std::unique_lock<std::mutex> lock(mu);
-    ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(30),
-                            [&] { return in_leadership_sync; }));
+    if (!cv.wait_for(lock, std::chrono::seconds(30),
+                     [&] { return gate_entered; })) {
+      release_gate = true;
+      cv.notify_all();
+      lock.unlock();
+      writer.join();
+      SyncPoint::GetInstance()->DisableProcessing();
+      SyncPoint::GetInstance()->ClearAllCallBacks();
+      FAIL() << "sync write never entered its gate fsync";
+    }
   }
-  ASSERT_OK(Flush(cf_for_partition_[1]));
+  // The rotation is issued strictly inside the gate-sync window: the gate
+  // is parked in its fsync and cannot finish until released below.
+  port::Thread flusher([&] { ASSERT_OK(Flush(cf_for_partition_[1])); });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    if (!cv.wait_for(lock, std::chrono::seconds(30),
+                     [&] { return seal_waiting; })) {
+      release_gate = true;
+      cv.notify_all();
+      lock.unlock();
+      writer.join();
+      flusher.join();
+      SyncPoint::GetInstance()->DisableProcessing();
+      SyncPoint::GetInstance()->ClearAllCallBacks();
+      FAIL() << "seal never parked waiting for the deferred insert";
+    }
+    release_gate = true;
+    cv.notify_all();
+  }
   writer.join();
+  flusher.join();
   SyncPoint::GetInstance()->DisableProcessing();
   SyncPoint::GetInstance()->ClearAllCallBacks();
-  latency_fs->SetDefaultLatency(LatencyInjectionFileSystem::Latency());
 
-  ASSERT_NE(0, completed_at.load());
+  // The gate entered its fsync first, the seal parked waiting for the
+  // deferred insert, the sync finished, and only then did the rotation's
+  // WAL creation land.
+  ASSERT_NE(0, sync_started_at.load());
+  ASSERT_NE(0, seal_waited_at.load());
+  ASSERT_NE(0, sync_finished_at.load());
   ASSERT_NE(0, rotated_at.load());
-  EXPECT_LT(completed_at.load(), rotated_at.load());
+  EXPECT_LT(sync_started_at.load(), seal_waited_at.load());
+  EXPECT_LT(seal_waited_at.load(), sync_finished_at.load());
+  EXPECT_LT(sync_finished_at.load(), rotated_at.load());
+  AssertPartitionDequesConsistent();
+  // The sync completed and left no mark behind: a second sync write, which
+  // would hang on a stuck getting_synced mark, succeeds.
+  ASSERT_OK(Put(cf_for_partition_[0], "synced2", "v", sync_wo));
   AssertPartitionDequesConsistent();
 }
 
@@ -4478,7 +4553,7 @@ TEST_P(DBWritePartitionTest, PostWaitSyncErrorFailsSyncWrite) {
   // starts, or that sync covers A and no post-wait sync runs.
   bool b_first_sync = false;
   SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::WriteGroupToWAL:TakesPartitionSyncMutex", [&](void*) {
+      "DBImpl::SyncEveryWalPartition:TakesPartitionSyncMutex", [&](void*) {
         std::lock_guard<std::mutex> lock(mu);
         if (!release_a) {
           b_first_sync = true;
@@ -4520,7 +4595,7 @@ TEST_P(DBWritePartitionTest, PostWaitSyncErrorFailsSyncWrite) {
   SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:log_entry");
   SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:AfterAddRecord");
   SyncPoint::GetInstance()->ClearCallBack(
-      "DBImpl::WriteGroupToWAL:TakesPartitionSyncMutex");
+      "DBImpl::SyncEveryWalPartition:TakesPartitionSyncMutex");
   SyncPoint::GetInstance()->ClearCallBack("DBImpl::SyncWalImpl:AfterSyncWAL");
 
   ASSERT_OK(a_status);
@@ -4539,10 +4614,6 @@ TEST_P(DBWritePartitionTest, RejectsPipelinedWalPartitions) {
         "rejects");
     return;
   }
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
   Options options = CurrentOptions();
   options.wal_partitions = 4;
   options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
@@ -4571,9 +4642,10 @@ TEST_P(DBWritePartitionTest, N1DefaultWritePathTakesPre08Locks) {
   SyncPoint::GetInstance()->SetCallBack("DBImpl::WriteToWAL:TakesWalMutex",
                                         [&](void*) { ++wal_take; });
   SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::PreprocessWrite:TakesSyncMarkMutex", [&](void*) { ++pre_mark; });
+      "DBImpl::SyncWalsFromCompletionGate:TakesSyncMarkMutex",
+      [&](void*) { ++pre_mark; });
   SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::WriteGroupToWAL:TakesPartitionSyncMutex",
+      "DBImpl::SyncEveryWalPartition:TakesPartitionSyncMutex",
       [&](void*) { ++sync_loop_take; });
   SyncPoint::GetInstance()->SetCallBack(
       "DBImpl::SyncWalImpl:TakesSyncMarkMutex", [&](void*) { ++syncwal_mark; });
@@ -4607,9 +4679,9 @@ TEST_P(DBWritePartitionTest, N1DefaultWritePathTakesPre08Locks) {
 
   SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:TakesWalMutex");
   SyncPoint::GetInstance()->ClearCallBack(
-      "DBImpl::PreprocessWrite:TakesSyncMarkMutex");
+      "DBImpl::SyncWalsFromCompletionGate:TakesSyncMarkMutex");
   SyncPoint::GetInstance()->ClearCallBack(
-      "DBImpl::WriteGroupToWAL:TakesPartitionSyncMutex");
+      "DBImpl::SyncEveryWalPartition:TakesPartitionSyncMutex");
   SyncPoint::GetInstance()->ClearCallBack(
       "DBImpl::SyncWalImpl:TakesSyncMarkMutex");
 }
@@ -4626,9 +4698,10 @@ TEST_P(DBWritePartitionTest, N1ManualFlushWritePathTakesPre08Locks) {
   SyncPoint::GetInstance()->SetCallBack("DBImpl::WriteToWAL:TakesWalMutex",
                                         [&](void*) { ++wal_take; });
   SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::PreprocessWrite:TakesSyncMarkMutex", [&](void*) { ++pre_mark; });
+      "DBImpl::SyncWalsFromCompletionGate:TakesSyncMarkMutex",
+      [&](void*) { ++pre_mark; });
   SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::WriteGroupToWAL:TakesPartitionSyncMutex",
+      "DBImpl::SyncEveryWalPartition:TakesPartitionSyncMutex",
       [&](void*) { ++sync_loop_take; });
 
   SyncPoint::GetInstance()->EnableProcessing();
@@ -4656,9 +4729,9 @@ TEST_P(DBWritePartitionTest, N1ManualFlushWritePathTakesPre08Locks) {
 
   SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:TakesWalMutex");
   SyncPoint::GetInstance()->ClearCallBack(
-      "DBImpl::PreprocessWrite:TakesSyncMarkMutex");
+      "DBImpl::SyncWalsFromCompletionGate:TakesSyncMarkMutex");
   SyncPoint::GetInstance()->ClearCallBack(
-      "DBImpl::WriteGroupToWAL:TakesPartitionSyncMutex");
+      "DBImpl::SyncEveryWalPartition:TakesPartitionSyncMutex");
 }
 
 TEST_P(DBWritePartitionTest, N2WritePathTakesPartitionLocks) {
@@ -4679,9 +4752,10 @@ TEST_P(DBWritePartitionTest, N2WritePathTakesPartitionLocks) {
   SyncPoint::GetInstance()->SetCallBack("DBImpl::WriteToWAL:TakesWalMutex",
                                         [&](void*) { ++wal_take; });
   SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::PreprocessWrite:TakesSyncMarkMutex", [&](void*) { ++pre_mark; });
+      "DBImpl::SyncWalsFromCompletionGate:TakesSyncMarkMutex",
+      [&](void*) { ++pre_mark; });
   SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::WriteGroupToWAL:TakesPartitionSyncMutex",
+      "DBImpl::SyncEveryWalPartition:TakesPartitionSyncMutex",
       [&](void*) { ++sync_loop_take; });
   SyncPoint::GetInstance()->SetCallBack(
       "DBImpl::SyncWalImpl:TakesSyncMarkMutex", [&](void*) { ++syncwal_mark; });
@@ -4714,9 +4788,9 @@ TEST_P(DBWritePartitionTest, N2WritePathTakesPartitionLocks) {
 
   SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:TakesWalMutex");
   SyncPoint::GetInstance()->ClearCallBack(
-      "DBImpl::PreprocessWrite:TakesSyncMarkMutex");
+      "DBImpl::SyncWalsFromCompletionGate:TakesSyncMarkMutex");
   SyncPoint::GetInstance()->ClearCallBack(
-      "DBImpl::WriteGroupToWAL:TakesPartitionSyncMutex");
+      "DBImpl::SyncEveryWalPartition:TakesPartitionSyncMutex");
   SyncPoint::GetInstance()->ClearCallBack(
       "DBImpl::SyncWalImpl:TakesSyncMarkMutex");
 }
@@ -5910,16 +5984,16 @@ TEST_P(DBWritePartitionTest, CompactionErrorWakesParkedGate) {
 }
 
 TEST_P(DBWritePartitionTest, LeadershipSyncFailureWakesParkedGate) {
-  // Q1, leadership-time sync failure: A is held open on partition 0; W
-  // appends on partition 1 and parks in its gate; C (sync) then fails
-  // exactly its leadership fsync. The failure fences C's range, which lies
-  // above W's, so the wake leaves W parked (D-N71 (b)): once A is released W
-  // is acknowledged, as one WAL acknowledges an async write whose append
-  // landed before a later sync failed. Standard path only: with two write
-  // queues a sync write
+  // Q1, gate-time sync failure: A is held open on partition 0; W appends
+  // on partition 1 and parks in its gate; C (sync) then fails exactly its
+  // gate fsync. The failure raises the background error without fencing
+  // (no range is pinned or fenced on this path), so the wake leaves W
+  // parked (D-N71 (b)): once A is released W is acknowledged, as one WAL
+  // acknowledges an async write whose append landed before a later sync
+  // failed. Standard path only: with two write queues a sync write
   // takes all N WAL mutexes in PreprocessWrite, so C would block on A's
-  // held append before ever reaching its sync. The two-queue leadership
-  // sync still funnels through the same SetBGError transition the
+  // held append before ever reaching its sync. The two-queue gate sync
+  // still funnels through the same SetBGError transition the
   // two-queue append-failure run already covers; only the funnel
   // (WriteStatusCheck) differs, and it is pre-existing code.
   if (GetParam()) {
@@ -5939,8 +6013,8 @@ TEST_P(DBWritePartitionTest, LeadershipSyncFailureWakesParkedGate) {
   bool a_in_append = false;
   bool release_a = false;
   bool w_appended = false;
-  bool fail_leadership_sync = false;
-  int leadership_syncs = 0;
+  bool fail_gate_sync = false;
+  int gate_syncs = 0;
   std::atomic<bool> w_returned{false};
   Status c_status;
   Status a_status;
@@ -5966,13 +6040,13 @@ TEST_P(DBWritePartitionTest, LeadershipSyncFailureWakesParkedGate) {
                                           }
                                         });
   SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::WriteGroupToWAL:AfterLeadershipSync", [&](void* arg) {
+      "DBImpl::SyncWalsFromCompletionGate:AfterGateSync", [&](void* arg) {
         std::lock_guard<std::mutex> lock(mu);
-        if (fail_leadership_sync) {
-          fail_leadership_sync = false;
-          ++leadership_syncs;
+        if (fail_gate_sync) {
+          fail_gate_sync = false;
+          ++gate_syncs;
           *static_cast<IOStatus*>(arg) =
-              IOStatus::IOError("injected leadership sync error");
+              IOStatus::IOError("injected gate sync error");
         }
       });
   SyncPoint::GetInstance()->SetCallBack(
@@ -5997,7 +6071,7 @@ TEST_P(DBWritePartitionTest, LeadershipSyncFailureWakesParkedGate) {
   EXPECT_TRUE(WaitForDurabilityWaiters(1));
   {
     std::lock_guard<std::mutex> lock(mu);
-    fail_leadership_sync = true;
+    fail_gate_sync = true;
   }
   WriteOptions sync_options;
   sync_options.sync = true;
@@ -6020,7 +6094,7 @@ TEST_P(DBWritePartitionTest, LeadershipSyncFailureWakesParkedGate) {
   SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:log_entry");
   SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:AfterAddRecord");
   SyncPoint::GetInstance()->ClearCallBack(
-      "DBImpl::WriteGroupToWAL:AfterLeadershipSync");
+      "DBImpl::SyncWalsFromCompletionGate:AfterGateSync");
   SyncPoint::GetInstance()->ClearCallBack(
       "DBImpl::SignalWalDurabilityWaitersOnBGError");
 
@@ -6028,7 +6102,7 @@ TEST_P(DBWritePartitionTest, LeadershipSyncFailureWakesParkedGate) {
   EXPECT_TRUE(c_status.IsIOError());
   ASSERT_OK(w_status);
   ASSERT_OK(a_status);
-  EXPECT_EQ(1, leadership_syncs);
+  EXPECT_EQ(1, gate_syncs);
   EXPECT_EQ(1, bg_error_wakes.load());
   EXPECT_TRUE(dbfull()->TEST_WalDurabilityBGError());
   EXPECT_EQ(c_status.ToString(), dbfull()->TEST_GetBGError().ToString());
@@ -7243,7 +7317,7 @@ TEST_P(DBWritePartitionTest, AsyncWriteDoesNotWaitForOtherPartitionsSync) {
   Status b_status;
   Status c_status;
   SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::WriteGroupToWAL:TakesPartitionSyncMutex", [&](void*) {
+      "DBImpl::SyncEveryWalPartition:TakesPartitionSyncMutex", [&](void*) {
         std::unique_lock<std::mutex> lock(mu);
         if (!b_in_sync) {
           b_in_sync = true;
@@ -7297,10 +7371,296 @@ TEST_P(DBWritePartitionTest, AsyncWriteDoesNotWaitForOtherPartitionsSync) {
   b_thread.join();
   c_thread.join();
   SyncPoint::GetInstance()->ClearCallBack(
-      "DBImpl::WriteGroupToWAL:TakesPartitionSyncMutex");
+      "DBImpl::SyncEveryWalPartition:TakesPartitionSyncMutex");
   ASSERT_OK(b_status);
   ASSERT_OK(c_status);
   ASSERT_EQ("value_b", Get(cf_b, "key_b"));
+}
+
+TEST_P(DBWritePartitionTest, AsyncAboveSyncReturnsWhileSyncFsyncHeld) {
+  // D-G11 (c): a sync=false write never waits for another partition's
+  // fsync. B (sync) on partition 1 is held inside its gate-time fsync of
+  // partition 1's WAL files, holding partition 1's WAL mutex; C (async)
+  // on partition 2, above B, still returns within the bound and is
+  // visible while B is unsynced. B itself already published (a sync write
+  // publishes before its fsync), so it is visible too. Under the old
+  // order, fsync before publication, C would hang in its gate until B's
+  // fsync finished.
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS(
+        "N > 1 needs indexed WALs, which two_write_queues "
+        "rejects");
+    return;
+  }
+  constexpr size_t kPartitions = 4;
+  Options options = CurrentOptions();
+  options.avoid_flush_during_shutdown = true;
+  OpenWithPartitions(kPartitions, options);
+  const int cf_b = cf_for_partition_[1];
+  const int cf_c = cf_for_partition_[2];
+
+  std::mutex mu;
+  std::condition_variable cv;
+  bool b_in_fsync = false;
+  bool release_b = false;
+  std::atomic<bool> b_returned{false};
+  Status b_status;
+  Status c_status;
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SyncWalPartitionFiles:BeforeSyncPartition", [&](void* arg) {
+        if (*static_cast<size_t*>(arg) != 1) {
+          return;
+        }
+        std::unique_lock<std::mutex> lock(mu);
+        b_in_fsync = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return release_b; });
+      });
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  WriteOptions sync_wo;
+  sync_wo.sync = true;
+  port::Thread b_thread([&] {
+    b_status = Put(cf_b, "key_b", "value_b", sync_wo);
+    b_returned.store(true);
+  });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    ASSERT_TRUE(cv.wait_until(lock, deadline, [&] { return b_in_fsync; }));
+  }
+  // B is held inside its partition-1 fsync, still unsynced. C, above B,
+  // returns promptly anyway.
+  const auto c_start = std::chrono::steady_clock::now();
+  c_status = RunWithin(std::chrono::seconds(30),
+                       [&] { return Put(cf_c, "key_c", "value_c"); });
+  const int64_t c_micros =
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now() - c_start)
+          .count();
+  ASSERT_OK(c_status);
+  EXPECT_LT(c_micros, 30LL * 1000 * 1000);
+  ASSERT_EQ("value_c", Get(cf_c, "key_c"));
+  EXPECT_FALSE(b_returned.load());
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    release_b = true;
+    cv.notify_all();
+  }
+  b_thread.join();
+  SyncPoint::GetInstance()->ClearCallBack(
+      "DBImpl::SyncWalPartitionFiles:BeforeSyncPartition");
+  ASSERT_OK(b_status);
+  EXPECT_TRUE(b_returned.load());
+  ASSERT_EQ("value_b", Get(cf_b, "key_b"));
+}
+
+TEST_P(DBWritePartitionTest, AsyncOnHeldPartitionWaitsForItsFsync) {
+  // D-G11 (c) accepted (Q9): an async write appending to the partition whose
+  // fsync is held waits for that fsync (one-WAL semantics: an append waits
+  // for its file's fsync), while other partitions' async writes do not (see
+  // AsyncAboveSyncReturnsWhileSyncFsyncHeld). B (sync) is held inside
+  // partition 1's WAL mutex; Q (async) on partition 1 must not return until
+  // B is released, then completes within the bound.
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS(
+        "N > 1 needs indexed WALs, which two_write_queues "
+        "rejects");
+    return;
+  }
+  constexpr size_t kPartitions = 4;
+  Options options = CurrentOptions();
+  options.avoid_flush_during_shutdown = true;
+  OpenWithPartitions(kPartitions, options);
+  const int cf_b = cf_for_partition_[1];
+
+  std::mutex mu;
+  std::condition_variable cv;
+  bool b_in_fsync = false;
+  bool release_b = false;
+  std::atomic<bool> b_returned{false};
+  std::atomic<bool> q_returned{false};
+  Status b_status;
+  Status q_status;
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SyncWalPartitionFiles:BeforeSyncPartition", [&](void* arg) {
+        if (*static_cast<size_t*>(arg) != 1) {
+          return;
+        }
+        std::unique_lock<std::mutex> lock(mu);
+        b_in_fsync = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return release_b; });
+      });
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  WriteOptions sync_wo;
+  sync_wo.sync = true;
+  port::Thread b_thread([&] {
+    b_status = Put(cf_b, "key_b", "value_b", sync_wo);
+    b_returned.store(true);
+  });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    ASSERT_TRUE(cv.wait_until(lock, deadline, [&] { return b_in_fsync; }));
+  }
+  // Q appends to partition 1, whose WAL mutex B holds: it cannot return
+  // while B is held. (A bounded sleep proving a negative; the completion
+  // below is bounded by RunWithin.)
+  port::Thread q_thread([&] {
+    q_status = Put(cf_b, "key_q", "value_q");
+    q_returned.store(true);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  EXPECT_FALSE(q_returned.load());
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    release_b = true;
+    cv.notify_all();
+  }
+  ASSERT_OK(RunWithin(std::chrono::seconds(30), [&] {
+    q_thread.join();
+    return q_status;
+  }));
+  ASSERT_EQ("value_q", Get(cf_b, "key_q"));
+  b_thread.join();
+  SyncPoint::GetInstance()->ClearCallBack(
+      "DBImpl::SyncWalPartitionFiles:BeforeSyncPartition");
+  ASSERT_OK(b_status);
+  EXPECT_TRUE(b_returned.load());
+  ASSERT_EQ("value_b", Get(cf_b, "key_b"));
+}
+
+TEST_P(DBWritePartitionTest, SyncWritesAckedOnlyAfterEveryPartitionSynced) {
+  // Q10: RunCoalescedGateSync's direct test. Two sync writes on different
+  // partitions run their gates concurrently; the rounds serialize (one fsync
+  // per partition per round, in index order), and each write is acknowledged
+  // only after every partition is synced through its sequence, so a crash
+  // that drops unsynced data keeps both.
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS(
+        "N > 1 needs indexed WALs, which two_write_queues "
+        "rejects");
+    return;
+  }
+  constexpr size_t kPartitions = 4;
+  std::unique_ptr<FaultInjectionTestEnv> fault_env(
+      new FaultInjectionTestEnv(env_));
+  Defer close_before_env([this] { Close(); });
+  Options options = IndexedWalOptions(CurrentOptions());
+  options.env = fault_env.get();
+  options.paranoid_checks = true;
+  options.avoid_flush_during_shutdown = true;
+  OpenWithPartitions(kPartitions, options);
+  const int cf_a = cf_for_partition_[0];
+  const int cf_b = cf_for_partition_[1];
+
+  std::mutex mu;
+  std::condition_variable cv;
+  bool a_in_sync = false;
+  bool release_a = false;
+  std::vector<size_t> sync_order;
+  std::atomic<int> gate_installs{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SyncWalPartitionFiles:BeforeSyncPartition", [&](void* arg) {
+        std::unique_lock<std::mutex> lock(mu);
+        sync_order.push_back(*static_cast<size_t*>(arg));
+        if (*static_cast<size_t*>(arg) == 0 && !release_a) {
+          a_in_sync = true;
+          cv.notify_all();
+          cv.wait(lock, [&] { return release_a; });
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack("DBImpl::InstallCompletionGate",
+                                        [&](void*) { ++gate_installs; });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  WriteOptions sync_wo;
+  sync_wo.sync = true;
+  Status a_status;
+  Status b_status;
+  port::Thread a_thread(
+      [&] { a_status = Put(cf_a, "key_a", "value_a", sync_wo); });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    ASSERT_TRUE(
+        cv.wait_for(lock, std::chrono::seconds(30), [&] { return a_in_sync; }));
+  }
+  // B appends to partition 1 (unheld) and parks joining A's active round;
+  // A holds partition 0's WAL mutex the whole time.
+  port::Thread b_thread(
+      [&] { b_status = Put(cf_b, "key_b", "value_b", sync_wo); });
+  const auto join_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while (gate_installs.load() < 2 &&
+         std::chrono::steady_clock::now() < join_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_EQ(2, gate_installs.load());
+  // Install-to-join is wait-free; 200 ms proves B parked, not raced.
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    release_a = true;
+    cv.notify_all();
+  }
+  a_thread.join();
+  b_thread.join();
+  SyncPoint::GetInstance()->ClearCallBack(
+      "DBImpl::SyncWalPartitionFiles:BeforeSyncPartition");
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::InstallCompletionGate");
+  ASSERT_OK(a_status);
+  ASSERT_OK(b_status);
+
+  // Two serialized rounds, one fsync per partition per round, in order.
+  ASSERT_EQ(2 * kPartitions, sync_order.size());
+  for (size_t i = 0; i < kPartitions; ++i) {
+    EXPECT_EQ(i, sync_order[i]) << "A round, fire " << i;
+    EXPECT_EQ(i, sync_order[kPartitions + i]) << "B round, fire " << i;
+  }
+
+  Close();
+  ASSERT_OK(fault_env->DropUnsyncedFileData());
+  ReopenWithPartitions(kPartitions, options);
+  EXPECT_EQ("value_a", Get(cf_a, "key_a"));
+  EXPECT_EQ("value_b", Get(cf_b, "key_b"));
+}
+
+TEST_P(DBWritePartitionTest, ManualWalFlushSyncWritesSurviveCrash) {
+  // Q10: manual_wal_flush with sync writes at N>1 keeps every acknowledged
+  // sync write across a crash that drops unsynced data.
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS(
+        "N > 1 needs indexed WALs, which two_write_queues "
+        "rejects");
+    return;
+  }
+  constexpr size_t kPartitions = 4;
+  std::unique_ptr<FaultInjectionTestEnv> fault_env(
+      new FaultInjectionTestEnv(env_));
+  Defer close_before_env([this] { Close(); });
+  Options options = IndexedWalOptions(CurrentOptions());
+  options.env = fault_env.get();
+  options.paranoid_checks = true;
+  options.manual_wal_flush = true;
+  OpenWithPartitions(kPartitions, options);
+  WriteOptions sync_wo;
+  sync_wo.sync = true;
+  for (size_t p = 0; p < kPartitions; ++p) {
+    ASSERT_OK(Put(cf_for_partition_[p], "key_sync", "value_sync", sync_wo));
+  }
+  ASSERT_OK(Put(cf_for_partition_[0], "key_control", "value_control"));
+
+  Close();
+  ASSERT_OK(fault_env->DropUnsyncedFileData());
+  ReopenWithPartitions(kPartitions, options);
+  for (size_t p = 0; p < kPartitions; ++p) {
+    EXPECT_EQ("value_sync", Get(cf_for_partition_[p], "key_sync")) << p;
+  }
+  EXPECT_EQ("NOT_FOUND", Get(cf_for_partition_[0], "key_control"));
 }
 
 TEST_P(DBWritePartitionTest, SyncWriteAboveAsyncWriteSurvivesCrash) {
@@ -7334,6 +7694,84 @@ TEST_P(DBWritePartitionTest, SyncWriteAboveAsyncWriteSurvivesCrash) {
   EXPECT_EQ("value_a", Get(cf_for_partition_[0], "key_a"));
   EXPECT_EQ("value_b", Get(cf_for_partition_[1], "key_b"));
   EXPECT_EQ("NOT_FOUND", Get(cf_for_partition_[0], "key_control"));
+}
+
+TEST_P(DBWritePartitionTest, PartialGateSyncCutLosesHigherAsyncWrite) {
+  // D-G11 (c) accepted risk: records in one partition's WAL that follow a
+  // lower record never fsynced in another partition's WAL exist on disk
+  // but cannot be used; recovery cuts at the hole. D (async) on partition
+  // 2, then R (async) on partition 0 above D; a sync write's gate sync
+  // then fails after fsyncing partitions 0 and 1, so R's bytes are on
+  // disk while D's are not. After the crash the recovered state is a
+  // prefix: A (below the hole, fsynced) survives, while D and the
+  // acknowledged R are both gone.
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS(
+        "N > 1 needs indexed WALs, which two_write_queues "
+        "rejects");
+    return;
+  }
+  constexpr size_t kPartitions = 4;
+  std::unique_ptr<FaultInjectionTestEnv> fault_env(
+      new FaultInjectionTestEnv(env_));
+  // Close before `fault_env` goes out of scope on every exit path, including
+  // a fatal assertion's early return.
+  Defer close_before_env([this] { Close(); });
+  Options options = IndexedWalOptions(CurrentOptions());
+  options.env = fault_env.get();
+  options.paranoid_checks = true;
+  OpenWithPartitions(kPartitions, options);
+  const int cf_a = cf_for_partition_[0];
+  const int cf_d = cf_for_partition_[2];
+  const int cf_s = cf_for_partition_[1];
+  WriteOptions sync_wo;
+  sync_wo.sync = true;
+  // Baseline sync: every partition's WAL file exists on disk synced, so
+  // the crash below truncates partition 2's WAL at a record boundary.
+  ASSERT_OK(Put(cf_a, "key_s0", "value_s0", sync_wo));
+  ASSERT_OK(Put(cf_a, "key_a", "value_a"));
+  ASSERT_OK(Put(cf_d, "key_d", "value_d"));
+  ASSERT_OK(Put(cf_a, "key_r", "value_r"));
+
+  // Fail the next sync write's gate sync inside partition 2's slice, after
+  // partitions 0 and 1 (holding A and R) really fsynced. The filesystem
+  // goes inactive only for that slice; nothing else runs concurrently.
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SyncWalPartitionFiles:BeforeSyncPartition", [&](void* arg) {
+        if (*static_cast<size_t*>(arg) == 2) {
+          fault_env->SetFilesystemActive(false);
+        }
+      });
+  Status s_status = Put(cf_s, "key_s", "value_s", sync_wo);
+  fault_env->SetFilesystemActive(true);
+  SyncPoint::GetInstance()->ClearCallBack(
+      "DBImpl::SyncWalPartitionFiles:BeforeSyncPartition");
+  ASSERT_NOK(s_status);
+  EXPECT_TRUE(s_status.IsIOError());
+  EXPECT_FALSE(dbfull()->TEST_GetBGError().ok());
+  dbfull()->Resume().PermitUncheckedError();
+  Close();
+  ASSERT_OK(fault_env->DropUnsyncedFileData());
+
+  // Default recovery fails closed on the unexplained hole (pinned
+  // behavior); point-in-time recovery cuts at it and opens the prefix.
+  std::vector<std::string> cf_names;
+  ASSERT_OK(DB::ListColumnFamilies(options, dbname_, &cf_names));
+  options.wal_partitions = static_cast<uint32_t>(kPartitions);
+  const Status default_reopen_status =
+      TryReopenWithColumnFamilies(cf_names, options);
+  ASSERT_TRUE(default_reopen_status.IsCorruption())
+      << default_reopen_status.ToString();
+  EXPECT_NE(std::string::npos,
+            default_reopen_status.ToString().find("unexplained hole"));
+  options.wal_recovery_mode = WALRecoveryMode::kPointInTimeRecovery;
+  ReopenWithPartitions(kPartitions, options);
+
+  ASSERT_EQ("value_s0", Get(cf_a, "key_s0"));
+  ASSERT_EQ("value_a", Get(cf_a, "key_a"));
+  ASSERT_EQ("NOT_FOUND", Get(cf_d, "key_d"));
+  ASSERT_EQ("NOT_FOUND", Get(cf_a, "key_r"));
+  ASSERT_EQ("NOT_FOUND", Get(cf_s, "key_s"));
 }
 
 TEST_P(DBWritePartitionTest, AckedAsyncWriteAboveUnsyncedHoleIsCut) {
@@ -8841,10 +9279,6 @@ TEST_P(DBWritePartitionTest, FirstSessionBottomLossIsDetected) {
     return;
   }
   constexpr size_t kPartitions = 2;
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
   Options options = IndexedWalOptions(CurrentOptions());
   options.wal_partitions = kPartitions;
   options.create_missing_column_families = true;
@@ -9420,10 +9854,6 @@ TEST_P(DBWritePartitionTest, ReadOnlyAndSecondaryApplyPartitionChecks) {
   if (GetParam()) {
     return;
   }
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
   Options base = CurrentOptions();
   DestroyAndReopen(base);
   Close();
@@ -9486,10 +9916,6 @@ TEST_P(DBWritePartitionTest, ReadOnlyCompactedOpenAppliesPartitionChecks) {
   if (GetParam()) {
     return;
   }
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
   Options options = CurrentOptions();
   options.max_open_files = -1;
   DestroyAndReopen(options);
@@ -11025,8 +11451,8 @@ class DBWalAppendFailureTest : public DBWritePartitionTest {
 
 TEST_F(DBWriteTestUnparameterized, WalPartitionsRequireParanoidChecks) {
   // Q1 (G-12, G-22 N>1 half): a failed append must stop an N>1 DB, so Open
-  // refuses paranoid_checks=false there and names both options. Without the
-  // test hook N>1 is still refused first; N=1 is unaffected.
+  // refuses paranoid_checks=false there and names both options. N=1 is
+  // unaffected.
   Options options = CurrentOptions();
   options.wal_partitions = 2;
   options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
@@ -11034,15 +11460,6 @@ TEST_F(DBWriteTestUnparameterized, WalPartitionsRequireParanoidChecks) {
   options.paranoid_checks = false;
   Destroy(options);
   Status s = TryReopen(options);
-  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
-  EXPECT_NE(nullptr, std::strstr(s.getState(), "not supported yet"))
-      << s.ToString();
-
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
-  s = TryReopen(options);
   ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
   EXPECT_NE(nullptr, std::strstr(s.getState(), "wal_partitions"))
       << s.ToString();
@@ -11054,8 +11471,6 @@ TEST_F(DBWriteTestUnparameterized, WalPartitionsRequireParanoidChecks) {
   options.wal_partitions = 1;
   options.paranoid_checks = false;
   ASSERT_OK(TryReopen(options));
-  SyncPoint::GetInstance()->DisableProcessing();
-  SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
 TEST_P(DBWalAppendFailureTest, EveryAppendFailureStopsTheDb) {
@@ -11478,6 +11893,123 @@ TEST_P(DBWalAppendFailureTest, ResumeRestoresWritesOnEveryPartition) {
   ASSERT_EQ(Status::Severity::kHardError, bg.severity()) << bg.ToString();
   ASSERT_OK(dbfull()->Resume());
   ExpectWritesResumeOnEveryPartition(this, options);
+}
+
+// Q8: a sync write whose gate fsync fails stays invisible, like a WAL
+// append failure. The write routes to partition 0 and its append lands, but
+// partition 0's WAL fails Sync with a retryable error once the gate sync
+// starts: it returns the error and raises the background error, and its
+// unpublished range is pinned and fenced. The key is absent before Resume,
+// after Resume plus a flush (writes above the closed fence are still
+// admitted), and after a reopen in every recovery mode, while every
+// acknowledged write below it stays present.
+// Neuters: skip the fence (the key appears after Resume); skip the pin (the
+// LastSequence assertion fails).
+TEST_P(DBWalAppendFailureTest, FailedGateSyncStaysInvisibleAtNPartitions) {
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS("two_write_queues rejects N>1");
+    return;
+  }
+  const std::vector<WALRecoveryMode> recovery_modes = {
+      WALRecoveryMode::kAbsoluteConsistency,
+      WALRecoveryMode::kTolerateCorruptedTailRecords,
+      WALRecoveryMode::kPointInTimeRecovery,
+      WALRecoveryMode::kSkipAnyCorruptedRecords,
+  };
+  // FailingWalFS outside, FaultInjectionTestFS inside: the armed Sync
+  // short-circuits before the inner layer sees it, so the failed write's
+  // bytes stay unsynced there for the crash below. Function scope: the
+  // fixture's last_options_ keeps pointing at it across loop iterations.
+  auto fault_fs = std::make_shared<FaultInjectionTestFS>(FileSystem::Default());
+  auto fail_fs = std::make_shared<FailingWalFS>(fault_fs);
+  std::unique_ptr<Env> fail_env(NewCompositeEnv(fail_fs));
+  Defer close_before_env([this] { Close(); });
+  for (const size_t num_partitions : {size_t{2}, size_t{8}}) {
+    SCOPED_TRACE("partitions=" + std::to_string(num_partitions));
+    Options options = IndexedWalOptions(CurrentOptions());
+    options.env = fail_env.get();
+    options.paranoid_checks = true;
+    options.max_bgerror_resume_count = 0;
+    DestroyAndReopen(options);
+    OpenWithPartitions(num_partitions, options);
+
+    // Below: an async key on every partition, then a sync barrier so every
+    // byte below the failing write is fsynced.
+    for (size_t p = 0; p < num_partitions; ++p) {
+      ASSERT_OK(Put(cf_for_partition_[p], "below", "v"));
+    }
+    WriteOptions sync_wo;
+    sync_wo.sync = true;
+    ASSERT_OK(Put(cf_for_partition_[0], "barrier", "v", sync_wo));
+    const SequenceNumber before_w = db_->GetLatestSequenceNumber();
+
+    // The failing write routes to partition 0. Its append lands; arming
+    // partition 0's WAL once its gate sync starts fails the fsync with a
+    // retryable error.
+    const int cf_w = cf_for_partition_[0];
+    const uint64_t wal0 = dbfull()->TEST_CurrentWalNumber(0);
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::SyncEveryWalPartition:TakesPartitionSyncMutex",
+        [&](void*) { fail_fs->Arm(wal0, Retryable("q8")); });
+    const Status ws = Put(cf_w, "w", "v", sync_wo);
+    fail_fs->Disarm();
+    SyncPoint::GetInstance()->ClearCallBack(
+        "DBImpl::SyncEveryWalPartition:TakesPartitionSyncMutex");
+    ASSERT_NOK(ws);
+    EXPECT_TRUE(ws.IsIOError()) << ws.ToString();
+    const Status bg = dbfull()->TEST_GetBGError();
+    EXPECT_FALSE(bg.ok());
+    EXPECT_EQ(Status::Severity::kHardError, bg.severity()) << bg.ToString();
+
+    // Before Resume: the failed key is absent, everything below is present.
+    EXPECT_EQ("NOT_FOUND", Get(cf_w, "w"));
+    for (size_t p = 0; p < num_partitions; ++p) {
+      EXPECT_EQ("v", Get(cf_for_partition_[p], "below")) << p;
+    }
+    EXPECT_EQ("v", Get(cf_for_partition_[0], "barrier"));
+
+    // The failed write published but was never inserted. Resume clears the
+    // error; the key stays absent through a later flush, and a write above
+    // it is admitted.
+    ASSERT_OK(dbfull()->Resume());
+    EXPECT_GT(db_->GetLatestSequenceNumber(), before_w);
+    EXPECT_EQ("NOT_FOUND", Get(cf_w, "w"));
+    ASSERT_OK(Put(cf_for_partition_[0], "above", "v"));
+    EXPECT_EQ("v", Get(cf_for_partition_[0], "above"));
+    for (size_t p = 0; p < num_partitions; ++p) {
+      ASSERT_OK(Flush(cf_for_partition_[p]));
+    }
+    EXPECT_EQ("NOT_FOUND", Get(cf_w, "w"));
+    for (size_t p = 0; p < num_partitions; ++p) {
+      EXPECT_EQ("v", Get(cf_for_partition_[p], "below")) << p;
+    }
+
+    // The crash drops the never-synced bytes; every recovery mode either
+    // fails closed or reopens without the failed key and with the prefix.
+    Close();
+    ASSERT_OK(fault_fs->DropUnsyncedFileData());
+    std::vector<std::string> cf_names;
+    ASSERT_OK(DB::ListColumnFamilies(options, dbname_, &cf_names));
+    options.wal_partitions = static_cast<uint32_t>(num_partitions);
+    int opens = 0;
+    for (const WALRecoveryMode mode : recovery_modes) {
+      SCOPED_TRACE("mode=" + std::to_string(static_cast<int>(mode)));
+      options.wal_recovery_mode = mode;
+      const Status rs = TryReopenWithColumnFamilies(cf_names, options);
+      if (!rs.ok()) {
+        continue;
+      }
+      ++opens;
+      EXPECT_EQ("NOT_FOUND", Get(cf_w, "w"));
+      for (size_t p = 0; p < num_partitions; ++p) {
+        EXPECT_EQ("v", Get(cf_for_partition_[p], "below")) << p;
+      }
+      EXPECT_EQ("v", Get(cf_for_partition_[0], "barrier"));
+      EXPECT_EQ("v", Get(cf_for_partition_[0], "above"));
+      Close();
+    }
+    EXPECT_GT(opens, 0);
+  }
 }
 
 TEST_P(DBWalAppendFailureTest, FailedResumeKeepsFailingLaterWrites) {
@@ -12055,11 +12587,12 @@ TEST_P(DBWalAppendFailureTest, WriteHeldPastRecoveryStillFails) {
 TEST_P(DBWalAppendFailureTest, WriteAdmittedByRecoveryAllocatesAboveFences) {
   // Q7 (N-2-5): ClearBGError closes every open gate fence at the last
   // allocated sequence before it clears the stopped flag, so a write the
-  // cleared flag admits allocates above every closed fence. W is started
-  // between the two steps: it waits on the stopped flag, allocates only once
-  // recovery finishes, returns OK, and survives a reopen. Swapping the two
-  // steps admits W in between: it allocates inside the still-open fence,
-  // which then closes above it, and W fails.
+  // cleared flag admits allocates above every closed fence, returns OK once
+  // covered, and stays visible after a reopen. The hold observes the fences
+  // between the two steps: swapping the steps leaves them open and fails
+  // this test. (Q10: asserts the fences at the hold are non-empty and
+  // closed, and the writer waits by retry, not by a fixed sleep; fence
+  // assertions ported from GC17's Muse candidate.)
   Options options = FailureOptions();
   OpenWithPartitions(2, options);
   const int cf_w = cf_for_partition_[1];
@@ -12071,52 +12604,70 @@ TEST_P(DBWalAppendFailureTest, WriteAdmittedByRecoveryAllocatesAboveFences) {
 
   std::mutex mu;
   std::condition_variable cv;
-  bool w_appended = false;
-  bool w_started = false;
-  SequenceNumber closed_at = 0;
-  SequenceNumber w_seq = 0;
-  std::unique_ptr<Writer> w;
-  SyncPoint::GetInstance()->SetCallBack("DBImpl::WriteToWAL:log_entry",
-                                        [&](void*) {
-                                          std::lock_guard<std::mutex> lock(mu);
-                                          w_appended = true;
-                                          cv.notify_all();
-                                        });
+  bool reached_hold = false;
+  bool release_hold = false;
+  std::vector<std::pair<SequenceNumber, SequenceNumber>> fences_at_hold;
   SyncPoint::GetInstance()->SetCallBack(
       "ErrorHandler::ClearBGError:BeforeClearStopped", [&](void*) {
-        if (w_started) {
+        std::unique_lock<std::mutex> lock(mu);
+        if (reached_hold) {
           return;
         }
-        w_started = true;
+        reached_hold = true;
         // Every fence still open was closed here; nothing allocates while
         // the DB is stopped.
-        closed_at = dbfull()->GetVersionSet()->LastAllocatedSequence();
-        w.reset(new Writer([&] {
-          WriteBatch batch;
-          Status s = batch.Put(handles_[cf_w], "admitted", "value");
-          if (s.ok()) {
-            s = db_->Write(WriteOptions(), &batch);
-          }
-          w_seq = WriteBatchInternal::Sequence(&batch);
-          return s;
-        }));
-        // Give W every chance to (wrongly) get through while the DB is still
-        // stopped; with the right order it waits for this step to return.
-        std::unique_lock<std::mutex> lock(mu);
-        cv.wait_for(lock, std::chrono::milliseconds(200),
-                    [&] { return w_appended; });
+        fences_at_hold = dbfull()->TEST_WalGateFences();
+        cv.notify_all();
+        cv.wait(lock, [&] { return release_hold; });
       });
-  ASSERT_OK(dbfull()->Resume());
-  ASSERT_TRUE(w_started);
-  const Status w_status = w->Join();
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  std::atomic<int> attempts{0};
+  std::string admitted_key;
+  Status admitted_status = Status::TimedOut("writer never admitted");
+  port::Thread writer([&] {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    for (int i = 0; std::chrono::steady_clock::now() < deadline; ++i) {
+      attempts.fetch_add(1);
+      Status s = Put(cf_w, "admitted" + std::to_string(i), "value");
+      if (s.ok()) {
+        admitted_key = "admitted" + std::to_string(i);
+        admitted_status = s;
+        return;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  });
+  Writer resume([&] { return dbfull()->Resume(); });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(30),
+                            [&] { return reached_hold; }));
+    release_hold = true;
+    cv.notify_all();
+  }
+  ASSERT_OK(resume.Join());
+  writer.join();
   SyncPoint::GetInstance()->ClearCallBack(
       "ErrorHandler::ClearBGError:BeforeClearStopped");
-  SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:log_entry");
-  ASSERT_OK(w_status);
-  EXPECT_GT(w_seq, closed_at);
-  EXPECT_EQ("value", Get(cf_w, "admitted"));
+  ASSERT_OK(admitted_status) << "after " << attempts.load() << " attempts";
+
+  // The hold saw the fences after recovery closed them and before any write
+  // they could fence was admitted.
+  ASSERT_FALSE(fences_at_hold.empty());
+  for (const auto& fence : fences_at_hold) {
+    EXPECT_NE(kMaxSequenceNumber, fence.second);
+  }
+  const SequenceNumber admitted_seq = db_->GetLatestSequenceNumber();
+  for (const auto& fence : dbfull()->TEST_WalGateFences()) {
+    EXPECT_GT(admitted_seq, fence.second)
+        << "admitted write inside a closed fence";
+  }
+  EXPECT_EQ("value", Get(cf_w, admitted_key));
   ReopenWithPartitions(2, options);
-  EXPECT_EQ("value", Get(cf_for_partition_[1], "admitted"));
+  EXPECT_EQ("value", Get(cf_for_partition_[1], admitted_key));
+  EXPECT_EQ("NOT_FOUND", Get(cf_for_partition_[0], "failed"));
 }
 
 TEST_P(DBWritePartitionTest, PublicationBoundedForParallelGroup) {

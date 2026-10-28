@@ -296,22 +296,25 @@ Status DBImpl::ValidateOptions(
 }
 
 // M1.4 gate dispositions by (partition_wal_usage, wal_partitions), as Open
-// enforces them without the test hook. "Indexed" is any usage that writes WAL
-// index records. "N>1 rejection" is the NotSupported "wal_partitions > 1 is
-// not supported yet (for any partition_wal_usage)" below. "Option rejection"
-// is a NotSupported naming wal_partitions and the option, checked before the
-// N>1 rejection and kept with the test hook.
+// enforces them. "Indexed" is any usage that writes WAL index records.
+// "Option rejection" is a NotSupported naming wal_partitions and the option.
+// (kNone, >1) stays rejected: unindexed WALs cannot be merged at recovery.
+// (indexed, >1) opens; the options below stay rejected with it.
 //
-//   Option                  (kNone, 1)    (indexed, 1)  (any, >1)
-//   manual_wal_flush        Open OK       Open OK       N>1 rejection
-//   recycle_log_file_num    Open OK (a)   Open OK (a)   Option rejection (b)
-//   unordered_write         Open OK       Open OK       Option rejection
-//   enable_pipelined_write  Open OK       Open OK       Option rejection
-//   track_and_verify_wals   Open OK       Open OK       Option rejection
-//   two_write_queues        Open OK       NotSupported  Option rejection
-//                                         (c)
-//
-// With the test hook, (kNone, >1) stays rejected after the N>1 rejection.
+//   Option                  (kNone, 1)   (indexed, 1)  (kNone, >1)
+//   manual_wal_flush        Open OK      Open OK       kNone rejection
+//   recycle_log_file_num    Open OK (a)  Open OK (a)   Option rej. (b)
+//   unordered_write         Open OK      Open OK       Option rejection
+//   enable_pipelined_write  Open OK      Open OK       Option rejection
+//   track_and_verify_wals   Open OK      Open OK       Option rejection
+//   two_write_queues        Open OK      NotSupported  Option rejection
+//                                        (c)
+// (indexed, >1) opens with every option above unset; with any of them set
+// the same Option rejection fires. manual_wal_flush opens at (indexed, >1)
+// (supported but not recommended); the kNone rejection fires only at
+// (kNone, >1), after the option rejections.
+// "kNone rejection" names wal_partitions and partition_wal_usage; the option
+// rejections above fire before it.
 //
 // (a) SanitizeOptions zeroes it under WAL_ttl_seconds, WAL_size_limit_MB,
 //     kTolerateCorruptedTailRecords and kAbsoluteConsistency, for any usage.
@@ -419,28 +422,10 @@ Status DBImpl::ValidateOptions(const DBOptions& db_options) {
         "wal_partitions > 1 is not supported with recycle_log_file_num > 0");
   }
 
-  if (db_options.wal_partitions > 1) {
-    // The partitioned write path, its completion gate, stalled-partition
-    // handling, and WAL rotation exist, but production opens stay rejected
-    // until the feature is complete. Tests reach the write path through this
-    // sync point; test tools through the experimental opt-in, which admits
-    // indexed WALs only.
-    bool allow_wal_partitions =
-        db_options.experimental_allow_wal_partitions_for_testing &&
-        log::WALIndexEnabled(db_options.partition_wal_usage);
-    TEST_SYNC_POINT_CALLBACK("DBImpl::ValidateOptions:AllowWalPartitions",
-                             &allow_wal_partitions);
-    if (!allow_wal_partitions) {
-      return Status::NotSupported(
-          "wal_partitions > 1 is not supported yet (for any "
-          "partition_wal_usage)");
-    }
-  }
-
   if (db_options.wal_partitions > 1 &&
       !log::WALIndexEnabled(db_options.partition_wal_usage)) {
     // Recovery orders N WALs only by their WAL index records; unindexed WALs
-    // cannot be merged. Permanent, whatever the sync point above allows.
+    // cannot be merged.
     return Status::NotSupported(
         "wal_partitions > 1 requires partition_wal_usage other than kNone");
   }

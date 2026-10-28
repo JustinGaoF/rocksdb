@@ -1022,9 +1022,8 @@ static enum ROCKSDB_NAMESPACE::PartitionWALUsage FLAGS_partition_wal_usage_e =
     ROCKSDB_NAMESPACE::PartitionWALUsage::kNone;
 
 DEFINE_uint32(wal_partitions, ROCKSDB_NAMESPACE::Options().wal_partitions,
-              "DBOptions::wal_partitions. Values above 1 also set the "
-              "testing-only experimental_allow_wal_partitions_for_testing "
-              "and track_and_verify_wals_in_manifest, and need "
+              "DBOptions::wal_partitions. Values above 1 also set "
+              "track_and_verify_wals_in_manifest, and need "
               "--partition_wal_usage other than none.");
 
 DEFINE_string(wal_dir, "", "If not empty, use the given dir for WAL");
@@ -5954,8 +5953,6 @@ class Benchmark {
     options.wal_compression = FLAGS_wal_compression_e;
     options.partition_wal_usage = FLAGS_partition_wal_usage_e;
     options.wal_partitions = FLAGS_wal_partitions;
-    options.experimental_allow_wal_partitions_for_testing =
-        FLAGS_wal_partitions > 1;
     options.ttl = FLAGS_fifo_compaction_ttl;
     options.compaction_options_fifo = CompactionOptionsFIFO(
         FLAGS_fifo_compaction_max_table_files_size_mb * 1024 * 1024,

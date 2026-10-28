@@ -1575,6 +1575,18 @@ class DBImpl : public DB
     return wal_durability_bg_error_.load(std::memory_order_acquire);
   }
 
+  // Every gate fence as {low, high} (high is kMaxSequenceNumber while the
+  // fence is open). Tests use it to prove a write admitted by recovery
+  // allocated above every closed fence.
+  std::vector<std::pair<SequenceNumber, SequenceNumber>> TEST_WalGateFences() {
+    InstrumentedMutexLock l(&sequence_wal_index_mutex_);
+    std::vector<std::pair<SequenceNumber, SequenceNumber>> fences;
+    for (const WalGateFence& fence : wal_gate_fences_) {
+      fences.emplace_back(fence.low, fence.high);
+    }
+    return fences;
+  }
+
   // Partition p's lowest registered, not yet completed sequence, or
   // WalDurabilityTracker::kIdle. Tests use it to observe a registration
   // directly, whether or not it is later completed.
@@ -3389,11 +3401,19 @@ class DBImpl : public DB
                            SequenceNumber pre_sync_safe_point,
                            uint64_t sync_micros);
 
+  // N>1 only. Inserts a deferred sync group's batches into the memtable,
+  // called from its completion gate after every gate sync succeeded (Q8).
+  // `first_sequence` is the group's first sequence, for insert-failure
+  // handling. An insert failure is handled like an inline one and returned.
+  Status InsertDeferredGroupIntoMemtable(
+      const WriteThread::WriteGroup* write_group,
+      SequenceNumber first_sequence);
+
   // N>1 only. A sync write's own fsync (D-G11 (c)), run from its completion
-  // gate once its group has inserted and published, so no write on any
-  // partition waits for it: claims every partition, fsyncs every live WAL,
-  // marks them synced and records them in the MANIFEST. A failure stops the
-  // DB.
+  // gate once its group has published (its memtable insert runs after the
+  // gate's syncs succeed), so no write on any partition waits for it: claims
+  // every partition, fsyncs every live WAL, marks them synced and records
+  // them in the MANIFEST. A failure stops the DB.
   Status SyncWalsFromCompletionGate(Env::IOPriority rate_limiter_priority);
 
   // N>1 only. Runs a completion gate's `sync`, which must cover every record
@@ -4840,6 +4860,12 @@ class DBImpl : public DB
   // See CloseMemTableSwitchGate().
   std::atomic<size_t> leaders_past_switch_gate_{0};
   std::atomic<bool> switch_gate_closed_{false};
+  // N>1 sync groups whose memtable insert is deferred to their completion
+  // gate (Q8): incremented when the leader skips its switch-gate exit,
+  // decremented when the gate inserts or fails. SwitchMemtableImpl waits
+  // for zero, so no seal lands between a deferred group's append and its
+  // insert. Guarded by mutex_ for the wait/signal pairing.
+  std::atomic<uint64_t> pending_deferred_gate_inserts_{0};
 
   WriteController write_controller_;
 

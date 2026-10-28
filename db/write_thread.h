@@ -113,6 +113,11 @@ class WriteThread {
     // the gate. Lets ExitAsBatchGroupFollower hand the gate outcome to the
     // leader, whose own status is otherwise untouched by the exit.
     Status gate_status;
+    // N>1 sync WAL groups only, set with completion_gate: the group's
+    // memtable insert waits for its gate syncs to succeed, so a failed gate
+    // fsync leaves nothing inserted (Q8). The leader skips the insert phase
+    // and launches no parallel workers; the gate inserts on success.
+    bool defer_memtable_insert_until_gate = false;
 
     struct Iterator {
       Writer* writer;
@@ -157,6 +162,9 @@ class WriteThread {
     bool disable_memtable;
     size_t batch_cnt;  // if non-zero, number of sub-batches in the write batch
     size_t protection_bytes_per_key;
+    // Per-writer insert options, for a deferred group's gate insert (Q8).
+    bool ignore_missing_column_families;
+    bool memtable_insert_hint_per_batch;
     PreReleaseCallback* pre_release_callback;
     PostMemTableCallback* post_memtable_callback;
     // Resolved before this writer joins a batch group. A write group may not
@@ -191,6 +199,8 @@ class WriteThread {
           disable_memtable(false),
           batch_cnt(0),
           protection_bytes_per_key(0),
+          ignore_missing_column_families(false),
+          memtable_insert_hint_per_batch(false),
           pre_release_callback(nullptr),
           post_memtable_callback(nullptr),
           wal_partition(0),
@@ -223,6 +233,10 @@ class WriteThread {
           disable_memtable(_disable_memtable),
           batch_cnt(_batch_cnt),
           protection_bytes_per_key(_batch->GetProtectionBytesPerKey()),
+          ignore_missing_column_families(
+              write_options.ignore_missing_column_families),
+          memtable_insert_hint_per_batch(
+              write_options.memtable_insert_hint_per_batch),
           pre_release_callback(_pre_release_callback),
           post_memtable_callback(_post_memtable_callback),
           wal_partition(0),

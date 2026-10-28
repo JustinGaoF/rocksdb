@@ -1633,6 +1633,66 @@ TEST_P(BackupEngineTest, BackupWithoutFlushDuringWritesIsPrefix) {
                                        kMaxKeys);
 }
 
+// Q7 (G-30 residual follow-up): flush-less backups racing another thread's
+// LockWAL/UnlockWAL at N>1 always restore to a copy that opens in every
+// recovery mode with a per-writer prefix. Modelled on
+// BackupWithoutFlushDuringWritesIsPrefix with a racing locker (as in
+// CheckpointRacingLockWAL) and repeated backups; run with --gtest_repeat=100
+// for 1000 backup cycles.
+TEST_P(BackupEngineTest, BackupRacingLockWAL) {
+  constexpr uint64_t kMaxKeys = 400;
+  constexpr int kBackups = 10;
+  const std::vector<uint32_t> cf_ids =
+      ColumnFamilyIdsCoveringWalPartitions(GetParam());
+  std::vector<ColumnFamilyDescriptor> column_families;
+  for (const std::string& name : ColumnFamilyNamesThrough(cf_ids)) {
+    column_families.emplace_back(name, options_);
+  }
+  options_.create_missing_column_families = true;
+  DestroyDBWithoutCheck(dbname_, options_);
+  std::vector<ColumnFamilyHandle*> handles;
+  ASSERT_OK(DB::Open(options_, dbname_, column_families, &handles, &db_));
+  OpenBackupEngine(/*destroy_old_data=*/true);
+  std::vector<std::vector<uint64_t>> acked_before(kBackups);
+  {
+    PartitionWriters writers(db_.get(), handles, cf_ids, kMaxKeys);
+    std::atomic<bool> stop_locking{false};
+    port::Thread locker([&] {
+      while (!stop_locking.load()) {
+        ASSERT_OK(db_->LockWAL());
+        std::this_thread::yield();
+        ASSERT_OK(db_->UnlockWAL());
+      }
+    });
+    for (int b = 0; b < kBackups; ++b) {
+      writers.WaitForAcked(static_cast<uint64_t>(b + 1) * 10);
+      acked_before[b] = writers.Acked();
+      ASSERT_OK(RunWithin(std::chrono::seconds(30), [&] {
+        return backup_engine_->CreateNewBackup(db_.get(),
+                                               /*flush_before_backup=*/false);
+      }));
+    }
+    stop_locking.store(true);
+    locker.join();
+  }
+  for (ColumnFamilyHandle* handle : handles) {
+    ASSERT_OK(db_->DestroyColumnFamilyHandle(handle));
+  }
+  CloseDBAndBackupEngine();
+  // Restore each backup over a clean dbname_ and check it opens in every
+  // recovery mode with a per-writer prefix. Backup ids start at 1.
+  OpenBackupEngine();
+  for (int b = 0; b < kBackups; ++b) {
+    SCOPED_TRACE("backup " + std::to_string(b + 1));
+    DestroyDBWithoutCheck(dbname_, options_);
+    ASSERT_OK(backup_engine_->RestoreDBFromBackup(static_cast<BackupID>(b + 1),
+                                                  dbname_, dbname_));
+    AssertKeyPrefixesInEveryRecoveryMode(options_, dbname_, cf_ids,
+                                         acked_before[b], kMaxKeys);
+  }
+  CloseBackupEngine();
+}
+
 // this will make sure that backup does not copy the same file twice
 TEST_P(BackupEngineTest, NoDoubleCopy_And_AutoGC) {
   OpenDBAndBackupEngine(true, true);

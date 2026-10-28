@@ -2614,6 +2614,128 @@ TEST_P(WritePreparedTransactionTest, RollbackPreparedAfterCommitWriteFailure) {
   ASSERT_OK(ReOpenNoDelete());
 }
 
+TEST_P(WritePreparedTransactionTest,
+       TwoPhaseCommitSpanningPartitionsRecoversAtomically) {
+  // Q6 (G-55 follow-up, ported from GC14a's Muse candidate): at N in {2, 8}, a
+  // pessimistic TransactionDB (WritePrepared, allow_2pc) prepares a transaction
+  // on one partition (prepare routes by lowest CF id) and commits it on another
+  // (the CF-less commit marker routes by XID). Crashing before the commit
+  // recovers the prepared transaction with neither key visible; crashing after
+  // it recovers both keys committed; never half. Runs its own N loop once,
+  // under every recovery mode. (WriteCommitted cannot span: its commits carry
+  // their keys and co-route with the prepare. See
+  // TwoPhaseCommitRecoversAtomically- AtWalPartitions in transaction_test.cc.)
+  if (txn_db_options.write_policy != WRITE_PREPARED || use_stackable_db_ ||
+      options.two_write_queues || test::WalPartitionsForCurrentTest() != 1 ||
+      txn_db_options.use_per_key_point_lock_mgr) {
+    return;
+  }
+  const std::vector<WALRecoveryMode> recovery_modes = {
+      WALRecoveryMode::kAbsoluteConsistency,
+      WALRecoveryMode::kTolerateCorruptedTailRecords,
+      WALRecoveryMode::kPointInTimeRecovery,
+      WALRecoveryMode::kSkipAnyCorruptedRecords,
+  };
+  options.allow_2pc = true;
+  options.two_write_queues = false;
+  options.unordered_write = false;
+  options.avoid_flush_during_shutdown = true;
+  options.avoid_flush_during_recovery = true;
+  WriteOptions write_options;
+  write_options.sync = true;
+  ReadOptions read_options;
+
+  for (const uint32_t num_partitions : {2, 8}) {
+    SCOPED_TRACE("partitions=" + std::to_string(num_partitions));
+    test::SetWalPartitions(&options, num_partitions);
+    ASSERT_OK(ReOpen());
+
+    // Find an XID whose commit marker lands on a different partition than
+    // the prepare (default CF id 0 routes the prepare).
+    std::vector<DBImpl::WalAppendOutcome> outcomes;
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::WriteToWAL:AppendOutcome", [&](void* arg) {
+          outcomes.push_back(*static_cast<DBImpl::WalAppendOutcome*>(arg));
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+    std::string spanning_xid;
+    for (int attempt = 0; attempt < 100; ++attempt) {
+      const std::string xid = "span_" + std::to_string(attempt);
+      TransactionOptions txn_options;
+      Transaction* txn = db->BeginTransaction(write_options, txn_options);
+      ASSERT_NE(nullptr, txn);
+      ASSERT_OK(txn->SetName(xid));
+      ASSERT_OK(txn->Put(Slice("probe"), Slice("probe")));
+      outcomes.clear();
+      ASSERT_OK(txn->Prepare());
+      ASSERT_OK(txn->Commit());
+      delete txn;
+      ASSERT_EQ(2U, outcomes.size());
+      if (outcomes[0].wal_partition != outcomes[1].wal_partition) {
+        spanning_xid = xid;
+        break;
+      }
+    }
+    ASSERT_FALSE(spanning_xid.empty());
+
+    for (const WALRecoveryMode recovery_mode : recovery_modes) {
+      for (const bool crash_after_commit : {false, true}) {
+        SCOPED_TRACE("mode=" + std::to_string(static_cast<int>(recovery_mode)) +
+                     (crash_after_commit ? " crash-after" : " crash-before"));
+        options.wal_recovery_mode = recovery_mode;
+        ASSERT_OK(ReOpen());
+        TransactionOptions txn_options;
+        Transaction* txn = db->BeginTransaction(write_options, txn_options);
+        ASSERT_NE(nullptr, txn);
+        ASSERT_OK(txn->SetName(spanning_xid));
+        ASSERT_OK(txn->Put(Slice("xa"), Slice("va")));
+        ASSERT_OK(txn->Put(Slice("xb"), Slice("vb")));
+        outcomes.clear();
+        ASSERT_OK(txn->Prepare());
+        ASSERT_EQ(1U, outcomes.size());
+        const size_t prepare_partition = outcomes[0].wal_partition;
+        if (crash_after_commit) {
+          ASSERT_OK(txn->Commit());
+          ASSERT_EQ(2U, outcomes.size());
+          ASSERT_NE(prepare_partition, outcomes[1].wal_partition);
+        }
+        delete txn;
+
+        if (!crash_after_commit) {
+          // A prepared transaction is still in the heap: mark the crash so
+          // closing over it does not trip the heap-empty assert.
+          dynamic_cast<WritePreparedTxnDB*>(db)->TEST_Crash();
+        }
+        // ReOpenNoDelete closes, drops unsynced file data and reopens: the
+        // crash.
+        ASSERT_OK(ReOpenNoDelete());
+
+        std::string value;
+        if (crash_after_commit) {
+          ASSERT_OK(db->Get(read_options, "xa", &value));
+          ASSERT_EQ("va", value);
+          ASSERT_OK(db->Get(read_options, "xb", &value));
+          ASSERT_EQ("vb", value);
+          ASSERT_EQ(nullptr, db->GetTransactionByName(spanning_xid));
+        } else {
+          ASSERT_TRUE(db->Get(read_options, "xa", &value).IsNotFound());
+          ASSERT_TRUE(db->Get(read_options, "xb", &value).IsNotFound());
+          Transaction* recovered = db->GetTransactionByName(spanning_xid);
+          ASSERT_NE(nullptr, recovered);
+          ASSERT_OK(recovered->Commit());
+          delete recovered;
+          ASSERT_OK(db->Get(read_options, "xa", &value));
+          ASSERT_EQ("va", value);
+          ASSERT_OK(db->Get(read_options, "xb", &value));
+          ASSERT_EQ("vb", value);
+        }
+      }
+    }
+    SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:AppendOutcome");
+    SyncPoint::GetInstance()->DisableProcessing();
+  }
+}
+
 TEST_P(WritePreparedTransactionTest, DisableGCDuringRecovery) {
   // Use large buffer to avoid memtable flush after 1024 insertions
   options.write_buffer_size = 1024 * 1024;
@@ -4701,9 +4823,9 @@ TEST_P(WritePreparedTransactionTest, TxnGetEntitySkipsPreparedUncommitted) {
   scenario.TearDown(db);
 }
 
-// WritePrepared with more than one WAL partition (allowed only through the
-// debug hook), one queue, and the commit-time batch cached for recovery: the
-// leaders of different partitions cache the recoverable state concurrently.
+// WritePrepared with more than one WAL partition, one queue, and the
+// commit-time batch cached for recovery: the leaders of different partitions
+// cache the recoverable state concurrently.
 class WritePreparedPartitionedWalTest : public testing::Test {
  public:
   WritePreparedPartitionedWalTest()
@@ -4713,9 +4835,6 @@ class WritePreparedPartitionedWalTest : public testing::Test {
     options_.track_and_verify_wals_in_manifest = true;
     options_.two_write_queues = false;
     txn_db_options_.write_policy = WRITE_PREPARED;
-    SyncPoint::GetInstance()->SetCallBack(
-        "DBImpl::ValidateOptions:AllowWalPartitions",
-        [](void* arg) { *static_cast<bool*>(arg) = true; });
     SyncPoint::GetInstance()->EnableProcessing();
     EXPECT_OK(DestroyDB(dbname_, options_));
   }

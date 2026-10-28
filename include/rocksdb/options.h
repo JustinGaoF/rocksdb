@@ -1530,35 +1530,35 @@ struct DBOptions {
   // latency is high relative to bandwidth, that single outstanding I/O bounds
   // write throughput no matter how fast the device is. Spreading writes over N
   // WAL files allows N concurrent appends. Recovery merges the partitions back
-  // into a single sequence-ordered stream, so the logical log is unchanged.
+  // into a single wal_index-ordered stream, so the logical log is unchanged.
+  //
+  // Values greater than 1 require a `partition_wal_usage` that enables WAL
+  // indexing; `kNone` with more than one partition is rejected at Open() with
+  // Status::NotSupported. Values above 64 are rejected with
+  // Status::InvalidArgument. With the default of 1 the WAL is byte-for-byte
+  // identical to a build without this option.
+  //
+  // More than one partition is rejected with two_write_queues,
+  // enable_pipelined_write, unordered_write, track_and_verify_wals,
+  // recycle_log_file_num > 0, allow_concurrent_memtable_write=false,
+  // paranoid_checks=false, and track_and_verify_wals_in_manifest=false (see
+  // DBImpl::ValidateOptions for the exact list), and with per-column-family
+  // inplace_update_support and enable_blob_direct_write, callback writes,
+  // and serial OCC validation.
+  //
+  // Not dynamically changeable via SetDBOptions() or SetOptions().
   //
   // manual_wal_flush is supported but not recommended with more than one
   // partition: FlushWAL() flushes every partition's buffer while holding every
   // partition's WAL write lock, which re-imposes the coordinated flushing that
   // partitions exist to avoid.
   //
-  // Not dynamically changeable via SetOptions().
-  //
-  // Values greater than 1 are not implemented yet and are rejected at Open()
-  // with Status::NotSupported, except for testing through
-  // experimental_allow_wal_partitions_for_testing. With the default of 1 the
-  // WAL is byte-for-byte identical to a build without this option. Values
-  // above 64 are rejected with Status::InvalidArgument.
+  // Enabling this is a rollout step: every reader of these WALs (ldb, backup
+  // and checkpoint restore, RepairDB, secondaries) must run a binary that
+  // understands indexed WALs first.
   //
   // Default: 1
   uint32_t wal_partitions = 1;
-
-  // EXPERIMENTAL, for testing only. Not for production use; it will be
-  // removed once wal_partitions > 1 is supported.
-  //
-  // Lets Open() accept wal_partitions > 1 when partition_wal_usage is not
-  // kNone, instead of rejecting it with Status::NotSupported. Every other
-  // rejection of wal_partitions > 1 still applies. It is not written to the
-  // OPTIONS file, so a DB reopened from its OPTIONS file never gets it. It has
-  // no effect when wal_partitions is 1.
-  //
-  // Default: false
-  bool experimental_allow_wal_partitions_for_testing = false;
 
   // The maximum number of microseconds that a write operation will use
   // a yielding spin loop to coordinate with other write threads before

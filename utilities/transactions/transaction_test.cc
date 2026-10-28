@@ -10419,10 +10419,6 @@ TEST(TransactionPartitionedWalTest, SwitchWALFindsOldestWalAcrossPartitions) {
   // pinned by the outstanding prepare and give up on releasing it, as at
   // N=1, instead of comparing against partition 0's newer WAL.
   constexpr size_t kPartitions = 2;
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
   const std::string dbname =
       test::PerThreadDBPath("transaction_partitioned_wal_switch");
   Options options;
@@ -10509,10 +10505,6 @@ TEST(TransactionPartitionedWalTest, SwitchWALFindsOldestWalAcrossPartitions) {
 // the commit written after the upgrade finds its prepare.
 TEST(TransactionPartitionedWalTest, PreparedUnindexedWalSurvivesPartitioning) {
   constexpr size_t kPartitions = 2;
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
   const std::string dbname =
       test::PerThreadDBPath("transaction_prepare_across_partitioning");
   Options options;
@@ -10605,9 +10597,6 @@ TEST(TransactionPartitionedWalTest, PreparedUnindexedWalSurvivesPartitioning) {
 TEST(TransactionPartitionedWalTest,
      SnapshotCommitPublishesAboveHeldLowerWrite) {
   constexpr size_t kPartitions = 2;
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
   SyncPoint::GetInstance()->EnableProcessing();
   const std::string dbname =
       test::PerThreadDBPath("transaction_partitioned_wal_snapshot_commit");

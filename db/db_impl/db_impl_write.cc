@@ -1698,11 +1698,42 @@ Status DBImpl::WriteImpl(
     if (NumWalPartitions() > 1 && !write_options.disableWAL && io_s.ok()) {
       TEST_SYNC_POINT_CALLBACK("DBImpl::InstallCompletionGate", &last_sequence);
       const SequenceNumber gate_target = last_sequence;
+      const SequenceNumber gate_first = current_sequence;
       const bool gate_sync = write_options.sync;
       const Env::IOPriority gate_io_priority =
           write_group.leader->rate_limiter_priority;
-      write_group.completion_gate = [this, gate_target, gate_sync,
-                                     gate_io_priority]() {
+      // A sync group inserts into the memtable from its gate, once every
+      // gate sync succeeded, so a failed gate fsync leaves nothing inserted
+      // (Q8): never visible, nothing to flush. The insert phase below is
+      // skipped for the group, which holds its switch-gate usage until
+      // the gate inserts; publishing still happens at the exit, before
+      // the gate (D-G11 (c)).
+      write_group.defer_memtable_insert_until_gate = gate_sync;
+      const WriteThread::WriteGroup* gate_group = &write_group;
+      write_group.completion_gate = [this, gate_target, gate_first, gate_sync,
+                                     gate_group, gate_io_priority]() {
+        // A deferred group held its memtable-switch-gate usage past the
+        // exit and counted itself pending, so no seal lands between its
+        // append and its deferred insert (Q8): release both on every path
+        // below, after the insert or with none when a sync failed.
+        struct DeferredGateExit {
+          DBImpl* db;
+          bool deferred;
+          ~DeferredGateExit() {
+            if (!deferred) {
+              return;
+            }
+            {
+              InstrumentedMutexLock l(&db->mutex_);
+              if (db->pending_deferred_gate_inserts_.fetch_sub(
+                      1, std::memory_order_relaxed) == 1) {
+                db->bg_cv_.SignalAll();
+              }
+            }
+            db->ExitMemTableSwitchGate();
+          }
+        } deferred_gate_exit{this,
+                             gate_group->defer_memtable_insert_until_gate};
         // D-G11 (c): a sync write fsyncs every partition here, after its
         // group published, so no write on any partition waits for it. An
         // async write never syncs; its gate waits only for every record at
@@ -1719,8 +1750,15 @@ Status DBImpl::WriteImpl(
             return s;
           }
         }
-        return RunCompletionGate(gate_target, gate_sync, pre_sync_safe_point,
-                                 sync_micros);
+        Status gate_status = RunCompletionGate(
+            gate_target, gate_sync, pre_sync_safe_point, sync_micros);
+        if (!gate_status.ok() ||
+            !gate_group->defer_memtable_insert_until_gate) {
+          return gate_status;
+        }
+        // Every sync succeeded: insert the group's batches now. An insert
+        // failure here is handled like an inline one.
+        return InsertDeferredGroupIntoMemtable(gate_group, gate_first);
       };
     } else if (NumWalPartitions() > 1 && seq_inc > 0 && io_s.ok()) {
       // A disableWAL group has nothing to make durable, but its sequences
@@ -1763,7 +1801,10 @@ Status DBImpl::WriteImpl(
     release_unapplied_range =
         registered_applied_range && io_s.ok() && !status.ok();
 
-    if (status.ok()) {
+    // A deferred sync group skips this insert; its gate inserts after every
+    // sync succeeded (Q8). No parallel workers are launched, so followers
+    // wait in JoinBatchGroup until the leader completes them after the gate.
+    if (status.ok() && !write_group.defer_memtable_insert_until_gate) {
       PERF_TIMER_FOR_WAIT_GUARD(write_memtable_time);
 
       if (!parallel) {
@@ -1801,9 +1842,9 @@ Status DBImpl::WriteImpl(
               write_options.memtable_insert_hint_per_batch);
         }
       }
-      if (seq_used != nullptr) {
-        *seq_used = w.sequence;
-      }
+    }
+    if (status.ok() && seq_used != nullptr) {
+      *seq_used = w.sequence;
     }
   }
   PERF_TIMER_START(write_pre_and_post_process_time);
@@ -1907,7 +1948,19 @@ Status DBImpl::WriteImpl(
       }
       HandleMemTableInsertFailure(w.status, last_sequence + 1 - seq_inc);
     }
-    ExitMemTableSwitchGate();
+    // A sync group whose insert is deferred keeps its switch-gate usage
+    // and counts itself pending until its gate inserts: a seal between
+    // the append and the deferred insert would rotate the WAL past
+    // uninserted records and flush an SST without them, losing
+    // acknowledged writes at recovery (Q8). The gate releases both on
+    // every path; a group whose gate never runs exits here.
+    if (!write_group.defer_memtable_insert_until_gate || !status.ok() ||
+        write_group.completion_gate == nullptr) {
+      ExitMemTableSwitchGate();
+    } else {
+      InstrumentedMutexLock l(&mutex_);
+      pending_deferred_gate_inserts_.fetch_add(1, std::memory_order_relaxed);
+    }
     write_thread.ExitAsBatchGroupLeader(write_group, status);
   }
 
@@ -3285,6 +3338,43 @@ SequenceNumber DBImpl::UnreleasedWalGateFenceLow() {
   return low;
 }
 
+Status DBImpl::InsertDeferredGroupIntoMemtable(
+    const WriteThread::WriteGroup* write_group, SequenceNumber first_sequence) {
+  assert(NumWalPartitions() > 1);
+  assert(write_group != nullptr);
+  assert(write_group->defer_memtable_insert_until_gate);
+  // A sync group's memtable insert, run from its completion gate after every
+  // gate sync succeeded (Q8). Same per-writer form the parallel workers use,
+  // with each writer's own sequence, options and batch count, so a failed
+  // gate sync returns before anything is inserted: never visible to a
+  // reader, nothing to flush after Resume(). An insert failure here is
+  // handled exactly like an inline one (background error plus fence).
+  PERF_TIMER_FOR_WAIT_GUARD(write_memtable_time);
+  ColumnFamilyMemTablesImpl column_family_memtables(
+      versions_->GetColumnFamilySet());
+  Status first_failure;
+  for (auto* tmp_w : *write_group) {
+    assert(tmp_w);
+    if (!tmp_w->ShouldWriteToMemtable()) {
+      continue;
+    }
+    Status s = WriteBatchInternal::InsertInto(
+        tmp_w, tmp_w->sequence, &column_family_memtables, &flush_scheduler_,
+        &trim_history_scheduler_, tmp_w->ignore_missing_column_families,
+        0 /*log_number*/, this, true /*concurrent_memtable_writes*/,
+        seq_per_batch_, tmp_w->batch_cnt, batch_per_txn_,
+        tmp_w->memtable_insert_hint_per_batch);
+    tmp_w->status = s;
+    if (!s.ok() && first_failure.ok()) {
+      first_failure = s;
+    }
+  }
+  if (!first_failure.ok()) {
+    HandleMemTableInsertFailure(first_failure, first_sequence);
+  }
+  return first_failure;
+}
+
 Status DBImpl::RunCompletionGate(SequenceNumber target, bool sync,
                                  SequenceNumber pre_sync_safe_point,
                                  uint64_t sync_micros) {
@@ -3478,7 +3568,7 @@ IOStatus DBImpl::SyncEveryWalPartition(const WriteOptions& write_options,
   // unchanged.)
   const bool take_partition_locks = !needs_locking && NumWalPartitions() > 1;
   if (take_partition_locks) {
-    TEST_SYNC_POINT("DBImpl::WriteGroupToWAL:TakesPartitionSyncMutex");
+    TEST_SYNC_POINT("DBImpl::SyncEveryWalPartition:TakesPartitionSyncMutex");
   }
   for (size_t p = 0; p < NumWalPartitions(); ++p) {
     // Per-partition here: with manual_wal_flush_, needs_locking already
@@ -3561,7 +3651,7 @@ Status DBImpl::SyncWalsFromCompletionGate(
   autovector<uint8_t, 1> claimed;
   uint32_t unsynced_partitions = 0;
   {
-    TEST_SYNC_POINT("DBImpl::PreprocessWrite:TakesSyncMarkMutex");
+    TEST_SYNC_POINT("DBImpl::SyncWalsFromCompletionGate:TakesSyncMarkMutex");
     InstrumentedMutexLock mark_lock(&wal_sync_mark_mutex_);
     claimed.resize(NumWalPartitions());
     for (size_t p = 0; p < NumWalPartitions(); ++p) {
@@ -3581,7 +3671,7 @@ Status DBImpl::SyncWalsFromCompletionGate(
                                  &fsynced_partitions);
     // Tests override io_s here to fail exactly this sync, which then
     // follows the WAL error path below.
-    TEST_SYNC_POINT_CALLBACK("DBImpl::WriteGroupToWAL:AfterLeadershipSync",
+    TEST_SYNC_POINT_CALLBACK("DBImpl::SyncWalsFromCompletionGate:AfterGateSync",
                              &io_s);
     if (io_s.ok() && need_wal_dir_sync) {
       io_s = directories_.GetWalDir()->FsyncWithDirOptions(
@@ -3602,7 +3692,8 @@ Status DBImpl::SyncWalsFromCompletionGate(
     }
   }
   if (!io_s.ok()) {
-    // The group is already inserted and published, so, as for a failed
+    // The group is published but not yet inserted (a sync group's memtable
+    // insert runs after its gate's syncs succeed), so, as for a failed
     // SyncWAL(), only the WAL is named: the failure stops the DB (D-1) and
     // the write reports it, but no range is pinned or fenced. Fencing here
     // would also fail every acknowledged write above it.
@@ -4536,6 +4627,16 @@ Status DBImpl::SwitchMemtableImpl(ColumnFamilyData* cfd, WriteContext* context,
                                   bool refresh_wbm_accounting) {
   mutex_.AssertHeld();
   assert(lock_wal_owner_thread_id_counts_.empty());
+  // A deferred N>1 sync group (Q8) appends before its gate and inserts in
+  // it. Wait for any outstanding deferred insert: sealing now would freeze
+  // a memtable without records the WAL rotation already covers, and a
+  // flush of it would advance past their WAL, losing acknowledged writes
+  // at recovery. The wait releases mutex_, and gates never block on the
+  // seal, so this cannot deadlock.
+  while (pending_deferred_gate_inserts_.load(std::memory_order_relaxed) != 0) {
+    TEST_SYNC_POINT("DBImpl::SwitchMemtableImpl:WaitForDeferredGateInsert");
+    bg_cv_.Wait();
+  }
 
   // TODO: plumb Env::IOActivity, Env::IOPriority
   const WriteOptions write_options;
