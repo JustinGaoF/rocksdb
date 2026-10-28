@@ -12616,6 +12616,67 @@ TEST_P(DBWalAppendFailureTest, WriteAdmittedByRecoveryAllocatesAboveFences) {
   EXPECT_EQ("NOT_FOUND", Get(cf_for_partition_[0], "failed"));
 }
 
+// FU14 M-a: partition 1's append fails with a retryable IOError (a hard,
+// resumable error) and poisons its writer. A sync=true write on partition 0,
+// allocated below the failed range and held between its append and its
+// completion gate, then reaches its gate sync, which fsyncs every partition
+// including partition 1's poisoned writer. That Sync reports "Writer has
+// previous error." (non-retryable) and the WAL error path escalates the
+// background error. Correct behaviour: the error stays hard and Resume()
+// succeeds.
+TEST_P(DBWalAppendFailureTest, GateSyncKeepsOtherPartitionsErrorResumable) {
+  Options options = FailureOptions();
+  OpenWithPartitions(2, options);
+  PutBeforeFailure(this);
+  const int cf_a = cf_for_partition_[0];
+  const int cf_b = cf_for_partition_[1];
+  WriteOptions sync_wo;
+  sync_wo.sync = true;
+
+  std::mutex mu;
+  std::condition_variable cv;
+  bool hold_armed = true;
+  bool a_held = false;
+  bool release_a = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::InstallCompletionGate", [&](void*) {
+        std::unique_lock<std::mutex> lock(mu);
+        if (!hold_armed) {
+          return;
+        }
+        hold_armed = false;
+        a_held = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return release_a; });
+      });
+  Writer a([&] { return Put(cf_a, "a", "value", sync_wo); });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    ASSERT_TRUE(
+        cv.wait_for(lock, std::chrono::seconds(30), [&] { return a_held; }));
+  }
+  fail_fs_->Arm(dbfull()->TEST_CurrentWalNumber(1), Retryable("injected"));
+  const Status b_status = PutWithin(cf_b, "failed");
+  fail_fs_->Disarm();
+  ASSERT_NOK(b_status);
+  const Status bg_before = dbfull()->TEST_GetBGError();
+  ASSERT_EQ(Status::Severity::kHardError, bg_before.severity())
+      << bg_before.ToString();
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    release_a = true;
+    cv.notify_all();
+  }
+  const Status a_status = a.Join();
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::InstallCompletionGate");
+  fprintf(stderr, "M-a: held sync write on partition 0 returned: %s\n",
+          a_status.ToString().c_str());
+  const Status bg_after = dbfull()->TEST_GetBGError();
+  EXPECT_EQ(Status::Severity::kHardError, bg_after.severity())
+      << bg_after.ToString();
+  EXPECT_OK(dbfull()->Resume());
+}
+
 TEST_P(DBWritePartitionTest, PublicationBoundedForParallelGroup) {
   // G-10 on the parallel-memtable path (ported from D126813582): B1 and B2
   // are forced into one group on partition 1, above A held in its append on

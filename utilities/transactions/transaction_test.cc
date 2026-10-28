@@ -31,6 +31,7 @@
 #include "test_util/transaction_test_util.h"
 #include "util/random.h"
 #include "util/string_util.h"
+#include "utilities/fault_injection_env.h"
 #include "utilities/merge_operators.h"
 #include "utilities/secondary_index/secondary_index_helper.h"
 #include "utilities/transactions/pessimistic_transaction_db.h"
@@ -10671,6 +10672,92 @@ TEST(TransactionPartitionedWalTest,
   delete db;
   SyncPoint::GetInstance()->DisableProcessing();
   SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_OK(DestroyDB(dbname, options));
+}
+
+// FU14 H1: a WriteCommitted Prepare is a WAL-only write (kDisableMemtable)
+// and consumes no sequence number, so at N>1 its completion gate targets the
+// already-published last sequence L. Once a previous sync write has advanced
+// the coalesced gate-sync frontier to L, a sync=true Prepare is acknowledged
+// without any fsync. Correct behaviour: the acknowledged Prepare survives a
+// power loss that drops every unsynced byte, so the transaction recovers as
+// prepared.
+TEST(TransactionPartitionedWalTest, SyncPrepareAfterSyncCommitSurvivesCrash) {
+  constexpr size_t kPartitions = 2;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::ValidateOptions:AllowWalPartitions",
+      [](void* arg) { *static_cast<bool*>(arg) = true; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  const std::string dbname =
+      test::PerThreadDBPath("transaction_partitioned_wal_sync_prepare");
+  // Drops every byte not synced when the DB closes (simulated power loss),
+  // as SyncWriteMakesPriorPartitionAppendSurviveCrash in db_write_test does.
+  std::unique_ptr<FaultInjectionTestEnv> fault_env(
+      new FaultInjectionTestEnv(Env::Default()));
+  Options options;
+  options.create_if_missing = true;
+  options.wal_partitions = kPartitions;
+  options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  options.track_and_verify_wals_in_manifest = true;
+  options.avoid_flush_during_recovery = true;
+  options.avoid_flush_during_shutdown = true;
+  options.env = fault_env.get();
+  options.statistics = CreateDBStatistics();
+  ASSERT_OK(DestroyDB(dbname, options));
+  TransactionDBOptions txn_db_options;
+  txn_db_options.write_policy = WRITE_COMMITTED;
+  TransactionDB* db = nullptr;
+  ASSERT_OK(TransactionDB::Open(options, txn_db_options, dbname, &db));
+  ASSERT_EQ(
+      kPartitions,
+      static_cast_with_check<DBImpl>(db->GetRootDB())->TEST_NumWalPartitions());
+
+  WriteOptions sync_wo;
+  sync_wo.sync = true;
+  Transaction* txn1 = db->BeginTransaction(sync_wo);
+  ASSERT_OK(txn1->SetName("xid1"));
+  ASSERT_OK(txn1->Put("k1", "v1"));
+  ASSERT_OK(txn1->Prepare());
+  ASSERT_OK(txn1->Commit());
+  delete txn1;
+
+  Transaction* txn2 = db->BeginTransaction(sync_wo);
+  ASSERT_OK(txn2->SetName("xid2"));
+  ASSERT_OK(txn2->Put("k2", "v2"));
+  const uint64_t synced_before =
+      options.statistics->getTickerCount(WAL_FILE_SYNCED);
+  ASSERT_OK(txn2->Prepare());
+  const uint64_t synced_after =
+      options.statistics->getTickerCount(WAL_FILE_SYNCED);
+  // The sync=true Prepare must sync the WAL before it is acknowledged.
+  EXPECT_GT(synced_after, synced_before)
+      << "sync=true Prepare acknowledged without a WAL sync";
+  delete txn2;
+
+  // Control: never synced, so the power loss below must drop it.
+  ASSERT_OK(db->Put(WriteOptions(), "control", "v"));
+
+  delete db;
+  db = nullptr;
+  ASSERT_OK(fault_env->DropUnsyncedFileData());
+  fault_env->ResetState();
+
+  ASSERT_OK(TransactionDB::Open(options, txn_db_options, dbname, &db));
+  std::string value;
+  ASSERT_OK(db->Get(ReadOptions(), "k1", &value));
+  ASSERT_EQ("v1", value);
+  ASSERT_TRUE(db->Get(ReadOptions(), "control", &value).IsNotFound());
+  Transaction* recovered = db->GetTransactionByName("xid2");
+  EXPECT_NE(nullptr, recovered)
+      << "acknowledged sync=true Prepare of xid2 lost after power loss";
+  if (recovered != nullptr) {
+    ASSERT_OK(recovered->Rollback());
+    delete recovered;
+  }
+  delete db;
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  options.env = Env::Default();
   ASSERT_OK(DestroyDB(dbname, options));
 }
 
