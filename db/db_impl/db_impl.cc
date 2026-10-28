@@ -2903,7 +2903,8 @@ bool DBImpl::ClaimWalPartitionForSyncWalImpl(
 
 IOStatus DBImpl::SyncWalPartitionFiles(size_t partition,
                                        const WriteOptions& write_options,
-                                       uint64_t* failed_wal_number) {
+                                       uint64_t* failed_wal_number,
+                                       bool* previously_failed) {
   // At N==1 the single-queue leadership sync calls this without the WAL
   // mutex, as before the partitioned path existed (single writer, and the
   // getting_synced marks exclude SyncWAL); every other caller holds it.
@@ -2922,13 +2923,27 @@ IOStatus DBImpl::SyncWalPartitionFiles(size_t partition,
     if (!io_s.ok()) {
       break;
     }
+    if (previously_failed != nullptr &&
+        log.number <= wal_recovery_cutoff_.load(std::memory_order_acquire)) {
+      // As in SyncWalImpl: a failed handle is unusable, and recovery
+      // persists what this WAL holds. The caller reports the stored
+      // background error instead.
+      *previously_failed = true;
+      continue;
+    }
     // If last sync failed on a later WAL, this could be a fully synced
     // and closed WAL that just needs to be recorded as synced in the
     // manifest.
     if (auto* f = log.writer->file()) {
       const uint64_t size = f->GetFileSize();
-      io_s = immutable_db_options_.use_fsync ? f->Fsync(opts) : f->Sync(opts);
+      bool seen_error = false;
+      io_s = f->Sync(opts, immutable_db_options_.use_fsync, &seen_error);
       if (!io_s.ok()) {
+        if (previously_failed != nullptr && seen_error) {
+          // The writer failed earlier, and whoever saw that failure owns
+          // classifying it; this synthetic status has lost its scope.
+          *previously_failed = true;
+        }
         *failed_wal_number = log.number;
         break;
       }
@@ -4704,6 +4719,11 @@ void DBImpl::MultiGetWithCallbackImpl(
     timestamp_read_callback.Refresh(consistent_seqnum);
     read_callback = &timestamp_read_callback;
   }
+  std::optional<WalGateReadMask> gate_read_mask;
+  if (auto ranges = WalGateReadMaskRanges()) {
+    gate_read_mask.emplace(std::move(ranges), read_callback, consistent_seqnum);
+    read_callback = &*gate_read_mask;
+  }
 
   s = MultiGetImpl(read_options, 0, num_keys, sorted_keys,
                    cf_sv_pairs[0].super_version, consistent_seqnum,
@@ -5604,10 +5624,25 @@ ArenaWrappedDBIter* DBImpl::NewIteratorImpl(
   // Laying out the iterators in the order of being accessed makes it more
   // likely that any iterator pointer is close to the iterator it points to so
   // that they are likely to be in the same cache line and/or page.
-  return NewArenaWrappedDbIterator(env_, read_options, cfh, sv, snapshot,
-                                   read_callback, this, expose_blob_index,
-                                   allow_refresh,
-                                   /*allow_mark_memtable_for_flush=*/true);
+  WalGateReadMask* gate_read_mask = nullptr;
+  if (auto ranges = WalGateReadMaskRanges()) {
+    gate_read_mask =
+        new WalGateReadMask(std::move(ranges), read_callback, snapshot);
+    read_callback = gate_read_mask;
+  }
+  ArenaWrappedDBIter* iter = NewArenaWrappedDbIterator(
+      env_, read_options, cfh, sv, snapshot, read_callback, this,
+      expose_blob_index, allow_refresh,
+      /*allow_mark_memtable_for_flush=*/true);
+  if (gate_read_mask != nullptr) {
+    // Lives as long as the iterator, which keeps it across Refresh().
+    iter->RegisterCleanup(
+        [](void* arg1, void* /*arg2*/) {
+          delete static_cast<WalGateReadMask*>(arg1);
+        },
+        gate_read_mask, nullptr);
+  }
+  return iter;
 }
 
 std::unique_ptr<Iterator> DBImpl::NewCoalescingIterator(

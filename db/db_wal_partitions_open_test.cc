@@ -29,17 +29,21 @@ INSTANTIATE_TEST_CASE_P(CrashOrCleanClose, DBWalPartitionsOpenTest,
 
 // Indexed N=4 opens with wal_partitions and partition_wal_usage alone. Writes
 // spread over several column families, so several partitions' WALs are live,
-// with every fifth write synced. With the parameter set, the DB is closed and
-// every byte that was never synced is dropped (a crash): every write up to and
-// including the last acknowledged sync write comes back, and what comes back
-// is a prefix of the write order. A clean close and reopen recovers every
-// write. Neuter: restore the wal_partitions > 1 gate; Open returns
-// NotSupported.
+// with every fifth write synced, then an async tail after the last sync write.
+// With the parameter set, the DB is closed and every byte that was never
+// synced is dropped (a crash): every write up to and including the last
+// acknowledged sync write comes back, part of the tail is lost, and what comes
+// back is a prefix of the write order. A clean close and reopen recovers every
+// write. Neuters: restore the wal_partitions > 1 gate, and Open returns
+// NotSupported; treat a middle synced key as missing, and the prefix check
+// fails.
 TEST_P(DBWalPartitionsOpenTest, IndexedOpensWithoutHookAndRecoversPrefix) {
   const bool crash = GetParam();
   constexpr uint32_t kPartitions = 4;
   constexpr int kColumnFamilies = 8;
-  constexpr int kWrites = 200;
+  constexpr int kSyncedWrites = 200;
+  constexpr int kAsyncTail = 10;
+  constexpr int kWrites = kSyncedWrites + kAsyncTail;
   constexpr int kSyncEvery = 5;
 
   auto env = std::make_unique<FaultInjectionTestEnv>(Env::Default());
@@ -72,7 +76,8 @@ TEST_P(DBWalPartitionsOpenTest, IndexedOpensWithoutHookAndRecoversPrefix) {
     ASSERT_EQ(kPartitions, db->GetDBOptions().wal_partitions);
     for (int i = 0; i < kWrites; ++i) {
       WriteOptions write_options;
-      write_options.sync = i % kSyncEvery == kSyncEvery - 1;
+      write_options.sync =
+          i < kSyncedWrites && i % kSyncEvery == kSyncEvery - 1;
       ASSERT_OK(db->Put(write_options, handles[i % kColumnFamilies], key(i),
                         "value" + std::to_string(i)));
       if (write_options.sync) {
@@ -98,7 +103,7 @@ TEST_P(DBWalPartitionsOpenTest, IndexedOpensWithoutHookAndRecoversPrefix) {
     }
     ASSERT_OK(db->Close());
   }
-  ASSERT_EQ(kWrites - 1, last_synced);
+  ASSERT_EQ(kSyncedWrites - 1, last_synced);
   if (crash) {
     ASSERT_OK(env->DropUnsyncedFileData());
   }
@@ -122,6 +127,7 @@ TEST_P(DBWalPartitionsOpenTest, IndexedOpensWithoutHookAndRecoversPrefix) {
   }
   if (crash) {
     ASSERT_GE(recovered, last_synced + 1);
+    ASSERT_LT(recovered, kWrites) << "the crash dropped no unsynced tail write";
   } else {
     ASSERT_EQ(kWrites, recovered);
   }

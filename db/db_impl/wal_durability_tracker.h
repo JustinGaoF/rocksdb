@@ -87,9 +87,12 @@ class WalDurabilityTracker {
   // from infinity to low - 1 == old maximum when leaving all-idle, which is
   // also unchanged). Updates min_owner_ on that leaving-all-idle transition
   // so a later Complete by another partition does not skip its rescan.
+  // high == low - 1 is an empty range (a record that consumes no sequence):
+  // it pins low while outstanding, and completes durable only through
+  // low - 1, the last sequence allocated when it registered.
   void Register(size_t partition, uint64_t low, uint64_t high) {
     assert(partition < partitions_.size());
-    assert(low <= high);
+    assert(low <= high + 1);
     assert(high != kIdle);
     std::vector<Range>& fifo = partitions_[partition].inflight;
     fifo.push_back({low, high});
@@ -111,9 +114,9 @@ class WalDurabilityTracker {
   }
 
   // Marks one occurrence of [low, high] on partition p durable after its
-  // write() completed. Duplicate lows (a WAL-only marker stamped with
-  // last_allocated + 1 without consuming it shares its value with the next
-  // real write) are stored as separate entries: the minimum is indifferent
+  // write() completed. Duplicate lows (a WAL-only marker's empty range
+  // [last_allocated + 1, last_allocated] shares its low with the next real
+  // write) are stored as separate entries: the minimum is indifferent
   // to duplicates and does not advance past the shared value until every
   // entry carrying it completes, which is correct since an undurable commit
   // marker strands its transaction. Recomputes the safe point unless the

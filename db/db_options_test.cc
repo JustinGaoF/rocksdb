@@ -2052,6 +2052,7 @@ TEST_F(DBOptionsTest, WalPartitionsValidation) {
   Destroy(options);
 
   // Default is a single WAL and must open cleanly.
+  ASSERT_EQ(1U, DBOptions().wal_partitions);
   ASSERT_EQ(1U, options.wal_partitions);
   ASSERT_OK(TryReopen(options));
 
@@ -2070,6 +2071,11 @@ TEST_F(DBOptionsTest, WalPartitionsValidation) {
   ASSERT_TRUE(std::strstr(
       s.getState(),
       "wal_partitions > 1 requires partition_wal_usage other than kNone"));
+
+  // With indexing it opens.
+  options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  options.track_and_verify_wals_in_manifest = true;
+  ASSERT_OK(TryReopen(options));
 
   options.wal_partitions = 1;
   ASSERT_OK(TryReopen(options));

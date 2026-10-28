@@ -326,6 +326,12 @@ DEFINE_SYNC_AND_ASYNC(Status, DBImpl::GetImpl)
     read_cb.EnableNewerVersionTracking(snapshot, newer_version_upper_bound_seq,
                                        get_impl_options.newer_version_present);
   }
+  std::optional<WalGateReadMask> gate_read_mask;
+  if (auto ranges = WalGateReadMaskRanges()) {
+    gate_read_mask.emplace(std::move(ranges), get_impl_options.callback,
+                           snapshot);
+    get_impl_options.callback = &*gate_read_mask;
+  }
   TEST_SYNC_POINT("DBImpl::GetImpl:3");
   TEST_SYNC_POINT("DBImpl::GetImpl:4");
 
@@ -920,6 +926,11 @@ DEFINE_SYNC_AND_ASYNC(void, DBImpl::MultiGetCommon)
           /*single_key_result=*/nullptr);
     }
     read_callback = &timestamp_read_callback;
+  }
+  std::optional<WalGateReadMask> gate_read_mask;
+  if (auto ranges = WalGateReadMaskRanges()) {
+    gate_read_mask.emplace(std::move(ranges), read_callback, consistent_seqnum);
+    read_callback = &*gate_read_mask;
   }
 
   assert(key_range_per_cf.size() == cf_sv_pairs.size());

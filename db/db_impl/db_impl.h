@@ -29,6 +29,7 @@
 #include "db/compaction/compaction_iterator.h"
 #include "db/compaction/compaction_job.h"
 #include "db/db_impl/wal_durability_tracker.h"
+#include "db/db_impl/wal_gate_read_mask.h"
 #include "db/error_handler.h"
 #include "db/event_helpers.h"
 #include "db/external_sst_file_ingestion_job.h"
@@ -3290,8 +3291,11 @@ class DBImpl : public DB
   // partitioning a poisoned writer for partition p may want to fall back to a
   // healthy partition, so this signature needs revisiting then -- unless the
   // durability watermark rule above makes the fallback unnecessary.
+  // Takes WalWriteMutex(wal_partition) unless `wal_mutex_held`, whenever
+  // WriteToWAL would take it.
   IOStatus CoverBurnedWALIndex(const WriteOptions& write_options,
-                               log::Writer* log_writer, uint64_t wal_index);
+                               log::Writer* log_writer, uint64_t wal_index,
+                               size_t wal_partition, bool wal_mutex_held);
 
   // Binds `wal_context` to the WAL that writes should be appended to, and to
   // that WAL's file-number/size accounting.
@@ -3333,7 +3337,10 @@ class DBImpl : public DB
   // append succeeded. Called without holding any mutex; takes
   // sequence_wal_index_mutex_ only to check fences and park, never together
   // with mutex_.
-  Status WaitForWalDurability(SequenceNumber target, bool wal_record);
+  // `low` is the group's first sequence, when known: a zero-count group
+  // (low > target) lies above an exact fence ending at its target.
+  Status WaitForWalDurability(SequenceNumber target, bool wal_record,
+                              SequenceNumber low = 0);
 
   // Wakes durability waiters after the frontier advanced. Call with
   // sequence_wal_index_mutex_ held, which every Complete site already holds;
@@ -3369,23 +3376,51 @@ class DBImpl : public DB
   // at or above it can ever be acknowledged (D-1). The fence stays open-ended
   // until recovery releases the range (`released_by_recovery`; a failed
   // insert's range is never released), and holds `status` (the background
-  // error) for those gates to return. Wakes parked gates.
+  // error) for those gates to return. Wakes parked gates. A failed gate sync
+  // passes `high`, its group's last sequence, for a fence closed from the
+  // start (InstallFailedGateSyncFence).
   // REQUIRES: mutex_ held.
   void InstallWalGateFence(SequenceNumber low, const Status& status,
-                           bool released_by_recovery);
+                           bool released_by_recovery,
+                           SequenceNumber high = kMaxSequenceNumber);
 
-  // The status of a fence holding `target`, or OK.
+  // N>1 only. A sync write's gate sync failed after its group, [low, high],
+  // inserted and published (D-7, D-8): fences exactly that range, records it
+  // indeterminate, and hides it from every read that starts afterwards and
+  // from every flush (wal_gate_read_masks_). Writes outside it keep their
+  // outcome. Does nothing for a group that consumed no sequence (low >
+  // high): it has nothing to hide, and a fence there would hold a sequence
+  // nobody owns. Called in the mutex_ section that records the failure
+  // (WALIOStatusCheck), or by FenceFailedGateSync when that never ran.
+  // REQUIRES: mutex_ held.
+  void InstallFailedGateSyncFence(SequenceNumber low, SequenceNumber high,
+                                  const Status& status);
+
+  // The ranges InstallFailedGateSyncFence hid, or null when there are none
+  // (always at one partition). One acquire load when null.
+  std::shared_ptr<const WalGateReadMask::Ranges> WalGateReadMaskRanges() const {
+    if (!wal_gate_read_masked_.load(std::memory_order_acquire)) {
+      return nullptr;
+    }
+    MutexLock l(&wal_gate_read_mask_mutex_);
+    return wal_gate_read_masks_;
+  }
+
+  // The status of a fence holding `target`, or OK. An exact fence (a failed
+  // gate sync's) holds only groups that start at or below its high: a
+  // zero-count group whose target is its high lies above it.
   // REQUIRES: sequence_wal_index_mutex_ held.
-  Status WalGateFenceStatusLocked(SequenceNumber target) const;
+  Status WalGateFenceStatusLocked(SequenceNumber target,
+                                  SequenceNumber low = 0) const;
 
   // As above, without the mutex when no fence can hold `target`.
-  Status WalGateFenceStatus(SequenceNumber target) {
+  Status WalGateFenceStatus(SequenceNumber target, SequenceNumber low = 0) {
     if (target < wal_gate_fence_low_.load(std::memory_order_acquire) ||
         target > wal_gate_fence_high_.load(std::memory_order_acquire)) {
       return Status::OK();
     }
     InstrumentedMutexLock l(&sequence_wal_index_mutex_);
-    return WalGateFenceStatusLocked(target);
+    return WalGateFenceStatusLocked(target, low);
   }
 
   // The lowest sequence an unreleased fence holds, or kMaxSequenceNumber.
@@ -3393,6 +3428,15 @@ class DBImpl : public DB
   // acknowledged, so a flush drops it.
   // REQUIRES: mutex_ held.
   SequenceNumber UnreleasedWalGateFenceLow();
+
+  // The ranges of failed gate syncs, which a flush drops as well. Read in
+  // the mutex_ section that picks the memtables, which a failed gate sync's
+  // range never misses: it is installed in the section that records the
+  // failure.
+  WalGateReadMask::Ranges FailedGateSyncFlushDrops() const {
+    auto ranges = WalGateReadMaskRanges();
+    return ranges != nullptr ? *ranges : WalGateReadMask::Ranges{};
+  }
 
   // As above, with sequence_wal_index_mutex_ held instead.
   SequenceNumber OpenWalGateFenceLowLocked() const;
@@ -3418,31 +3462,36 @@ class DBImpl : public DB
   Status SyncWalsFromCompletionGate(Env::IOPriority rate_limiter_priority);
 
   // N>1 only. Runs a completion gate's `sync`, which must cover every record
-  // written before it starts, unless a gate sync that already completed
-  // covers `target`; while another gate's sync runs, waits for it and
-  // checks again (group commit). Sets `*covered` to a sequence at or below
-  // which every record is now synced (when `sync` ran, the durability safe
-  // point read just before it). Takes only wal_gate_sync_mutex_, never
-  // across `sync`. If `sync` fails, fences the group, whose first sequence is
-  // `low` (FenceFailedGateSync), before any waiter rechecks.
+  // written before it starts, unless a gate sync that started after this
+  // call, or (for a group that consumes sequences) one whose safe point read
+  // covered `target`, already succeeded; while another gate's sync runs,
+  // waits for it and checks again (group commit). Sets `*covered` to a sequence
+  // at or below which every record is now synced (when `sync` ran, the
+  // durability safe point read just before it). Takes only
+  // wal_gate_sync_mutex_, never across `sync`. A gate that queued on a sync
+  // that fails returns that sync's status and fences its own group. If `sync`
+  // fails, fences the group, [low, target] (InstallFailedGateSyncFence), in the
+  // mutex_ section that records the failure, before any waiter rechecks.
   Status RunCoalescedGateSync(SequenceNumber low, SequenceNumber target,
                               SequenceNumber* covered,
                               const std::function<Status()>& sync);
 
-  // N>1 only. A sync write's gate sync failed after its group inserted and
-  // applied: fences every gate at or above `low` with the background error,
-  // released by recovery, as a failed append does, so the group never becomes
-  // visible past the fence and recovery's flush drops it. Does nothing once no
-  // background error is recorded. Takes mutex_.
-  void FenceFailedGateSync(SequenceNumber low);
+  // N>1 only. A sync write's gate sync failed with `status` and no
+  // WALIOStatusCheck installed its fence (the failure was an earlier one's,
+  // or not a WAL I/O error): installs it now (InstallFailedGateSyncFence).
+  // Takes mutex_.
+  void FenceFailedGateSync(SequenceNumber low, SequenceNumber target,
+                           const Status& status);
 
   // Fsyncs every partition's live WALs, each partition under its own WAL
   // mutex above one partition (all N with manual flush); at one partition
   // without manual flush it takes none. Stops at the first failure, naming
   // its WAL in `*failed_wal_number`; counts the partitions fsynced.
+  // `previously_failed` as for SyncWalPartitionFiles.
   IOStatus SyncEveryWalPartition(const WriteOptions& write_options,
                                  uint64_t* failed_wal_number,
-                                 uint64_t* fsynced_partitions);
+                                 uint64_t* fsynced_partitions,
+                                 bool* previously_failed = nullptr);
 
   // Used by WriteImpl to update bg_error_ if paranoid check is enabled.
   // Caller must hold mutex_.
@@ -4201,6 +4250,15 @@ class DBImpl : public DB
   InstrumentedCondVar wal_gate_sync_cv_{&wal_gate_sync_mutex_};
   bool wal_gate_sync_running_ = false;
   SequenceNumber wal_gate_synced_upto_ = 0;
+  // Gate syncs are numbered as they start; wal_gate_synced_epoch_ is the
+  // number of the latest one that succeeded, wal_gate_sync_failed_epoch_ of
+  // the latest one that failed, with its status. A gate is covered by any
+  // sync numbered above the last one started before it asked, whatever its
+  // group's count, and fails with any sync it queued on.
+  uint64_t wal_gate_sync_started_epoch_ = 0;
+  uint64_t wal_gate_synced_epoch_ = 0;
+  uint64_t wal_gate_sync_failed_epoch_ = 0;
+  Status wal_gate_sync_failed_status_;
 
   // Serializes sequence-block and WAL-index allocation across all WAL
   // partitions. It is never held across batch merging or I/O.
@@ -4227,16 +4285,27 @@ class DBImpl : public DB
   // releases the failed range. Kept for the DB's lifetime, one per failure,
   // so a write held past recovery still fails. Guarded by
   // sequence_wal_index_mutex_; the bounds below are stored under it and read
-  // lock-free, so a gate outside every fence pays two loads.
+  // lock-free, so a gate outside every fence pays two loads. An exact fence
+  // (a failed gate sync's group) is closed from the start.
   struct WalGateFence {
     SequenceNumber low;
     SequenceNumber high;
     Status status;
     bool released_by_recovery;
+    bool exact;
   };
   std::vector<WalGateFence> wal_gate_fences_;
   std::atomic<SequenceNumber> wal_gate_fence_low_{kMaxSequenceNumber};
   std::atomic<SequenceNumber> wal_gate_fence_high_{0};
+  // The closed fences of failed gate syncs, as read masks
+  // (InstallFailedGateSyncFence). Copy-on-write under
+  // wal_gate_read_mask_mutex_, a leaf taken below mutex_ and
+  // sequence_wal_index_mutex_; the flag is set once the first range is in.
+  // Kept for the DB's lifetime: an iterator or a flush may still hold a
+  // memtable with the range.
+  mutable port::Mutex wal_gate_read_mask_mutex_;
+  std::shared_ptr<const WalGateReadMask::Ranges> wal_gate_read_masks_;
+  std::atomic<bool> wal_gate_read_masked_{false};
   uint64_t next_wal_index_ = log::kWALIndexStartNumber;
 
   // If zero, manual compactions are allowed to proceed. If non-zero, manual
@@ -4477,9 +4546,13 @@ class DBImpl : public DB
   // REQUIRES: WalWriteMutex(partition) held, except the N==1 single-queue
   // leadership sync, which holds no WAL mutex (single writer; the
   // getting_synced marks exclude SyncWAL).
+  // `previously_failed`, when not null (the gate sync, N>1), also skips
+  // every WAL at or below wal_recovery_cutoff_, and is set when a WAL was
+  // skipped or its writer had already failed.
   IOStatus SyncWalPartitionFiles(size_t partition,
                                  const WriteOptions& write_options,
-                                 uint64_t* failed_wal_number);
+                                 uint64_t* failed_wal_number,
+                                 bool* previously_failed = nullptr);
   // Closes partition p's WAL writers and drops the deque (CloseHelper).
   // Warns per WAL and returns the first error.
   // REQUIRES: WalWriteMutex(partition) held (the driver holds all N).

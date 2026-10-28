@@ -10761,6 +10761,70 @@ TEST(TransactionPartitionedWalTest, SyncPrepareAfterSyncCommitSurvivesCrash) {
   ASSERT_OK(DestroyDB(dbname, options));
 }
 
+// GC20 Q8: a WriteCommitted Prepare consumes no sequence, so its group is the
+// empty range [L + 1, L]. When its gate fsync fails at N=2, the Prepare
+// returns the error and no fence is installed: one would hold L + 1, which
+// nobody owns. After Resume(), the next write takes L + 1 and succeeds.
+// Neuter: GC18's unconditional fence (FenceFailedGateSync without the
+// low > target check); the write after Resume() fails at the stale fence.
+TEST(TransactionPartitionedWalTest, FailedSyncPrepareLeavesNoStaleFence) {
+  constexpr size_t kPartitions = 2;
+  const std::string dbname =
+      test::PerThreadDBPath("transaction_partitioned_wal_failed_prepare");
+  Options options;
+  options.create_if_missing = true;
+  options.wal_partitions = kPartitions;
+  options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  options.track_and_verify_wals_in_manifest = true;
+  options.avoid_flush_during_shutdown = true;
+  options.max_bgerror_resume_count = 0;
+  ASSERT_OK(DestroyDB(dbname, options));
+  TransactionDBOptions txn_db_options;
+  txn_db_options.write_policy = WRITE_COMMITTED;
+  TransactionDB* db = nullptr;
+  ASSERT_OK(TransactionDB::Open(options, txn_db_options, dbname, &db));
+  DBImpl* db_impl = static_cast_with_check<DBImpl>(db->GetRootDB());
+  ASSERT_EQ(kPartitions, db_impl->TEST_NumWalPartitions());
+  ASSERT_OK(db->Put(WriteOptions(), "before", "v"));
+
+  std::atomic<bool> fail_sync{false};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SyncWalsFromCompletionGate:AfterGateSync", [&](void* arg) {
+        if (fail_sync.exchange(false)) {
+          IOStatus error = IOStatus::IOError("injected gate sync error");
+          error.SetRetryable(true);
+          *static_cast<IOStatus*>(arg) = error;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  WriteOptions sync_wo;
+  sync_wo.sync = true;
+  Transaction* txn = db->BeginTransaction(sync_wo);
+  ASSERT_OK(txn->SetName("xid"));
+  ASSERT_OK(txn->Put("k", "v"));
+  const SequenceNumber last = db->GetLatestSequenceNumber();
+  fail_sync = true;
+  const Status prepare_status = txn->Prepare();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_TRUE(prepare_status.IsIOError()) << prepare_status.ToString();
+  ASSERT_FALSE(fail_sync.load());
+  EXPECT_EQ(last, db->GetLatestSequenceNumber());
+  EXPECT_TRUE(db_impl->TEST_WalGateFences().empty());
+
+  ASSERT_OK(db->Resume());
+  ASSERT_OK(db->Put(WriteOptions(), "after", "v"));
+  EXPECT_EQ(last + 1, db->GetLatestSequenceNumber());
+  EXPECT_TRUE(db_impl->TEST_WalGateFences().empty());
+  std::string value;
+  ASSERT_OK(db->Get(ReadOptions(), "after", &value));
+  ASSERT_EQ("v", value);
+  txn->Rollback().PermitUncheckedError();
+  delete txn;
+  delete db;
+  ASSERT_OK(DestroyDB(dbname, options));
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
