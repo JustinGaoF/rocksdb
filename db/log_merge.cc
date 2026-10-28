@@ -148,6 +148,10 @@ bool WALIndexMerger::ReaderMember::Supersedes(uint64_t bearer,
   return reader_->IsWALIndexSuperseded(bearer, index);
 }
 
+uint64_t WALIndexMerger::ReaderMember::SupersededFrom(uint64_t bearer) const {
+  return reader_->GetFirstSupersededWALIndex(bearer);
+}
+
 bool WALIndexMerger::ReaderMember::AttestedSpan(PredecessorSpan* span) const {
   return reader_->GetWALIndexPredecessorSpan(&span->wal_number, &span->first,
                                              &span->last);
@@ -218,6 +222,64 @@ WALIndexMerger::MemberState* WALIndexMerger::FindState(uint64_t wal_number) {
     }
   }
   return nullptr;
+}
+
+bool WALIndexMerger::SupersededHoleSplitsLiveStream(
+    const std::vector<MemberState*>& holders) {
+  bool live_below = false;
+  for (const MemberState* holder : holders) {
+    uint64_t first_obsolete = std::numeric_limits<uint64_t>::max();
+    for (const auto& state : states_) {
+      const uint64_t from =
+          state.member->SupersededFrom(holder->member->wal_number());
+      if (from != 0) {
+        first_obsolete = std::min(first_obsolete, from);
+      }
+    }
+    // Emissions increase strictly, so every emission so far sits below the
+    // hole: one at or above the cut is between the cut and the hole.
+    if (first_obsolete != std::numeric_limits<uint64_t>::max() &&
+        max_indexed_emitted_ >= first_obsolete) {
+      live_below = true;
+      break;
+    }
+  }
+  if (!live_below) {
+    return false;
+  }
+  for (const auto& state : states_) {
+    if (state.finished) {
+      continue;
+    }
+    bool is_holder = false;
+    for (const MemberState* holder : holders) {
+      is_holder = is_holder || holder == &state;
+    }
+    if (is_holder) {
+      // Its lookahead was the hole itself, just consumed above: it holds
+      // nothing above it.
+      continue;
+    }
+    if (!state.has_lookahead) {
+      // Cleared past the hole by a progress bound: records above it may still
+      // arrive, so a live one cannot be ruled out.
+      return true;
+    }
+    if (state.lookahead.wal_index > expected_) {
+      bool superseded = false;
+      for (const auto& other : states_) {
+        if (other.member->Supersedes(state.member->wal_number(),
+                                     state.lookahead.wal_index)) {
+          superseded = true;
+          break;
+        }
+      }
+      if (!superseded) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 namespace {
@@ -609,6 +671,7 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
       }
       *record = winner->lookahead.payload;
       last_emitted_index_ = expected_;
+      max_indexed_emitted_ = expected_;
       last_emitted_member_ = winner->member;
       last_emitted_checksum_ = winner->member->LastRecordChecksum();
       for (auto* h : holders) {
@@ -670,10 +733,17 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
       // question is the absent live copy. With no torn tail covering the
       // index, no member lost anything and the index was never reissued
       // after the cut that discarded it: re-trust that declaration and move
-      // on. A torn tail over the same index may still hold its live copy,
-      // which stays a frontier. (Under skip, recovery opts out of even that
-      // via continue_past_discarded_holes.)
+      // on, unless the hole sits inside a live stream, in which case the
+      // reissued copy was lost. A torn tail over the same index may still
+      // hold its live copy, which stays a frontier. (Under skip, recovery
+      // opts out of even that via continue_past_discarded_holes.)
       if (gap.members.empty() || continue_past_discarded_holes_) {
+        if (!continue_past_discarded_holes_ &&
+            SupersededHoleSplitsLiveStream(holders)) {
+          frontier_ = expected_;
+          terminal_ = Result::kFrontier;
+          return terminal_;
+        }
         expected_++;
         continue;
       }

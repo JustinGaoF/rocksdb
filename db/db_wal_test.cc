@@ -7151,6 +7151,91 @@ TEST_F(DBWALIndexTest, MixedRecoverySetOpensAfterEnablingWALIndex) {
   Destroy(options);
 }
 
+// K2: a legacy prefix ahead of indexed WALs, a filter stop with
+// avoid_flush_during_recovery, then new writes that reissue the dropped
+// suffix's indices. The reopen must honor the cut's supersessions: the
+// dropped keys stay dropped. Neuter: today's routing (sequential replay of
+// the mixed set); the reopen trips "Sequence number is being set backwards".
+TEST_F(DBWALIndexTest, MixedPrefixFilterStopHonorsSupersessionsOnReopen) {
+  Options none = WALIndexOptions(PartitionWALUsage::kNone);
+  DestroyAndReopen(none);
+  WriteKeyRange(0, 4);
+  const uint64_t legacy_wal = LatestWALNumber();
+  Close();
+
+  Options options =
+      WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+  Reopen(options);
+  WriteKeyRange(4, 4);
+  const uint64_t indexed_a = LatestWALNumber();
+  ASSERT_NE(legacy_wal, indexed_a);
+  Close();
+  Reopen(options);
+  WriteKeyRange(8, 4);
+  const uint64_t indexed_b = LatestWALNumber();
+  ASSERT_NE(indexed_a, indexed_b);
+  Close();
+
+  StopReplayAfterRecordsWalFilter filter(/*stop_after=*/8);
+  options.wal_filter = &filter;
+  Reopen(options);
+  options.wal_filter = nullptr;
+  for (int i = 0; i <= 7; ++i) {
+    EXPECT_EQ("value" + std::to_string(i), Get(Key(i))) << "key " << i;
+  }
+  WriteKeyRange(12, 2);
+  Close();
+
+  ASSERT_OK(TryReopen(options));
+  for (int i = 0; i <= 7; ++i) {
+    EXPECT_EQ("value" + std::to_string(i), Get(Key(i))) << "key " << i;
+  }
+  std::string missing;
+  for (int i = 8; i <= 11; ++i) {
+    EXPECT_TRUE(db_->Get(ReadOptions(), Key(i), &missing).IsNotFound())
+        << "key " << i;
+  }
+  for (int i = 12; i <= 13; ++i) {
+    EXPECT_EQ("value" + std::to_string(i), Get(Key(i))) << "key " << i;
+  }
+  Close();
+  Destroy(options);
+}
+
+// K2 interleaved: a filter stop leaves live supersessions in the indexed
+// WALs, then a kNone open appends unindexed WALs after them. The mixed set
+// replays sequentially, which cannot honor supersessions, so it fails closed
+// with a clear status instead of replaying the cut suffix (silently, when
+// nothing reissued it). Neuter: today's routing (no scan); the open succeeds
+// with the dropped keys present.
+TEST_F(DBWALIndexTest, InterleavedMixedSetWithSupersessionsFailsClosed) {
+  Options options =
+      WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+  DestroyAndReopen(options);
+  WriteKeyRange(0, 4);
+  Close();
+  Reopen(options);
+  WriteKeyRange(4, 4);
+  Close();
+
+  StopReplayAfterRecordsWalFilter filter(/*stop_after=*/6);
+  options.wal_filter = &filter;
+  Reopen(options);
+  options.wal_filter = nullptr;
+  Close();
+
+  Options none = WALIndexOptions(PartitionWALUsage::kNone);
+  Reopen(none);
+  WriteKeyRange(8, 2);
+  Close();
+
+  const Status s = TryReopen(none);
+  ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+  EXPECT_NE(std::string::npos, s.ToString().find("supersession"))
+      << s.ToString();
+  Destroy(none);
+}
+
 // The documented rollback: opening with kNone while indexed WALs survive.
 // The pre-pass is skipped and the sequential path replays the survivors;
 // new writes are byte-identical legacy records.

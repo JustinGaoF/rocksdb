@@ -2844,6 +2844,15 @@ class DBImpl : public DB
                                     uint64_t* unindexed_high,
                                     uint64_t* indexed_low);
 
+  // Reads every live WAL to completion for its supersession records, setting
+  // *superseding_wal to the first WAL carrying any (zero when none). The
+  // sequential fallback cannot skip superseded records, so its callers fail
+  // closed when this finds any. Reports are counted, never wired: damage
+  // surfaces when the chosen path replays the file.
+  Status WALSetCarriesSupersessions(const std::vector<uint64_t>& wal_numbers,
+                                    uint64_t min_wal_number, bool is_retry,
+                                    uint64_t* superseding_wal);
+
   Status ProcessLogFile(uint64_t wal_number, uint64_t min_wal_number,
                         bool is_retry, bool read_only, int job_id,
                         SequenceNumber* next_sequence,

@@ -32,8 +32,9 @@ namespace log {
 // absent index it decides: covered by a burn cover (skip), below nothing
 // (the merge derives its lower bound, so below-bound cannot occur), swallowed
 // between two positioned pulls of one member (skip), superseded-only with no
-// torn tail covering it (skip: never reissued after the cut), covered by a
-// finished member's torn or swallowed tail (a tail gap, surfaced for the
+// torn tail covering it (skip, unless the hole sits inside a live stream, in
+// which case its reissued copy was lost and it is the frontier), covered by
+// a finished member's torn or swallowed tail (a tail gap, surfaced for the
 // recovery-mode mapping, then skipped), or the frontier (stop). A record
 // covered by a supersession for its bearer is consumed silently and never
 // emitted; two live records at one index fail closed rather than being chosen
@@ -86,6 +87,9 @@ class WALIndexMerger {
     virtual bool VoidCovers(uint64_t index) const = 0;
     // Whether a supersession read so far obsoletes (`bearer`, `index`).
     virtual bool Supersedes(uint64_t bearer, uint64_t index) const = 0;
+    // First index superseded in `bearer` by a supersession read so far, or
+    // zero when none. Only meaningful once HeadScanned().
+    virtual uint64_t SupersededFrom(uint64_t bearer) const = 0;
     // Predecessor span attested by this member's head, if one was read.
     struct PredecessorSpan {
       uint64_t wal_number = 0;
@@ -171,6 +175,7 @@ class WALIndexMerger {
     uint64_t ProgressBound() const override;
     bool VoidCovers(uint64_t index) const override;
     bool Supersedes(uint64_t bearer, uint64_t index) const override;
+    uint64_t SupersededFrom(uint64_t bearer) const override;
     bool AttestedSpan(PredecessorSpan* span) const override;
     bool SwallowedCovers(uint64_t index) const override;
     bool TailImpure() const override;
@@ -351,6 +356,13 @@ class WALIndexMerger {
     return attested_wals_.count(wal_number) != 0 ||
            wal_number >= min_anchoring_wal_;
   }
+  // Whether the history floor bounds every member head: the floor is set and
+  // no member attests a predecessor span. Below the floor nothing was ever
+  // retired, so a data-less torn member lost nothing the merge skipped over;
+  // its loss is a trailing one. Valid once the lower bound is set.
+  bool HistoryFloorBoundsHeads() const {
+    return history_floor_ != 0 && attested_wals_.empty();
+  }
 
   // How a member finished, for the recovery-mode mapping: after kCleanEnd,
   // recovery asks this to tell a torn tail (mode-dependent) from a clean one.
@@ -401,6 +413,13 @@ class WALIndexMerger {
 
   MemberState* FindState(uint64_t wal_number);
 
+  // Whether the superseded-only hole at `expected_` sits inside a live
+  // stream: `holders` are its (all superseded) holders. True when a live
+  // record was already emitted between some holder's cut and the hole, and an
+  // unfinished member can still hold a live record above it; the hole's
+  // reissued copy was then lost.
+  bool SupersededHoleSplitsLiveStream(const std::vector<MemberState*>& holders);
+
   std::vector<std::unique_ptr<Member>> members_;
   std::set<uint64_t> expected_wals_;
   std::function<Status(Slice, SequenceNumber*)> sequence_of_;
@@ -423,6 +442,11 @@ class WALIndexMerger {
   uint64_t lower_ = 0;
   uint64_t expected_ = 0;
   uint64_t last_sequence_ = 0;
+  // Highest indexed record emitted so far. Emissions increase strictly, so at
+  // a superseded-only hole this tells whether a live record was already
+  // emitted between the holder's cut and the hole. Unlike
+  // last_emitted_index_, unindexed emissions do not reset it.
+  uint64_t max_indexed_emitted_ = 0;
   uint64_t last_emitted_index_ = 0;
   const Member* last_emitted_member_ = nullptr;
   uint64_t last_emitted_checksum_ = 0;

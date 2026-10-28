@@ -218,6 +218,11 @@ class Reader {
     return it == first_superseded_wal_indices_.end() ? 0 : it->second;
   }
 
+  // Whether any supersession record was read so far.
+  bool HasWALIndexSupersessions() const {
+    return !first_superseded_wal_indices_.empty();
+  }
+
  protected:
   std::shared_ptr<Logger> info_log_;
   const std::unique_ptr<SequentialFileReader> file_;
