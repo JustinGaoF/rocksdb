@@ -392,19 +392,6 @@ Status DBImplSecondary::MaybeInitLogReader(
                    "Recovering log #%" PRIu64 " mode %d", log_number,
                    static_cast<int>(immutable_db_options_.wal_recovery_mode));
 
-    // Checked before any of the set is replayed: partition 0's WAL comes
-    // first in number order and would be applied without the other
-    // partitions' records interleaved with it.
-    uint32_t wal_partition = 0;
-    if (log::ReadWALPartition(fs_.get(), fname,
-                              fs_->OptimizeForLogRead(file_options_),
-                              log_number, &wal_partition)
-            .ok() &&
-        wal_partition != 0) {
-      *log_reader = nullptr;
-      return PartitionedWalNotSupported(log_number, wal_partition);
-    }
-
     std::unique_ptr<SequentialFileReader> file_reader;
     {
       std::unique_ptr<FSSequentialFile> file;
@@ -432,6 +419,69 @@ Status DBImplSecondary::MaybeInitLogReader(
   return Status::OK();
 }
 
+Status DBImplSecondary::CheckNoPartitionedWal(
+    const std::vector<uint64_t>& log_numbers) {
+  bool indexed = false;
+  uint64_t unknown_log = 0;
+  for (auto log_number : log_numbers) {
+    auto it = log_readers_.find(log_number);
+    log::Reader* head = nullptr;
+    std::unique_ptr<log::Reader> head_reader;
+    if (it != log_readers_.end() &&
+        (it->second->reader_->SawWALIndexMarker() ||
+         it->second->reader_->LastRecordEnd() > 0)) {
+      head = it->second->reader_;
+    } else {
+      // No reader yet, or one that has read nothing: read the head afresh.
+      std::string fname =
+          LogFileName(immutable_db_options_.GetWalDir(), log_number);
+      std::unique_ptr<FSSequentialFile> file;
+      if (!fs_->NewSequentialFile(fname, fs_->OptimizeForLogRead(file_options_),
+                                  &file, /*dbg=*/nullptr)
+               .ok()) {
+        // MaybeInitLogReader reports a missing file as before.
+        continue;
+      }
+      head_reader = std::make_unique<log::Reader>(
+          /*info_log=*/nullptr,
+          std::make_unique<SequentialFileReader>(std::move(file), fname),
+          /*reporter=*/nullptr, /*checksum=*/true, log_number);
+      std::string scratch;
+      Slice record;
+      if (!head_reader->ReadRecord(&record, &scratch) &&
+          !head_reader->SawWALIndexMarker()) {
+        // Empty, or nothing readable yet: a partition's WAL whose marker is
+        // still buffered looks the same.
+        if (unknown_log == 0) {
+          unknown_log = log_number;
+        }
+        continue;
+      }
+      head = head_reader.get();
+    }
+    if (head->WALPartition() != 0) {
+      return PartitionedWalNotSupported(log_number, head->WALPartition());
+    }
+    if (head->SawWALIndexMarker()) {
+      indexed = true;
+    } else if (head->GetLastReadWALIndex() != 0) {
+      // Indexed records without the marker the writer puts first.
+      indexed = true;
+      if (unknown_log == 0) {
+        unknown_log = log_number;
+      }
+    }
+  }
+  if (indexed && unknown_log != 0) {
+    return Status::NotSupported(
+        "WAL " + std::to_string(unknown_log) +
+        " has no readable WAL index marker while other WALs carry one, so it "
+        "may belong to a DB with wal_partitions > 1; secondary instances do "
+        "not support partitioned WALs");
+  }
+  return Status::OK();
+}
+
 // After manifest recovery, replay WALs and refresh log_readers_ if necessary
 // REQUIRES: log_numbers are sorted in ascending order
 Status DBImplSecondary::RecoverLogFiles(
@@ -441,7 +491,10 @@ Status DBImplSecondary::RecoverLogFiles(
   assert(nullptr != cfds_changed);
   assert(nullptr != job_context);
   mutex_.AssertHeld();
-  Status status;
+  Status status = CheckNoPartitionedWal(log_numbers);
+  if (!status.ok()) {
+    return status;
+  }
   for (auto log_number : log_numbers) {
     log::FragmentBufferedReader* reader = nullptr;
     status = MaybeInitLogReader(log_number, &reader);
