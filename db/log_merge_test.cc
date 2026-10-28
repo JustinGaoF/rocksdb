@@ -1468,8 +1468,10 @@ TEST_P(LogMergeTest, EqualSequenceEmitsInOrder) {
   ASSERT_EQ(std::vector<uint64_t>({1, 2, 3}), DrivenIndices(driven));
 }
 
-// Superseded-only holes with no torn tail covering them were never reissued
-// after the cut: the merge re-trusts the declaration and moves on.
+// Superseded-only holes with no torn tail covering them and no live record
+// above them were never reissued after the cut: the merge re-trusts the
+// declaration and moves on. Here the writes after the cut reached index 4
+// only, so index 5 was never reissued.
 TEST_P(LogMergeTest, DiscardedHoleWithoutTornTailSkips) {
   MemberFile old(120, recyclable());
   MemberFile young(121, recyclable());
@@ -1479,8 +1481,7 @@ TEST_P(LogMergeTest, DiscardedHoleWithoutTornTailSkips) {
   }
   ASSERT_OK(young.Marker());
   ASSERT_OK(young.Sup(120, 4));
-  ASSERT_OK(young.Data("n6", 6, 6));
-  ASSERT_OK(young.Data("n7", 7, 7));
+  ASSERT_OK(young.Data("n4", 4, 4));
 
   std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
   members.push_back(MakeMember(old, old.Bytes()));
@@ -1488,9 +1489,69 @@ TEST_P(LogMergeTest, DiscardedHoleWithoutTornTailSkips) {
   auto merger = MakeMerger(std::move(members), {120, 121});
   DriveResult driven = Drive(merger.get());
   ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome);
-  ASSERT_EQ(std::vector<uint64_t>({1, 2, 3, 6, 7}), DrivenIndices(driven));
+  ASSERT_EQ(std::vector<uint64_t>({1, 2, 3, 4}), DrivenIndices(driven));
   ASSERT_TRUE(driven.gaps.empty());
-  ASSERT_EQ(8U, merger->GetFrontier());
+  ASSERT_EQ(6U, merger->GetFrontier());
+}
+
+// FU14 H4: writes after a cut reissue indices in order, so a live record
+// above a superseded-only index means its reissued copy was lost: the index
+// is the frontier. A void in a WAL older than the declaration predates the
+// cut, and an open at N=1 seeds past it, so the indices below it were never
+// reissued; a void the declaring WAL holds was burned after the cut and
+// explains nothing below it. Neuter: skip superseded-only indices
+// unconditionally; the first and third cases drive 6 and 7 to a clean end.
+TEST_P(LogMergeTest, DiscardedHoleWithLiveAboveIsAFrontier) {
+  struct Case {
+    const char* name;
+    bool old_void;
+    bool young_void;
+    WALIndexMerger::Result outcome;
+    std::vector<uint64_t> driven;
+  };
+  for (const Case& c : {Case{"no void",
+                             false,
+                             false,
+                             WALIndexMerger::Result::kFrontier,
+                             {1, 2, 3}},
+                        Case{"pre-cut void",
+                             true,
+                             false,
+                             WALIndexMerger::Result::kCleanEnd,
+                             {1, 2, 3, 7}},
+                        Case{"post-cut void",
+                             false,
+                             true,
+                             WALIndexMerger::Result::kFrontier,
+                             {1, 2, 3}}}) {
+    SCOPED_TRACE(c.name);
+    MemberFile old(120, recyclable());
+    MemberFile young(121, recyclable());
+    ASSERT_OK(old.Marker());
+    for (uint64_t i = 1; i <= 5; ++i) {
+      ASSERT_OK(old.Data("o" + std::to_string(i), i, i));
+    }
+    if (c.old_void) {
+      ASSERT_OK(old.Void(6, 6));
+    }
+    ASSERT_OK(young.Marker());
+    ASSERT_OK(young.Sup(120, 4));
+    if (c.young_void) {
+      ASSERT_OK(young.Void(6, 6));
+    }
+    ASSERT_OK(young.Data("n7", 7, 7));
+
+    std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+    members.push_back(MakeMember(old, old.Bytes()));
+    members.push_back(MakeMember(young, young.Bytes()));
+    auto merger = MakeMerger(std::move(members), {120, 121});
+    DriveResult driven = Drive(merger.get());
+    ASSERT_EQ(c.outcome, driven.outcome);
+    ASSERT_EQ(c.driven, DrivenIndices(driven));
+    if (c.outcome == WALIndexMerger::Result::kFrontier) {
+      ASSERT_EQ(4U, merger->GetFrontier());
+    }
+  }
 }
 
 // A torn tail over a superseded-only hole keeps the strict merge at the

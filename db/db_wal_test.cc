@@ -5301,6 +5301,128 @@ TEST_F(DBWALIndexTest, WalFilterStopWritesSupersessionAtReplayCut) {
   Destroy(options);
 }
 
+// K2: a legacy WAL ahead of two indexed WALs, written with one partition. A
+// filter stop under avoid_flush_during_recovery cuts the indexed WALs, and
+// the writes after it reuse the discarded sequences. The next open must honor
+// the supersession: the legacy prefix replays ahead of the merge, and the
+// dropped keys stay dropped. Neuter: route the legacy prefix through the
+// sequential path; the reopen replays the discarded suffix and fails with
+// "Sequence number is being set backwards".
+TEST_F(DBWALIndexTest, LegacyPrefixHonorsSupersessionAfterFilterStop) {
+  Options none = WALIndexOptions(PartitionWALUsage::kNone);
+  DestroyAndReopen(none);
+  WriteKeyRange(0, 2);
+  const uint64_t legacy_wal = LatestWALNumber();
+  Close();
+  Options options =
+      WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+  Reopen(options);
+  WriteKeyRange(2, 3);
+  Close();
+  Reopen(options);
+  WriteKeyRange(5, 3);
+  Close();
+
+  StopReplayAfterRecordsWalFilter filter(/*stop_after=*/5);
+  options.wal_filter = &filter;
+  Reopen(options);
+  std::vector<std::string> after_stop;
+  for (int i = 0; i < 8; ++i) {
+    after_stop.push_back(Get(Key(i)));
+  }
+  ASSERT_EQ("value0", after_stop[0]);
+  ASSERT_EQ("value1", after_stop[1]);
+  ASSERT_EQ("NOT_FOUND", after_stop[7]);
+  ASSERT_OK(Put(Key(20), "value20"));
+  Close();
+  ASSERT_OK(env_->FileExists(WALPath(legacy_wal)));
+
+  options.wal_filter = nullptr;
+  ASSERT_OK(TryReopen(options));
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(after_stop[i], Get(Key(i))) << "key " << i;
+  }
+  EXPECT_EQ("value20", Get(Key(20)));
+  Destroy(options);
+}
+
+// K2, the indexed set opened without indexing: written with one partition
+// and declaring a supersession, it merges so the supersession holds, rather
+// than replaying in file order. Neuter: ignore supersessions in the routing;
+// the open fails with "Sequence number is being set backwards".
+TEST_F(DBWALIndexTest, SupersedingSetOpenedWithoutIndexing) {
+  Options options =
+      WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+  DestroyAndReopen(options);
+  WriteKeyRange(0, 3);
+  Close();
+  Reopen(options);
+  WriteKeyRange(3, 3);
+  Close();
+
+  StopReplayAfterRecordsWalFilter filter(/*stop_after=*/4);
+  options.wal_filter = &filter;
+  Reopen(options);
+  std::vector<std::string> after_stop;
+  for (int i = 0; i < 6; ++i) {
+    after_stop.push_back(Get(Key(i)));
+  }
+  ASSERT_EQ("value0", after_stop[0]);
+  ASSERT_EQ("NOT_FOUND", after_stop[5]);
+  ASSERT_OK(Put(Key(20), "value20"));
+  Close();
+
+  ASSERT_OK(TryReopen(WALIndexOptions(PartitionWALUsage::kNone)));
+  for (int i = 0; i < 6; ++i) {
+    EXPECT_EQ(after_stop[i], Get(Key(i))) << "key " << i;
+  }
+  EXPECT_EQ("value20", Get(Key(20)));
+  Destroy(options);
+}
+
+// K2, the interleaved set: an unindexed WAL (written after indexing was
+// disabled) follows an indexed one, and a later indexed open's filter stop
+// declares a supersession for the indexed WAL. Sequential replay cannot honor
+// it, so the next open fails closed with a status that says so. Neuter: drop
+// the check; the open replays the superseded keys and fails with "Sequence
+// number is being set backwards".
+TEST_F(DBWALIndexTest, InterleavedSupersedingSetFailsClosed) {
+  Options options =
+      WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+  DestroyAndReopen(options);
+  WriteKeyRange(0, 3);
+  const uint64_t indexed_wal = LatestWALNumber();
+  Close();
+  Reopen(WALIndexOptions(PartitionWALUsage::kNone));
+  WriteKeyRange(3, 3);
+  Close();
+  ASSERT_OK(env_->FileExists(WALPath(indexed_wal)));
+
+  StopReplayAfterRecordsWalFilter filter(/*stop_after=*/1);
+  options.wal_filter = &filter;
+  Reopen(options);
+  ASSERT_EQ("value0", Get(Key(0)));
+  ASSERT_EQ("NOT_FOUND", Get(Key(1)));
+  ASSERT_OK(Put(Key(20), "value20"));
+  const uint64_t declaring_wal = LatestWALNumber();
+  Close();
+  const std::vector<std::pair<uint64_t, uint64_t>> supersessions =
+      ReadWALSupersessions(WALPath(declaring_wal));
+  ASSERT_TRUE(
+      std::any_of(supersessions.begin(), supersessions.end(),
+                  [&](const std::pair<uint64_t, uint64_t>& supersession) {
+                    return supersession.first == indexed_wal;
+                  }));
+
+  options.wal_filter = nullptr;
+  const Status status = TryReopen(options);
+  ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+  EXPECT_NE(std::string::npos,
+            status.ToString().find("declares WAL index supersessions"))
+      << status.ToString();
+  Destroy(options);
+}
+
 // After a filter or point-in-time stop, a record the drive emitted but
 // dropped sits at the next index in a WAL that finished clean. The stop must
 // cut that WAL too, or the next write reissues the index and the open after
