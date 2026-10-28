@@ -94,8 +94,15 @@ class SnapshotList {
     s->timestamp_ = ts;
     s->is_write_conflict_boundary_ = is_write_conflict_boundary;
     s->list_ = this;
-    s->next_ = &list_;
-    s->prev_ = list_.prev_;
+    // Kept in sequence order. Appending suffices except at N>1, where a write
+    // group reserves its timestamped snapshot above the published sequence
+    // (DBImpl::WriteImpl) and a later GetSnapshot() lands below it.
+    SnapshotImpl* next = &list_;
+    while (next->prev_ != &list_ && next->prev_->number_ > seq) {
+      next = next->prev_;
+    }
+    s->next_ = next;
+    s->prev_ = next->prev_;
     s->prev_->next_ = s;
     s->next_->prev_ = s;
     count_++;
@@ -205,6 +212,21 @@ class TimestampedSnapshotList {
       return std::shared_ptr<const SnapshotImpl>();
     }
     return it->second;
+  }
+
+  // The snapshot with the largest timestamp whose sequence is at most seq
+  // (null if none), and in *above the one right after it (null if none).
+  // Timestamp and sequence order agree across the list.
+  std::shared_ptr<const SnapshotImpl> GetLatestAtOrBelow(
+      SequenceNumber seq, std::shared_ptr<const SnapshotImpl>* above) const {
+    above->reset();
+    for (auto it = snapshots_.rbegin(); it != snapshots_.rend(); ++it) {
+      if (it->second->GetSequenceNumber() <= seq) {
+        return it->second;
+      }
+      *above = it->second;
+    }
+    return std::shared_ptr<const SnapshotImpl>();
   }
 
   void GetSnapshots(

@@ -442,6 +442,46 @@ TEST_F(DBSecondaryTest, FU14CatchUpRefusesBeforeApplyingPartitionZero) {
   CloseSecondary();
 }
 
+// GC22: at one partition with indexed WALs, a secondary catches up across a
+// WAL switch whose new marker is on disk. A WAL whose records carry the WAL
+// index but whose marker is missing may be any partition's, so the secondary
+// refuses it before applying anything.
+TEST_F(DBSecondaryTest, GC22RefusesMarkerlessIndexedWal) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  Reopen(options);
+  ASSERT_OK(Put("key", "value"));
+  Options secondary_options = options;
+  secondary_options.max_open_files = -1;
+  OpenSecondary(secondary_options);
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("key2", "value"));
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  std::string value;
+  ASSERT_OK(db_secondary_->Get(ReadOptions(), "key2", &value));
+  CloseSecondary();
+
+  const uint64_t wal = dbfull()->TEST_CurrentWalNumber(0);
+  Close();
+  // The marker is the file's first physical record; drop it.
+  const std::string fname = LogFileName(dbname_, wal);
+  std::string contents;
+  ASSERT_OK(ReadFileToString(env_, fname, &contents));
+  ASSERT_GE(contents.size(), static_cast<size_t>(log::kHeaderSize));
+  const size_t marker_size =
+      log::kHeaderSize + (static_cast<uint8_t>(contents[4]) |
+                          (static_cast<uint8_t>(contents[5]) << 8));
+  ASSERT_GT(contents.size(), marker_size);
+  ASSERT_OK(WriteStringToFile(env_, contents.substr(marker_size), fname,
+                              /*should_sync=*/true));
+
+  Status s = TryOpenSecondary(secondary_options);
+  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+  ASSERT_NE(std::string::npos, s.ToString().find("wal_partitions > 1"))
+      << s.ToString();
+}
+
 TEST_F(DBSecondaryTest, FailOpenIfLoggerCreationFail) {
   Options options = GetDefaultOptions();
   options.create_if_missing = true;

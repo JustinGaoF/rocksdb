@@ -11000,6 +11000,129 @@ TEST(TransactionPartitionedWalTest, FU14TimestampedSnapshotSurvivesCompaction) {
   ASSERT_NO_FATAL_FAILURE(race.Close());
 }
 
+namespace {
+// Runs `commit` on a thread held at its completion gate, after its group
+// published, while `while_held` runs on this thread.
+void RunWithCommitHeldAtGate(const std::function<void()>& commit,
+                             const std::function<void()>& while_held) {
+  std::mutex mu;
+  std::condition_variable cv;
+  bool held = false;
+  bool release = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::RunCompletionGate:BeforeWait", [&](void*) {
+        std::unique_lock<std::mutex> lock(mu);
+        if (held) {
+          return;
+        }
+        held = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return release; });
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  port::Thread t(commit);
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    cv.wait(lock, [&] { return held; });
+  }
+  while_held();
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    release = true;
+    cv.notify_all();
+  }
+  t.join();
+  SyncPoint::GetInstance()->ClearCallBack(
+      "DBImpl::RunCompletionGate:BeforeWait");
+}
+}  // namespace
+
+// GC22: a flush and compaction between T1's publication of S and its snapshot
+// callback keep K@(S-1) for snapshot S. Checks values only, no assert.
+TEST(TransactionPartitionedWalTest,
+     GC22TimestampedSnapshotReservedBeforePublish) {
+  FU14SnapshotRace race;
+  ASSERT_NO_FATAL_FAILURE(race.Open("gc22_ts_snapshot_reserved"));
+  ColumnFamilyHandle* cf = race.cf_for_partition[1];
+  ASSERT_OK(race.db->Put(WriteOptions(), cf, "k", "old"));
+  RunWithCommitHeldAtGate(
+      [&] {
+        std::unique_ptr<Transaction> txn(
+            race.db->BeginTransaction(WriteOptions()));
+        ASSERT_OK(txn->Put(race.cf_for_partition[0], "t1", "v"));
+        ASSERT_OK(txn->CommitAndTryCreateSnapshot(nullptr, /*ts=*/10,
+                                                  &race.t1_snapshot));
+      },
+      [&] {
+        race.t1_seq = race.db->GetLatestSequenceNumber();
+        ASSERT_OK(race.db->Put(WriteOptions(), cf, "k", "new"));
+        ASSERT_OK(race.db->Flush(FlushOptions(), cf));
+        ASSERT_OK(
+            race.db->CompactRange(CompactRangeOptions(), cf, nullptr, nullptr));
+      });
+  ASSERT_NE(nullptr, race.t1_snapshot);
+  EXPECT_EQ(race.t1_seq, race.t1_snapshot->GetSequenceNumber());
+  ReadOptions ro;
+  ro.snapshot = race.t1_snapshot.get();
+  std::string value;
+  EXPECT_OK(race.db->Get(ro, cf, "k", &value));
+  EXPECT_EQ("old", value);
+  ASSERT_OK(race.db->Get(ReadOptions(), cf, "k", &value));
+  EXPECT_EQ("new", value);
+  ASSERT_NO_FATAL_FAILURE(race.Close());
+}
+
+// GC22: timestamped snapshots whose callbacks run out of sequence order across
+// partitions are all created when their timestamps agree with their
+// sequences, and refused (commit still OK) when they do not.
+TEST(TransactionPartitionedWalTest,
+     GC22TimestampedSnapshotsOutOfSequenceOrder) {
+  FU14SnapshotRace race;
+  ASSERT_NO_FATAL_FAILURE(race.Open("gc22_ts_snapshot_order"));
+  auto commit = [&](size_t partition, const std::string& key, TxnTimestamp ts,
+                    std::shared_ptr<const Snapshot>* snapshot) {
+    std::unique_ptr<Transaction> txn(race.db->BeginTransaction(WriteOptions()));
+    ASSERT_OK(txn->Put(race.cf_for_partition[partition], key, "v"));
+    ASSERT_OK(txn->CommitAndTryCreateSnapshot(nullptr, ts, snapshot));
+  };
+  // T1 (ts 10) is held; T2 (ts 20) on the other partition commits at a
+  // higher sequence and creates its snapshot first.
+  std::shared_ptr<const Snapshot> t1;
+  std::shared_ptr<const Snapshot> t2;
+  RunWithCommitHeldAtGate([&] { commit(0, "t1", 10, &t1); },
+                          [&] { commit(1, "t2", 20, &t2); });
+  ASSERT_NE(nullptr, t1);
+  ASSERT_NE(nullptr, t2);
+  EXPECT_LT(t1->GetSequenceNumber(), t2->GetSequenceNumber());
+  {
+    std::vector<std::shared_ptr<const Snapshot>> listed;
+    ASSERT_OK(race.db->GetAllTimestampedSnapshots(listed));
+    ASSERT_EQ(2u, listed.size());
+    EXPECT_EQ(t1.get(), listed[0].get());
+    EXPECT_EQ(t2.get(), listed[1].get());
+  }
+
+  // Inverted: T3 (ts 30) below T4 (ts 25) in sequence order.
+  std::shared_ptr<const Snapshot> t3;
+  std::shared_ptr<const Snapshot> t4;
+  RunWithCommitHeldAtGate([&] { commit(0, "t3", 30, &t3); },
+                          [&] { commit(1, "t4", 25, &t4); });
+  EXPECT_EQ(nullptr, t3);
+  ASSERT_NE(nullptr, t4);
+  std::string value;
+  ASSERT_OK(
+      race.db->Get(ReadOptions(), race.cf_for_partition[0], "t3", &value));
+
+  std::vector<SequenceNumber> snaps;
+  race.db_impl->LoadSnapshots(&snaps, nullptr, kMaxSequenceNumber);
+  EXPECT_TRUE(std::is_sorted(snaps.begin(), snaps.end()));
+  EXPECT_EQ(3u, snaps.size());
+  t1.reset();
+  t2.reset();
+  t4.reset();
+  ASSERT_NO_FATAL_FAILURE(race.Close());
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

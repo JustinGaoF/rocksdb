@@ -6004,6 +6004,27 @@ DBImpl::CreateTimestampedSnapshotImpl(SequenceNumber snapshot_seq, uint64_t ts,
   std::shared_ptr<const SnapshotImpl> latest =
       timestamped_snapshots_.GetSnapshot(std::numeric_limits<uint64_t>::max());
 
+  if (NumWalPartitions() > 1 && latest &&
+      latest->GetSequenceNumber() > snapshot_seq) {
+    // Write groups on different partitions create these out of sequence
+    // order. Check against the latest at or below snapshot_seq as below; the
+    // next one above must have a larger timestamp.
+    std::shared_ptr<const SnapshotImpl> above;
+    latest = timestamped_snapshots_.GetLatestAtOrBelow(snapshot_seq, &above);
+    assert(above);
+    if (above->GetTimestamp() <= ts) {
+      if (lock) {
+        mutex_.Unlock();
+      }
+      delete s;
+      std::ostringstream oss;
+      oss << "snapshot exists with larger seq " << above->GetSequenceNumber()
+          << " > " << snapshot_seq << " but timestamp " << above->GetTimestamp()
+          << " <= " << ts;
+      return std::make_pair(Status::InvalidArgument(oss.str()), nullptr);
+    }
+  }
+
   // If there is already a latest timestamped snapshot, then we need to do
   // some checks.
   if (latest) {
