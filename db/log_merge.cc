@@ -52,6 +52,7 @@ WALIndexMerger::Member::PulledRecord WALIndexMerger::ReaderMember::PullNext() {
     if (!seen_first_) {
       seen_first_ = true;
       corrupt_before_first_ = reporter_.saw_corruption();
+      head_floor_ = reader_->GetWALIndexProgressBound();
     }
     if (swallowed_before && !swallow_pending_) {
       // Reports since the previous read: corruption was observed and skipped
@@ -137,6 +138,10 @@ bool WALIndexMerger::ReaderMember::HeadIntact() const {
 
 uint64_t WALIndexMerger::ReaderMember::ProgressBound() const {
   return reader_->GetWALIndexProgressBound();
+}
+
+uint64_t WALIndexMerger::ReaderMember::HeadFloor() const {
+  return seen_first_ ? head_floor_ : reader_->GetWALIndexProgressBound();
 }
 
 bool WALIndexMerger::ReaderMember::VoidCovers(uint64_t index) const {
@@ -457,6 +462,20 @@ Status WALIndexMerger::ComputeLowerBound() {
   }
   if (have_lower && history_floor_ != 0 && attested.empty()) {
     lower = std::min(lower, history_floor_);
+  }
+  // A head floor bounds the indices allocated since its WAL was created,
+  // whatever lost WAL bore them: a partition's current WAL is attested by no
+  // successor, so a loss below every surviving record surfaces as a hole only
+  // through the floor.
+  bool use_head_floors = true;
+  // Lets the prefix oracle's G-20 self-test drop every lower-bound witness.
+  TEST_SYNC_POINT_CALLBACK("WALIndexMerger::ComputeLowerBound:UseHeadFloors",
+                           &use_head_floors);
+  for (auto& s : states_) {
+    const uint64_t floor = s.member->HeadFloor();
+    if (have_lower && use_head_floors && floor != 0) {
+      lower = std::min(lower, floor);
+    }
   }
   if (!have_lower) {
     frontier_ = 0;

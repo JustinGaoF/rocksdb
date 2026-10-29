@@ -2827,6 +2827,9 @@ class DBImpl : public DB
   IOStatus WriteWALIndexSupersessions(
       const WriteOptions& write_options, log::Writer* new_log,
       const std::vector<WALIndexSupersession>& supersessions);
+  // With more than one partition, writes the index floor into the head of
+  // every WAL Open created whose predecessor span carries none.
+  IOStatus WriteWALIndexHeadFloors(const WriteOptions& write_options);
 
   void SetupLogFilesRecovery(
       const std::vector<uint64_t>& wal_numbers,
@@ -3427,7 +3430,11 @@ class DBImpl : public DB
 
   // Drops every read mask once no memtable that held a masked range is left:
   // flushes, recovery's included, dropped the ranges, so the read path
-  // returns to no mask. Called after each flush frees its memtables.
+  // returns to no mask. A memtable counts until its final Unref(), so a read
+  // that still holds an older superversion delays retirement; masked
+  // memtables skip history (MemTableListVersion::Remove). Called in every
+  // superversion install, so in step with the flush that frees the last one,
+  // and after each background flush.
   // REQUIRES: mutex_ held.
   void MaybeRetireWalGateReadMasks();
 
@@ -3485,9 +3492,12 @@ class DBImpl : public DB
   // `sync_micros` is the sync write's claim and fsync time so far, which the
   // gate's own sync adds to before recording WAL_SYNC_BARRIER_MICROS.
   // `low` is the group's first sequence, which a failed sync fences.
+  // `group` is the sync group's registration (RegisterGateSyncGroup), if any.
+  struct WalGateSyncWaiter;
   Status RunCompletionGate(SequenceNumber low, SequenceNumber target, bool sync,
                            SequenceNumber pre_sync_safe_point,
-                           uint64_t sync_micros);
+                           uint64_t sync_micros,
+                           WalGateSyncWaiter* group = nullptr);
 
   // N>1 only. A sync write's own fsync (D-G11 (c)), run from its completion
   // gate once its group has inserted and published, so no write on any
@@ -3507,9 +3517,26 @@ class DBImpl : public DB
   // that fails returns that sync's status. If `sync` fails, fences the group,
   // [low, target] (InstallFailedGateSyncFence), and every queued group, in the
   // mutex_ section that records the failure, before any waiter rechecks.
+  // A registered sync group passes its registration as `group`, which that
+  // section fences whether or not it is queued.
   Status RunCoalescedGateSync(SequenceNumber low, SequenceNumber target,
                               SequenceNumber* covered,
-                              const std::function<Status()>& sync);
+                              const std::function<Status()>& sync,
+                              WalGateSyncWaiter* group = nullptr);
+
+  // N>1 only. Registers a sync group that consumes sequences, [low, target],
+  // when its completion gate is installed, before its memtable insert and
+  // before it leaves the write group: from then on a failed gate sync fences
+  // it in the mutex_ section that records the failure, wherever its gate is
+  // (a memtable switch waits only for groups still in the write group). The
+  // registration ends with EndGateSyncGroup, or when the returned pointer is
+  // released.
+  std::shared_ptr<WalGateSyncWaiter> RegisterGateSyncGroup(
+      SequenceNumber low, SequenceNumber target);
+  // Ends `group`'s registration as its gate returns `status`: a group fenced
+  // meanwhile fails with the failure that fenced it, since the fence hides it
+  // and every flush drops it.
+  Status EndGateSyncGroup(WalGateSyncWaiter* group, const Status& status);
 
   // N>1 only. A sync write's gate sync failed with `status` and no
   // WALIOStatusCheck installed its fence (the failure was an earlier one's,
@@ -4296,13 +4323,15 @@ class DBImpl : public DB
   uint64_t wal_gate_synced_epoch_ = 0;
   uint64_t wal_gate_sync_failed_epoch_ = 0;
   Status wal_gate_sync_failed_status_;
-  // Gates queued on the running sync, each of which shares its failure.
-  // WALIOStatusCheck fences them (and sets `fenced`) in the mutex_ section
-  // that records that failure.
+  // Gates queued on the running sync, each of which shares its failure, and
+  // registered sync groups (RegisterGateSyncGroup). WALIOStatusCheck fences
+  // them (and sets `fenced` and `status`) in the mutex_ section that records
+  // a failed gate sync.
   struct WalGateSyncWaiter {
     SequenceNumber low;
     SequenceNumber target;
     bool fenced;
+    Status status;
   };
   std::vector<WalGateSyncWaiter*> wal_gate_sync_waiters_;
 
@@ -4354,9 +4383,10 @@ class DBImpl : public DB
   std::shared_ptr<const WalGateReadMask::Ranges> wal_gate_read_masks_;
   std::atomic<bool> wal_gate_read_masked_{false};
   std::atomic<uint64_t> wal_gate_read_mask_version_{0};
-  // The ranges as the memtables live at the last install hold them; expires
-  // once every one of those memtables is freed. Guarded by mutex_.
-  std::weak_ptr<const ReadOnlyMemTable::MaskedSequenceRanges>
+  // The ranges as the memtables live at each install hold them; each expires
+  // once every one of those memtables is released (its final Unref()).
+  // Guarded by mutex_.
+  std::vector<std::weak_ptr<const ReadOnlyMemTable::MaskedSequenceRanges>>
       wal_gate_masked_memtables_;
   uint64_t next_wal_index_ = log::kWALIndexStartNumber;
 

@@ -286,6 +286,13 @@ class ReadOnlyMemTable {
   virtual void SetMaskedSequenceRanges(
       std::shared_ptr<const MaskedSequenceRanges> /*ranges*/) {}
   virtual bool HasMaskedSequenceRanges() const { return false; }
+  // Lets go of the ranges at the final Unref(), when no read can reach this
+  // memtable any more, rather than at its deletion, which may come later.
+  virtual void DropMaskedSequenceRanges() {}
+  virtual std::shared_ptr<const MaskedSequenceRanges> GetMaskedSequenceRanges()
+      const {
+    return nullptr;
+  }
 
   virtual uint64_t GetDataSize() const = 0;
 
@@ -383,6 +390,7 @@ class ReadOnlyMemTable {
     assert(refs_ >= 0);
     if (refs_ <= 0) {
       ReleaseProtectedSealedBlobFiles();
+      DropMaskedSequenceRanges();
       return this;
     }
     return nullptr;
@@ -808,6 +816,15 @@ class MemTable final : public ReadOnlyMemTable {
   }
   bool HasMaskedSequenceRanges() const override {
     return has_masked_ranges_.load(std::memory_order_acquire);
+  }
+  void DropMaskedSequenceRanges() override {
+    AtomicSharedPtrStore(&masked_ranges_,
+                         std::shared_ptr<const MaskedSequenceRanges>(),
+                         std::memory_order_release);
+  }
+  std::shared_ptr<const MaskedSequenceRanges> GetMaskedSequenceRanges()
+      const override {
+    return AtomicSharedPtrLoad(&masked_ranges_, std::memory_order_acquire);
   }
 
   uint64_t GetDataSize() const override { return data_size_.LoadRelaxed(); }

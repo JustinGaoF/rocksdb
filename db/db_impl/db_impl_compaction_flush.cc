@@ -5884,6 +5884,8 @@ void DBImpl::InstallSuperVersionAndScheduleWork(
   }
   cfd->InstallSuperVersion(sv_context, &mutex_,
                            std::move(new_seqno_to_time_mapping));
+  // The install may have released the last masked memtable, as a flush's does.
+  MaybeRetireWalGateReadMasks();
 
   // Refresh the seqno->time preserve-window bound used to gate bottommost file
   // marking, so a file whose largest seqno is still within the preserve window

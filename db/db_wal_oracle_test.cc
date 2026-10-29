@@ -816,10 +816,12 @@ TEST_F(DBWalOracleTest, CatchesMergeStopOffByOne) {
 }
 
 TEST_F(DBWalOracleTest, CatchesLowerBoundWithoutSpans) {
-  // G-20: with predecessor spans disabled, the merge derives its lower bound
-  // from the lowest index any live WAL still holds, so losing a partition's
-  // lowest live records while another partition keeps a higher one replays a
-  // non-prefix. Every cycle reruns kLowerBoundSeed's configuration.
+  // G-20: with predecessor spans and head floors disabled, the merge derives
+  // its lower bound from the lowest index any live WAL still holds, so losing
+  // a partition's lowest live records while another partition keeps a higher
+  // one replays a non-prefix. Every cycle reruns kLowerBoundSeed's
+  // configuration. (GC24: head floors bound the lower bound too, so the
+  // injection drops them as well.)
   const uint64_t seed = EnvU64("ROCKSDB_WAL_ORACLE_SEED", kLowerBoundSeed);
   auto rerun_seed = [seed](CycleConfig* config) {
     *config = ConfigForSeed(seed);
@@ -827,9 +829,14 @@ TEST_F(DBWalOracleTest, CatchesLowerBoundWithoutSpans) {
   SyncPoint::GetInstance()->SetCallBack(
       "DBImpl::StartWALFile:WriteSpan",
       [](void* arg) { *static_cast<bool*>(arg) = false; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "WALIndexMerger::ComputeLowerBound:UseHeadFloors",
+      [](void* arg) { *static_cast<bool*>(arg) = false; });
   const uint64_t caught_at = RunCycles(seed, kSelfTestMaxCycles, rerun_seed,
                                        /*stop_at_violation=*/true);
   SyncPoint::GetInstance()->ClearCallBack("DBImpl::StartWALFile:WriteSpan");
+  SyncPoint::GetInstance()->ClearCallBack(
+      "WALIndexMerger::ComputeLowerBound:UseHeadFloors");
   fprintf(stderr, "lower bound without spans caught at cycle %" PRIu64 "\n",
           caught_at);
   ASSERT_NE(0u, caught_at);

@@ -495,12 +495,19 @@ Status FlushJob::MemPurge() {
   std::vector<InternalIterator*> memtables;
   std::vector<std::unique_ptr<FragmentedRangeTombstoneIterator>>
       range_del_iters;
+  // What a flush would drop, MemPurge drops too: entries at or above an
+  // unreleased fence, and failed gate syncs' entries (masked memtables hide
+  // their range tombstones themselves).
+  const SequenceNumber range_del_read_seq =
+      drop_entries_at_or_above_ == kMaxSequenceNumber
+          ? kMaxSequenceNumber
+          : drop_entries_at_or_above_ - 1;
   for (ReadOnlyMemTable* m : mems_) {
     memtables.push_back(m->NewIterator(ro, /*seqno_to_time_mapping=*/nullptr,
                                        &arena, /*prefix_extractor=*/nullptr,
                                        /*for_flush=*/true));
     auto* range_del_iter = m->NewRangeTombstoneIterator(
-        ro, kMaxSequenceNumber, true /* immutable_memtable */);
+        ro, range_del_read_seq, true /* immutable_memtable */);
     if (range_del_iter != nullptr) {
       range_del_iters.emplace_back(range_del_iter);
     }
@@ -520,9 +527,17 @@ Status FlushJob::MemPurge() {
                          : earliest_seqno;
   }
 
-  ScopedArenaPtr<InternalIterator> iter(
+  ScopedArenaPtr<InternalIterator> merged(
       NewMergingIterator(&(cfd_->internal_comparator()), memtables.data(),
                          static_cast<int>(memtables.size()), &arena));
+  std::unique_ptr<SequenceFloorIterator> floor_iter;
+  InternalIterator* iter = merged.get();
+  if (drop_entries_at_or_above_ != kMaxSequenceNumber ||
+      !drop_entry_ranges_.empty()) {
+    floor_iter.reset(new SequenceFloorIterator(
+        merged.get(), drop_entries_at_or_above_, drop_entry_ranges_));
+    iter = floor_iter.get();
+  }
 
   const auto& ioptions = cfd_->ioptions();
 
@@ -584,7 +599,7 @@ Status FlushJob::MemPurge() {
     assert(job_context_);
     const std::atomic<bool> kManualCompactionCanceledFalse{false};
     CompactionIterator c_iter(
-        iter.get(), (cfd_->internal_comparator()).user_comparator(), &merge,
+        iter, (cfd_->internal_comparator()).user_comparator(), &merge,
         kMaxSequenceNumber, &job_context_->snapshot_seqs, earliest_snapshot_,
         job_context_->earliest_write_conflict_snapshot,
         job_context_->GetJobSnapshotSequence(), job_context_->snapshot_checker,
@@ -722,6 +737,13 @@ Status FlushJob::MemPurge() {
         // Take the latest memtable's next log number.
         new_mem->SetNextLogNumber(mems_.back()->GetNextLogNumber());
 
+        // A failed gate sync may have masked the inputs since they were
+        // picked (DBImpl::InstallFailedGateSyncFence). The output holds what
+        // they held, so it hides the same ranges and keeps the mask alive
+        // until it is released, as they would have.
+        if (auto masked = mems_.front()->GetMaskedSequenceRanges()) {
+          new_mem->SetMaskedSequenceRanges(std::move(masked));
+        }
         // This addition will not trigger another flush, because
         // we do not call EnqueuePendingFlush().
         cfd_->imm()->Add(new_mem, &job_context_->memtables_to_free);

@@ -83,6 +83,11 @@ class WALIndexMerger {
     virtual uint64_t FirstIndexed() const = 0;
     // Highest progress bound read so far, or zero when none.
     virtual uint64_t ProgressBound() const = 0;
+    // Progress bound read before the member's first data record, or zero
+    // when none. A progress bound is the next index the writer would allocate
+    // when it wrote the record, so every index allocated later is at or above
+    // it, in this WAL's generation or a later one.
+    virtual uint64_t HeadFloor() const { return 0; }
     // Whether any void range read so far covers `index`.
     virtual bool VoidCovers(uint64_t index) const = 0;
     // Whether a supersession read so far obsoletes (`bearer`, `index`).
@@ -170,6 +175,7 @@ class WALIndexMerger {
     // Index of the last indexed record pulled, or zero when none.
     uint64_t LastIndexed() const { return last_positioned_index_; }
     uint64_t ProgressBound() const override;
+    uint64_t HeadFloor() const override;
     bool VoidCovers(uint64_t index) const override;
     bool Supersedes(uint64_t bearer, uint64_t index) const override;
     bool AttestedSpan(PredecessorSpan* span) const override;
@@ -241,6 +247,7 @@ class WALIndexMerger {
     PulledRecord terminal_;
     bool seen_first_ = false;
     bool corrupt_before_first_ = false;
+    uint64_t head_floor_ = 0;
     uint64_t indexed_pulled_ = 0;
     uint64_t unindexed_pulled_ = 0;
     bool progress_noted_ = false;
@@ -342,6 +349,10 @@ class WALIndexMerger {
   // An attested predecessor the merge stopped for, or zero. Valid after
   // kFrontier.
   uint64_t GetLostPredecessor() const { return lost_predecessor_; }
+  // Whether the frontier is a pending superseded-only index (one no void
+  // older than its declaration explained) rather than a plain hole. Valid
+  // after kFrontier.
+  bool FrontierIsPendingDiscard() const { return frontier_pending_discard_; }
   // Whether the drive skipped a superseded-only index that no void older
   // than its declaration explained: one re-trusted under
   // continue_past_discarded_holes, or one still pending at the end. A record
@@ -400,6 +411,7 @@ class WALIndexMerger {
   // unexplained.
   Result StopAtFrontier() {
     frontier_ = pending_discarded_ != 0 ? pending_discarded_ : expected_;
+    frontier_pending_discard_ = pending_discarded_ != 0;
     terminal_ = Result::kFrontier;
     return terminal_;
   }
@@ -455,6 +467,7 @@ class WALIndexMerger {
   uint64_t pending_discarded_ = 0;
   uint64_t pending_declarer_ = 0;
   uint64_t frontier_ = 0;
+  bool frontier_pending_discard_ = false;
   Status error_ = Status::OK();
   uint64_t retirement_bound_ = std::numeric_limits<uint64_t>::max();
   uint64_t history_floor_ = 0;
