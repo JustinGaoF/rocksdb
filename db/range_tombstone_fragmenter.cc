@@ -339,6 +339,7 @@ FragmentedRangeTombstoneIterator::FragmentedRangeTombstoneIterator(
 void FragmentedRangeTombstoneIterator::SeekToFirst() {
   pos_ = tombstones_->begin();
   seq_pos_ = tombstones_->seq_begin();
+  SkipHiddenForward();
 }
 
 void FragmentedRangeTombstoneIterator::SeekToTopFirst() {
@@ -354,6 +355,7 @@ void FragmentedRangeTombstoneIterator::SeekToTopFirst() {
 void FragmentedRangeTombstoneIterator::SeekToLast() {
   pos_ = std::prev(tombstones_->end());
   seq_pos_ = std::prev(tombstones_->seq_end());
+  SkipHiddenBackward();
 }
 
 void FragmentedRangeTombstoneIterator::SeekToTopLast() {
@@ -446,6 +448,7 @@ void FragmentedRangeTombstoneIterator::Next() {
   if (seq_pos_ == tombstones_->seq_iter(pos_->seq_end_idx)) {
     ++pos_;
   }
+  SkipHiddenForward();
 }
 
 void FragmentedRangeTombstoneIterator::TopNext() {
@@ -467,6 +470,58 @@ void FragmentedRangeTombstoneIterator::Prev() {
       seq_pos_ == tombstones_->seq_iter(pos_->seq_start_idx - 1)) {
     --pos_;
   }
+  SkipHiddenBackward();
+}
+
+void FragmentedRangeTombstoneIterator::SkipHiddenForward() {
+  if (hidden_seq_ranges_ == nullptr) {
+    return;
+  }
+  while (pos_ != tombstones_->end() && Hidden(*seq_pos_)) {
+    ++seq_pos_;
+    if (seq_pos_ == tombstones_->seq_iter(pos_->seq_end_idx)) {
+      ++pos_;
+      if (pos_ != tombstones_->end()) {
+        seq_pos_ = tombstones_->seq_iter(pos_->seq_start_idx);
+      }
+    }
+  }
+}
+
+void FragmentedRangeTombstoneIterator::SkipHiddenBackward() {
+  if (hidden_seq_ranges_ == nullptr) {
+    return;
+  }
+  while (pos_ != tombstones_->end() && Hidden(*seq_pos_)) {
+    if (seq_pos_ == tombstones_->seq_iter(pos_->seq_start_idx)) {
+      if (pos_ == tombstones_->begin()) {
+        Invalidate();
+        return;
+      }
+      --pos_;
+      seq_pos_ = std::prev(tombstones_->seq_iter(pos_->seq_end_idx));
+    } else {
+      --seq_pos_;
+    }
+  }
+}
+
+bool FragmentedRangeTombstoneIterator::empty() const {
+  if (tombstones_->empty()) {
+    return true;
+  }
+  if (hidden_seq_ranges_ == nullptr) {
+    return false;
+  }
+  for (auto frag = tombstones_->begin(); frag != tombstones_->end(); ++frag) {
+    for (auto s = tombstones_->seq_iter(frag->seq_start_idx);
+         s != tombstones_->seq_iter(frag->seq_end_idx); ++s) {
+      if (*s >= lower_bound_ && *s <= upper_bound_ && !Hidden(*s)) {
+        return false;
+      }
+    }
+  }
+  return true;
 }
 
 void FragmentedRangeTombstoneIterator::TopPrev() {
@@ -532,9 +587,10 @@ FragmentedRangeTombstoneIterator::SplitBySnapshot(
       upper = snapshots[i];
     }
     if (tombstones_->ContainsRange(lower, upper)) {
-      splits.emplace(upper,
-                     std::make_unique<FragmentedRangeTombstoneIterator>(
-                         tombstones_, *icmp_, upper, ts_upper_bound_, lower));
+      auto split = std::make_unique<FragmentedRangeTombstoneIterator>(
+          tombstones_, *icmp_, upper, ts_upper_bound_, lower);
+      split->SetHiddenSeqRanges(hidden_seq_ranges_);
+      splits.emplace(upper, std::move(split));
     }
     lower = upper + 1;
   }

@@ -59,6 +59,10 @@ class WalManager {
                                         SequenceNumber start_sequence,
                                         SequenceNumber end_sequence);
 
+  // The indeterminate set's size. Tests use it to prove a failed zero-count
+  // sync recorded nothing.
+  size_t TEST_NumIndeterminateWriteGaps() const;
+
   void PurgeObsoleteWALFiles();
 
   void ArchiveWALFile(const std::string& fname, uint64_t number);

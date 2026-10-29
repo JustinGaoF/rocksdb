@@ -269,7 +269,9 @@ bool MemTableListVersion::GetFromList(
 
 Status MemTableListVersion::AddRangeTombstoneIterators(
     const ReadOptions& read_opts, Arena* /*arena*/,
-    RangeDelAggregator* range_del_agg) {
+    RangeDelAggregator* range_del_agg,
+    const std::vector<std::pair<SequenceNumber, SequenceNumber>>*
+        hidden_seq_ranges) {
   assert(range_del_agg != nullptr);
   // Except for snapshot read, using kMaxSequenceNumber is OK because these
   // are immutable memtables.
@@ -281,6 +283,9 @@ Status MemTableListVersion::AddRangeTombstoneIterators(
     std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter(
         m->NewRangeTombstoneIterator(read_opts, read_seq,
                                      true /* immutable_memtable */));
+    if (range_del_iter != nullptr && hidden_seq_ranges != nullptr) {
+      range_del_iter->SetHiddenSeqRanges(hidden_seq_ranges);
+    }
     range_del_agg->AddTombstones(std::move(range_del_iter));
   }
   return Status::OK();
@@ -304,7 +309,9 @@ void MemTableListVersion::AddIterators(
     const SliceTransform* prefix_extractor,
     MergeIteratorBuilder* merge_iter_builder, bool add_range_tombstone_iter,
     SequenceNumber read_seq, const MultiScanArgs* scan_opts,
-    const Comparator* user_comparator) {
+    const Comparator* user_comparator,
+    const std::vector<std::pair<SequenceNumber, SequenceNumber>>*
+        hidden_seq_ranges) {
   for (auto& m : memlist_) {
     const bool should_probe_scan_intersection =
         scan_opts != nullptr && scan_opts->HasBoundedScanRanges() &&
@@ -331,6 +338,9 @@ void MemTableListVersion::AddIterators(
       std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter(
           m->NewRangeTombstoneIterator(options, range_del_read_seq,
                                        true /* immutale_memtable */));
+      if (range_del_iter != nullptr && hidden_seq_ranges != nullptr) {
+        range_del_iter->SetHiddenSeqRanges(hidden_seq_ranges);
+      }
       if (range_del_iter != nullptr && !range_del_iter->empty()) {
         mem_tombstone_iter = std::make_unique<TruncatedRangeDelIterator>(
             std::move(range_del_iter), &m->GetInternalKeyComparator(),

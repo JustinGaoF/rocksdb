@@ -8,6 +8,7 @@
 #include <limits>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "db/column_family.h"
 #include "db/db_impl/db_impl.h"
@@ -726,14 +727,24 @@ void ForwardIterator::RebuildIterators(bool refresh_sv) {
                          sv_->mutable_cf_options.prefix_extractor.get(),
                          &imm_iters_, &arena_);
   if (!read_options_.ignore_range_deletions) {
+    // A failed gate-sync write's tombstones stay hidden like its points, so
+    // they neither delete through this iterator nor trip the unsupported
+    // range-tombstone check below. Fetched per build; the aggregator is local
+    // to the build, so no lifetime is needed past it.
+    auto hidden_ranges = db_->WalGateReadMaskRanges();
+    const std::vector<std::pair<SequenceNumber, SequenceNumber>>* hidden =
+        hidden_ranges.get();
     std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter(
         sv_->mem->NewRangeTombstoneIterator(
             read_options_, sv_->current->version_set()->LastSequence(),
             false /* immutable_memtable */));
+    if (range_del_iter != nullptr && hidden != nullptr) {
+      range_del_iter->SetHiddenSeqRanges(hidden);
+    }
     range_del_agg.AddTombstones(std::move(range_del_iter));
     // Always return Status::OK().
-    Status temp_s = sv_->imm->AddRangeTombstoneIterators(read_options_, &arena_,
-                                                         &range_del_agg);
+    Status temp_s = sv_->imm->AddRangeTombstoneIterators(
+        read_options_, &arena_, &range_del_agg, hidden);
     assert(temp_s.ok());
   }
   has_iter_trimmed_for_upper_bound_ = false;
@@ -799,14 +810,22 @@ void ForwardIterator::RenewIterators() {
   ReadRangeDelAggregator range_del_agg(&cfd_->internal_comparator(),
                                        kMaxSequenceNumber /* upper_bound */);
   if (!read_options_.ignore_range_deletions) {
+    // Same hidden-tombstone handling as RebuildIterators above: the renew
+    // path rebuilds the aggregator from the new super version's memtables.
+    auto hidden_ranges = db_->WalGateReadMaskRanges();
+    const std::vector<std::pair<SequenceNumber, SequenceNumber>>* hidden =
+        hidden_ranges.get();
     std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter(
         svnew->mem->NewRangeTombstoneIterator(
             read_options_, sv_->current->version_set()->LastSequence(),
             false /* immutable_memtable */));
+    if (range_del_iter != nullptr && hidden != nullptr) {
+      range_del_iter->SetHiddenSeqRanges(hidden);
+    }
     range_del_agg.AddTombstones(std::move(range_del_iter));
     // Always return Status::OK().
     Status temp_s = svnew->imm->AddRangeTombstoneIterators(
-        read_options_, &arena_, &range_del_agg);
+        read_options_, &arena_, &range_del_agg, hidden);
     assert(temp_s.ok());
   }
 

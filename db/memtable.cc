@@ -1625,6 +1625,9 @@ bool MemTable::Get(const LookupKey& key, std::string* value,
       NewRangeTombstoneIterator(read_opts, range_del_read_seq,
                                 immutable_memtable));
   if (range_del_iter != nullptr) {
+    if (callback != nullptr) {
+      range_del_iter->SetHiddenSeqRanges(callback->GetHiddenSeqRanges());
+    }
     SequenceNumber covering_seq =
         range_del_iter->MaxCoveringTombstoneSeqnum(key.user_key());
     if (covering_seq > *max_covering_tombstone_seq) {
@@ -1853,6 +1856,9 @@ void MemTable::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
           std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter(
               NewRangeTombstoneIteratorInternal(
                   read_options, range_del_read_seq, immutable_memtable));
+          if (callback != nullptr) {
+            range_del_iter->SetHiddenSeqRanges(callback->GetHiddenSeqRanges());
+          }
           SequenceNumber covering_seq =
               range_del_iter->MaxCoveringTombstoneSeqnum(
                   iter->lkey->user_key());
@@ -1985,6 +1991,9 @@ void MemTable::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
           std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter(
               NewRangeTombstoneIteratorInternal(
                   read_options, range_del_read_seq, immutable_memtable));
+          if (callback != nullptr) {
+            range_del_iter->SetHiddenSeqRanges(callback->GetHiddenSeqRanges());
+          }
           SequenceNumber covering_seq =
               range_del_iter->MaxCoveringTombstoneSeqnum(
                   iter->lkey->user_key());

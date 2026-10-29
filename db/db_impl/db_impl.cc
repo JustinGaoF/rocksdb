@@ -611,6 +611,18 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
   if (s.ok()) {
     recovering_from_wal_write_error_ = context.IsWALWriteErrorRecovery();
     recover_wal_through_number_ = context.failed_wal_number;
+    // The mask ranges the flush below can drop: only a full flush switches
+    // every column family's memtable, and only ranges already installed are
+    // dropped. A retry flush re-flushes immutable memtables only, so it
+    // retires nothing.
+    size_t retire_mask_ranges = 0;
+    const bool full_flush =
+        context.flush_reason != FlushReason::kErrorRecoveryRetryFlush;
+    if (full_flush) {
+      if (auto ranges = WalGateReadMaskRanges()) {
+        retire_mask_ranges = ranges->size();
+      }
+    }
     if (context.flush_reason == FlushReason::kErrorRecoveryRetryFlush) {
       s = RetryFlushesForErrorRecovery(FlushReason::kErrorRecoveryRetryFlush,
                                        true /* wait */);
@@ -636,6 +648,11 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
                        "[WAL recovery] Atomic flush completed through WAL "
                        "#%" PRIu64,
                        context.failed_wal_number);
+      }
+      if (s.ok()) {
+        // The flush switched every column family's memtable and dropped
+        // every fenced range durably: reads no longer need to hide them.
+        RetireWalGateReadMasks(retire_mask_ranges);
       }
     }
     recovering_from_wal_write_error_ = false;
@@ -741,6 +758,14 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
   }
   job_context.Clean();
   mutex_.Lock();
+
+  if (s.ok() && NumWalPartitions() > 1 && !failed_wal_ranges_.empty()) {
+    // The release below admits writes above the failed ranges. First explain
+    // every burn durably: without it a later recovery reads the burned index
+    // as an unexplained hole and cuts those writes (with 2PC), or refuses to
+    // open. A failure here fails Resume and the DB stays stopped.
+    s = WriteDurableBurnedWALIndexCovers();
+  }
 
   if (s.ok()) {
     // Will notify and unblock threads waiting for error recovery to finish.
@@ -3398,7 +3423,9 @@ InternalIterator* DBImpl::NewInternalIterator(
     const ReadOptions& read_options, ColumnFamilyData* cfd,
     SuperVersion* super_version, Arena* arena, SequenceNumber sequence,
     bool allow_unprepared_value, ArenaWrappedDBIter* db_iter,
-    const MultiScanArgs* scan_opts) {
+    const MultiScanArgs* scan_opts,
+    const std::vector<std::pair<SequenceNumber, SequenceNumber>>*
+        hidden_seq_ranges) {
   InternalIterator* internal_iter;
   assert(arena != nullptr);
   auto prefix_extractor =
@@ -3428,6 +3455,9 @@ InternalIterator* DBImpl::NewInternalIterator(
       std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter(
           super_version->mem->NewRangeTombstoneIterator(
               read_options, sequence, false /* immutable_memtable */));
+      if (range_del_iter != nullptr && hidden_seq_ranges != nullptr) {
+        range_del_iter->SetHiddenSeqRanges(hidden_seq_ranges);
+      }
       if (range_del_iter != nullptr && !range_del_iter->empty()) {
         mem_tombstone_iter = std::make_unique<TruncatedRangeDelIterator>(
             std::move(range_del_iter), &cfd->ioptions().internal_comparator,
@@ -3451,7 +3481,7 @@ InternalIterator* DBImpl::NewInternalIterator(
         read_options, super_version->GetSeqnoToTimeMapping(),
         super_version->mutable_cf_options.prefix_extractor.get(),
         &merge_iter_builder, !read_options.ignore_range_deletions, sequence,
-        scan_opts, user_comparator);
+        scan_opts, user_comparator, hidden_seq_ranges);
   }
   TEST_SYNC_POINT_CALLBACK("DBImpl::NewInternalIterator:StatusCallback", &s);
   if (s.ok()) {
@@ -5539,14 +5569,31 @@ Iterator* DBImpl::NewIterator(const ReadOptions& _read_options,
 
     auto iter = new ForwardIterator(this, read_options, cfd, sv,
                                     /* allow_unprepared_value */ true);
+    // Tailing iterators bypass NewIteratorImpl, so wrap their DBIter in the
+    // same read mask a plain iterator gets; without it a failed sync write
+    // stays visible here until Resume drops it.
+    ReadCallback* tailing_read_callback = nullptr;
+    WalGateReadMask* tailing_gate_read_mask = nullptr;
+    if (auto ranges = WalGateReadMaskRanges()) {
+      tailing_gate_read_mask = new WalGateReadMask(
+          std::move(ranges), /*inner=*/nullptr, kMaxSequenceNumber);
+      tailing_read_callback = tailing_gate_read_mask;
+    }
     // TODO(cbi): Add support for `memtable_op_scan_flush_trigger` for tailing
     // iterator. This requires refreshing DBIter's pointer to active_mem when
     // tailing iterator refreshes to new memtable internally.
     result = DBIter::NewIter(env_, read_options, cfd->ioptions(),
                              sv->mutable_cf_options, cfd->user_comparator(),
                              iter, sv->current, kMaxSequenceNumber,
-                             /*read_callback=*/nullptr, /*active_mem=*/nullptr,
-                             cfh, /*expose_blob_index=*/false);
+                             tailing_read_callback, /*active_mem=*/nullptr, cfh,
+                             /*expose_blob_index=*/false);
+    if (tailing_gate_read_mask != nullptr) {
+      result->RegisterCleanup(
+          [](void* arg1, void* /*arg2*/) {
+            delete static_cast<WalGateReadMask*>(arg1);
+          },
+          tailing_gate_read_mask, nullptr);
+    }
   } else {
     // Note: no need to consider the special case of
     // last_seq_same_as_publish_seq_==false since NewIterator is overridden in

@@ -128,8 +128,13 @@ class MemTableListVersion {
                           is_blob_index, blob_fetcher);
   }
 
-  Status AddRangeTombstoneIterators(const ReadOptions& read_opts, Arena* arena,
-                                    RangeDelAggregator* range_del_agg);
+  // `hidden_seq_ranges`, when not null, hides the tombstones it names from
+  // the iterators (a read's hidden ranges).
+  Status AddRangeTombstoneIterators(
+      const ReadOptions& read_opts, Arena* arena,
+      RangeDelAggregator* range_del_agg,
+      const std::vector<std::pair<SequenceNumber, SequenceNumber>>*
+          hidden_seq_ranges = nullptr);
 
   void AddIterators(const ReadOptions& options,
                     UnownedPtr<const SeqnoToTimeMapping> seqno_to_time_mapping,
@@ -139,15 +144,18 @@ class MemTableListVersion {
 
   // read_seq controls range tombstone visibility. It may be captured before
   // lazy iterator initialization. scan_opts can prune immutable memtables that
-  // cannot intersect the requested scan ranges.
-  void AddIterators(const ReadOptions& options,
-                    UnownedPtr<const SeqnoToTimeMapping> seqno_to_time_mapping,
-                    const SliceTransform* prefix_extractor,
-                    MergeIteratorBuilder* merge_iter_builder,
-                    bool add_range_tombstone_iter,
-                    SequenceNumber read_seq = kMaxSequenceNumber,
-                    const MultiScanArgs* scan_opts = nullptr,
-                    const Comparator* user_comparator = nullptr);
+  // cannot intersect the requested scan ranges. `hidden_seq_ranges`, when not
+  // null, hides the tombstones it names (a read's hidden ranges).
+  void AddIterators(
+      const ReadOptions& options,
+      UnownedPtr<const SeqnoToTimeMapping> seqno_to_time_mapping,
+      const SliceTransform* prefix_extractor,
+      MergeIteratorBuilder* merge_iter_builder, bool add_range_tombstone_iter,
+      SequenceNumber read_seq = kMaxSequenceNumber,
+      const MultiScanArgs* scan_opts = nullptr,
+      const Comparator* user_comparator = nullptr,
+      const std::vector<std::pair<SequenceNumber, SequenceNumber>>*
+          hidden_seq_ranges = nullptr);
 
   uint64_t GetTotalNumEntries() const;
 

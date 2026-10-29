@@ -39,6 +39,11 @@ class WalRecoverySequenceTracker {
   bool FirstAtOrAfter(SequenceNumber sequence,
                       WalRecoverySequenceGap* recovery_gap) const;
   uint64_t CurrentGeneration() const;
+  // Tests use it to prove a failed zero-count sync recorded nothing.
+  size_t TEST_NumGaps() const {
+    MutexLock l(&mutex_);
+    return gaps_by_end_sequence_.size();
+  }
 
  private:
   mutable port::Mutex mutex_;

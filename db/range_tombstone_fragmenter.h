@@ -9,6 +9,7 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "db/dbformat.h"
@@ -192,7 +193,18 @@ class FragmentedRangeTombstoneIterator : public InternalIterator {
   bool IsValuePinned() const override { return true; }
   Status status() const override { return Status::OK(); }
 
-  bool empty() const { return tombstones_->empty(); }
+  // Hides every tombstone whose sequence falls in one of `hidden_ranges`
+  // (a read's GetHiddenSeqRanges, or a flush's drop ranges): seeks and both
+  // steppers skip them, empty() ignores them, and SplitBySnapshot propagates
+  // them. Null (the default) hides nothing. Call before the first seek; the
+  // ranges must outlive this iterator.
+  void SetHiddenSeqRanges(
+      const std::vector<std::pair<SequenceNumber, SequenceNumber>>*
+          hidden_ranges) {
+    hidden_seq_ranges_ = hidden_ranges;
+  }
+
+  bool empty() const;
   void Invalidate() {
     pos_ = tombstones_->end();
     seq_pos_ = tombstones_->seq_end();
@@ -342,11 +354,27 @@ class FragmentedRangeTombstoneIterator : public InternalIterator {
   SequenceNumber lower_bound_;
   // Only consider timestamps <= ts_upper_bound_.
   const Slice* ts_upper_bound_;
+  // Tombstone sequences to skip (see SetHiddenSeqRanges), or null for none.
+  // Borrowed; the owner keeps it alive past this iterator.
+  const std::vector<std::pair<SequenceNumber, SequenceNumber>>*
+      hidden_seq_ranges_ = nullptr;
   std::vector<RangeTombstoneStack>::const_iterator pos_;
   std::vector<SequenceNumber>::const_iterator seq_pos_;
   mutable std::vector<RangeTombstoneStack>::const_iterator pinned_pos_;
   mutable std::vector<SequenceNumber>::const_iterator pinned_seq_pos_;
   mutable InternalKey current_start_key_;
+
+  bool Hidden(SequenceNumber seq) const {
+    if (hidden_seq_ranges_ == nullptr) {
+      return false;
+    }
+    for (const auto& range : *hidden_seq_ranges_) {
+      if (seq >= range.first && seq <= range.second) {
+        return true;
+      }
+    }
+    return false;
+  }
 
   // Check the current RangeTombstoneStack `pos_` against timestamp
   // upper bound `ts_upper_bound_` and sequence number upper bound
@@ -371,7 +399,21 @@ class FragmentedRangeTombstoneIterator : public InternalIterator {
         seq_pos_ = tombstones_->seq_iter(pos_->seq_start_idx + ts_idx);
       }
     }
+    if (hidden_seq_ranges_ != nullptr) {
+      // Newest-first within the fragment, so skipping hidden sequences can
+      // only reveal an older visible one (or exhaust the fragment, which the
+      // scans treat as invisible).
+      const auto seq_end = tombstones_->seq_iter(pos_->seq_end_idx);
+      while (seq_pos_ != seq_end && Hidden(*seq_pos_)) {
+        ++seq_pos_;
+      }
+    }
   }
+
+  // Advance seq_pos_ (and pos_ past exhausted fragments) over hidden
+  // sequences; no-op when nothing is hidden.
+  void SkipHiddenForward();
+  void SkipHiddenBackward();
 };
 
 }  // namespace ROCKSDB_NAMESPACE

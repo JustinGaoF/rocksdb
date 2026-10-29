@@ -128,9 +128,9 @@ class FlushJob {
   }
 
   // Leaves every entry at or above `sequence` out of the flush output, point
-  // entries and range tombstones alike, and every point entry inside one of
-  // `ranges` (failed gate syncs at N>1). Set before PickMemTable() with the
-  // DB mutex held.
+  // entries and range tombstones alike, and every point entry and range
+  // tombstone inside one of `ranges` (failed gate syncs at N>1). Set before
+  // PickMemTable() with the DB mutex held.
   void DropEntriesAtOrAbove(
       SequenceNumber sequence,
       std::vector<std::pair<SequenceNumber, SequenceNumber>> ranges = {}) {

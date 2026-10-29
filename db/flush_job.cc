@@ -1031,6 +1031,12 @@ Status FlushJob::WriteLevel0Table() {
               : m->NewRangeTombstoneIterator(ro, range_del_read_seq,
                                              true /* immutable_memtable */);
       if (range_del_iter != nullptr) {
+        // A failed gate-sync write's tombstones drop with its points: hidden
+        // here, they reach neither the output table nor ShouldDelete (which
+        // would otherwise delete surviving points below them).
+        if (!drop_entry_ranges_.empty()) {
+          range_del_iter->SetHiddenSeqRanges(&drop_entry_ranges_);
+        }
         range_del_iters.emplace_back(range_del_iter);
       }
       total_num_input_entries += m->NumEntries();

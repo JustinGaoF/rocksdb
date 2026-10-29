@@ -5,6 +5,9 @@
 
 #pragma once
 
+#include <utility>
+#include <vector>
+
 #include "db/dbformat.h"
 #include "rocksdb/types.h"
 
@@ -53,6 +56,15 @@ class ReadCallback {
   virtual bool NeedToTrackNewerVersions(
       const bool* /*per_key_result*/ = nullptr) const {
     return false;
+  }
+
+  // Sequence ranges this read hides beyond the snapshot, or null for none.
+  // Point reads consult IsVisible; range-tombstone iterators skip tombstones
+  // whose sequence falls in these ranges (the WAL gate-sync mask hides a
+  // failed write's range deletions the same way it hides its points).
+  virtual const std::vector<std::pair<SequenceNumber, SequenceNumber>>*
+  GetHiddenSeqRanges() const {
+    return nullptr;
   }
 
   virtual bool IsNewerVisibleForMetadataRead(SequenceNumber /*seq*/) {

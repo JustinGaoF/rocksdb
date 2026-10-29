@@ -37,6 +37,8 @@ class WalGateReadMask : public ReadCallback {
     return !Masked(seq) && (inner_ == nullptr || inner_->IsVisible(seq));
   }
 
+  const Ranges* GetHiddenSeqRanges() const override { return ranges_.get(); }
+
   void Refresh(SequenceNumber seq) override {
     if (inner_ != nullptr) {
       inner_->Refresh(seq);

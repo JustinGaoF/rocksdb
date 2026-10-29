@@ -97,7 +97,9 @@ Status ArenaWrappedDBIter::EnsureInternalIteratorInitialized(
   child_read_options_.snapshot = nullptr;
   InternalIterator* internal_iter = db_impl_->NewInternalIterator(
       child_read_options_, deferred_cfd_, deferred_sv_, &arena_, sequence_,
-      /*allow_unprepared_value=*/true, this, pruning_scan_opts);
+      /*allow_unprepared_value=*/true, this, pruning_scan_opts,
+      read_callback_ == nullptr ? nullptr
+                                : read_callback_->GetHiddenSeqRanges());
   deferred_cfd_ = nullptr;
   deferred_sv_ = nullptr;
   SetIterUnderDBIterImpl(internal_iter);
@@ -246,7 +248,10 @@ void ArenaWrappedDBIter::DoRefresh(const Snapshot* snapshot,
 
   InternalIterator* internal_iter = db_impl->NewInternalIterator(
       read_options_, cfd, sv, &arena_, read_seq,
-      /* allow_unprepared_value */ true, /* db_iter */ this);
+      /* allow_unprepared_value */ true, /* db_iter */ this,
+      /* scan_opts */ nullptr,
+      read_callback_ == nullptr ? nullptr
+                                : read_callback_->GetHiddenSeqRanges());
   SetIterUnderDBIter(internal_iter);
   internal_iter_initialized_ = true;
 }
@@ -289,6 +294,9 @@ Status ArenaWrappedDBIter::Refresh(const Snapshot* snapshot) {
         TEST_SYNC_POINT_CALLBACK("ArenaWrappedDBIter::Refresh:SV", nullptr);
         auto t = sv->mem->NewRangeTombstoneIterator(
             read_options_, read_seq, false /* immutable_memtable */);
+        if (t != nullptr && read_callback_ != nullptr) {
+          t->SetHiddenSeqRanges(read_callback_->GetHiddenSeqRanges());
+        }
         if (!t || t->empty()) {
           // If memtable_range_tombstone_iter_ points to a non-empty tombstone
           // iterator, then it means sv->mem is not the memtable that
