@@ -1700,6 +1700,15 @@ IOStatus DBImpl::WriteWALIndexSupersessions(
   // cut. That repeat is idempotent: the declaration names one file and one
   // lower bound, and a reader folds the minimum per file.
   assert(new_log != nullptr);
+  // Recovery finds supersessions by reading WAL heads only, so they must
+  // precede this file's first data record.
+  assert(new_log->last_wal_index_recorded() == 0);
+  // The merge takes a void in a WAL numbered below the declaring WAL to
+  // predate the cut. That holds because the declaring WAL is partition 0's
+  // new WAL, the lowest-numbered WAL this open creates: every other
+  // partition's new WAL is numbered above it (asserted where Open creates
+  // them), and so is every later WAL.
+  assert(supersessions.empty() || new_log->get_log_number() == cur_wal_number_);
   for (const WALIndexSupersession& supersession : supersessions) {
     IOStatus io_s = new_log->AddWALIndexSupersessionRecord(
         write_options, supersession.wal_number,
@@ -1809,6 +1818,18 @@ Status DBImpl::ProcessLogFiles(
         wal_numbers, read_only, job_id, flushed, version_edits, recovery_ctx);
   }
   return status;
+}
+
+// Supersessions are written only into a new WAL's head, ahead of its first
+// data record (WriteWALIndexSupersessions), and routing finds them by reading
+// heads (CheckWALFilesCarryWALIndex). One after data was never honored, and
+// the records it names may already be applied, so recovery fails in every
+// mode.
+static Status MisplacedSupersessionStatus(uint64_t wal_number) {
+  return Status::Corruption(
+      "WAL " + std::to_string(wal_number) +
+      " declares a WAL index supersession after a data record; recovery "
+      "cannot honor it");
 }
 
 // Projects the witness sequence number from a merged record's payload. The
@@ -2294,6 +2315,12 @@ Status DBImpl::ProcessLogFilesMerged(
     }
   }
 
+  for (const auto* reader : readers) {
+    if (reader->reader()->SawMisplacedWALIndexSupersession()) {
+      return MisplacedSupersessionStatus(reader->wal_number());
+    }
+  }
+
   if (!recovered_wal_partitions_.empty()) {
     // A data-less loss is a tail only while one WAL is written at a time, so
     // that a later WAL's record passes it in stream order. Partitioned WALs
@@ -2454,6 +2481,12 @@ Status DBImpl::ProcessLogFilesMerged(
       }
     }
     cut_index = frontier;
+    if (merger.SkippedUnexplainedDiscard()) {
+      // The next write lands above the skipped index, and the next merge
+      // would take it for a live record above a lost reissue. Flush, so the
+      // WALs holding the superseded copies retire first.
+      flushed = true;
+    }
   }
 
   if (wal_recovery_mode == WALRecoveryMode::kPointInTimeRecovery) {
@@ -2722,6 +2755,10 @@ Status DBImpl::ProcessLogFile(
       }
       has_replayed_indexed_record |= reader->GetLastReadWALIndex() != 0;
     }
+  }
+
+  if (reader->SawMisplacedWALIndexSupersession()) {
+    return MisplacedSupersessionStatus(wal_number);
   }
 
   if (wal_index_enabled) {

@@ -218,6 +218,13 @@ class Reader {
     return it == first_superseded_wal_indices_.end() ? 0 : it->second;
   }
 
+  // Whether a supersession record was read after a data or progress record.
+  // Such a record is reported and dropped, so it supersedes nothing, and a
+  // replay that already applied the records it names cannot honor it.
+  bool SawMisplacedWALIndexSupersession() const {
+    return saw_misplaced_supersession_;
+  }
+
  protected:
   std::shared_ptr<Logger> info_log_;
   const std::unique_ptr<SequentialFileReader> file_;
@@ -316,6 +323,8 @@ class Reader {
   bool saw_wal_index_marker_ = false;
   // Whether this file's head attested a predecessor span.
   bool has_predecessor_span_ = false;
+  // Whether a supersession record followed a data or progress record.
+  bool saw_misplaced_supersession_ = false;
   uint32_t wal_partition_ = 0;
 
   // Extend record types with the following special values

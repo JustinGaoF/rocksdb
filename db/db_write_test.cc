@@ -14118,6 +14118,47 @@ class DBWalPartitionCoverageTest : public DBWritePartitionTest {
     }
   }
 
+  // Creates a brand-new DB directly at `num_partitions` partitions, with
+  // column families covering every partition (cf_for_partition_), so its
+  // history floor applies: no sequence persisted and no WAL retired.
+  void CreateBrandNewPartitionedDb(size_t num_partitions, Options options) {
+    Close();
+    ASSERT_OK(DestroyDB(dbname_, options));
+    std::vector<std::string> cf_names = {kDefaultColumnFamilyName};
+    cf_for_partition_.assign(num_partitions, -1);
+    size_t covered = 0;
+    for (uint32_t cf_id = 1; covered < num_partitions; ++cf_id) {
+      WriteBatch batch;
+      ASSERT_OK(WriteBatchInternal::Put(&batch, cf_id, "key", "value"));
+      size_t partition = num_partitions;
+      ASSERT_OK(
+          DBImpl::TEST_WalPartitionForWrite(batch, num_partitions, &partition));
+      cf_names.push_back("cf" + std::to_string(cf_id));
+      if (cf_for_partition_[partition] < 0) {
+        cf_for_partition_[partition] = static_cast<int>(cf_id);
+        ++covered;
+      }
+    }
+    options.create_if_missing = true;
+    options.create_missing_column_families = true;
+    options.wal_partitions = static_cast<uint32_t>(num_partitions);
+    options.two_write_queues = GetParam();
+    ASSERT_OK(TryReopenWithColumnFamilies(cf_names, options));
+    ASSERT_EQ(num_partitions, dbfull()->TEST_NumWalPartitions());
+    ASSERT_EQ(0U, dbfull()->GetVersionSet()->LastSequence());
+    writes_.clear();
+  }
+
+  // Flips one byte in the middle of `write`'s record in the crash image.
+  void CorruptImageRecord(const std::string& image, const LoggedWrite& write) {
+    const std::string fname = LogFileName(image, write.wal);
+    std::string contents;
+    ASSERT_OK(ReadFileToString(env_, fname, &contents));
+    ASSERT_LT(write.end, contents.size() + 1);
+    contents[(write.begin + write.end) / 2] ^= 0x5a;
+    ASSERT_OK(WriteStringToFile(env_, contents, fname, /*should_sync=*/true));
+  }
+
   std::vector<LoggedWrite> writes_;
 };
 
@@ -15414,7 +15455,10 @@ TEST_P(DBWalPartitionCoverageTest, FU14H6TornFirstRecordInBrandNewNTwoDb) {
 // (an earlier pass consumed the report); with the higher-numbered one the
 // report is still pending when the gap surfaces. Tolerate and absolute fail
 // at the gap as before. Neuter: ignore TailGap::reported in map_tail_gap; the
-// lower-numbered case recovers i4 above the gap.
+// lower-numbered case recovers i4 above the gap. The higher-numbered case is
+// caught by map_tail_gap's pending-report branch instead: neuter that
+// branch's point-in-time stop (consume the report without arming the stop)
+// and it recovers i4 above the gap.
 TEST_P(DBWalPartitionCoverageTest, GC19ReportedTailGapStopsPITEitherPartition) {
   for (const bool torn_lower : {true, false}) {
     SCOPED_TRACE(torn_lower ? "torn WAL numbered lower"
@@ -15499,6 +15543,75 @@ TEST_P(DBWalPartitionCoverageTest, GC19MissingIndexedWalAfterPrefixFails) {
     ASSERT_TRUE(s.IsCorruption()) << s.ToString();
     EXPECT_NE(std::string::npos, s.ToString().find(std::to_string(missing)))
         << s.ToString();
+  }
+}
+
+// GC23 Q2: as GC19MissingIndexedWalAfterPrefixFails, but the deleted WAL is
+// partition 1's current (never rotated) indexed WAL, after SyncWAL. The
+// MANIFEST records a WAL's synced size only once the WAL is inactive
+// (FinishWalPartitionSync, as upstream), so a current WAL stays untracked and
+// neither WalSet::CheckWals nor the merge's expected set demands it. Nothing
+// attests it either: it has no successor. Its records are therefore judged by
+// the surviving files alone, exactly as at the base, and this test pins that
+// outcome: every mode opens without the lost record. On top that is a lost
+// tail. Below a survivor it is a known gap: the lost index sits under the
+// lower bound the survivors set, so the open keeps the later write without
+// the earlier one. Detecting it needs the MANIFEST to track current WALs or
+// a floor for the index epoch; a fix flips the "lost record below" cells.
+TEST_P(DBWalPartitionCoverageTest, GC23MissingCurrentIndexedWalAfterPrefix) {
+  if (GetParam()) {
+    return;
+  }
+  for (const bool lost_on_top : {false, true}) {
+    SCOPED_TRACE(lost_on_top ? "lost record on top" : "lost record below");
+    Options options = IndexedWalOptions(CurrentOptions());
+    DestroyAndReopen(options);
+    OpenWithPartitions(2, options);
+    FlushAllColumnFamilies();
+    const int cf_flushed = cf_for_partition_[0];
+    const int cf_kept = cf_for_partition_[1];
+    Options none = options;
+    none.partition_wal_usage = PartitionWALUsage::kNone;
+    ReopenWithPartitions(1, none);
+    ASSERT_OK(Put(cf_flushed, "unindexed_flushed", "value"));
+    ASSERT_OK(Put(cf_kept, "unindexed_kept", "value"));
+    const uint64_t unindexed_wal = dbfull()->TEST_CurrentWalNumber(0);
+    ASSERT_OK(Flush(cf_flushed));
+    ReopenWithPartitions(2, options);
+    ASSERT_OK(env_->FileExists(LogFileName(dbname_, unindexed_wal)));
+    writes_.clear();
+    if (lost_on_top) {
+      LoggedPut(cf_for_partition_[0], "kept");
+      LoggedPut(cf_for_partition_[1], "lost");
+    } else {
+      LoggedPut(cf_for_partition_[1], "lost");
+      LoggedPut(cf_for_partition_[0], "kept");
+    }
+    const uint64_t missing = dbfull()->TEST_CurrentWalNumber(1);
+    ASSERT_EQ(missing, writes_[IndexOf("lost")].wal);
+    ASSERT_GT(missing, unindexed_wal);
+    ASSERT_OK(db_->SyncWAL());
+    ASSERT_EQ(missing, dbfull()->TEST_CurrentWalNumber(1));
+    {
+      const auto& wals = dbfull()->GetVersionSet()->GetWalSet().GetWals();
+      ASSERT_TRUE(wals.find(missing) == wals.end()) << "WAL " << missing;
+      const auto it = wals.find(unindexed_wal);
+      ASSERT_TRUE(it != wals.end() && it->second.HasSyncedSize())
+          << "WAL " << unindexed_wal;
+    }
+    const std::string image = dbname_ + "_image";
+    CopyDBAsCrashImage(image);
+    Close();
+    ASSERT_OK(env_->DeleteFile(LogFileName(image, missing)));
+    SCOPED_TRACE("deleted current WAL " + std::to_string(missing));
+    if (!lost_on_top) {
+      // AssertCells checks a prefix of writes_: list the survivor first.
+      std::swap(writes_[0], writes_[1]);
+    }
+    AssertCells(image, 2, options,
+                EveryModeOpens(1, lost_on_top ? "lost tail"
+                                              : "lost below the lower bound"),
+                {});
   }
 }
 
@@ -15595,6 +15708,413 @@ TEST_P(DBWalPartitionCoverageTest, GC19TornFirstRecordAfterFlushStaysDamaged) {
     EXPECT_NE(std::string::npos,
               s.ToString().find("head damaged and unattested"))
         << s.ToString();
+  }
+}
+
+// GC23 Q3, ported from GC19's Muse candidate: the H6 image's remaining
+// modes. Absolute fails as for any torn tail; skip opens with it dropped.
+// (Point-in-time and tolerate are H6.) Neuter: drop the floor term from
+// HeadBounded; both modes fail with "head damaged and unattested".
+TEST_P(DBWalPartitionCoverageTest, GC19H6FloorSetAbsoluteAndSkipOutcomes) {
+  if (GetParam()) {
+    return;
+  }
+  constexpr size_t kPartitions = 2;
+  Options options = IndexedWalOptions(CurrentOptions());
+  CreateBrandNewPartitionedDb(kPartitions, options);
+  LoggedPut(cf_for_partition_[0], "k1");
+  LoggedPut(cf_for_partition_[1], "k2");
+  ASSERT_NE(writes_[0].wal, writes_[1].wal);
+  const std::string image = dbname_ + "_image";
+  CopyDBAsCrashImage(image);
+  Close();
+  const LoggedWrite& k2 = writes_[IndexOf("k2")];
+  SCOPED_TRACE("torn partition-1 WAL " + std::to_string(k2.wal));
+  TruncateImageWal(image, k2.wal, (k2.begin + k2.end) / 2);
+  options.create_if_missing = false;
+  AssertCells(
+      image, kPartitions, options,
+      {{kAbsolute, Status::kCorruption, 0, "absolute fails on the torn tail"}},
+      {});
+  AssertCells(image, kPartitions, options,
+              {{kSkip, Status::kOk, 1, "skip drops the torn tail"}}, {});
+}
+
+// GC23 Q3, ported from GC19's Muse candidate: the H6 shape (spanless
+// first-generation WALs, torn mid-first-record), but a rotation created
+// second-generation WALs whose spans attest the first generation. The
+// rotation records a minimum WAL to keep, so the history floor is off, and
+// the torn partition-1 WAL is unattested (its successor's span tore with its
+// marker) and numbered below the anchoring WAL, so nothing bounds it and
+// every mode fails closed. Neuter: let HeadBounded hold for every member;
+// the opens succeed. (GC23FloorSetLaterGenerationHeads covers the same shape
+// with the floor set.)
+TEST_P(DBWalPartitionCoverageTest, GC19H6FloorUnsetHeadDamageStillFails) {
+  if (GetParam()) {
+    return;
+  }
+  constexpr size_t kPartitions = 2;
+  Options options = IndexedWalOptions(CurrentOptions());
+  CreateBrandNewPartitionedDb(kPartitions, options);
+  LoggedPut(cf_for_partition_[0], "k1");
+  LoggedPut(cf_for_partition_[1], "k2");
+  ASSERT_NE(writes_[0].wal, writes_[1].wal);
+  const uint64_t torn_wal = writes_[IndexOf("k2")].wal;
+  Rotate();
+  const uint64_t gen2_p0 = dbfull()->TEST_CurrentWalNumber(0);
+  const uint64_t gen2_p1 = dbfull()->TEST_CurrentWalNumber(1);
+  ASSERT_GT(gen2_p0, torn_wal);
+  ASSERT_GT(gen2_p1, torn_wal);
+  auto synced_size_recorded = [&](uint64_t wal) {
+    const auto& wals = dbfull()->GetVersionSet()->GetWalSet().GetWals();
+    const auto it = wals.find(wal);
+    return it != wals.end() && it->second.HasSyncedSize();
+  };
+  // Nothing synced the torn WALs, so the tears below reach the merge instead
+  // of tripping MANIFEST size verification.
+  ASSERT_OK(db_->FlushWAL(false));
+  ASSERT_FALSE(synced_size_recorded(torn_wal));
+  ASSERT_FALSE(synced_size_recorded(gen2_p1));
+  const std::string image = dbname_ + "_image";
+  CopyDBAsCrashImage(image);
+  Close();
+  const LoggedWrite& k2 = writes_[IndexOf("k2")];
+  SCOPED_TRACE("torn partition-1 WAL " + std::to_string(k2.wal));
+  TruncateImageWal(image, k2.wal, (k2.begin + k2.end) / 2);
+  TruncateImageWal(image, gen2_p1, log::kHeaderSize - 2);
+  options.create_if_missing = false;
+  const char* reason =
+      "the floor is off, so the torn head may hide loss below it";
+  AssertCells(image, kPartitions, options,
+              {{kTolerate, Status::kCorruption, 0, reason},
+               {kAbsolute, Status::kCorruption, 0, reason},
+               {kPointInTime, Status::kCorruption, 0, reason},
+               {kSkip, Status::kCorruption, 0, reason}},
+              {});
+}
+
+// GC23 Q3: the history floor never reaches a member that is not the first
+// of history. Recovery sets the floor only while no sequence is persisted and
+// the MANIFEST records no minimum WAL to keep, and wal_partitions > 1
+// requires MANIFEST WAL tracking. Both ways a brand-new N = 2 DB gets a second
+// WAL generation record that minimum: a rotation, and a reopen (here one
+// whose first-generation WALs were torn mid-first-record, so it recovered no
+// sequence). With spans suppressed nothing attests, so the second
+// generation's damaged head (b1 corrupted, b3 surviving behind it) is
+// examined by the lower-bound gate without the floor, and every mode fails
+// with "head damaged and unattested". The brand-new case, where every member
+// is first of history and the floor bounds them, is H6 and
+// GC19TornFirstRecordInBrandNewNTwoDbModes. Neuters: set the floor without
+// the MinWalNumberToKeep condition, or let HeadBounded hold whenever no
+// member attests; both open.
+TEST_P(DBWalPartitionCoverageTest, GC23FloorOffForLaterGenerationHeads) {
+  if (GetParam()) {
+    return;
+  }
+  constexpr size_t kPartitions = 2;
+  Options options = IndexedWalOptions(CurrentOptions());
+  for (const bool by_reopen : {false, true}) {
+    SCOPED_TRACE(by_reopen ? "second generation by reopen"
+                           : "second generation by rotation");
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::StartWALFile:WriteSpan",
+        [](void* arg) { *static_cast<bool*>(arg) = false; });
+    SyncPoint::GetInstance()->EnableProcessing();
+    CreateBrandNewPartitionedDb(kPartitions, options);
+    LoggedPut(cf_for_partition_[0], "a1");
+    LoggedPut(cf_for_partition_[1], "a2");
+    const uint64_t first_generation_p1 = writes_[IndexOf("a2")].wal;
+    if (by_reopen) {
+      const std::vector<LoggedWrite> first = writes_;
+      std::vector<std::string> cf_names;
+      ASSERT_OK(DB::ListColumnFamilies(options, dbname_, &cf_names));
+      ASSERT_OK(db_->FlushWAL(false));
+      Close();
+      for (const LoggedWrite& write : first) {
+        ASSERT_OK(test::TruncateFile(env_, LogFileName(dbname_, write.wal),
+                                     (write.begin + write.end) / 2));
+      }
+      Options reopen = options;
+      reopen.wal_partitions = kPartitions;
+      reopen.two_write_queues = GetParam();
+      ASSERT_OK(TryReopenWithColumnFamilies(cf_names, reopen));
+      ASSERT_EQ(0U, dbfull()->GetVersionSet()->LastSequence());
+      writes_.clear();
+    } else {
+      Rotate();
+    }
+    ASSERT_NE(0U,
+              dbfull()->GetVersionSet()->GetWalSet().GetMinWalNumberToKeep());
+    LoggedPut(cf_for_partition_[1], "b1");
+    LoggedPut(cf_for_partition_[0], "b2");
+    LoggedPut(cf_for_partition_[1], "b3");
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearCallBack("DBImpl::StartWALFile:WriteSpan");
+    const LoggedWrite b1 = writes_[IndexOf("b1")];
+    ASSERT_GT(b1.wal, first_generation_p1);
+    ASSERT_EQ(b1.wal, writes_[IndexOf("b3")].wal);
+    ASSERT_OK(db_->FlushWAL(false));
+    const std::string image = dbname_ + "_image";
+    CopyDBAsCrashImage(image);
+    Close();
+    CorruptImageRecord(image, b1);
+    SCOPED_TRACE("damaged second-generation WAL " + std::to_string(b1.wal));
+    const std::string copy = image + "_open";
+    for (const WALRecoveryMode mode :
+         {kTolerate, kAbsolute, kPointInTime, kSkip}) {
+      SCOPED_TRACE(static_cast<int>(mode));
+      CopyDir(image, copy);
+      std::vector<ColumnFamilyHandle*> handles;
+      std::unique_ptr<DB> db;
+      const Status s =
+          OpenCopy(copy, kPartitions, options, mode, &handles, &db);
+      for (ColumnFamilyHandle* handle : handles) {
+        EXPECT_OK(db->DestroyColumnFamilyHandle(handle));
+      }
+      ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+      EXPECT_NE(std::string::npos,
+                s.ToString().find("WAL " + std::to_string(b1.wal) +
+                                  " head damaged and unattested"))
+          << s.ToString();
+    }
+  }
+}
+
+// Offsets of the physical records in the first block of a non-recyclable
+// WAL's contents, with their types.
+static std::vector<std::pair<size_t, uint8_t>> FirstBlockRecords(
+    const std::string& contents) {
+  std::vector<std::pair<size_t, uint8_t>> records;
+  size_t offset = 0;
+  while (offset + log::kHeaderSize <= contents.size() &&
+         offset + log::kHeaderSize <= static_cast<size_t>(log::kBlockSize)) {
+    const uint8_t type = static_cast<uint8_t>(contents[offset + 6]);
+    if (type == log::kZeroType) {
+      break;
+    }
+    EXPECT_FALSE(log::IsRecyclableRecordType(type));
+    const size_t length =
+        static_cast<uint8_t>(contents[offset + 4]) |
+        (static_cast<size_t>(static_cast<uint8_t>(contents[offset + 5])) << 8);
+    records.emplace_back(offset, type);
+    offset += log::kHeaderSize + length;
+  }
+  return records;
+}
+
+// GC23 Q4: the void exception to a pending superseded-only index, through DB
+// opens at N > 1. Within N > 1 histories every cut sits at or above the seed,
+// which is above every surviving void, so the pre-cut case arises from an
+// N = 1 cut carried into an upgrade: keys k0-k4, then a burned index whose
+// void ends the WAL; a filter stop after k1 cuts k2-k4, the open seeds past
+// the void, and its writes n0-n3 take indices above it, leaving k2-k4's
+// indices superseded-only. The DB is then reopened at N and written in every
+// partition (p*).
+// - Pre-cut void (as written): the void sits in a WAL numbered below the
+//   declaring WAL, so it clears the pending index and every mode opens with
+//   k0, k1, n* and p*.
+// - Post-cut void: the same void moved into the declaring WAL, or into the
+//   highest partition WAL the upgrade created, ahead of its first record. It
+//   explains nothing below it, so the pending index is the frontier: a
+//   point-in-time read-only open holds only k0 and k1; read-write opens fail
+//   (point-in-time on an index above the cut a write would reissue, since
+//   the end-of-recovery check counts only this open's cuts; tolerate and
+//   absolute on the unexplained hole); skip re-trusts the declaration and
+//   opens.
+// No write path burns an index after a cut while leaving the reissue of a
+// lower superseded index absent, so the post-cut layout is crafted.
+// Neuters: clear the pending index on any void (the post-cut cases open with
+// n* and p*); never clear it (the pre-cut case loses n* and p*).
+TEST_P(DBWalPartitionCoverageTest, GC23VoidAgainstPendingSupersededIndex) {
+  if (GetParam()) {
+    return;
+  }
+  for (const size_t num_partitions : {size_t{2}, size_t{8}}) {
+    SCOPED_TRACE("wal_partitions=" + std::to_string(num_partitions));
+    Options options = IndexedWalOptions(CurrentOptions());
+    DestroyAndReopen(options);
+    OpenWithPartitions(num_partitions, options);
+    ReopenWithPartitions(1, options);
+    const int cf = cf_for_partition_[0];
+    std::vector<std::pair<int, std::string>> kept;
+    std::vector<std::pair<int, std::string>> cut;
+    std::vector<std::pair<int, std::string>> above;
+    for (int i = 0; i < 5; ++i) {
+      const std::string key = "k" + std::to_string(i);
+      ASSERT_OK(Put(cf, key, ValueOf(key)));
+      (i < 2 ? kept : cut).emplace_back(cf, key);
+    }
+    const uint64_t cut_wal = dbfull()->TEST_CurrentWalNumber(0);
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::WriteToWAL:log_entry", [](void* arg) {
+          Slice* const log_entry = static_cast<Slice*>(arg);
+          char* const data = const_cast<char*>(log_entry->data());
+          data[log_entry->size() - 1] ^= 0xff;
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+    WriteBatch burned(/*reserved_bytes=*/0, /*max_bytes=*/0,
+                      /*protection_bytes_per_key=*/8, /*default_cf_ts_sz=*/0);
+    ASSERT_OK(burned.Put(handles_[cf], "burned", "v"));
+    ASSERT_NOK(db_->Write(WriteOptions(), &burned));
+    SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:log_entry");
+    Close();
+
+    class StopAfterRecords : public WalFilter {
+     public:
+      const char* Name() const override { return "StopAfterRecords"; }
+      WalProcessingOption LogRecordFound(unsigned long long /*log_number*/,
+                                         const std::string& /*log_file_name*/,
+                                         const WriteBatch& /*batch*/,
+                                         WriteBatch* /*new_batch*/,
+                                         bool* /*batch_changed*/) override {
+        return records_found_++ < 2 ? WalProcessingOption::kContinueProcessing
+                                    : WalProcessingOption::kStopReplay;
+      }
+
+     private:
+      int records_found_ = 0;
+    } stop;
+    options.wal_filter = &stop;
+    ReopenWithPartitions(1, options);
+    options.wal_filter = nullptr;
+    const uint64_t declarer = dbfull()->TEST_CurrentWalNumber(0);
+    ASSERT_GT(declarer, cut_wal);
+    for (int i = 0; i < 4; ++i) {
+      const std::string key = "n" + std::to_string(i);
+      ASSERT_OK(Put(cf, key, ValueOf(key)));
+      above.emplace_back(cf, key);
+    }
+    Close();
+    ReopenWithPartitions(num_partitions, options);
+    for (size_t p = 0; p < num_partitions; ++p) {
+      const std::string key = "p" + std::to_string(p);
+      ASSERT_OK(Put(cf_for_partition_[p], key, ValueOf(key)));
+      above.emplace_back(cf_for_partition_[p], key);
+    }
+    const uint64_t later_wal =
+        dbfull()->TEST_CurrentWalNumber(num_partitions - 1);
+    ASSERT_GT(later_wal, declarer);
+    const std::string image = dbname_ + "_image";
+    CopyDBAsCrashImage(image);
+    Close();
+
+    // Opens a copy of `dir` and checks which keys it holds.
+    auto assert_open = [&](const std::string& dir, WALRecoveryMode mode,
+                           bool read_only, bool expect_above) {
+      std::vector<std::string> cf_names;
+      ASSERT_OK(DB::ListColumnFamilies(options, dir, &cf_names));
+      std::vector<ColumnFamilyDescriptor> descriptors;
+      for (const std::string& name : cf_names) {
+        descriptors.emplace_back(name, options);
+      }
+      Options open_options = options;
+      open_options.create_if_missing = false;
+      open_options.wal_partitions = static_cast<uint32_t>(num_partitions);
+      open_options.wal_recovery_mode = mode;
+      std::vector<ColumnFamilyHandle*> handles;
+      std::unique_ptr<DB> db;
+      const Status s = read_only
+                           ? DB::OpenForReadOnly(DBOptions(open_options), dir,
+                                                 descriptors, &handles, &db)
+                           : DB::Open(DBOptions(open_options), dir, descriptors,
+                                      &handles, &db);
+      ASSERT_OK(s);
+      auto get = [&](const std::pair<int, std::string>& key) {
+        std::string value;
+        const Status g =
+            db->Get(ReadOptions(), handles[key.first], key.second, &value);
+        return g.ok() ? value : g.ToString();
+      };
+      for (const auto& key : kept) {
+        EXPECT_EQ(ValueOf(key.second), get(key)) << key.second;
+      }
+      for (const auto& key : cut) {
+        EXPECT_EQ("NotFound: ", get(key)) << key.second;
+      }
+      for (const auto& key : above) {
+        EXPECT_EQ(expect_above ? ValueOf(key.second) : "NotFound: ", get(key))
+            << key.second;
+      }
+      for (ColumnFamilyHandle* handle : handles) {
+        EXPECT_OK(db->DestroyColumnFamilyHandle(handle));
+      }
+    };
+    auto open_status = [&](const std::string& dir, WALRecoveryMode mode) {
+      std::vector<ColumnFamilyHandle*> handles;
+      std::unique_ptr<DB> db;
+      const Status s =
+          OpenCopy(dir, num_partitions, options, mode, &handles, &db);
+      for (ColumnFamilyHandle* handle : handles) {
+        EXPECT_OK(db->DestroyColumnFamilyHandle(handle));
+      }
+      return s;
+    };
+
+    const std::string copy = image + "_open";
+    {
+      SCOPED_TRACE("pre-cut void");
+      for (const WALRecoveryMode mode :
+           {kTolerate, kAbsolute, kPointInTime, kSkip}) {
+        SCOPED_TRACE(static_cast<int>(mode));
+        CopyDir(image, copy);
+        assert_open(copy, mode, /*read_only=*/false, /*expect_above=*/true);
+      }
+    }
+
+    // Takes the void out of the cut WAL and puts it ahead of `target`'s first
+    // record that carries a wal_index.
+    const std::string moved = image + "_moved";
+    auto move_void = [&](uint64_t target) {
+      CopyDir(image, moved);
+      std::string source;
+      ASSERT_OK(ReadFileToString(env_, LogFileName(moved, cut_wal), &source));
+      const auto source_records = FirstBlockRecords(source);
+      ASSERT_FALSE(source_records.empty());
+      const size_t void_offset = source_records.back().first;
+      ASSERT_EQ(log::kWALIndexVoidType, source_records.back().second);
+      const std::string void_record = source.substr(void_offset);
+      ASSERT_EQ(log::kHeaderSize + log::kWALIndexVoidPayloadSize,
+                void_record.size());
+      ASSERT_OK(WriteStringToFile(env_, source.substr(0, void_offset),
+                                  LogFileName(moved, cut_wal),
+                                  /*should_sync=*/true));
+      std::string contents;
+      ASSERT_OK(ReadFileToString(env_, LogFileName(moved, target), &contents));
+      ASSERT_LT(contents.size() + void_record.size(),
+                static_cast<size_t>(log::kBlockSize));
+      size_t insert_at = contents.size();
+      for (const auto& [offset, type] : FirstBlockRecords(contents)) {
+        if (log::IsWALIndexRecordType(type)) {
+          insert_at = offset;
+          break;
+        }
+      }
+      ASSERT_LT(insert_at, contents.size());
+      contents.insert(insert_at, void_record);
+      ASSERT_OK(WriteStringToFile(env_, contents, LogFileName(moved, target),
+                                  /*should_sync=*/true));
+    };
+    for (const uint64_t target : {declarer, later_wal}) {
+      SCOPED_TRACE("post-cut void in WAL " + std::to_string(target) +
+                   (target == declarer ? " (declarer)" : " (later)"));
+      ASSERT_NO_FATAL_FAILURE(move_void(target));
+      CopyDir(moved, copy);
+      assert_open(copy, kPointInTime, /*read_only=*/true,
+                  /*expect_above=*/false);
+      for (const WALRecoveryMode mode : {kTolerate, kAbsolute, kPointInTime}) {
+        SCOPED_TRACE(static_cast<int>(mode));
+        CopyDir(moved, copy);
+        const Status s = open_status(copy, mode);
+        EXPECT_TRUE(s.IsCorruption()) << s.ToString();
+        EXPECT_NE(
+            std::string::npos,
+            s.ToString().find(mode == kPointInTime ? "a write would reissue it"
+                                                   : "unexplained hole"))
+            << s.ToString();
+      }
+      CopyDir(moved, copy);
+      assert_open(copy, kSkip, /*read_only=*/false, /*expect_above=*/true);
+    }
   }
 }
 

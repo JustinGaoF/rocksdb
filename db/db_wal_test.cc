@@ -5423,6 +5423,185 @@ TEST_F(DBWALIndexTest, InterleavedSupersedingSetFailsClosed) {
   Destroy(options);
 }
 
+// GC23 Q1: a supersession record after data. Supersessions are written only
+// into a new WAL's head, and routing finds them by reading heads, so one
+// after data is never honored. Here the newer WAL declares the older WAL's
+// last three records obsolete after its own data. Every open, sequential
+// (kNone) or merged (indexed), in every mode fails closed naming the WAL
+// instead of replaying the superseded records. Neuter: drop the guards in
+// ProcessLogFile and ProcessLogFilesMerged; point-in-time and skip open with
+// keys 3-5 present.
+TEST_F(DBWALIndexTest, SupersessionAfterDataFailsClosed) {
+  Options options =
+      WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+  DestroyAndReopen(options);
+  WriteKeyRange(0, 6);
+  const uint64_t old_wal = LatestWALNumber();
+  Close();
+  Reopen(options);
+  WriteKeyRange(6, 2);
+  const uint64_t new_wal = LatestWALNumber();
+  ASSERT_NE(old_wal, new_wal);
+  Close();
+
+  const std::vector<uint64_t> old_indices =
+      ReadWALIndices(WALPath(old_wal), old_wal);
+  ASSERT_GE(old_indices.size(), 6U);
+  const uint64_t first_superseded = old_indices[old_indices.size() - 3];
+  std::string contents = ReadWALContents(WALPath(new_wal));
+  const std::vector<PhysicalRecord> records = ScanPhysicalRecords(contents);
+  ASSERT_FALSE(records.empty());
+  ASSERT_FALSE(log::IsRecyclableRecordType(records.back().type));
+  ASSERT_TRUE(log::IsWALIndexRecordType(records.back().type));
+  // A whole supersession record appended after the last data record.
+  std::string record(log::kHeaderSize, '\0');
+  PutFixed64(&record, old_wal);
+  PutFixed64(&record, first_superseded);
+  record[4] = static_cast<char>(log::kWALIndexSupersessionPayloadSize);
+  record[5] = 0;
+  record[6] = static_cast<char>(log::kWALIndexSupersessionType);
+  EncodeFixed32(&record[0],
+                crc32c::Mask(crc32c::Value(
+                    &record[6], 1 + log::kWALIndexSupersessionPayloadSize)));
+  ASSERT_LE(contents.size() % log::kBlockSize + record.size(),
+            static_cast<size_t>(log::kBlockSize));
+  contents += record;
+  WriteWALContents(WALPath(new_wal), contents);
+  const std::vector<std::pair<uint64_t, uint64_t>> appended = {
+      {old_wal, first_superseded}};
+  ASSERT_EQ(appended, ReadWALSupersessions(WALPath(new_wal)));
+
+  const std::string expected = "WAL " + std::to_string(new_wal) +
+                               " declares a WAL index supersession after a "
+                               "data record";
+  for (const PartitionWALUsage usage :
+       {PartitionWALUsage::kNone,
+        PartitionWALUsage::kPartitionByColumnFamily}) {
+    for (const WALRecoveryMode mode :
+         {WALRecoveryMode::kTolerateCorruptedTailRecords,
+          WALRecoveryMode::kAbsoluteConsistency,
+          WALRecoveryMode::kPointInTimeRecovery,
+          WALRecoveryMode::kSkipAnyCorruptedRecords}) {
+      SCOPED_TRACE("usage=" + std::to_string(static_cast<int>(usage)) +
+                   " mode=" + std::to_string(static_cast<int>(mode)));
+      Options reopen = WALIndexOptions(usage);
+      reopen.wal_recovery_mode = mode;
+      const Status s = TryReopen(reopen);
+      if (s.ok()) {
+        for (int i = 3; i < 6; ++i) {
+          EXPECT_EQ("NOT_FOUND", Get(Key(i))) << "superseded key " << i;
+        }
+        Close();
+      }
+      ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+      EXPECT_NE(std::string::npos, s.ToString().find(expected)) << s.ToString();
+    }
+  }
+  Destroy(options);
+}
+
+// GC23 Q4: a superseded-only index that an open skips as trailing (no live
+// record above it) must not turn into a frontier once later writes land
+// above it. A filter stop cuts keys 2-4 (indices 3-5); the write after it
+// reissues only index 3, so indices 4 and 5 are superseded-only. The next
+// open skips them and its write takes index 6; at the base the open after
+// that reads index 6 as a live record above a lost reissue and stops at 4
+// (point-in-time loses key 21; tolerate and absolute fail with "unexplained
+// hole at wal_index 4"). The skipping open now flushes, so the superseded
+// WAL retires before any write lands above the hole. Neuter: drop that
+// flush.
+TEST_F(DBWALIndexTest, SkippedSupersededHoleSurvivesLaterWrites) {
+  for (const WALRecoveryMode mode :
+       {WALRecoveryMode::kPointInTimeRecovery,
+        WALRecoveryMode::kTolerateCorruptedTailRecords,
+        WALRecoveryMode::kAbsoluteConsistency,
+        WALRecoveryMode::kSkipAnyCorruptedRecords}) {
+    SCOPED_TRACE(static_cast<int>(mode));
+    Options options =
+        WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+    options.wal_recovery_mode = mode;
+    DestroyAndReopen(options);
+    WriteKeyRange(0, 5);
+    const uint64_t cut_wal = LatestWALNumber();
+    Close();
+    StopReplayAfterRecordsWalFilter filter(/*stop_after=*/2);
+    options.wal_filter = &filter;
+    Reopen(options);
+    options.wal_filter = nullptr;
+    ASSERT_OK(Put(Key(20), "value20"));
+    Close();
+    ASSERT_OK(env_->FileExists(WALPath(cut_wal)));
+    Reopen(options);
+    EXPECT_EQ("value20", Get(Key(20)));
+    ASSERT_OK(Put(Key(21), "value21"));
+    Close();
+    ASSERT_OK(TryReopen(options));
+    for (int i = 0; i < 2; ++i) {
+      EXPECT_EQ("value" + std::to_string(i), Get(Key(i))) << "key " << i;
+    }
+    for (int i = 2; i < 5; ++i) {
+      EXPECT_EQ("NOT_FOUND", Get(Key(i))) << "key " << i;
+    }
+    EXPECT_EQ("value20", Get(Key(20)));
+    EXPECT_EQ("value21", Get(Key(21)));
+    Close();
+    Destroy(options);
+  }
+}
+
+// GC23 Q5, ported from GC19's Muse candidate and reworked: a filter stop
+// declares supersessions in the indexed WALs' successor, then a kNone open
+// and, after unindexed writes, a second kNone open. After each kNone open,
+// either the open succeeds with the dropped keys 6 and 7 still absent, or it
+// fails closed with a status naming the supersession. Neuter: GC19's Q5
+// neuter (ignore supersessions in the kNone routing); the first kNone open
+// replays the superseded records and fails with "Sequence number is being
+// set backwards".
+TEST_F(DBWALIndexTest, InterleavedMixedSetWithSupersessionsFailsClosed) {
+  Options options =
+      WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+  DestroyAndReopen(options);
+  WriteKeyRange(0, 4);
+  Close();
+  Reopen(options);
+  WriteKeyRange(4, 4);
+  Close();
+
+  StopReplayAfterRecordsWalFilter filter(/*stop_after=*/6);
+  options.wal_filter = &filter;
+  Reopen(options);
+  ASSERT_EQ("value5", Get(Key(5)));
+  ASSERT_EQ("NOT_FOUND", Get(Key(6)));
+  options.wal_filter = nullptr;
+  Close();
+
+  // OK with the dropped keys still absent, or a clean fail-closed status.
+  auto honored_or_failed_closed = [&](const Status& s) {
+    if (!s.ok()) {
+      EXPECT_TRUE(s.IsCorruption()) << s.ToString();
+      EXPECT_NE(std::string::npos, s.ToString().find("supersession"))
+          << s.ToString();
+      return false;
+    }
+    EXPECT_EQ("value5", Get(Key(5)));
+    EXPECT_EQ("NOT_FOUND", Get(Key(6)));
+    EXPECT_EQ("NOT_FOUND", Get(Key(7)));
+    return true;
+  };
+  Options none = WALIndexOptions(PartitionWALUsage::kNone);
+  if (!honored_or_failed_closed(TryReopen(none))) {
+    Destroy(none);
+    return;
+  }
+  WriteKeyRange(8, 2);
+  Close();
+  if (honored_or_failed_closed(TryReopen(none))) {
+    EXPECT_EQ("value8", Get(Key(8)));
+    EXPECT_EQ("value9", Get(Key(9)));
+  }
+  Destroy(none);
+}
+
 // After a filter or point-in-time stop, a record the drive emitted but
 // dropped sits at the next index in a WAL that finished clean. The stop must
 // cut that WAL too, or the next write reissues the index and the open after
