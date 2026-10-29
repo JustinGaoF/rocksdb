@@ -913,6 +913,16 @@ void WriteThread::ExitAsBatchGroupLeader(WriteGroup& write_group,
       // group's acknowledgment, never the next append. Skipped when the group
       // already failed; followers are failing either way, and a failed append
       // stays pinned, so waiting on it could never succeed.
+      if (write_group.async_writers_gate) {
+        // The leader, a sync writer, inserts every batch of such a group
+        // itself and so runs this exit: only sync writers wait for the
+        // completion gate below.
+        assert(leader->sync);
+        Status async_status = write_group.async_writers_gate();
+        CompleteAsyncWriters(write_group,
+                             async_status.ok() ? status : async_status);
+        last_writer = write_group.last_writer;
+      }
       write_group.gate_status = write_group.completion_gate();
       if (!write_group.gate_status.ok()) {
         status = write_group.gate_status;
@@ -931,6 +941,33 @@ void WriteThread::ExitAsBatchGroupLeader(WriteGroup& write_group,
       last_writer = next;
     }
   }
+}
+
+void WriteThread::CompleteAsyncWriters(WriteGroup& write_group,
+                                       const Status& status) {
+  // The group is already unlinked from the writer queue, so only this thread
+  // touches its links. Read each writer's link before completing it: its
+  // thread may free it as soon as it is completed.
+  Writer* newest_kept = write_group.leader;
+  size_t size = 1;
+  Writer* w = write_group.leader == write_group.last_writer
+                  ? nullptr
+                  : write_group.leader->link_newer;
+  while (w != nullptr) {
+    Writer* next = w == write_group.last_writer ? nullptr : w->link_newer;
+    if (w->sync) {
+      newest_kept->link_newer = w;
+      w->link_older = newest_kept;
+      newest_kept = w;
+      ++size;
+    } else {
+      w->status = status;
+      SetState(w, STATE_COMPLETED);
+    }
+    w = next;
+  }
+  write_group.last_writer = newest_kept;
+  write_group.size = size;
 }
 
 static WriteThread::AdaptationContext eu_ctx("EnterUnbatched");

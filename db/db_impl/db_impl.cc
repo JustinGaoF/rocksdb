@@ -4724,11 +4724,6 @@ void DBImpl::MultiGetWithCallbackImpl(
     timestamp_read_callback.Refresh(consistent_seqnum);
     read_callback = &timestamp_read_callback;
   }
-  std::optional<WalGateReadMask> gate_read_mask;
-  if (auto ranges = WalGateReadMaskRanges()) {
-    gate_read_mask.emplace(std::move(ranges), read_callback, consistent_seqnum);
-    read_callback = &*gate_read_mask;
-  }
 
   s = MultiGetImpl(read_options, 0, num_keys, sorted_keys,
                    cf_sv_pairs[0].super_version, consistent_seqnum,
@@ -5544,16 +5539,14 @@ Iterator* DBImpl::NewIterator(const ReadOptions& _read_options,
 
     auto iter = new ForwardIterator(this, read_options, cfd, sv,
                                     /* allow_unprepared_value */ true);
-    ReadCallback* gate_read_mask = NewTailingWalGateReadMask();
     // TODO(cbi): Add support for `memtable_op_scan_flush_trigger` for tailing
     // iterator. This requires refreshing DBIter's pointer to active_mem when
     // tailing iterator refreshes to new memtable internally.
     result = DBIter::NewIter(env_, read_options, cfd->ioptions(),
                              sv->mutable_cf_options, cfd->user_comparator(),
                              iter, sv->current, kMaxSequenceNumber,
-                             gate_read_mask, /*active_mem=*/nullptr, cfh,
-                             /*expose_blob_index=*/false);
-    RegisterTailingWalGateReadMaskCleanup(result, gate_read_mask);
+                             /*read_callback=*/nullptr, /*active_mem=*/nullptr,
+                             cfh, /*expose_blob_index=*/false);
   } else {
     // Note: no need to consider the special case of
     // last_seq_same_as_publish_seq_==false since NewIterator is overridden in
@@ -5565,25 +5558,6 @@ Iterator* DBImpl::NewIterator(const ReadOptions& _read_options,
                              nullptr /* read_callback */);
   }
   return result;
-}
-
-ReadCallback* DBImpl::NewTailingWalGateReadMask() {
-  if (NumWalPartitions() == 1) {
-    return nullptr;
-  }
-  return new LiveWalGateReadMask(&wal_gate_read_mask_version_,
-                                 [this]() { return WalGateReadMaskRanges(); });
-}
-
-void DBImpl::RegisterTailingWalGateReadMaskCleanup(Iterator* iter,
-                                                   ReadCallback* mask) {
-  if (mask != nullptr) {
-    iter->RegisterCleanup(
-        [](void* arg1, void* /*arg2*/) {
-          delete static_cast<LiveWalGateReadMask*>(arg1);
-        },
-        mask, nullptr);
-  }
 }
 
 ArenaWrappedDBIter* DBImpl::NewIteratorImpl(
@@ -5650,25 +5624,10 @@ ArenaWrappedDBIter* DBImpl::NewIteratorImpl(
   // Laying out the iterators in the order of being accessed makes it more
   // likely that any iterator pointer is close to the iterator it points to so
   // that they are likely to be in the same cache line and/or page.
-  WalGateReadMask* gate_read_mask = nullptr;
-  if (auto ranges = WalGateReadMaskRanges()) {
-    gate_read_mask =
-        new WalGateReadMask(std::move(ranges), read_callback, snapshot);
-    read_callback = gate_read_mask;
-  }
-  ArenaWrappedDBIter* iter = NewArenaWrappedDbIterator(
-      env_, read_options, cfh, sv, snapshot, read_callback, this,
-      expose_blob_index, allow_refresh,
-      /*allow_mark_memtable_for_flush=*/true);
-  if (gate_read_mask != nullptr) {
-    // Lives as long as the iterator, which keeps it across Refresh().
-    iter->RegisterCleanup(
-        [](void* arg1, void* /*arg2*/) {
-          delete static_cast<WalGateReadMask*>(arg1);
-        },
-        gate_read_mask, nullptr);
-  }
-  return iter;
+  return NewArenaWrappedDbIterator(env_, read_options, cfh, sv, snapshot,
+                                   read_callback, this, expose_blob_index,
+                                   allow_refresh,
+                                   /*allow_mark_memtable_for_flush=*/true);
 }
 
 std::unique_ptr<Iterator> DBImpl::NewCoalescingIterator(
@@ -5872,15 +5831,13 @@ Status DBImpl::NewIterators(
       auto* iter = new ForwardIterator(this, options, cf_sv_pair.cfd,
                                        cf_sv_pair.super_version,
                                        /* allow_unprepared_value */ true);
-      ReadCallback* gate_read_mask = NewTailingWalGateReadMask();
       iterators->push_back(DBIter::NewIter(
           env_, options, cf_sv_pair.cfd->ioptions(),
           cf_sv_pair.super_version->mutable_cf_options,
           cf_sv_pair.cfd->user_comparator(), iter,
-          cf_sv_pair.super_version->current, kMaxSequenceNumber, gate_read_mask,
-          /* active_mem */ nullptr, cf_sv_pair.cfh,
+          cf_sv_pair.super_version->current, kMaxSequenceNumber,
+          nullptr /* read_callback */, /* active_mem */ nullptr, cf_sv_pair.cfh,
           /* expose_blob_index */ false, /* arena */ nullptr));
-      RegisterTailingWalGateReadMaskCleanup(iterators->back(), gate_read_mask);
     }
   } else {
     for (size_t i = 0; i < cf_sv_pairs.size(); ++i) {

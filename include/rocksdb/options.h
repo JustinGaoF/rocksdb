@@ -1555,14 +1555,18 @@ struct DBOptions {
   // partition's WAL write lock, which re-imposes the coordinated flushing that
   // partitions exist to avoid.
   //
-  // With more than one partition a sync write is inserted and becomes visible
-  // before its WAL sync, so that no write on another partition waits for that
-  // sync. If the sync fails, the write returns the error, and from then on no
-  // read, snapshot or iterator that starts sees it, and the error recovery
-  // drops it; writes outside it keep their outcome. A read or iterator that
-  // started between the write becoming visible and the sync failing may see
-  // it. Tailing iterators, and range deletions in the failed write, are not
-  // hidden.
+  // With more than one partition, writes become visible in sequence order,
+  // and a sync write becomes visible only once its record, and every record
+  // ordered before it on any partition, is synced, as with one WAL. An
+  // async write batched with a sync write is ordered before it and returns
+  // without waiting for its sync; a write ordered after a pending sync write
+  // becomes visible, and returns, only after that sync. If the sync fails,
+  // the sync write returns the error and is never visible, every write
+  // ordered after it that has not returned fails with the background error,
+  // and writes stop until DB::Resume().
+  // As with one WAL, a reopen without DB::Resume() after a failed sync or WAL
+  // append may recover a failed write whose record reached the WAL, and so
+  // may a backup or checkpoint taken before DB::Resume().
   //
   // Enabling more than one partition is a rollout step: every binary that may
   // read these WAL files (the DB itself on reopen or rollback, ldb, backup and

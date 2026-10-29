@@ -47,7 +47,6 @@
 #include "util/autovector.h"
 #include "util/coding.h"
 #include "util/mutexlock.h"
-#include "util/vector_iterator.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -923,32 +922,6 @@ MemTable::NewTimestampStrippingRangeTombstoneIterator(
 FragmentedRangeTombstoneIterator* MemTable::NewRangeTombstoneIteratorInternal(
     const ReadOptions& read_options, SequenceNumber read_seq,
     bool immutable_memtable) {
-  if (UNLIKELY(HasMaskedSequenceRanges())) {
-    // Rare and short-lived (until recovery flushes this memtable): fragment
-    // the unmasked tombstones afresh rather than keep a second cache.
-    const std::shared_ptr<const MaskedSequenceRanges> masked =
-        AtomicSharedPtrLoad(&masked_ranges_, std::memory_order_acquire);
-    std::vector<std::string> keys;
-    std::vector<std::string> values;
-    MemTableIterator unfragmented(MemTableIterator::kRangeDelEntries, *this,
-                                  read_options);
-    for (unfragmented.SeekToFirst(); unfragmented.Valid();
-         unfragmented.Next()) {
-      const SequenceNumber seq = GetInternalKeySeqno(unfragmented.key());
-      if (std::none_of(masked->begin(), masked->end(), [seq](const auto& r) {
-            return r.first <= seq && seq <= r.second;
-          })) {
-        keys.push_back(unfragmented.key().ToString());
-        values.push_back(unfragmented.value().ToString());
-      }
-    }
-    auto tombstones = std::make_shared<FragmentedRangeTombstoneList>(
-        std::make_unique<VectorIterator>(std::move(keys), std::move(values),
-                                         &comparator_.comparator),
-        comparator_.comparator);
-    return new FragmentedRangeTombstoneIterator(
-        tombstones, comparator_.comparator, read_seq, read_options.timestamp);
-  }
   if (immutable_memtable) {
     // Note that caller should already have verified that
     // !is_range_del_table_empty_

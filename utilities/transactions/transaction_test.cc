@@ -10761,12 +10761,14 @@ TEST(TransactionPartitionedWalTest, SyncPrepareAfterSyncCommitSurvivesCrash) {
   ASSERT_OK(DestroyDB(dbname, options));
 }
 
-// GC20 Q8: a WriteCommitted Prepare consumes no sequence, so its group is the
-// empty range [L + 1, L]. When its gate fsync fails at N=2, the Prepare
-// returns the error and no fence is installed: one would hold L + 1, which
-// nobody owns. After Resume(), the next write takes L + 1 and succeeds.
-// Neuter: GC18's unconditional fence (FenceFailedGateSync without the
-// low > target check); the write after Resume() fails at the stale fence.
+// GC20 Q8, under D-9: a WriteCommitted Prepare consumes no sequence, so its
+// group is the empty range [L + 1, L]. When its gate fsync fails at N=2, the
+// Prepare returns the error, and, as any failed sync group, it is pinned
+// under an open fence at L + 1, which fails every write above it. With
+// nothing allocated since, Resume() closes that fence empty, so the next
+// write takes L + 1 and succeeds.
+// Neuter: close the fence at max(low, last allocated), as before; the write
+// after Resume() fails at the stale fence [L + 1, L + 1].
 TEST(TransactionPartitionedWalTest, FailedSyncPrepareLeavesNoStaleFence) {
   constexpr size_t kPartitions = 2;
   const std::string dbname =
@@ -10810,12 +10812,19 @@ TEST(TransactionPartitionedWalTest, FailedSyncPrepareLeavesNoStaleFence) {
   ASSERT_TRUE(prepare_status.IsIOError()) << prepare_status.ToString();
   ASSERT_FALSE(fail_sync.load());
   EXPECT_EQ(last, db->GetLatestSequenceNumber());
-  EXPECT_TRUE(db_impl->TEST_WalGateFences().empty());
+  {
+    const auto fences = db_impl->TEST_WalGateFences();
+    ASSERT_EQ(1U, fences.size());
+    EXPECT_EQ(last + 1, fences[0].first);
+    EXPECT_EQ(kMaxSequenceNumber, fences[0].second);
+  }
 
   ASSERT_OK(db->Resume());
   ASSERT_OK(db->Put(WriteOptions(), "after", "v"));
   EXPECT_EQ(last + 1, db->GetLatestSequenceNumber());
-  EXPECT_TRUE(db_impl->TEST_WalGateFences().empty());
+  for (const auto& [low, high] : db_impl->TEST_WalGateFences()) {
+    EXPECT_GT(low, high);
+  }
   std::string value;
   ASSERT_OK(db->Get(ReadOptions(), "after", &value));
   ASSERT_EQ("v", value);
@@ -10957,6 +10966,89 @@ struct FU14SnapshotRace {
   }
 };
 }  // namespace
+
+// GC25 Q5 (review F005): above one partition, a WriteCommitted
+// CommitAndTryCreateSnapshot of an empty write set with disableWAL consumes
+// no sequence, yet its timestamped snapshot is taken only once every
+// sequence at or below it is published, so it never lies above
+// LastSequence() and reads through it repeat. W (on the other partition) is
+// held after its sequence allocation, before its insert; T, the empty
+// commit, parks until W is released.
+// Neuter: no gate for a group that consumes no sequence without a record
+// (today's condition): T's callback runs inside its group at W's
+// unpublished sequence; T does not park, and debug builds assert the
+// snapshot lies above the published sequence.
+TEST(TransactionPartitionedWalTest, EmptyDisableWalCommitSnapshotIsPublished) {
+  FU14SnapshotRace race;
+  race.Open("transaction_partitioned_wal_empty_commit_snapshot");
+  size_t t_partition = FU14SnapshotRace::kPartitions;
+  ASSERT_OK(DBImpl::TEST_WalPartitionForWrite(
+      WriteBatch(), FU14SnapshotRace::kPartitions, &t_partition));
+  ColumnFamilyHandle* w_cf = race.cf_for_partition[1 - t_partition];
+  ASSERT_OK(race.db->Put(WriteOptions(), w_cf, "k", "old"));
+
+  std::mutex mu;
+  std::condition_variable cv;
+  bool armed = true;
+  bool w_held = false;
+  bool release_w = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::InstallCompletionGate", [&](void*) {
+        std::unique_lock<std::mutex> lock(mu);
+        if (!armed) {
+          return;
+        }
+        armed = false;
+        w_held = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return release_w; });
+      });
+  port::Thread w(
+      [&] { ASSERT_OK(race.db->Put(WriteOptions(), w_cf, "k", "new")); });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    ASSERT_TRUE(
+        cv.wait_for(lock, std::chrono::seconds(30), [&] { return w_held; }));
+  }
+  const SequenceNumber published_before = race.db->GetLatestSequenceNumber();
+  std::shared_ptr<const Snapshot> snapshot;
+  SequenceNumber published_at_return = 0;
+  port::Thread t([&] {
+    WriteOptions disable_wal;
+    disable_wal.disableWAL = true;
+    std::unique_ptr<Transaction> txn(race.db->BeginTransaction(disable_wal));
+    ASSERT_OK(txn->CommitAndTryCreateSnapshot(nullptr, /*ts=*/10, &snapshot));
+    published_at_return = race.db->GetLatestSequenceNumber();
+  });
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while (race.db_impl->TEST_WalDurabilityWaiters() != 1) {
+    ASSERT_LT(std::chrono::steady_clock::now(), deadline) << "T never parked";
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_EQ(published_before, race.db->GetLatestSequenceNumber());
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    release_w = true;
+    cv.notify_all();
+  }
+  w.join();
+  t.join();
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::InstallCompletionGate");
+  ASSERT_NE(nullptr, snapshot);
+  EXPECT_LE(snapshot->GetSequenceNumber(), published_at_return);
+  EXPECT_EQ(published_before + 1, snapshot->GetSequenceNumber());
+  ReadOptions at_snapshot;
+  at_snapshot.snapshot = snapshot.get();
+  std::string value;
+  ASSERT_OK(race.db->Get(at_snapshot, w_cf, "k", &value));
+  EXPECT_EQ("new", value);
+  ASSERT_OK(race.db->Put(WriteOptions(), w_cf, "k", "newer"));
+  ASSERT_OK(race.db->Get(at_snapshot, w_cf, "k", &value));
+  EXPECT_EQ("new", value);
+  snapshot.reset();
+  race.Close();
+}
 
 // FU14 H2: the snapshot list stays sorted by sequence when a timestamped
 // snapshot is created while another partition publishes past it.

@@ -505,15 +505,6 @@ class MemTableList {
     return newest_udts;
   }
 
-  // DB mutex held. See ReadOnlyMemTable::SetMaskedSequenceRanges().
-  void SetMaskedSequenceRanges(
-      const std::shared_ptr<const ReadOnlyMemTable::MaskedSequenceRanges>&
-          ranges) {
-    for (ReadOnlyMemTable* mem : current_->memlist_) {
-      mem->SetMaskedSequenceRanges(ranges);
-    }
-  }
-
   void AssignAtomicFlushSeq(const SequenceNumber& seq) {
     const auto& memlist = current_->memlist_;
     // Scan the memtable list from new to old

@@ -3831,17 +3831,17 @@ TEST_P(DBWritePartitionTest, LeadershipSyncRecordsWalsBelowClaimHorizon) {
 }
 
 TEST_P(DBWritePartitionTest, GateSyncToleratesCoupledRotation) {
-  // D-G11 (c): the sync write's claim and fsync run in its completion gate,
-  // after publication, so a coupled rotation may land inside the sync
-  // window. The sync write is held in its gate fsync by slow WAL syncs,
-  // and a manual flush (a coupled rotation of every partition) is started
-  // inside that window. The rotation provably interleaves (its WAL creation
-  // falls between the sync's start and end), and the sync still completes
-  // correctly: the write is acknowledged, every partition's deque stays
-  // consistent, and no mark is left behind. Ported from GC17's Muse
-  // candidate; it replaces LeadershipSyncExcludesCoupledRotation, whose
-  // ordering (gate installed before the rotation) held vacuously once the
-  // sync moved into the gate.
+  // The sync write's claim and fsync run in its completion gate, after its
+  // group left the write queue. The sync write is held in its gate fsync by
+  // slow WAL syncs, and a manual flush (a coupled rotation of every
+  // partition) is started inside that window. D-9: the write is neither
+  // inserted nor published until the fsync, so the rotation's memtable
+  // switch waits for it (WaitForUnpublishedSyncGroups) and its WAL creation
+  // falls after the sync's end. The sync completes correctly: the write is
+  // acknowledged, every partition's deque stays consistent, and no mark is
+  // left behind. Ported from GC17's Muse candidate.
+  // Neuter: no WaitForUnpublishedSyncGroups in WaitForPendingWrites; the
+  // rotation lands inside the sync window.
   if (GetParam()) {
     ROCKSDB_GTEST_BYPASS("single-queue path only");
     return;
@@ -3903,12 +3903,12 @@ TEST_P(DBWritePartitionTest, GateSyncToleratesCoupledRotation) {
   SyncPoint::GetInstance()->ClearAllCallBacks();
   latency_fs->SetDefaultLatency(LatencyInjectionFileSystem::Latency());
 
-  // The rotation landed strictly inside the gate sync window.
+  // The rotation waited for the gate sync to finish.
   ASSERT_NE(0, sync_started_at.load());
   ASSERT_NE(0, rotated_at.load());
   ASSERT_NE(0, sync_finished_at.load());
-  EXPECT_LT(sync_started_at.load(), rotated_at.load());
-  EXPECT_LT(rotated_at.load(), sync_finished_at.load());
+  EXPECT_LT(sync_started_at.load(), sync_finished_at.load());
+  EXPECT_LT(sync_finished_at.load(), rotated_at.load());
   AssertPartitionDequesConsistent();
   // The sync completed and left no mark behind: a second sync write, which
   // would hang on a stuck getting_synced mark, succeeds.
@@ -5002,9 +5002,12 @@ TEST_P(DBWritePartitionTest, GatePostWaitSyncFailureWakesParkedGate) {
   // (sync, partition 1) appends and parks; M (async, partition 2)
   // allocates then holds its append open; W (async, partition 0) appends
   // after A is released and parks behind M's still-open range. Releasing
-  // A lets B reach its post-wait sync, which fails: W wakes, but no failed
-  // range lies at or below it, so it parks again while M is still held
-  // (D-N71 (b)). M's append then fails below W, and that fails W.
+  // A lets B reach its post-wait sync, which fails: W wakes and, being above
+  // B's failed range, fails with the background error while M is still held
+  // (D-9; at GC24, before D-9, it parked again as D-N71 (b) had it). M's
+  // append then fails too.
+  // Neuter: no fence for a failed sync (FailUnpublishedSyncRange always
+  // publishing the range as a hole): W is not failed while M is held.
   // Standard path only (as in PostWaitSyncErrorFailsSyncWrite): with two
   // write queues the leadership sync itself goes through SyncWAL, so the
   // failure cannot be aimed at the post-wait sync alone.
@@ -5155,18 +5158,19 @@ TEST_P(DBWritePartitionTest, GatePostWaitSyncFailureWakesParkedGate) {
     release_a = true;
     cv.notify_all();
   }
-  // B's sync failure wakes W, which parks again, once, while M is held.
+  // B's sync failure wakes W, which fails without parking again while M is
+  // held.
   const auto w_deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(30);
-  while ((bg_error_wakes.load() < 1 || w_parks.load() < 2) &&
+  while ((bg_error_wakes.load() < 1 || !w_returned.load()) &&
          std::chrono::steady_clock::now() < w_deadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   b_thread.join();
   EXPECT_EQ(1, bg_error_wakes.load());
-  EXPECT_EQ(2, w_parks.load());
-  EXPECT_EQ(1U, dbfull()->TEST_WalDurabilityWaiters());
-  EXPECT_FALSE(w_returned.load());
+  EXPECT_GE(w_parks.load(), 1);
+  EXPECT_EQ(0U, dbfull()->TEST_WalDurabilityWaiters());
+  EXPECT_TRUE(w_returned.load());
   EXPECT_FALSE(m_returned.load());
   {
     std::lock_guard<std::mutex> lock(mu);
@@ -6025,17 +6029,340 @@ TEST_P(DBWritePartitionTest, GateSyncFailureWakesParkedGate) {
   dbfull()->Resume().PermitUncheckedError();
 }
 
+TEST_P(DBWritePartitionTest, SyncWriteVisibleOnlyOnceDurable) {
+  // GC25 Q1 (D-9): a sync write becomes visible only once it and every
+  // record below it are fsynced, and a write above it neither returns nor
+  // becomes visible before that. S (sync, partition 0) is held at the start
+  // of its gate fsync; C (async, partition 1, above S) parks behind it. While
+  // S is held, neither key reads through Get, MultiGet, a plain or a tailing
+  // iterator, and the published sequence has not moved. Released, both
+  // return OK and read back. Failed instead, S returns an IOError and C the
+  // background error, and both are absent before and after Resume(), after
+  // a flush, and after a reopen in every recovery mode.
+  // Neuter: insert and publish the sync range before its fsync (RunSyncGate's
+  // callbacks, insert and PublishLastSequence moved before
+  // RunCoalescedGateSync): S reads back
+  // while held, and C returns.
+  if (GetParam()) {
+    return;
+  }
+  for (const size_t partitions : {size_t{2}, size_t{8}}) {
+    for (const bool fail : {false, true}) {
+      SCOPED_TRACE("partitions=" + std::to_string(partitions) +
+                   " fail=" + std::to_string(fail));
+      Options options = IndexedWalOptions(CurrentOptions());
+      options.paranoid_checks = true;
+      options.max_bgerror_resume_count = 0;
+      DestroyAndReopen(options);
+      OpenWithPartitions(partitions, options);
+      const int cf_s = cf_for_partition_[0];
+      const int cf_c = cf_for_partition_[1];
+      WriteOptions sync_wo;
+      sync_wo.sync = true;
+      ASSERT_OK(Put(cf_s, "below", "value_below", sync_wo));
+      const SequenceNumber before = db_->GetLatestSequenceNumber();
+
+      std::mutex mu;
+      std::condition_variable cv;
+      bool s_in_sync = false;
+      bool release_s = false;
+      bool fail_sync = false;
+      SyncPoint::GetInstance()->SetCallBack(
+          "DBImpl::SyncEveryWalPartition:TakesPartitionSyncMutex", [&](void*) {
+            std::unique_lock<std::mutex> lock(mu);
+            if (!s_in_sync) {
+              s_in_sync = true;
+              cv.notify_all();
+              cv.wait(lock, [&] { return release_s; });
+            }
+          });
+      SyncPoint::GetInstance()->SetCallBack(
+          "DBImpl::SyncWalsFromCompletionGate:AfterGateSync", [&](void* arg) {
+            std::lock_guard<std::mutex> lock(mu);
+            if (fail_sync) {
+              fail_sync = false;
+              IOStatus error = IOStatus::IOError("injected gate sync error");
+              error.SetRetryable(true);
+              *static_cast<IOStatus*>(arg) = error;
+            }
+          });
+      Status s_status;
+      Status c_status;
+      std::atomic<bool> c_returned{false};
+      port::Thread s_thread(
+          [&] { s_status = Put(cf_s, "key_s", "value_s", sync_wo); });
+      {
+        std::unique_lock<std::mutex> lock(mu);
+        ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(30),
+                                [&] { return s_in_sync; }));
+      }
+      port::Thread c_thread([&] {
+        c_status = Put(cf_c, "key_c", "value_c");
+        c_returned = true;
+      });
+      ASSERT_TRUE(WaitForDurabilityWaiters(1));
+
+      auto expect_reads = [&](const std::string& phase, bool visible) {
+        SCOPED_TRACE(phase);
+        const std::string s_value = visible ? "value_s" : "NOT_FOUND";
+        const std::string c_value = visible ? "value_c" : "NOT_FOUND";
+        EXPECT_EQ("value_below", Get(cf_s, "below"));
+        EXPECT_EQ(s_value, Get(cf_s, "key_s"));
+        EXPECT_EQ(c_value, Get(cf_c, "key_c"));
+        std::vector<ColumnFamilyHandle*> cfhs = {handles_[cf_s],
+                                                 handles_[cf_c]};
+        std::vector<Slice> keys = {"key_s", "key_c"};
+        std::vector<std::string> values;
+        std::vector<Status> statuses =
+            db_->MultiGet(ReadOptions(), cfhs, keys, &values);
+        ASSERT_EQ(2U, statuses.size());
+        for (const Status& st : statuses) {
+          EXPECT_EQ(visible, st.ok()) << st.ToString();
+          EXPECT_EQ(!visible, st.IsNotFound()) << st.ToString();
+        }
+        for (const bool tailing : {false, true}) {
+          ReadOptions ro;
+          ro.tailing = tailing;
+          std::unique_ptr<Iterator> it(db_->NewIterator(ro, handles_[cf_s]));
+          it->Seek("key_s");
+          EXPECT_EQ(visible, it->Valid() && it->key() == "key_s")
+              << (tailing ? "tailing" : "plain");
+          EXPECT_OK(it->status());
+        }
+      };
+      // Held: neither is visible, and C has not returned.
+      EXPECT_FALSE(c_returned.load());
+      EXPECT_EQ(before, db_->GetLatestSequenceNumber());
+      expect_reads("held", /*visible=*/false);
+      {
+        std::lock_guard<std::mutex> lock(mu);
+        fail_sync = fail;
+        release_s = true;
+        cv.notify_all();
+      }
+      s_thread.join();
+      c_thread.join();
+      SyncPoint::GetInstance()->ClearCallBack(
+          "DBImpl::SyncEveryWalPartition:TakesPartitionSyncMutex");
+      SyncPoint::GetInstance()->ClearCallBack(
+          "DBImpl::SyncWalsFromCompletionGate:AfterGateSync");
+      if (!fail) {
+        ASSERT_OK(s_status);
+        ASSERT_OK(c_status);
+        expect_reads("released", /*visible=*/true);
+        Close();
+        continue;
+      }
+      ASSERT_TRUE(s_status.IsIOError()) << s_status.ToString();
+      ASSERT_NOK(c_status);
+      EXPECT_EQ(dbfull()->TEST_GetBGError().ToString(), c_status.ToString());
+      expect_reads("failed", /*visible=*/false);
+      ASSERT_OK(dbfull()->Resume());
+      expect_reads("resumed", /*visible=*/false);
+      ASSERT_OK(Flush(cf_s));
+      ASSERT_OK(Flush(cf_c));
+      expect_reads("flushed", /*visible=*/false);
+      for (const WALRecoveryMode mode :
+           {WALRecoveryMode::kAbsoluteConsistency,
+            WALRecoveryMode::kTolerateCorruptedTailRecords,
+            WALRecoveryMode::kPointInTimeRecovery,
+            WALRecoveryMode::kSkipAnyCorruptedRecords}) {
+        options.wal_recovery_mode = mode;
+        ReopenWithPartitions(partitions, options);
+        expect_reads(
+            "reopened in mode " + std::to_string(static_cast<int>(mode)),
+            /*visible=*/false);
+      }
+      Close();
+    }
+  }
+}
+
+TEST_P(DBWritePartitionTest, SyncLedGroupAsyncWritersReturnBeforeFsync) {
+  // GC25 Q2 (D-9): in a group led by a sync write, the async writers take
+  // the group's lower sequences and return, visible, without waiting for
+  // the fsync; the sync leader stays parked and invisible until it. W0
+  // (async, partition 1) is held in its append as leader, while L (sync)
+  // and then A1 and A2 (async) queue behind it on partition 1; released,
+  // W0 hands L the group [L, A1, A2]. L's gate fsync is held: A1 and A2
+  // return OK and read back, the published sequence stops just below L's,
+  // and L has not returned and does not read. Released, L returns and reads
+  // back.
+  // Neuter: the async writers wait for an fsync before they complete
+  // (SyncWalsFromCompletionGate at the start of async_writers_gate): A1 and
+  // A2 do not return while L is held.
+  if (GetParam()) {
+    return;
+  }
+  for (const size_t partitions : {size_t{2}, size_t{8}}) {
+    SCOPED_TRACE("partitions=" + std::to_string(partitions));
+    Options options = CurrentOptions();
+    options.avoid_flush_during_shutdown = true;
+    DestroyAndReopen(options);
+    OpenWithPartitions(partitions, options);
+    const int cf = cf_for_partition_[1];
+    WriteOptions sync_wo;
+    sync_wo.sync = true;
+    ASSERT_OK(Put(cf, "below", "v", sync_wo));
+    const SequenceNumber before = db_->GetLatestSequenceNumber();
+
+    std::mutex mu;
+    std::condition_variable cv;
+    bool hold_append = true;
+    bool w0_in_append = false;
+    bool release_w0 = false;
+    size_t waiting = 0;
+    bool l_in_sync = false;
+    bool release_l = false;
+    size_t async_returned = 0;
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::WriteToWAL:log_entry", [&](void*) {
+          std::unique_lock<std::mutex> lock(mu);
+          if (hold_append) {
+            hold_append = false;
+            w0_in_append = true;
+            cv.notify_all();
+            cv.wait(lock, [&] { return release_w0; });
+          }
+        });
+    SyncPoint::GetInstance()->SetCallBack(
+        "WriteThread::JoinBatchGroup:BeganWaiting", [&](void* arg) {
+          if (static_cast<WriteThread::Writer*>(arg)->wal_partition != 1) {
+            return;
+          }
+          std::lock_guard<std::mutex> lock(mu);
+          ++waiting;
+          cv.notify_all();
+        });
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::SyncEveryWalPartition:TakesPartitionSyncMutex", [&](void*) {
+          std::unique_lock<std::mutex> lock(mu);
+          if (!l_in_sync) {
+            l_in_sync = true;
+            cv.notify_all();
+            cv.wait(lock, [&] { return release_l; });
+          }
+        });
+    auto wait_for = [&](const std::function<bool()>& pred) {
+      std::unique_lock<std::mutex> lock(mu);
+      return cv.wait_for(lock, std::chrono::seconds(30), pred);
+    };
+    Status w0_status;
+    Status l_status;
+    Status a1_status;
+    Status a2_status;
+    port::Thread w0([&] { w0_status = Put(cf, "w0", "v"); });
+    ASSERT_TRUE(wait_for([&] { return w0_in_append; }));
+    port::Thread l([&] { l_status = Put(cf, "l", "v", sync_wo); });
+    ASSERT_TRUE(wait_for([&] { return waiting == 1; }));
+    auto async_writer = [&](const std::string& key, Status* status) {
+      *status = Put(cf, key, "v");
+      std::lock_guard<std::mutex> lock(mu);
+      ++async_returned;
+      cv.notify_all();
+    };
+    port::Thread a1([&] { async_writer("a1", &a1_status); });
+    ASSERT_TRUE(wait_for([&] { return waiting == 2; }));
+    port::Thread a2([&] { async_writer("a2", &a2_status); });
+    ASSERT_TRUE(wait_for([&] { return waiting == 3; }));
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      release_w0 = true;
+      cv.notify_all();
+    }
+    w0.join();
+    ASSERT_OK(w0_status);
+    ASSERT_TRUE(wait_for([&] { return l_in_sync; }));
+    // The async writers return while L's fsync is held.
+    EXPECT_TRUE(wait_for([&] { return async_returned == 2; }));
+    EXPECT_EQ(before + 3, db_->GetLatestSequenceNumber());
+    EXPECT_EQ("v", Get(cf, "w0"));
+    EXPECT_EQ("v", Get(cf, "a1"));
+    EXPECT_EQ("v", Get(cf, "a2"));
+    EXPECT_EQ("NOT_FOUND", Get(cf, "l"));
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      release_l = true;
+      cv.notify_all();
+    }
+    l.join();
+    a1.join();
+    a2.join();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    ASSERT_OK(l_status);
+    ASSERT_OK(a1_status);
+    ASSERT_OK(a2_status);
+    EXPECT_EQ(before + 4, db_->GetLatestSequenceNumber());
+    EXPECT_EQ("v", Get(cf, "l"));
+    Close();
+  }
+}
+
+TEST_P(DBWritePartitionTest, FailedSyncReopenWithoutResumeMayRecoverIt) {
+  // GC25 Q4 (G3-A-3): the documented reopen rule. A sync write whose record
+  // reached the WAL but whose gate sync failed returns the error and is not
+  // visible; a reopen without Resume(), with the error still set at Close,
+  // replays the record, as one WAL does, in every recovery mode. (After
+  // Resume() it never reads back: SyncWriteVisibleOnlyOnceDurable.)
+  if (GetParam()) {
+    return;
+  }
+  for (const size_t partitions : {size_t{2}, size_t{8}}) {
+    for (const WALRecoveryMode mode :
+         {WALRecoveryMode::kAbsoluteConsistency,
+          WALRecoveryMode::kTolerateCorruptedTailRecords,
+          WALRecoveryMode::kPointInTimeRecovery,
+          WALRecoveryMode::kSkipAnyCorruptedRecords}) {
+      SCOPED_TRACE("partitions=" + std::to_string(partitions) +
+                   " mode=" + std::to_string(static_cast<int>(mode)));
+      Options options = IndexedWalOptions(CurrentOptions());
+      options.paranoid_checks = true;
+      options.max_bgerror_resume_count = 0;
+      DestroyAndReopen(options);
+      OpenWithPartitions(partitions, options);
+      const int cf = cf_for_partition_[0];
+      WriteOptions sync_wo;
+      sync_wo.sync = true;
+      ASSERT_OK(Put(cf, "below", "v", sync_wo));
+      std::atomic<bool> fail_sync{true};
+      SyncPoint::GetInstance()->SetCallBack(
+          "DBImpl::SyncWalsFromCompletionGate:AfterGateSync", [&](void* arg) {
+            if (fail_sync.exchange(false)) {
+              IOStatus error = IOStatus::IOError("injected gate sync error");
+              error.SetRetryable(true);
+              *static_cast<IOStatus*>(arg) = error;
+            }
+          });
+      const Status s = Put(cf, "failed", "v", sync_wo);
+      SyncPoint::GetInstance()->ClearCallBack(
+          "DBImpl::SyncWalsFromCompletionGate:AfterGateSync");
+      ASSERT_TRUE(s.IsIOError()) << s.ToString();
+      ASSERT_NOK(dbfull()->TEST_GetBGError());
+      EXPECT_EQ("NOT_FOUND", Get(cf, "failed"));
+      Close();
+      options.wal_recovery_mode = mode;
+      ReopenWithPartitions(partitions, options);
+      EXPECT_EQ("v", Get(cf, "below"));
+      EXPECT_EQ("v", Get(cf, "failed"));
+      Close();
+    }
+  }
+}
+
 TEST_P(DBWritePartitionTest, FailedGateSyncWriteStaysInvisible) {
   // A sync write whose gate fsync fails stays invisible, as at N=1, where a
   // failed sync never inserted the write. Async A on partition 0 is held in
-  // its append, so B (sync, partition 1, above A) inserts but cannot publish;
-  // B's gate sync then fails. Once A is released A is acknowledged and
+  // its append, so B (sync, partition 1, above A) cannot publish; B's gate
+  // sync then fails. Once A is released A is acknowledged and
   // published, while B stays absent: before Resume(), after Resume() and a
   // flush, and after a reopen in every recovery mode. Then, above A2 held the
   // same way, C (sync) is held inside its gate sync while D (sync, above C)
   // queues behind it in the coalescer; C's sync fails, and both get the error
   // and stay absent. Every write acknowledged below them stays present.
-  // Neuter: skip the fence in FenceFailedGateSync; A's publication exposes B.
+  // Neuter: insert and publish the sync range before its fsync (RunSyncGate's
+  // callbacks, insert and PublishLastSequence moved before
+  // RunCoalescedGateSync); A's publication
+  // exposes B.
   if (GetParam()) {
     return;
   }
@@ -6207,17 +6534,15 @@ TEST_P(DBWritePartitionTest, FailedGateSyncWriteStaysInvisible) {
 }
 
 TEST_P(DBWritePartitionTest, FailedGateSyncFencesCoalescedWaiterAtomically) {
-  // Ported from GC21's losing candidate (Muse), for GC24 Q3 and Q9.
-  // GC21 Q3: two sync groups coalesce onto one failed gate sync. The waiter
-  // (D, queued on C's running sync) must be fenced in the same critical
-  // section that records the background error: with auto-resume on, a
-  // recovery flush running before a late waiter fence persists D's write,
-  // which the read mask hides in-process but which reappears after a reopen.
-  // The runner is held between its failed sync and its publication, so the
-  // recovery flush provably runs while D is still unfenced-but-waiting; both
-  // writes are absent after recovery and after a reopen.
-  // Neuter: the waiter installs its fence on the shared-failure path only
-  // (today's late fence); its key survives the reopen.
+  // Ported from GC21's losing candidate (Muse), for GC24 Q3 and Q9; under
+  // D-9, two sync groups coalesce onto one failed gate sync, and with
+  // auto-resume on, recovery's flush waits until neither group's entries
+  // can still be published (WaitForUnpublishedSyncGroups). The runner (C)
+  // is held between its failed sync and its fence while D waits on it,
+  // until recovery has reached that wait; both writes are absent after
+  // recovery and after a reopen.
+  // Neuter: no WaitForUnpublishedSyncGroups in WaitForPendingWrites;
+  // recovery never waits (recovery_waited stays false).
   if (GetParam()) {
     return;
   }
@@ -6240,8 +6565,8 @@ TEST_P(DBWritePartitionTest, FailedGateSyncFencesCoalescedWaiterAtomically) {
   bool c_in_sync = false;
   bool release_c = false;
   bool d_waiting = false;
-  bool runner_held = false;
-  bool release_runner = false;
+  bool recovery_waiting = false;
+  std::atomic<bool> recovery_waited{false};
   SyncPoint::GetInstance()->SetCallBack(
       "DBImpl::SyncWalsFromCompletionGate:AfterGateSync", [&](void* arg) {
         std::lock_guard<std::mutex> lock(mu);
@@ -6269,13 +6594,16 @@ TEST_P(DBWritePartitionTest, FailedGateSyncFencesCoalescedWaiterAtomically) {
         cv.notify_all();
       });
   SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WaitForUnpublishedSyncGroups:Wait", [&](void*) {
+        std::lock_guard<std::mutex> lock(mu);
+        recovery_waiting = true;
+        cv.notify_all();
+      });
+  SyncPoint::GetInstance()->SetCallBack(
       "DBImpl::RunCoalescedGateSync:AfterFailedSync", [&](void*) {
         std::unique_lock<std::mutex> lock(mu);
-        if (!runner_held) {
-          runner_held = true;
-          cv.notify_all();
-          cv.wait(lock, [&] { return release_runner; });
-        }
+        recovery_waited = cv.wait_for(lock, std::chrono::seconds(30),
+                                      [&] { return recovery_waiting; });
       });
 
   Status c_status;
@@ -6297,13 +6625,9 @@ TEST_P(DBWritePartitionTest, FailedGateSyncFencesCoalescedWaiterAtomically) {
     release_c = true;
     cv.notify_all();
   }
-  // The failed sync's error is recorded; hold its publication until the
-  // auto-resume recovery (including its flush) completes.
-  {
-    std::unique_lock<std::mutex> lock(mu);
-    ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(30),
-                            [&] { return runner_held; }));
-  }
+  c_thread.join();
+  d_thread.join();
+  ASSERT_TRUE(recovery_waited.load());
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(30);
   while (!dbfull()->TEST_GetBGError().ok()) {
@@ -6311,13 +6635,6 @@ TEST_P(DBWritePartitionTest, FailedGateSyncFencesCoalescedWaiterAtomically) {
         << "auto-resume recovery never completed";
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
-  {
-    std::lock_guard<std::mutex> lock(mu);
-    release_runner = true;
-    cv.notify_all();
-  }
-  c_thread.join();
-  d_thread.join();
   SyncPoint::GetInstance()->ClearAllCallBacks();
   ASSERT_TRUE(c_status.IsIOError()) << c_status.ToString();
   ASSERT_TRUE(d_status.IsIOError()) << d_status.ToString();
@@ -6347,19 +6664,24 @@ TEST_P(DBWritePartitionTest, FailedGateSyncFencesCoalescedWaiterAtomically) {
 }
 
 TEST_P(DBWritePartitionTest, FailedSyncRangeDeletionHiddenUntilResumeDropsIt) {
-  // Ported from GC21's losing candidate (Muse), for GC24 Q2: its retirement
-  // check runs right after Resume() and Flush(), with no background wait.
-  // GC21 Q4: a failed sync write's point keys and range deletions are
-  // invisible through Get, MultiGet, plain iterators and tailing iterators
-  // until Resume() drops them. The write below deletes ["a", "m"), covering
-  // the acked key "f", and puts "point" outside the range; its gate sync
-  // fails. Before Resume, "f" still reads (the tombstone is masked) and
-  // "point" does not, through all four paths -- and the tailing iterator
-  // works instead of refusing on the masked tombstone. After Resume plus a
-  // flush the mask is retired (WalGateReadMaskRanges() is empty) and the
-  // same reads hold; a reopen agrees in every recovery mode.
-  // Neuter: no mask on tailing iterators, and no tombstone masking; the
-  // tailing iterator refuses and "f" reads deleted.
+  // Ported from GC21's losing candidate (Muse), for GC24 Q2; under D-9
+  // (GC21 Q4): a failed sync write's point keys and range deletions are
+  // invisible through Get, MultiGet, plain iterators and tailing iterators,
+  // before and after Resume() drops them. The write below deletes
+  // ["a", "m"), covering the acked key "f", and puts "point" outside the
+  // range; it is held inside its gate sync while an async write above it,
+  // "zebra", parks behind it. Its gate sync then fails, and so does
+  // "zebra". "f" still reads and neither "point" nor "zebra" does, through
+  // all four paths, before Resume, after Resume plus a flush, and after a
+  // reopen in every recovery mode. The one exception: before Resume a
+  // tailing iterator, which reads the memtable at kMaxSequenceNumber, may
+  // show "zebra", which inserted before it failed, as it may any write
+  // above a failed append (D-1).
+  // Neuters: insert and publish the sync range before its fsync
+  // (RunSyncGate's callbacks, insert and PublishLastSequence moved before
+  // RunCoalescedGateSync): "zebra" no longer parks behind F. No drop at the
+  // fence (UnreleasedWalGateFenceLow() returning kMaxSequenceNumber):
+  // Resume()'s flush keeps "zebra", which then reads back.
   if (GetParam()) {
     return;
   }
@@ -6374,9 +6696,7 @@ TEST_P(DBWritePartitionTest, FailedSyncRangeDeletionHiddenUntilResumeDropsIt) {
   ASSERT_OK(Put(cf, "f", "value_f"));
 
   // The failing write runs first and is held inside its gate sync; an async
-  // write above it then completes and publishes past its range, so reads
-  // below run at a snapshot that covers the tombstone (without it every
-  // read would stop below the failed range and prove nothing).
+  // write above it then parks behind it.
   std::mutex mu;
   std::condition_variable cv;
   int fail_syncs = 0;
@@ -6415,10 +6735,12 @@ TEST_P(DBWritePartitionTest, FailedSyncRangeDeletionHiddenUntilResumeDropsIt) {
     ASSERT_TRUE(
         cv.wait_for(lock, std::chrono::seconds(30), [&] { return f_in_sync; }));
   }
-  // Outside ["a", "m"): always visible, before and after, masked or not.
-  // Same partition is fine: F already left its write thread, so this forms
-  // its own group above F's range.
-  ASSERT_OK(Put(cf, "zebra", "value_zebra"));
+  // Outside ["a", "m"). Same partition is fine: F already left its write
+  // thread, so this forms its own group above F's range.
+  Status zebra_status;
+  port::Thread zebra_thread(
+      [&] { zebra_status = Put(cf, "zebra", "value_zebra"); });
+  ASSERT_TRUE(WaitForDurabilityWaiters(1));
   {
     std::lock_guard<std::mutex> lock(mu);
     fail_syncs = 1;
@@ -6426,6 +6748,8 @@ TEST_P(DBWritePartitionTest, FailedSyncRangeDeletionHiddenUntilResumeDropsIt) {
     cv.notify_all();
   }
   f_thread.join();
+  zebra_thread.join();
+  ASSERT_TRUE(zebra_status.IsIOError()) << zebra_status.ToString();
   SyncPoint::GetInstance()->ClearCallBack(
       "DBImpl::SyncWalsFromCompletionGate:AfterGateSync");
   SyncPoint::GetInstance()->ClearCallBack(
@@ -6443,13 +6767,13 @@ TEST_P(DBWritePartitionTest, FailedSyncRangeDeletionHiddenUntilResumeDropsIt) {
     EXPECT_OK(it->status());
     return kv;
   };
-  const std::map<std::string, std::string> kExpected = {
-      {"f", "value_f"}, {"zebra", "value_zebra"}};
+  const std::map<std::string, std::string> kExpected = {{"f", "value_f"}};
+  bool resumed = false;
   auto check_reads = [&](const std::string& phase) {
     SCOPED_TRACE(phase);
     EXPECT_EQ("value_f", Get(cf, "f"));
     EXPECT_EQ("NOT_FOUND", Get(cf, "point"));
-    EXPECT_EQ("value_zebra", Get(cf, "zebra"));
+    EXPECT_EQ("NOT_FOUND", Get(cf, "zebra"));
     {
       std::vector<ColumnFamilyHandle*> cfhs = {handles_[cf], handles_[cf],
                                                handles_[cf]};
@@ -6460,22 +6784,22 @@ TEST_P(DBWritePartitionTest, FailedSyncRangeDeletionHiddenUntilResumeDropsIt) {
       ASSERT_EQ(3U, statuses.size());
       EXPECT_OK(statuses[0]) << statuses[0].ToString();
       EXPECT_TRUE(statuses[1].IsNotFound()) << statuses[1].ToString();
-      EXPECT_OK(statuses[2]) << statuses[2].ToString();
+      EXPECT_TRUE(statuses[2].IsNotFound()) << statuses[2].ToString();
       ASSERT_EQ(3U, values.size());
       EXPECT_EQ("value_f", values[0]);
-      EXPECT_EQ("value_zebra", values[2]);
     }
     EXPECT_EQ(kExpected, collect(false));
-    EXPECT_EQ(kExpected, collect(true));
+    std::map<std::string, std::string> tailing = collect(true);
+    if (!resumed) {
+      tailing.erase("zebra");
+    }
+    EXPECT_EQ(kExpected, tailing);
   };
   check_reads("before resume");
 
   ASSERT_OK(dbfull()->Resume());
   ASSERT_OK(Flush(cf));
-  {
-    auto ranges = dbfull()->TEST_WalGateReadMaskRanges();
-    EXPECT_TRUE(ranges == nullptr || ranges->empty());
-  }
+  resumed = true;
   check_reads("after resume");
 
   for (const WALRecoveryMode mode :
@@ -6494,13 +6818,12 @@ TEST_P(DBWritePartitionTest, FailedSyncRangeDeletionHiddenUntilResumeDropsIt) {
 TEST_P(DBWritePartitionTest, FailedZeroCountSyncLeavesNoIndeterminateRecord) {
   // Ported from GC21's losing candidate (Muse), for GC24 Q9, with its gap
   // count mapped to TEST_HasIndeterminateWriteSequence.
-  // GC21 Q5 (Q8): a zero-count sync write (LogData only) whose gate sync
-  // fails is spared a fence -- FenceFailedGateSync ignores a group that
-  // consumed no sequence -- so no indeterminate record may name it either.
-  // After Resume the WAL manager's indeterminate set is empty and no read
-  // mask lingers.
-  // Neuter: fence the zero-count group anyway (fence it as [target, target]
-  // in place of the `low > high` return in InstallFailedGateSyncFence); the
+  // GC21 Q5 (Q8), under D-9: a zero-count sync write (LogData only) whose
+  // gate sync fails holds no sequence, so once nothing was allocated above
+  // it, its fence closes empty at Resume and no indeterminate record names
+  // it. After Resume the WAL manager's indeterminate set is empty, and a
+  // write after it succeeds.
+  // Neuter: close the fence at max(low, last allocated), as before; the
   // indeterminate assertion below fails.
   if (GetParam()) {
     return;
@@ -6537,7 +6860,6 @@ TEST_P(DBWritePartitionTest, FailedZeroCountSyncLeavesNoIndeterminateRecord) {
 
   ASSERT_OK(dbfull()->Resume());
   EXPECT_FALSE(dbfull()->TEST_HasIndeterminateWriteSequence());
-  EXPECT_EQ(nullptr, dbfull()->TEST_WalGateReadMaskRanges());
 
   ASSERT_OK(Put(cf, "after", "value", sync_wo));
   ReopenWithPartitions(kPartitions, options);
@@ -7723,99 +8045,9 @@ TEST_P(DBWritePartitionTest, MalformedBatchFailsAsAtN1) {
   EXPECT_EQ(at_one.second, at_four.second);
 }
 
-TEST_P(DBWritePartitionTest, AsyncWriteDoesNotWaitForOtherPartitionsSync) {
-  // D-G11 (c): a sync=false write waits only for every record at or below it
-  // to be written, never for a sync write's fsync on another partition. Sync
-  // B on partition 1 is held at the start of its fsync of every partition;
-  // async C on partition 2, allocated above B, must return and be visible
-  // (published past its own sequence) while B is still held. B then returns
-  // OK. Holding the fsync before B's publication instead (the pre-(c) order)
-  // keeps C parked behind B, and C misses the deadline below.
-  if (GetParam()) {
-    ROCKSDB_GTEST_BYPASS(
-        "N > 1 needs indexed WALs, which two_write_queues "
-        "rejects");
-    return;
-  }
-  constexpr size_t kPartitions = 4;
-  Options options = CurrentOptions();
-  options.avoid_flush_during_shutdown = true;
-  OpenWithPartitions(kPartitions, options);
-  const int cf_b = cf_for_partition_[1];
-  const int cf_c = cf_for_partition_[2];
-
-  std::mutex mu;
-  std::condition_variable cv;
-  bool b_in_sync = false;
-  bool release_b = false;
-  std::atomic<bool> b_returned{false};
-  std::atomic<bool> c_returned{false};
-  Status b_status;
-  Status c_status;
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::SyncEveryWalPartition:TakesPartitionSyncMutex", [&](void*) {
-        std::unique_lock<std::mutex> lock(mu);
-        if (!b_in_sync) {
-          b_in_sync = true;
-          cv.notify_all();
-          cv.wait(lock, [&] { return release_b; });
-        }
-      });
-
-  WriteOptions sync_wo;
-  sync_wo.sync = true;
-  port::Thread b_thread([&] {
-    b_status = Put(cf_b, "key_b", "value_b", sync_wo);
-    b_returned.store(true);
-  });
-  {
-    std::unique_lock<std::mutex> lock(mu);
-    ASSERT_TRUE(
-        cv.wait_for(lock, std::chrono::seconds(30), [&] { return b_in_sync; }));
-  }
-  const SequenceNumber b_seq = dbfull()->GetLatestSequenceNumber();
-
-  SequenceNumber c_seq = 0;
-  port::Thread c_thread([&] {
-    WriteBatch batch;
-    ASSERT_OK(batch.Put(handles_[cf_c], "key_c", "value_c"));
-    c_status = db_->Write(WriteOptions(), &batch);
-    // C writes alone, so its batch is the group's record and carries its
-    // sequence.
-    c_seq = WriteBatchInternal::Sequence(&batch);
-    c_returned.store(true);
-  });
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(10);
-  while (!c_returned.load() && std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  }
-  const bool c_returned_while_b_held = c_returned.load();
-  EXPECT_TRUE(c_returned_while_b_held);
-  if (c_returned_while_b_held) {
-    EXPECT_OK(c_status);
-    EXPECT_FALSE(b_returned.load());
-    EXPECT_GT(c_seq, b_seq);
-    EXPECT_GE(dbfull()->GetLatestSequenceNumber(), c_seq);
-    EXPECT_EQ("value_c", Get(cf_c, "key_c"));
-  }
-  {
-    std::lock_guard<std::mutex> lock(mu);
-    release_b = true;
-    cv.notify_all();
-  }
-  b_thread.join();
-  c_thread.join();
-  SyncPoint::GetInstance()->ClearCallBack(
-      "DBImpl::SyncEveryWalPartition:TakesPartitionSyncMutex");
-  ASSERT_OK(b_status);
-  ASSERT_OK(c_status);
-  ASSERT_EQ("value_b", Get(cf_b, "key_b"));
-}
-
 TEST_P(DBWritePartitionTest, SyncWriteAboveAsyncWriteSurvivesCrash) {
-  // D-G11 (c): async A on partition 0, then sync B on partition 1. B fsyncs
-  // every partition's WAL once its group published, so after a crash that
+  // Async A on partition 0, then sync B on partition 1. B fsyncs every
+  // partition's WAL before its group publishes, so after a crash that
   // drops every unsynced byte both come back; a later async write on
   // partition 0 does not, proving the crash dropped unsynced data. Without
   // the gate's fsync both A and B are lost.
@@ -7846,82 +8078,12 @@ TEST_P(DBWritePartitionTest, SyncWriteAboveAsyncWriteSurvivesCrash) {
   EXPECT_EQ("NOT_FOUND", Get(cf_for_partition_[0], "key_control"));
 }
 
-TEST_P(DBWritePartitionTest, AsyncAboveSyncReturnsWhileSyncFsyncHeld) {
-  // D-G11 (c): a sync=false write never waits for another partition's
-  // fsync. B (sync) on partition 1 is held inside its gate-time fsync of
-  // partition 1's WAL files, holding partition 1's WAL mutex; C (async)
-  // on partition 2, above B, still returns within the bound and is
-  // visible while B is unsynced. B itself already published (a sync write
-  // publishes before its fsync), so it is visible too. Ported from GC17's
-  // Muse candidate. Neuter: hold every partition's WAL mutex across the
-  // whole fsync; C times out.
-  if (GetParam()) {
-    return;
-  }
-  constexpr size_t kPartitions = 4;
-  Options options = CurrentOptions();
-  options.avoid_flush_during_shutdown = true;
-  OpenWithPartitions(kPartitions, options);
-  const int cf_b = cf_for_partition_[1];
-  const int cf_c = cf_for_partition_[2];
-
-  std::mutex mu;
-  std::condition_variable cv;
-  bool b_in_fsync = false;
-  bool release_b = false;
-  std::atomic<bool> b_returned{false};
-  Status b_status;
-
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::SyncWalPartitionFiles:BeforeSyncPartition", [&](void* arg) {
-        if (*static_cast<size_t*>(arg) != 1) {
-          return;
-        }
-        std::unique_lock<std::mutex> lock(mu);
-        if (b_in_fsync) {
-          return;
-        }
-        b_in_fsync = true;
-        cv.notify_all();
-        cv.wait(lock, [&] { return release_b; });
-      });
-
-  WriteOptions sync_wo;
-  sync_wo.sync = true;
-  port::Thread b_thread([&] {
-    b_status = Put(cf_b, "key_b", "value_b", sync_wo);
-    b_returned.store(true);
-  });
-  {
-    std::unique_lock<std::mutex> lock(mu);
-    ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(30),
-                            [&] { return b_in_fsync; }));
-  }
-  // B is held inside its partition-1 fsync, still unsynced. C, above B,
-  // returns promptly anyway.
-  ASSERT_OK(RunWithin(std::chrono::seconds(30),
-                      [&] { return Put(cf_c, "key_c", "value_c"); }));
-  ASSERT_EQ("value_c", Get(cf_c, "key_c"));
-  ASSERT_EQ("value_b", Get(cf_b, "key_b"));
-  EXPECT_FALSE(b_returned.load());
-  {
-    std::lock_guard<std::mutex> lock(mu);
-    release_b = true;
-    cv.notify_all();
-  }
-  b_thread.join();
-  SyncPoint::GetInstance()->ClearCallBack(
-      "DBImpl::SyncWalPartitionFiles:BeforeSyncPartition");
-  ASSERT_OK(b_status);
-}
-
 TEST_P(DBWritePartitionTest, AsyncOnSyncingPartitionWaitsForItsFsync) {
-  // The other side of AsyncAboveSyncReturnsWhileSyncFsyncHeld, accepted as
-  // one-WAL semantics (an append to a file waits for that file's fsync): with
-  // B (sync) held inside its fsync of partition 1, under partition 1's WAL
-  // mutex, E (async) on partition 1 joins its write queue but cannot bind to
-  // the WAL, let alone return, until B's fsync of partition 1 finishes; then
-  // it returns.
+  // Accepted as one-WAL semantics (an append to a file waits for that
+  // file's fsync): with B (sync) held inside its fsync of partition 1, under
+  // partition 1's WAL mutex, E (async) on partition 1 joins its write queue
+  // but cannot bind to the WAL, let alone return, until B's fsync of
+  // partition 1 finishes; then it returns.
   if (GetParam()) {
     return;
   }
@@ -13375,15 +13537,17 @@ TEST_P(DBWalAppendFailureTest, GateSyncKeepsOtherPartitionsErrorResumable) {
   EXPECT_OK(dbfull()->Resume());
 }
 
-// GC20 Q5 (D-7): a failed gate fsync fences only its own group. B (sync, on
-// partition 0) is held inside its fsync of partition 0, and C (async, on
-// partition 1, above B) is acknowledged meanwhile. B's fsync then fails. C
-// keeps its outcome: readable before and after Resume(), in a live SST once
-// Resume() flushed, and after a clean reopen. B, which returned the error,
-// is absent throughout (D-8).
-// Neuter: GC18's open-ended fence [B, max) in InstallFailedGateSyncFence;
-// Resume()'s flush drops C.
-TEST_P(DBWalAppendFailureTest, FailedGateSyncKeepsAckedWritesAbove) {
+// D-9 (superseding GC20 Q5's D-7 for sync failures): a write ordered above
+// a pending sync write neither returns nor becomes visible before that
+// sync's fsync, and fails with the background error when it fails, as at
+// N=1. B (sync, on partition 0) is held inside its fsync of partition 0; C
+// (async, on partition 1, above B) parks behind it, unreturned and absent.
+// B's fsync then fails. Both return the error, and both are absent before
+// and after Resume(), after its flush, and after a reopen.
+// Neuter: B publishes before its fsync (PublishOnGroupExit ignoring
+// sync_first_sequence, RunSyncGate not publishing): C returns OK while B is
+// held, and key_b reads back.
+TEST_P(DBWalAppendFailureTest, FailedGateSyncFailsWritesAbove) {
   Options options = FailureOptions();
   OpenWithPartitions(2, options);
   PutBeforeFailure(this);
@@ -13416,9 +13580,10 @@ TEST_P(DBWalAppendFailureTest, FailedGateSyncKeepsAckedWritesAbove) {
     ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(30),
                             [&] { return b_in_fsync; }));
   }
-  ASSERT_OK(RunWithin(std::chrono::seconds(30),
-                      [&] { return Put(cf_c, "key_c", "value_c"); }));
-  EXPECT_EQ("value_c", Get(cf_c, "key_c"));
+  Writer c([&] { return Put(cf_c, "key_c", "value_c"); });
+  ASSERT_TRUE(WaitForDurabilityWaiters(1));
+  EXPECT_EQ("NOT_FOUND", Get(cf_b, "key_b"));
+  EXPECT_EQ("NOT_FOUND", Get(cf_c, "key_c"));
   fail_fs_->Arm(wal0, Retryable("injected sync error"));
   {
     std::lock_guard<std::mutex> lock(mu);
@@ -13426,119 +13591,30 @@ TEST_P(DBWalAppendFailureTest, FailedGateSyncKeepsAckedWritesAbove) {
     cv.notify_all();
   }
   const Status b_status = b.Join();
+  const Status c_status = c.Join();
   fail_fs_->Disarm();
   SyncPoint::GetInstance()->ClearCallBack(
       "DBImpl::SyncWalPartitionFiles:BeforeSyncPartition");
   ASSERT_NOK(b_status);
+  ASSERT_NOK(c_status);
+  EXPECT_EQ(dbfull()->TEST_GetBGError().ToString(), c_status.ToString());
   EXPECT_EQ("NOT_FOUND", Get(cf_b, "key_b"));
-  EXPECT_EQ("value_c", Get(cf_c, "key_c"));
+  EXPECT_EQ("NOT_FOUND", Get(cf_c, "key_c"));
 
   ASSERT_OK(dbfull()->Resume());
   EXPECT_EQ("NOT_FOUND", Get(cf_b, "key_b"));
-  EXPECT_EQ("value_c", Get(cf_c, "key_c"));
+  EXPECT_EQ("NOT_FOUND", Get(cf_c, "key_c"));
+  ASSERT_OK(Flush(cf_b));
   ASSERT_OK(Flush(cf_c));
-  std::string active_entries;
-  ASSERT_TRUE(db_->GetProperty(
-      handles_[cf_c], "rocksdb.num-entries-active-mem-table", &active_entries));
-  EXPECT_EQ("0", active_entries);
-  EXPECT_GE(NumTableFilesAtLevel(0, cf_c), 1);
-  EXPECT_EQ("value_c", Get(cf_c, "key_c"));
   EXPECT_EQ("NOT_FOUND", Get(cf_b, "key_b"));
+  EXPECT_EQ("NOT_FOUND", Get(cf_c, "key_c"));
 
   ReopenWithPartitions(2, options);
-  EXPECT_EQ("value_c", Get(cf_c, "key_c"));
   EXPECT_EQ("NOT_FOUND", Get(cf_b, "key_b"));
+  EXPECT_EQ("NOT_FOUND", Get(cf_c, "key_c"));
   for (size_t p = 0; p < 2; ++p) {
     EXPECT_EQ("value", Get(cf_for_partition_[p], "before" + std::to_string(p)));
   }
-}
-
-// GC20 Q5 (D-7), zero-count edge: Z, a WAL-only write that consumes no
-// sequence, allocates right after B, so its record sits at B's last
-// sequence + 1 while its gate target is B's last sequence. B (sync, on
-// partition 1) is held inside its fsync and Z (on partition 0) inside its
-// append; B's fsync fails, then Z is released. Z lies outside B's range and
-// keeps its OK.
-// Neuter: match an exact fence by target alone (drop the `low > high` test
-// in WalGateFenceStatusLocked); Z fails with B's error.
-TEST_P(DBWalAppendFailureTest, FailedGateSyncSparesZeroCountWriteAbove) {
-  Options options = FailureOptions();
-  OpenWithPartitions(2, options);
-  PutBeforeFailure(this);
-  const int cf_b = cf_for_partition_[1];
-  const uint64_t wal1 = dbfull()->TEST_CurrentWalNumber(1);
-  std::mutex mu;
-  std::condition_variable cv;
-  bool b_in_fsync = false;
-  bool release_b = false;
-  bool z_in_append = false;
-  bool release_z = false;
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::SyncWalPartitionFiles:BeforeSyncPartition", [&](void* arg) {
-        if (*static_cast<size_t*>(arg) != 1) {
-          return;
-        }
-        std::unique_lock<std::mutex> lock(mu);
-        if (b_in_fsync) {
-          return;
-        }
-        b_in_fsync = true;
-        cv.notify_all();
-        cv.wait(lock, [&] { return release_b; });
-      });
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::WriteToWAL:log_entry", [&](void* arg) {
-        if (!static_cast<Slice*>(arg)->ends_with("marker_z")) {
-          return;
-        }
-        std::unique_lock<std::mutex> lock(mu);
-        z_in_append = true;
-        cv.notify_all();
-        cv.wait(lock, [&] { return release_z; });
-      });
-  WriteOptions sync_wo;
-  sync_wo.sync = true;
-  Writer b([&] { return Put(cf_b, "key_b", "value_b", sync_wo); });
-  {
-    std::unique_lock<std::mutex> lock(mu);
-    ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(30),
-                            [&] { return b_in_fsync; }));
-  }
-  const SequenceNumber b_last = db_->GetLatestSequenceNumber();
-  // A LogData-only batch routes to partition 0.
-  Writer z([&] {
-    WriteBatch marker;
-    Status s = marker.PutLogData("marker_z");
-    return s.ok() ? db_->Write(WriteOptions(), &marker) : s;
-  });
-  {
-    std::unique_lock<std::mutex> lock(mu);
-    ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(30),
-                            [&] { return z_in_append; }));
-  }
-  fail_fs_->Arm(wal1, Retryable("injected sync error"));
-  {
-    std::lock_guard<std::mutex> lock(mu);
-    release_b = true;
-    cv.notify_all();
-  }
-  const Status b_status = b.Join();
-  fail_fs_->Disarm();
-  ASSERT_NOK(b_status);
-  const auto fences = dbfull()->TEST_WalGateFences();
-  ASSERT_EQ(1U, fences.size());
-  EXPECT_EQ(b_last, fences[0].second);
-  {
-    std::lock_guard<std::mutex> lock(mu);
-    release_z = true;
-    cv.notify_all();
-  }
-  EXPECT_OK(z.Join());
-  SyncPoint::GetInstance()->ClearCallBack(
-      "DBImpl::SyncWalPartitionFiles:BeforeSyncPartition");
-  SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:log_entry");
-  EXPECT_EQ("NOT_FOUND", Get(cf_b, "key_b"));
-  ASSERT_OK(dbfull()->Resume());
 }
 
 // GC20 Q6 (D-8), ported from GC18's Muse candidate (pwal/ab/gc18-muse-PR9,
@@ -13551,8 +13627,10 @@ TEST_P(DBWalAppendFailureTest, FailedGateSyncSparesZeroCountWriteAbove) {
 // recovery mode, each of which must open; every acknowledged write below it
 // stays present, and an unsynced control key written last is lost, so the
 // crash really dropped data.
-// Neuter: no read-time mask (WalGateReadMaskRanges returns null); the key
-// is readable right after the failure.
+// Neuter (D-9): insert and publish the sync range before its fsync
+// (RunSyncGate's callbacks, insert and PublishLastSequence moved before
+// RunCoalescedGateSync); the key is
+// readable right after the failure.
 TEST_P(DBWalAppendFailureTest, FailedGateSyncStaysInvisibleAtNPartitions) {
   if (GetParam()) {
     ROCKSDB_GTEST_BYPASS("two_write_queues rejects N>1");
@@ -13619,9 +13697,9 @@ TEST_P(DBWalAppendFailureTest, FailedGateSyncStaysInvisibleAtNPartitions) {
     }
     EXPECT_EQ("v", Get(cf_for_partition_[0], "barrier"));
 
-    // The failed write inserted and published before its sync failed.
-    // Resume clears the error; the key stays absent through a later flush,
-    // and a write above it is admitted.
+    // The failed write was never inserted or published. Resume clears the
+    // error; the key stays absent through a later flush, and a write above
+    // it is admitted.
     ASSERT_OK(dbfull()->Resume());
     EXPECT_GT(db_->GetLatestSequenceNumber(), before_w);
     EXPECT_EQ("NOT_FOUND", Get(cf_w, "w"));
@@ -13660,14 +13738,15 @@ TEST_P(DBWalAppendFailureTest, FailedGateSyncStaysInvisibleAtNPartitions) {
   }
 }
 
-// GC20 Q7: a failed gate sync's fence goes in with its background error, in
-// one mutex_ section. Auto-resume is on, and B's gate is held right after
-// its sync fails (where GC18 installed the fence, in a second section) until
-// recovery has run. B is a two-column-family batch, and recovery flushes
-// each column family on its own. B is absent from both after recovery and
-// after a reopen.
-// Neuter: install the fence only after the sync returns (GC18's two steps);
-// recovery's flush keeps B, which the reopen shows.
+// GC20 Q7, under D-9: recovery from a failed gate sync never flushes the
+// failed write. B's entries are unpublished, so recovery's flush waits until
+// B's range is fenced (WaitForUnpublishedSyncGroups). Auto-resume is on, and
+// B's gate is held right after its sync fails until recovery has reached
+// that wait. B is a two-column-family batch, and recovery flushes each
+// column family on its own. B is absent from both after recovery and after
+// a reopen.
+// Neuter: no WaitForUnpublishedSyncGroups in WaitForPendingWrites; recovery
+// never waits for B (recovery_waited stays false).
 TEST_P(DBWalAppendFailureTest, FailedGateSyncFenceGoesInWithItsError) {
   Options options = FailureOptions();
   options.max_bgerror_resume_count = 2;
@@ -13681,7 +13760,10 @@ TEST_P(DBWalAppendFailureTest, FailedGateSyncFenceGoesInWithItsError) {
   ASSERT_OK(batch.Put(handles_[cf_b], "key_b", "value_b"));
 
   std::atomic<bool> fail_sync{true};
-  std::atomic<bool> recovered_in_window{false};
+  std::mutex mu;
+  std::condition_variable cv;
+  bool recovery_waiting = false;
+  std::atomic<bool> recovery_waited{false};
   SyncPoint::GetInstance()->SetCallBack(
       "DBImpl::SyncWalsFromCompletionGate:AfterGateSync", [&](void* arg) {
         if (fail_sync.exchange(false)) {
@@ -13689,24 +13771,30 @@ TEST_P(DBWalAppendFailureTest, FailedGateSyncFenceGoesInWithItsError) {
         }
       });
   SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WaitForUnpublishedSyncGroups:Wait", [&](void*) {
+        std::lock_guard<std::mutex> lock(mu);
+        recovery_waiting = true;
+        cv.notify_all();
+      });
+  SyncPoint::GetInstance()->SetCallBack(
       "DBImpl::RunCoalescedGateSync:AfterFailedSync", [&](void*) {
-        const auto deadline =
-            std::chrono::steady_clock::now() + std::chrono::seconds(30);
-        while (!dbfull()->TEST_GetBGError().ok() &&
-               std::chrono::steady_clock::now() < deadline) {
-          std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-        recovered_in_window = dbfull()->TEST_GetBGError().ok();
+        std::unique_lock<std::mutex> lock(mu);
+        recovery_waited = cv.wait_for(lock, std::chrono::seconds(30),
+                                      [&] { return recovery_waiting; });
       });
   WriteOptions sync_wo;
   sync_wo.sync = true;
   const Status b_status = db_->Write(sync_wo, &batch);
-  SyncPoint::GetInstance()->ClearCallBack(
-      "DBImpl::SyncWalsFromCompletionGate:AfterGateSync");
-  SyncPoint::GetInstance()->ClearCallBack(
-      "DBImpl::RunCoalescedGateSync:AfterFailedSync");
   ASSERT_NOK(b_status);
-  ASSERT_TRUE(recovered_in_window.load());
+  ASSERT_TRUE(recovery_waited.load());
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while (!dbfull()->TEST_GetBGError().ok()) {
+    ASSERT_LT(std::chrono::steady_clock::now(), deadline)
+        << "auto-resume recovery never completed";
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  SyncPoint::GetInstance()->ClearAllCallBacks();
   EXPECT_EQ("NOT_FOUND", Get(cf_a, "key_b"));
   EXPECT_EQ("NOT_FOUND", Get(cf_b, "key_b"));
 
@@ -13901,15 +13989,15 @@ TEST_P(DBWalAppendFailureTest, RepeatedTwoPCHolesStayExplainedAfterCrash) {
   }
 }
 
-// GC21 Q3: every group queued on a failed gate sync is fenced in the mutex_
-// section that records the failure, not only the group whose sync failed.
-// A (sync, partition 0) runs the gate sync and is held inside it; B (sync,
+// GC21 Q3, under D-9: a group queued on a failed gate sync shares its
+// failure, and recovery's flush waits until its range too is fenced. A
+// (sync, partition 0) runs the gate sync and is held inside it; B (sync,
 // partition 1) queues on it. A's sync fails. Auto-resume is on, and B is
-// held where it learns of the shared failure until recovery has run. Both
-// are absent after recovery and after a reopen.
-// Neuter: fence the queued groups only on the shared-failure path (drop the
-// queued loop in WALIOStatusCheck); recovery's flush keeps B, which the
-// reopen shows.
+// held where it learns of the shared failure until recovery has reached
+// that wait (WaitForUnpublishedSyncGroups). Both are absent after recovery
+// and after a reopen.
+// Neuter: no WaitForUnpublishedSyncGroups in WaitForPendingWrites; recovery
+// never waits for B (recovery_waited stays false).
 TEST_P(DBWalAppendFailureTest, CoalescedFailedGateSyncFencedWithItsError) {
   Options options = FailureOptions();
   options.max_bgerror_resume_count = 2;
@@ -13923,8 +14011,9 @@ TEST_P(DBWalAppendFailureTest, CoalescedFailedGateSyncFencedWithItsError) {
   bool a_in_fsync = false;
   bool release_a = false;
   bool b_queued = false;
+  bool recovery_waiting = false;
   std::atomic<bool> fail_sync{true};
-  std::atomic<bool> recovered_in_window{false};
+  std::atomic<bool> recovery_waited{false};
   SyncPoint::GetInstance()->SetCallBack(
       "DBImpl::SyncWalPartitionFiles:BeforeSyncPartition", [&](void* arg) {
         if (*static_cast<size_t*>(arg) != 0) {
@@ -13951,14 +14040,16 @@ TEST_P(DBWalAppendFailureTest, CoalescedFailedGateSyncFencedWithItsError) {
         }
       });
   SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WaitForUnpublishedSyncGroups:Wait", [&](void*) {
+        std::lock_guard<std::mutex> lock(mu);
+        recovery_waiting = true;
+        cv.notify_all();
+      });
+  SyncPoint::GetInstance()->SetCallBack(
       "DBImpl::RunCoalescedGateSync:SharedFailure", [&](void*) {
-        const auto deadline =
-            std::chrono::steady_clock::now() + std::chrono::seconds(30);
-        while (!dbfull()->TEST_GetBGError().ok() &&
-               std::chrono::steady_clock::now() < deadline) {
-          std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-        recovered_in_window = dbfull()->TEST_GetBGError().ok();
+        std::unique_lock<std::mutex> lock(mu);
+        recovery_waited = cv.wait_for(lock, std::chrono::seconds(30),
+                                      [&] { return recovery_waiting; });
       });
   WriteOptions sync_wo;
   sync_wo.sync = true;
@@ -13978,17 +14069,17 @@ TEST_P(DBWalAppendFailureTest, CoalescedFailedGateSyncFencedWithItsError) {
   }
   const Status a_status = a.Join();
   const Status b_status = b.Join();
-  SyncPoint::GetInstance()->ClearCallBack(
-      "DBImpl::SyncWalPartitionFiles:BeforeSyncPartition");
-  SyncPoint::GetInstance()->ClearCallBack(
-      "DBImpl::RunCoalescedGateSync:BeforeWait");
-  SyncPoint::GetInstance()->ClearCallBack(
-      "DBImpl::SyncWalsFromCompletionGate:AfterGateSync");
-  SyncPoint::GetInstance()->ClearCallBack(
-      "DBImpl::RunCoalescedGateSync:SharedFailure");
   ASSERT_NOK(a_status);
   ASSERT_NOK(b_status);
-  ASSERT_TRUE(recovered_in_window.load());
+  ASSERT_TRUE(recovery_waited.load());
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while (!dbfull()->TEST_GetBGError().ok()) {
+    ASSERT_LT(std::chrono::steady_clock::now(), deadline)
+        << "auto-resume recovery never completed";
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  SyncPoint::GetInstance()->ClearAllCallBacks();
   EXPECT_EQ("NOT_FOUND", Get(cf_a, "key_a"));
   EXPECT_EQ("NOT_FOUND", Get(cf_b, "key_b"));
 
@@ -14000,16 +14091,14 @@ TEST_P(DBWalAppendFailureTest, CoalescedFailedGateSyncFencedWithItsError) {
   }
 }
 
-// GC21 Q4: a failed sync write's range deletion and point key stay hidden
-// from every read path until Resume() drops them: Get, MultiGet, a plain
-// iterator, a tailing iterator created after the failure and one created
-// before it. Resume()'s flush drops both, and once it has, the read mask is
-// retired.
-// Neuters: no mask on tailing iterators (NewTailingWalGateReadMask returns
-// nullptr): both tailing iterators return "w". No memtable mask (skip
-// SetMaskedSequenceRanges in InstallFailedGateSyncFence): Get misses k1 and
-// k2, the tailing iterators fail (ForwardIterator rejects range tombstones),
-// and the reopen loses k1 and k2. No retirement: the ranges stay.
+// GC21 Q4, under D-9: a failed sync write's range deletion and point key
+// are never visible on any read path: Get, MultiGet, a plain iterator, a
+// tailing iterator created after the failure and one created before it,
+// before Resume(), after it, after its flush, and after a reopen.
+// Neuter: insert and publish the sync range before its fsync (RunSyncGate's
+// callbacks, insert and PublishLastSequence moved before
+// RunCoalescedGateSync); Get misses k1 and
+// k2 and "w" reads back.
 TEST_P(DBWalAppendFailureTest, FailedGateSyncRangeDeletionStaysHidden) {
   Options options = FailureOptions();
   OpenWithPartitions(2, options);
@@ -14077,25 +14166,20 @@ TEST_P(DBWalAppendFailureTest, FailedGateSyncRangeDeletionStaysHidden) {
   ASSERT_OK(dbfull()->Resume());
   expect_hidden();
   ASSERT_OK(Flush(cf));
-  // Retirement runs once the flush job has freed its memtables.
-  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
-  EXPECT_EQ(nullptr, dbfull()->TEST_WalGateReadMaskRanges());
   expect_hidden();
 
   ReopenWithPartitions(2, options);
   expect_hidden();
 }
 
-// GC24 Q2: under TransactionDB's defaults (memtable history kept), the read
-// mask retires in step with the flush that frees the last masked memtable.
-// A sync write's gate sync fails; after Resume() and Flush() return, with no
-// background wait, the mask is null, and the failed write stays absent from
-// Get, MultiGet, a plain iterator and a tailing iterator, also after a
-// reopen. Neuters: keep masked memtables in history (the wait GC21 had): the
-// mask never retires. Retire before the drop (Resume's flush keeps the
-// failed group's entries, and the mask retires once its memtable is freed):
-// the failed write reads back.
-TEST_P(DBWalAppendFailureTest, FailedGateSyncMaskRetiresUnderTransactionDB) {
+// GC24 Q2, under D-9: under TransactionDB's defaults (memtable history
+// kept), a sync write whose gate sync fails stays absent from Get, MultiGet,
+// a plain iterator and a tailing iterator, before Resume(), after Resume()
+// and Flush(), and after a reopen.
+// Neuter: insert and publish the sync range before its fsync (RunSyncGate's
+// callbacks, insert and PublishLastSequence moved before
+// RunCoalescedGateSync): the failed write reads back.
+TEST_P(DBWalAppendFailureTest, FailedGateSyncAbsentUnderTransactionDB) {
   constexpr size_t kPartitions = 2;
   Options options = FailureOptions();
   options.disable_auto_compactions = true;
@@ -14119,7 +14203,6 @@ TEST_P(DBWalAppendFailureTest, FailedGateSyncMaskRetiresUnderTransactionDB) {
   std::vector<ColumnFamilyHandle*> handles;
   std::unique_ptr<TransactionDB> db = open_txn_db(&handles);
   ASSERT_NE(nullptr, db);
-  DBImpl* db_impl = static_cast_with_check<DBImpl>(db->GetRootDB());
   const int cf = cf_for_partition_[0];
   // The configuration GC21 never retired under: flushed memtables are kept.
   ASSERT_NE(0, db->GetOptions(handles[cf]).max_write_buffer_size_to_maintain);
@@ -14137,7 +14220,6 @@ TEST_P(DBWalAppendFailureTest, FailedGateSyncMaskRetiresUnderTransactionDB) {
   ASSERT_NOK(db->Put(sync_wo, handles[cf], "failed", "v"));
   SyncPoint::GetInstance()->ClearCallBack(
       "DBImpl::SyncWalsFromCompletionGate:AfterGateSync");
-  ASSERT_NE(nullptr, db_impl->TEST_WalGateReadMaskRanges());
 
   auto expect_absent = [&](const std::string& phase) {
     SCOPED_TRACE(phase);
@@ -14165,11 +14247,10 @@ TEST_P(DBWalAppendFailureTest, FailedGateSyncMaskRetiresUnderTransactionDB) {
           << (tailing ? "tailing" : "plain");
     }
   };
-  expect_absent("masked");
+  expect_absent("failed");
   ASSERT_OK(db->Resume());
   ASSERT_OK(db->Flush(FlushOptions(), handles[cf]));
-  EXPECT_EQ(nullptr, db_impl->TEST_WalGateReadMaskRanges());
-  expect_absent("retired");
+  expect_absent("resumed");
 
   for (ColumnFamilyHandle* handle : handles) {
     ASSERT_OK(db->DestroyColumnFamilyHandle(handle));
@@ -14364,103 +14445,6 @@ TEST_P(DBWalAppendFailureTest, RetryFlushResumeExplainsBurnedIndex) {
   }
 }
 
-// GC24 Q3: a sync group G publishes and leaves its write group, and is held
-// just before RunCoalescedGateSync. Another sync write's gate sync fails, and
-// auto-resume runs its recovery flush while G is still held, so G reaches the
-// coalescer only after the failure's error section and after recovery. G was
-// registered when its gate was installed, so that section fenced and masked
-// it: the recovery flush drops it, and G fails when released. Writes
-// acknowledged after recovery survive, in every recovery mode.
-// Neuter: no registration (fence late, as before): G runs its own sync after
-// recovery and is acknowledged, and its write, which the unmasked recovery
-// flush persisted, survives the reopen.
-TEST_P(DBWalAppendFailureTest, LateSyncGroupFencedWithTheFailure) {
-  Options options = FailureOptions();
-  options.max_bgerror_resume_count = 2;
-  options.bgerror_resume_retry_interval = 10000;
-  OpenWithPartitions(2, options);
-  PutBeforeFailure(this);
-  const int cf_a = cf_for_partition_[0];
-  const int cf_b = cf_for_partition_[1];
-  std::mutex mu;
-  std::condition_variable cv;
-  bool g_held = false;
-  bool release_g = false;
-  std::atomic<bool> hold_armed{true};
-  std::atomic<bool> fail_sync{false};
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::CompletionGate:BeforeCoalescedSync", [&](void*) {
-        if (!hold_armed.exchange(false)) {
-          return;
-        }
-        std::unique_lock<std::mutex> lock(mu);
-        g_held = true;
-        cv.notify_all();
-        cv.wait(lock, [&] { return release_g; });
-      });
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::SyncWalsFromCompletionGate:AfterGateSync", [&](void* arg) {
-        if (fail_sync.exchange(false)) {
-          *static_cast<IOStatus*>(arg) = Retryable("injected gate sync error");
-        }
-      });
-  WriteOptions sync_wo;
-  sync_wo.sync = true;
-  Writer g([&] { return Put(cf_b, "held", "value_held", sync_wo); });
-  {
-    std::unique_lock<std::mutex> lock(mu);
-    ASSERT_TRUE(
-        cv.wait_for(lock, std::chrono::seconds(30), [&] { return g_held; }));
-  }
-  fail_sync = true;
-  Writer failing([&] { return Put(cf_a, "failed", "value", sync_wo); });
-  const Status failed_status = failing.Join();
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(30);
-  while (!dbfull()->TEST_GetBGError().ok() &&
-         std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  }
-  const bool recovered = dbfull()->TEST_GetBGError().ok();
-  {
-    std::lock_guard<std::mutex> lock(mu);
-    release_g = true;
-    cv.notify_all();
-  }
-  const Status g_status = g.Join();
-  SyncPoint::GetInstance()->ClearCallBack(
-      "DBImpl::CompletionGate:BeforeCoalescedSync");
-  SyncPoint::GetInstance()->ClearCallBack(
-      "DBImpl::SyncWalsFromCompletionGate:AfterGateSync");
-  ASSERT_NOK(failed_status);
-  ASSERT_TRUE(recovered) << "auto-resume did not run while G was held";
-  EXPECT_NOK(g_status);
-  ASSERT_OK(Put(cf_a, "after_a", "value", sync_wo));
-  ASSERT_OK(Put(cf_b, "after_b", "value"));
-  auto expect_outcome = [&](const std::string& phase) {
-    SCOPED_TRACE(phase);
-    EXPECT_EQ("NOT_FOUND", Get(cf_b, "held"));
-    EXPECT_EQ("NOT_FOUND", Get(cf_a, "failed"));
-    EXPECT_EQ("value", Get(cf_a, "after_a"));
-    EXPECT_EQ("value", Get(cf_b, "after_b"));
-    for (size_t p = 0; p < 2; ++p) {
-      EXPECT_EQ("value",
-                Get(cf_for_partition_[p], "before" + std::to_string(p)));
-    }
-  };
-  expect_outcome("live");
-  for (const WALRecoveryMode mode :
-       {WALRecoveryMode::kPointInTimeRecovery,
-        WALRecoveryMode::kAbsoluteConsistency,
-        WALRecoveryMode::kTolerateCorruptedTailRecords,
-        WALRecoveryMode::kSkipAnyCorruptedRecords}) {
-    options.wal_recovery_mode = mode;
-    ReopenWithPartitions(2, options);
-    expect_outcome("reopened in mode " +
-                   std::to_string(static_cast<int>(mode)));
-  }
-}
-
 // GC24 Q4: the timestamp-stripping flush path never meets a read mask. Masks
 // exist only above one partition, which requires concurrent memtable writes;
 // not persisting user-defined timestamps, the only setting that strips them
@@ -14487,139 +14471,12 @@ TEST_P(DBWalAppendFailureTest, StrippingFlushNeverMeetsAMask) {
   }
 }
 
-// GC24 Q4: MemPurge. A sync write deleting [k1, k3) and putting "w" is held
-// in its gate while a write-buffer-full flush picks its memtable and runs
-// MemPurge, which is held before installing its output. The write's gate
-// sync then fails, masking the live memtables, MemPurge's input included;
-// the output, installed afterwards, inherits that mask. k1 and k2 stay
-// visible and "w" hidden, before Resume(), after Resume() and a flush, and
-// after a reopen.
-// Neuter: the output does not inherit the mask (as before): Resume()'s flush
-// persists its copy of the deletion, and k1 and k2 read NotFound after the
-// flush and after the reopen.
-TEST_P(DBWalAppendFailureTest, FailedGateSyncRangeDeletionHiddenAfterMemPurge) {
-  Options options = FailureOptions();
-  options.write_buffer_size = 1 << 20;
-  options.experimental_mempurge_threshold = 1.0;
-  options.disable_auto_compactions = true;
-  OpenWithPartitions(2, options);
-  const int cf = cf_for_partition_[0];
-  for (const char* key : {"k1", "k2", "k3"}) {
-    ASSERT_OK(Put(cf, key, "v"));
-  }
-  // In an SST, so MemPurge's sampling never meets a key the deletion covers.
-  ASSERT_OK(Flush(cf));
-  std::mutex mu;
-  std::condition_variable cv;
-  bool w_held = false;
-  bool release_w = false;
-  bool purge_held = false;
-  bool release_purge = false;
-  std::atomic<bool> hold_w{true};
-  std::atomic<bool> hold_purge{true};
-  std::atomic<bool> fail_sync{false};
-  std::atomic<int> purges{0};
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::CompletionGate:BeforeCoalescedSync", [&](void*) {
-        if (!hold_w.exchange(false)) {
-          return;
-        }
-        std::unique_lock<std::mutex> lock(mu);
-        w_held = true;
-        cv.notify_all();
-        cv.wait(lock, [&] { return release_w; });
-      });
-  SyncPoint::GetInstance()->SetCallBack(
-      "FlushJob::MemPurge:BeforeReacquireMutex", [&](void*) {
-        if (!hold_purge.exchange(false)) {
-          return;
-        }
-        std::unique_lock<std::mutex> lock(mu);
-        purge_held = true;
-        cv.notify_all();
-        cv.wait(lock, [&] { return release_purge; });
-      });
-  std::atomic<int> purges_failed{0};
-  SyncPoint::GetInstance()->SetCallBack("DBImpl::FlushJob:MemPurgeSuccessful",
-                                        [&](void*) { purges++; });
-  SyncPoint::GetInstance()->SetCallBack("DBImpl::FlushJob:MemPurgeUnsuccessful",
-                                        [&](void*) { purges_failed++; });
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::SyncWalsFromCompletionGate:AfterGateSync", [&](void* arg) {
-        if (fail_sync.exchange(false)) {
-          *static_cast<IOStatus*>(arg) = Retryable("injected gate sync error");
-        }
-      });
-  WriteOptions sync_wo;
-  sync_wo.sync = true;
-  Writer w([&] {
-    WriteBatch batch;
-    EXPECT_OK(batch.DeleteRange(handles_[cf], "k1", "k3"));
-    EXPECT_OK(batch.Put(handles_[cf], "w", "v"));
-    return db_->Write(sync_wo, &batch);
-  });
-  {
-    std::unique_lock<std::mutex> lock(mu);
-    ASSERT_TRUE(
-        cv.wait_for(lock, std::chrono::seconds(30), [&] { return w_held; }));
-  }
-  // Overwrites of one key: garbage MemPurge drops, filling the memtable
-  // until a write-buffer-full flush picks it.
-  Random rnd(301);
-  const std::string filler_value = rnd.RandomString(10240);
-  for (int i = 0; i < 1000; ++i) {
-    {
-      std::lock_guard<std::mutex> lock(mu);
-      if (purge_held) {
-        break;
-      }
-    }
-    ASSERT_OK(Put(cf, "filler", filler_value));
-  }
-  {
-    std::unique_lock<std::mutex> lock(mu);
-    ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(30),
-                            [&] { return purge_held; }));
-    fail_sync = true;
-    release_w = true;
-    cv.notify_all();
-  }
-  const Status w_status = w.Join();
-  {
-    std::lock_guard<std::mutex> lock(mu);
-    release_purge = true;
-    cv.notify_all();
-  }
-  ASSERT_NOK(w_status);
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(30);
-  while (purges.load() + purges_failed.load() == 0 &&
-         std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  }
-  SyncPoint::GetInstance()->ClearAllCallBacks();
-  ASSERT_EQ(1, purges.load());
-
-  auto expect_hidden = [&](const std::string& phase) {
-    SCOPED_TRACE(phase);
-    EXPECT_EQ("v", Get(cf, "k1"));
-    EXPECT_EQ("v", Get(cf, "k2"));
-    EXPECT_EQ("NOT_FOUND", Get(cf, "w"));
-  };
-  expect_hidden("masked");
-  ASSERT_OK(dbfull()->Resume());
-  ASSERT_OK(Flush(cf));
-  expect_hidden("flushed");
-  ReopenWithPartitions(2, options);
-  expect_hidden("reopened");
-}
-
-// GC21 Q5 (GC20 Q8): a sync write that consumes no sequence (LogData only)
-// and whose gate fsync fails fences nothing: its group holds no sequence to
-// hide. After Resume() the WAL manager holds no indeterminate write.
-// Neuter: fence a zero-count group as [target, target] (in place of the
-// `low > high` return in InstallFailedGateSyncFence); an indeterminate write
-// and a fence are recorded.
+// GC21 Q5 (GC20 Q8), under D-9: a sync write that consumes no sequence
+// (LogData only) and whose gate fsync fails holds no sequence: once nothing
+// was allocated above it, its fence closes empty at Resume(), holding no
+// sequence, and the WAL manager holds no indeterminate write.
+// Neuter: close the fence at max(low, last allocated), as before; an
+// indeterminate write is recorded and the fence holds a sequence.
 TEST_P(DBWalAppendFailureTest, FailedZeroCountGateSyncRecordsNoIndeterminate) {
   Options options = FailureOptions();
   OpenWithPartitions(2, options);
@@ -14643,7 +14500,9 @@ TEST_P(DBWalAppendFailureTest, FailedZeroCountGateSyncRecordsNoIndeterminate) {
   ASSERT_FALSE(dbfull()->TEST_GetBGError().ok());
   ASSERT_OK(dbfull()->Resume());
   EXPECT_FALSE(dbfull()->TEST_HasIndeterminateWriteSequence());
-  EXPECT_TRUE(dbfull()->TEST_WalGateFences().empty());
+  for (const auto& [low, high] : dbfull()->TEST_WalGateFences()) {
+    EXPECT_GT(low, high);
+  }
 }
 
 TEST_P(DBWritePartitionTest, PublicationBoundedForParallelGroup) {

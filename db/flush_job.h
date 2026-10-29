@@ -128,14 +128,10 @@ class FlushJob {
   }
 
   // Leaves every entry at or above `sequence` out of the flush output, point
-  // entries and range tombstones alike, and every point entry inside one of
-  // `ranges` (failed gate syncs at N>1). Set before PickMemTable() with the
+  // entries and range tombstones alike. Set before PickMemTable() with the
   // DB mutex held.
-  void DropEntriesAtOrAbove(
-      SequenceNumber sequence,
-      std::vector<std::pair<SequenceNumber, SequenceNumber>> ranges = {}) {
+  void DropEntriesAtOrAbove(SequenceNumber sequence) {
     drop_entries_at_or_above_ = sequence;
-    drop_entry_ranges_ = std::move(ranges);
   }
 
  private:
@@ -258,7 +254,6 @@ class FlushJob {
   BlobFileCompletionCallback* blob_callback_;
   bool fast_sst_open_;
   SequenceNumber drop_entries_at_or_above_ = kMaxSequenceNumber;
-  std::vector<std::pair<SequenceNumber, SequenceNumber>> drop_entry_ranges_;
   // Write-path blob files that should be committed with this flush.
   std::vector<BlobFileAddition> external_blob_file_additions_;
   // Initial garbage for write-path blob files that were partially abandoned

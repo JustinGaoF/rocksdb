@@ -132,6 +132,7 @@ Status DBImpl::TEST_SwitchMemtable(ColumnFamilyData* cfd) {
 
   Status s;
   void* writer = TEST_BeginWrite();
+  WaitForUnpublishedSyncGroups();
   if (two_write_queues_) {
     AllPartitionsWriter nonmem_w(this, /*nonmem=*/true);
     nonmem_w.EnterUnbatched();

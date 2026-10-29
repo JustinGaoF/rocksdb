@@ -29,7 +29,6 @@
 #include "db/compaction/compaction_iterator.h"
 #include "db/compaction/compaction_job.h"
 #include "db/db_impl/wal_durability_tracker.h"
-#include "db/db_impl/wal_gate_read_mask.h"
 #include "db/error_handler.h"
 #include "db/event_helpers.h"
 #include "db/external_sst_file_ingestion_job.h"
@@ -910,13 +909,6 @@ class DBImpl : public DB
                                SequenceNumber snapshot_seq, const Slice& key,
                                LazyWideColumns* result);
 
-  // N>1: a read mask for a tailing iterator (LiveWalGateReadMask), which
-  // RegisterTailingWalGateReadMaskCleanup ties to the iterator; nullptr at
-  // one partition.
-  ReadCallback* NewTailingWalGateReadMask();
-  void RegisterTailingWalGateReadMaskCleanup(Iterator* iter,
-                                             ReadCallback* mask);
-
   // If `snapshot` == kMaxSequenceNumber, set a recent one inside the file.
   ArenaWrappedDBIter* NewIteratorImpl(const ReadOptions& options,
                                       ColumnFamilyHandleImpl* cfh,
@@ -1599,13 +1591,6 @@ class DBImpl : public DB
   // prove a failure fenced nothing.
   bool TEST_HasIndeterminateWriteSequence() const {
     return wal_manager_.TEST_HasIndeterminateWriteSequence();
-  }
-
-  // The read mask's ranges, or null once none are left. Tests use it to
-  // prove the mask retires.
-  std::shared_ptr<const WalGateReadMask::Ranges> TEST_WalGateReadMaskRanges()
-      const {
-    return WalGateReadMaskRanges();
   }
 
   // Partition p's lowest registered, not yet completed sequence, or
@@ -3034,6 +3019,20 @@ class DBImpl : public DB
     }
   }
 
+  // What a write group publishes as it exits: [first_sequence,
+  // last_sequence], less the sync writers' sequences from
+  // `sync_first_sequence` (WriteGroup::sync_first_sequence) on, which
+  // RunSyncGate publishes once they are fsynced.
+  void PublishOnGroupExit(size_t wal_partition, SequenceNumber first_sequence,
+                          SequenceNumber last_sequence,
+                          SequenceNumber sync_first_sequence, bool wal_record) {
+    if (sync_first_sequence > first_sequence) {
+      PublishLastSequence(wal_partition, first_sequence,
+                          std::min(last_sequence, sync_first_sequence - 1),
+                          wal_record);
+    }
+  }
+
   // N>1 only. Marks the group's range applied in applied_tracker_ and raises
   // LastSequence() to the applied frontier: the highest sequence at or below
   // which every allocated range, on any partition, has been inserted. A range
@@ -3198,6 +3197,23 @@ class DBImpl : public DB
     while (!lock_wal_owner_thread_id_counts_.empty()) {
       bg_cv_.Wait();
     }
+
+    WaitForUnpublishedSyncGroups();
+  }
+
+  // N>1: a sync group leaves its write queue before its sync writers'
+  // batches are fsynced, inserted and published (RunSyncGate). Waits until
+  // each such group published or fenced them, so no memtable switch comes
+  // between their allocation and their insert, and no write in flight holds
+  // a sequence above LastSequence() (AssertLastSequenceCoversAllocated).
+  // REQUIRES: mutex_ held, and every write queue (or the closed memtable
+  // switch gate), so no group can start counting meanwhile.
+  void WaitForUnpublishedSyncGroups() {
+    mutex_.AssertHeld();
+    while (unpublished_sync_groups_.load() != 0) {
+      TEST_SYNC_POINT("DBImpl::WaitForUnpublishedSyncGroups:Wait");
+      bg_cv_.Wait();
+    }
   }
 
   // TaskType is used to identify tasks in thread-pool, currently only
@@ -3299,7 +3315,23 @@ class DBImpl : public DB
                                        SequenceNumber* last_sequence_before,
                                        uint64_t* wal_index,
                                        size_t wal_partition,
-                                       bool register_durability);
+                                       bool register_durability) {
+    return AllocateSequenceAndWALIndex(sequence_count, write_wal,
+                                       last_sequence_before, wal_index,
+                                       wal_partition, register_durability,
+                                       /*leading_sequence_count=*/0);
+  }
+  // As above. Above one partition, a nonzero `leading_sequence_count`
+  // registers the block's first that many sequences for publication as a
+  // range of their own, ahead of the rest: a sync group's async writers',
+  // which publish before the group's fsync (RunSyncGate). The rest is
+  // registered even when empty.
+  IOStatus AllocateSequenceAndWALIndex(size_t sequence_count, bool write_wal,
+                                       SequenceNumber* last_sequence_before,
+                                       uint64_t* wal_index,
+                                       size_t wal_partition,
+                                       bool register_durability,
+                                       size_t leading_sequence_count);
 
   // Writes a void record covering `wal_index`, which was allocated but whose
   // data record never reached the WAL. Every allocated index must end up
@@ -3351,9 +3383,11 @@ class DBImpl : public DB
                                      SequenceNumber* last_sequence,
                                      size_t seq_inc);
 
-  // Blocks until LastSequence() covers `target` and, for a group with a WAL
-  // record (`wal_record`), the durability frontier covers it too, i.e. every
-  // WAL record at or below it completed. Its only other exits: the status of
+  // Blocks until LastSequence() covers `target` (`published`) and, for a
+  // group with a WAL record (`wal_record`), the durability frontier covers it
+  // too, i.e. every WAL record at or below it completed. A sync group waits
+  // without `published` for its records below to complete before its range
+  // publishes (RunSyncGate). Its only other exits: the status of
   // a gate fence holding `target` (a range at or below it failed, so it can
   // never be acknowledged, even once recovery covers it), and
   // ShutdownInProgress once shutdown begins while still uncovered. Any other
@@ -3361,10 +3395,8 @@ class DBImpl : public DB
   // append succeeded. Called without holding any mutex; takes
   // sequence_wal_index_mutex_ only to check fences and park, never together
   // with mutex_.
-  // `low` is the group's first sequence, when known: a zero-count group
-  // (low > target) lies above an exact fence ending at its target.
   Status WaitForWalDurability(SequenceNumber target, bool wal_record,
-                              SequenceNumber low = 0);
+                              bool published);
 
   // Wakes durability waiters after the frontier advanced. Call with
   // sequence_wal_index_mutex_ held, which every Complete site already holds;
@@ -3404,65 +3436,28 @@ class DBImpl : public DB
   Status ExplainBurnedWALIndices(const WriteOptions& write_options);
 
   // N>1 only. Fences every gate whose target is at or above `low`: a range
-  // starting there failed (its append, or its memtable insert), so nothing
-  // at or above it can ever be acknowledged (D-1). The fence stays open-ended
-  // until recovery releases the range (`released_by_recovery`; a failed
-  // insert's range is never released), and holds `status` (the background
-  // error) for those gates to return. Wakes parked gates. A failed gate sync
-  // passes `high`, its group's last sequence, for a fence closed from the
-  // start (InstallFailedGateSyncFence).
+  // starting there failed (its append, its gate sync, or its memtable
+  // insert), so nothing at or above it can ever be acknowledged (D-1, D-9).
+  // The fence stays open-ended until recovery releases the range
+  // (`released_by_recovery`; a failed insert's range is never released), and
+  // holds `status` (the background error) for those gates to return. Wakes
+  // parked gates.
   // REQUIRES: mutex_ held.
   void InstallWalGateFence(SequenceNumber low, const Status& status,
-                           bool released_by_recovery,
-                           SequenceNumber high = kMaxSequenceNumber);
+                           bool released_by_recovery);
 
-  // N>1 only. A sync write's gate sync failed after its group, [low, high],
-  // inserted and published (D-7, D-8): fences exactly that range, records it
-  // indeterminate, and hides it from every read that starts afterwards and
-  // from every flush (wal_gate_read_masks_). Writes outside it keep their
-  // outcome. Does nothing for a group that consumed no sequence (low >
-  // high): it has nothing to hide, and a fence there would hold a sequence
-  // nobody owns. Called in the mutex_ section that records the failure
-  // (WALIOStatusCheck), or by FenceFailedGateSync when that never ran.
-  // REQUIRES: mutex_ held.
-  void InstallFailedGateSyncFence(SequenceNumber low, SequenceNumber high,
-                                  const Status& status);
-
-  // Drops every read mask once no memtable that held a masked range is left:
-  // flushes, recovery's included, dropped the ranges, so the read path
-  // returns to no mask. A memtable counts until its final Unref(), so a read
-  // that still holds an older superversion delays retirement; masked
-  // memtables skip history (MemTableListVersion::Remove). Called in every
-  // superversion install, so in step with the flush that frees the last one,
-  // and after each background flush.
-  // REQUIRES: mutex_ held.
-  void MaybeRetireWalGateReadMasks();
-
-  // The ranges InstallFailedGateSyncFence hid, or null when there are none
-  // (always at one partition). One acquire load when null.
-  std::shared_ptr<const WalGateReadMask::Ranges> WalGateReadMaskRanges() const {
-    if (!wal_gate_read_masked_.load(std::memory_order_acquire)) {
-      return nullptr;
-    }
-    MutexLock l(&wal_gate_read_mask_mutex_);
-    return wal_gate_read_masks_;
-  }
-
-  // The status of a fence holding `target`, or OK. An exact fence (a failed
-  // gate sync's) holds only groups that start at or below its high: a
-  // zero-count group whose target is its high lies above it.
+  // The status of a fence holding `target`, or OK.
   // REQUIRES: sequence_wal_index_mutex_ held.
-  Status WalGateFenceStatusLocked(SequenceNumber target,
-                                  SequenceNumber low = 0) const;
+  Status WalGateFenceStatusLocked(SequenceNumber target) const;
 
   // As above, without the mutex when no fence can hold `target`.
-  Status WalGateFenceStatus(SequenceNumber target, SequenceNumber low = 0) {
+  Status WalGateFenceStatus(SequenceNumber target) {
     if (target < wal_gate_fence_low_.load(std::memory_order_acquire) ||
         target > wal_gate_fence_high_.load(std::memory_order_acquire)) {
       return Status::OK();
     }
     InstrumentedMutexLock l(&sequence_wal_index_mutex_);
-    return WalGateFenceStatusLocked(target, low);
+    return WalGateFenceStatusLocked(target);
   }
 
   // The lowest sequence an unreleased fence holds, or kMaxSequenceNumber.
@@ -3471,39 +3466,56 @@ class DBImpl : public DB
   // REQUIRES: mutex_ held.
   SequenceNumber UnreleasedWalGateFenceLow();
 
-  // The ranges of failed gate syncs, which a flush drops as well. Read in
-  // the mutex_ section that picks the memtables, which a failed gate sync's
-  // range never misses: it is installed in the section that records the
-  // failure.
-  WalGateReadMask::Ranges FailedGateSyncFlushDrops() const {
-    auto ranges = WalGateReadMaskRanges();
-    return ranges != nullptr ? *ranges : WalGateReadMask::Ranges{};
-  }
-
-  // As above, with sequence_wal_index_mutex_ held instead.
-  SequenceNumber OpenWalGateFenceLowLocked() const;
-
   // Runs a write group's completion gate: wait until the durability frontier
   // covers `target`, then, for a sync write whose first fsync may not cover
   // it (`pre_sync_safe_point` < `target`), sync again so the sync covers
   // every predecessor. Returns the outcome to merge into the status handed
-  // to followers. The wait also covers publication (see
+  // to followers. With `published` the wait also covers publication (see
   // WaitForWalDurability).
   // `sync_micros` is the sync write's claim and fsync time so far, which the
   // gate's own sync adds to before recording WAL_SYNC_BARRIER_MICROS.
-  // `low` is the group's first sequence, which a failed sync fences.
-  // `group` is the sync group's registration (RegisterGateSyncGroup), if any.
-  struct WalGateSyncWaiter;
+  // `low` is the group's first sequence.
   Status RunCompletionGate(SequenceNumber low, SequenceNumber target, bool sync,
-                           SequenceNumber pre_sync_safe_point,
-                           uint64_t sync_micros,
-                           WalGateSyncWaiter* group = nullptr);
+                           bool published, SequenceNumber pre_sync_safe_point,
+                           uint64_t sync_micros);
 
-  // N>1 only. A sync write's own fsync (D-G11 (c)), run from its completion
-  // gate once its group has inserted and published, so no write on any
-  // partition waits for it: claims every partition, fsyncs every live WAL,
-  // marks them synced and records them in the MANIFEST. A failure stops the
-  // DB.
+  // N>1 only. The completion gate of a sync group's sync writers, whose
+  // range [low, target] on `wal_partition` is written to the WAL but neither
+  // inserted nor published (D-9): fsyncs every partition (coalesced, and
+  // again if a record below landed after the first fsync,
+  // RunCompletionGate), runs the sync writers' pre-release callbacks,
+  // inserts their batches (with the leader's `write_options`), then
+  // publishes the range and waits until it is visible, as one partition
+  // does in its write group. On any failure the range is never published
+  // (FailUnpublishedSyncRange, or HandleMemTableInsertFailure). Either way
+  // it leaves unpublished_sync_groups_ before the visibility wait.
+  // `write_group` holds only the leader and the sync writers by then.
+  Status RunSyncGate(size_t wal_partition, SequenceNumber low,
+                     SequenceNumber target, const WriteOptions& write_options,
+                     const WriteThread::WriteGroup& write_group,
+                     bool disable_memtable, size_t pre_release_callback_cnt);
+
+  // N>1 only. A sync group's range [low, high] failed before it was
+  // published. After a failed fsync, or a failed pre-release callback (which
+  // sets the background error from `status` when none is set), handles it
+  // as WALIOStatusCheck handles a failed append's range: pinned in
+  // failed_wal_ranges_ under an open fence at `low`, so it and every write
+  // above it fail, and every flush drops their entries until recovery
+  // releases it. Otherwise no background error is set (the MANIFEST record
+  // of the sync failed, or shutdown began): publishes the range as a hole,
+  // as one partition's failed write inserts nothing. Takes mutex_.
+  void FailUnpublishedSyncRange(size_t wal_partition, SequenceNumber low,
+                                SequenceNumber high, const Status& status,
+                                bool callback_failed);
+
+  // Leaves unpublished_sync_groups_, waking WaitForPendingWrites at zero.
+  // Takes mutex_ then; call without it.
+  void EndUnpublishedSyncGroup();
+
+  // N>1 only. A sync write's own fsync, run from its completion gate once
+  // its group has inserted, so no write on another partition waits for it:
+  // claims every partition, fsyncs every live WAL, marks them synced and
+  // records them in the MANIFEST. A failure stops the DB.
   Status SyncWalsFromCompletionGate(Env::IOPriority rate_limiter_priority);
 
   // N>1 only. Runs a completion gate's `sync`, which must cover every record
@@ -3514,36 +3526,10 @@ class DBImpl : public DB
   // at or below which every record is now synced (when `sync` ran, the
   // durability safe point read just before it). Takes only
   // wal_gate_sync_mutex_, never across `sync`. A gate that queued on a sync
-  // that fails returns that sync's status. If `sync` fails, fences the group,
-  // [low, target] (InstallFailedGateSyncFence), and every queued group, in the
-  // mutex_ section that records the failure, before any waiter rechecks.
-  // A registered sync group passes its registration as `group`, which that
-  // section fences whether or not it is queued.
+  // that fails returns that sync's status.
   Status RunCoalescedGateSync(SequenceNumber low, SequenceNumber target,
                               SequenceNumber* covered,
-                              const std::function<Status()>& sync,
-                              WalGateSyncWaiter* group = nullptr);
-
-  // N>1 only. Registers a sync group that consumes sequences, [low, target],
-  // when its completion gate is installed, before its memtable insert and
-  // before it leaves the write group: from then on a failed gate sync fences
-  // it in the mutex_ section that records the failure, wherever its gate is
-  // (a memtable switch waits only for groups still in the write group). The
-  // registration ends with EndGateSyncGroup, or when the returned pointer is
-  // released.
-  std::shared_ptr<WalGateSyncWaiter> RegisterGateSyncGroup(
-      SequenceNumber low, SequenceNumber target);
-  // Ends `group`'s registration as its gate returns `status`: a group fenced
-  // meanwhile fails with the failure that fenced it, since the fence hides it
-  // and every flush drops it.
-  Status EndGateSyncGroup(WalGateSyncWaiter* group, const Status& status);
-
-  // N>1 only. A sync write's gate sync failed with `status` and no
-  // WALIOStatusCheck installed its fence (the failure was an earlier one's,
-  // or not a WAL I/O error): installs it now (InstallFailedGateSyncFence).
-  // Takes mutex_.
-  void FenceFailedGateSync(SequenceNumber low, SequenceNumber target,
-                           const Status& status);
+                              const std::function<Status()>& sync);
 
   // Fsyncs every partition's live WALs, each partition under its own WAL
   // mutex above one partition (all N with manual flush); at one partition
@@ -4323,17 +4309,12 @@ class DBImpl : public DB
   uint64_t wal_gate_synced_epoch_ = 0;
   uint64_t wal_gate_sync_failed_epoch_ = 0;
   Status wal_gate_sync_failed_status_;
-  // Gates queued on the running sync, each of which shares its failure, and
-  // registered sync groups (RegisterGateSyncGroup). WALIOStatusCheck fences
-  // them (and sets `fenced` and `status`) in the mutex_ section that records
-  // a failed gate sync.
-  struct WalGateSyncWaiter {
-    SequenceNumber low;
-    SequenceNumber target;
-    bool fenced;
-    Status status;
-  };
-  std::vector<WalGateSyncWaiter*> wal_gate_sync_waiters_;
+  // N>1: sync groups counted from their completion gate's install, in their
+  // write group, until RunSyncGate publishes or fences their sync writers'
+  // range (or their group fails before the gate runs). While one is
+  // counted, its range is allocated but neither inserted nor published, so
+  // WaitForPendingWrites waits for zero before any memtable switch.
+  std::atomic<uint32_t> unpublished_sync_groups_{0};
 
   // Serializes sequence-block and WAL-index allocation across all WAL
   // partitions. It is never held across batch merging or I/O.
@@ -4360,34 +4341,16 @@ class DBImpl : public DB
   // releases the failed range. Kept for the DB's lifetime, one per failure,
   // so a write held past recovery still fails. Guarded by
   // sequence_wal_index_mutex_; the bounds below are stored under it and read
-  // lock-free, so a gate outside every fence pays two loads. An exact fence
-  // (a failed gate sync's group) is closed from the start.
+  // lock-free, so a gate outside every fence pays two loads.
   struct WalGateFence {
     SequenceNumber low;
     SequenceNumber high;
     Status status;
     bool released_by_recovery;
-    bool exact;
   };
   std::vector<WalGateFence> wal_gate_fences_;
   std::atomic<SequenceNumber> wal_gate_fence_low_{kMaxSequenceNumber};
   std::atomic<SequenceNumber> wal_gate_fence_high_{0};
-  // The closed fences of failed gate syncs, as read masks
-  // (InstallFailedGateSyncFence). Copy-on-write under
-  // wal_gate_read_mask_mutex_, a leaf taken below mutex_ and
-  // sequence_wal_index_mutex_; the flag is set once the first range is in.
-  // Kept until no memtable that may hold a range is left
-  // (MaybeRetireWalGateReadMasks): an iterator or a flush may still hold
-  // one. The version moves whenever the ranges change.
-  mutable port::Mutex wal_gate_read_mask_mutex_;
-  std::shared_ptr<const WalGateReadMask::Ranges> wal_gate_read_masks_;
-  std::atomic<bool> wal_gate_read_masked_{false};
-  std::atomic<uint64_t> wal_gate_read_mask_version_{0};
-  // The ranges as the memtables live at each install hold them; each expires
-  // once every one of those memtables is released (its final Unref()).
-  // Guarded by mutex_.
-  std::vector<std::weak_ptr<const ReadOnlyMemTable::MaskedSequenceRanges>>
-      wal_gate_masked_memtables_;
   uint64_t next_wal_index_ = log::kWALIndexStartNumber;
 
   // If zero, manual compactions are allowed to proceed. If non-zero, manual

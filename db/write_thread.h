@@ -109,6 +109,16 @@ class WriteThread {
     // single-WAL group, groups that consume no sequence without a record,
     // ingestion), which exit exactly as before.
     std::function<Status()> completion_gate;
+    // Above one WAL partition, a group led by a sync write gives its async
+    // writers its lower sequences, in group order, and its sync writers the
+    // rest, from sync_first_sequence on; the merged WAL batch follows that
+    // order. kMaxSequenceNumber in every other group. Set by DBImpl.
+    SequenceNumber sync_first_sequence = kMaxSequenceNumber;
+    // Set by DBImpl on such a group that has async writers. Runs before
+    // completion_gate, which fsyncs: once it returns, ExitAsBatchGroupLeader
+    // completes the async writers with its outcome and leaves only the
+    // leader and the sync writers in the group.
+    std::function<Status()> async_writers_gate;
     // Outcome of completion_gate, set by ExitAsBatchGroupLeader when it runs
     // the gate. Lets ExitAsBatchGroupFollower hand the gate outcome to the
     // leader, whose own status is otherwise untouched by the exit.
@@ -521,6 +531,10 @@ class WriteThread {
 
   // Set writer state and wake the writer up if it is waiting.
   void SetState(Writer* w, uint8_t new_state);
+
+  // Completes every async writer of an exiting group with `status`, and
+  // relinks the rest (the leader and the sync writers) as the group.
+  void CompleteAsyncWriters(WriteGroup& write_group, const Status& status);
 
   // Links w into the newest_writer list. Return true if w was linked directly
   // into the leader position.  Safe to call from multiple threads without
