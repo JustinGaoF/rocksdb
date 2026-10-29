@@ -342,6 +342,14 @@ class WALIndexMerger {
   // An attested predecessor the merge stopped for, or zero. Valid after
   // kFrontier.
   uint64_t GetLostPredecessor() const { return lost_predecessor_; }
+  // Whether the drive skipped a superseded-only index that no void older
+  // than its declaration explained: one re-trusted under
+  // continue_past_discarded_holes, or one still pending at the end. A record
+  // written above such an index later reads to the next merge as a live
+  // record above a lost reissue. Valid after kCleanEnd.
+  bool SkippedUnexplainedDiscard() const {
+    return skipped_discard_ || pending_discarded_ != 0;
+  }
   // Whether the lower bound sits at or below every index `wal_number` could
   // have lost from its head: a successor attests it, or a member numbered no
   // higher anchors the bound through its span (every index such a span
@@ -433,6 +441,7 @@ class WALIndexMerger {
   Result terminal_ = Result::kWaiting;
   bool membership_checked_ = false;
   bool lower_bound_set_ = false;
+  bool skipped_discard_ = false;
   uint64_t lower_ = 0;
   uint64_t expected_ = 0;
   uint64_t last_sequence_ = 0;

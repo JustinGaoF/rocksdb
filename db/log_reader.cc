@@ -629,6 +629,7 @@ void Reader::DecodeWALIndexSupersessionRecord(const Slice& fragment) {
   // readers inherit the same rule. A progress record closes the head: reading
   // one proves no supersession is still coming.
   if (first_record_read_ || last_progress_bound_read_ != 0) {
+    saw_misplaced_supersession_ = true;
     ReportCorruption(
         fragment.size(),
         "WAL_Index supersession follows a data record or progress assertion");

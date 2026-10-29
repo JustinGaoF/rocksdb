@@ -688,6 +688,7 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
       // its live copy, which stays a frontier. (Under skip, recovery opts out
       // of even that via continue_past_discarded_holes.)
       if (continue_past_discarded_holes_) {
+        skipped_discard_ = true;
         expected_++;
         continue;
       }
