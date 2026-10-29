@@ -475,6 +475,17 @@ Status FlushJob::MemPurge() {
   db_mutex_->Unlock();
   assert(!mems_.empty());
 
+  for (ReadOnlyMemTable* m : mems_) {
+    if (m->HasMaskedSequenceRanges()) {
+      // A failed gate sync's entries must be dropped by the flush, not
+      // copied into a live memtable unstamped; fall back to WriteLevel0Table.
+      TEST_SYNC_POINT("FlushJob::MemPurge:SkippedMaskedEntries");
+      db_mutex_->Lock();
+      return Status::Aborted(
+          "Mempurge skipped: masked failed sync entries present.");
+    }
+  }
+
   // Measure purging time.
   const uint64_t start_micros = clock_->NowMicros();
   const uint64_t start_cpu_micros = clock_->CPUMicros();

@@ -917,6 +917,11 @@ void WriteThread::ExitAsBatchGroupLeader(WriteGroup& write_group,
       if (!write_group.gate_status.ok()) {
         status = write_group.gate_status;
       }
+    } else if (write_group.gate_published_release) {
+      // The gate never ran because the group already failed: release its
+      // published-sync registration instead, so a failed sync snapshots only
+      // groups that may still run their gate.
+      write_group.gate_published_release();
     }
 
     while (last_writer != leader) {

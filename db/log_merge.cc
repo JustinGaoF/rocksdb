@@ -455,6 +455,13 @@ Status WALIndexMerger::ComputeLowerBound() {
       }
     }
   }
+  for (const auto& [wal_number, first] : lost_current_wals_) {
+    (void)wal_number;
+    if (first != 0) {
+      lower = std::min(lower, first);
+      have_lower = true;
+    }
+  }
   if (have_lower && history_floor_ != 0 && attested.empty()) {
     lower = std::min(lower, history_floor_);
   }
@@ -633,17 +640,42 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
         break;
       }
     }
-    if (void_covered || swallowed_covered) {
-      // A void in a WAL older than the declaration predates the cut, and an
-      // open at N=1 seeds past such voids: the pending indices below it were
-      // never reissued.
+    if (expected_ >= lost_current_floor_) {
+      // A MANIFEST-tracked current WAL bore this index or one below it, and
+      // the file is gone. With records above it the loss is a frontier,
+      // voids notwithstanding (a void over an index a WAL bore is stale:
+      // the index was written, not burned). A trailing loss stays a tail:
+      // skip toward the members' finish and the clean end below.
+      ClearPendingDiscardedOnPreDeclarerVoid(expected_);
+      if (states_.empty()) {
+        return StopAtFrontier();
+      }
+      bool above = false;
+      bool any_unfinished = false;
       for (auto& state : states_) {
-        if (pending_discarded_ != 0 &&
-            state.member->wal_number() < pending_declarer_ &&
-            state.member->VoidCovers(expected_)) {
-          pending_discarded_ = 0;
+        if (!state.finished) {
+          any_unfinished = true;
+          if (state.has_lookahead && state.lookahead.wal_index > expected_) {
+            above = true;
+            break;
+          }
+          if (state.progress <= expected_) {
+            above = true;
+            break;
+          }
         }
       }
+      if (above) {
+        return StopAtFrontier();
+      }
+      if (any_unfinished) {
+        expected_++;
+        continue;
+      }
+      // All finished: fall through to the clean end below.
+    }
+    if (void_covered || swallowed_covered) {
+      ClearPendingDiscardedOnPreDeclarerVoid(expected_);
       expected_++;
       continue;
     }

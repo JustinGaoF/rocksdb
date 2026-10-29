@@ -41,6 +41,23 @@ class WalMetadata {
 
   uint64_t GetSyncedSizeInBytes() const { return synced_size_bytes_; }
 
+  // N > 1 only: wal_index of this WAL's first data record, or zero when
+  // unknown (older entries, N == 1, unindexed or empty WALs). Recovery
+  // bounds a MANIFEST-tracked current WAL that is missing from disk at this
+  // index. Immutable per WAL number: WAL numbers are never reused.
+  bool HasFirstWALIndex() const { return first_wal_index_ != 0; }
+
+  void SetFirstWALIndex(uint64_t wal_index) { first_wal_index_ = wal_index; }
+
+  uint64_t GetFirstWALIndex() const { return first_wal_index_; }
+
+  // N > 1 only: whether this entry was recorded while the WAL was its
+  // partition's current WAL. A rotation records false. Meaningful only with
+  // HasFirstWALIndex().
+  bool IsCurrentWAL() const { return is_current_wal_; }
+
+  void SetCurrentWAL(bool current) { is_current_wal_ = current; }
+
  private:
   friend bool operator==(const WalMetadata& lhs, const WalMetadata& rhs);
   friend bool operator!=(const WalMetadata& lhs, const WalMetadata& rhs);
@@ -51,10 +68,14 @@ class WalMetadata {
 
   // Size of the most recently synced WAL in bytes.
   uint64_t synced_size_bytes_ = kUnknownWalSize;
+  uint64_t first_wal_index_ = 0;
+  bool is_current_wal_ = false;
 };
 
 inline bool operator==(const WalMetadata& lhs, const WalMetadata& rhs) {
-  return lhs.synced_size_bytes_ == rhs.synced_size_bytes_;
+  return lhs.synced_size_bytes_ == rhs.synced_size_bytes_ &&
+         lhs.first_wal_index_ == rhs.first_wal_index_ &&
+         lhs.is_current_wal_ == rhs.is_current_wal_;
 }
 
 inline bool operator!=(const WalMetadata& lhs, const WalMetadata& rhs) {
@@ -67,6 +88,10 @@ enum class WalAdditionTag : uint32_t {
   kTerminate = 1,
   // Synced Size in bytes.
   kSyncedSize = 2,
+  // First wal_index borne by the WAL (N > 1 only).
+  kFirstWALIndex = 3,
+  // Whether the WAL was current when recorded: 0 or 1 (N > 1 only).
+  kCurrentWAL = 4,
   // Add tags in the future, such as checksum?
 };
 

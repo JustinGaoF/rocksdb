@@ -6,7 +6,8 @@
 // Copyright (c) 2011 The LevelDB Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
-#ifndef NDEBUG
+//
+// Unguarded (see db_impl.h): the TEST_ helpers compile in opt builds too.
 #include <iostream>
 #include <unordered_set>
 
@@ -517,4 +518,3 @@ void DBImpl::TEST_VerifyNoObsoleteFilesCached(
   table_cache_->ApplyToAllEntries(fn, {});
 }
 }  // namespace ROCKSDB_NAMESPACE
-#endif  // NDEBUG

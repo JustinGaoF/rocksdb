@@ -109,6 +109,11 @@ class WriteThread {
     // single-WAL group, groups that consume no sequence without a record,
     // ingestion), which exit exactly as before.
     std::function<Status()> completion_gate;
+    // Releases the group's published-sync registration (DBImpl's
+    // wal_gate_published_groups_) when the exit skips its completion gate
+    // because the group already failed. Empty when the group never
+    // registered (no gate, or a non-sync write).
+    std::function<void()> gate_published_release;
     // Outcome of completion_gate, set by ExitAsBatchGroupLeader when it runs
     // the gate. Lets ExitAsBatchGroupFollower hand the gate outcome to the
     // leader, whose own status is otherwise untouched by the exit.

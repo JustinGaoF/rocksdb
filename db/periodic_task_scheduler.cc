@@ -115,13 +115,12 @@ Timer* PeriodicTaskScheduler::Default() {
   return &timer;
 }
 
-#ifndef NDEBUG
+// Unguarded with the header (see periodic_task_scheduler.h).
 void PeriodicTaskScheduler::TEST_OverrideTimer(SystemClock* clock) {
   static Timer test_timer(clock);
   test_timer.TEST_OverrideTimer(clock);
   MutexLock l(&timer_mutex);
   timer_ = &test_timer;
 }
-#endif  // NDEBUG
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -201,6 +201,9 @@ class SpecialEnv : public EnvWrapper {
         // Check preallocation size
         // preallocation size is never passed to base file.
         size_t preallocation_size = preallocation_block_size();
+        // In opt builds TEST_SYNC_POINT_CALLBACK is empty, leaving the
+        // variable unused (a -Werror failure). Mark it used in both modes.
+        (void)preallocation_size;
         TEST_SYNC_POINT_CALLBACK("DBTestWritableFile.GetPreallocationStatus",
                                  &preallocation_size);
 #endif  // !(defined NDEBUG) || !defined(OS_WIN)

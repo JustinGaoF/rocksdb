@@ -1403,7 +1403,9 @@ class DBImpl : public DB
   Status WaitForCompact(
       const WaitForCompactOptions& wait_for_compact_options) override;
 
-#ifndef NDEBUG
+  // TEST_ helpers, unguarded: the opt-capable snapshot stress check (and the
+  // shared test utils it links) need them in release builds too. They are
+  // inert accessors; SyncPoint stays debug-only.
   // Compact any files in the named level that overlap [*begin, *end]
   Status TEST_CompactRange(int level, const Slice* begin, const Slice* end,
                            ColumnFamilyHandle* column_family = nullptr,
@@ -1546,12 +1548,6 @@ class DBImpl : public DB
 
   size_t TEST_NumWalPartitions() const { return NumWalPartitions(); }
 
-  // As WalPartitionForWrite, with deferred PutEntity ops given by column
-  // family id (the only field routing reads). Null means no deferred ops.
-  static Status TEST_WalPartitionForWrite(
-      const WriteBatch& batch, size_t num_partitions, size_t* wal_partition,
-      const std::vector<uint32_t>* deferred_cf_ids = nullptr);
-
   // A WAL partition's alive WALs in deque order, as {number, size} pairs, and
   // the number of the WAL its writer appends to.
   std::vector<std::pair<uint64_t, uint64_t>> TEST_AliveWalFiles(
@@ -1652,7 +1648,11 @@ class DBImpl : public DB
     InstrumentedMutexLock lock(&sequence_wal_index_mutex_);
     next_wal_index_ = next_wal_index;
   }
-#endif  // NDEBUG
+  // As WalPartitionForWrite, with deferred PutEntity ops given by column
+  // family id (the only field routing reads). Null means no deferred ops.
+  static Status TEST_WalPartitionForWrite(
+      const WriteBatch& batch, size_t num_partitions, size_t* wal_partition,
+      const std::vector<uint32_t>* deferred_cf_ids = nullptr);
 
   // In certain configurations, verify that the table/blob file cache only
   // contains entries for live files, to check for effective leaks of open
@@ -2537,6 +2537,10 @@ class DBImpl : public DB
     // own fsync (SyncWalPartitionFiles) and, for every successful sync, to
     // the size at its mark when the sync finishes (FinishWalPartitionSync).
     uint64_t synced_size = 0;
+    // N > 1 only: the MANIFEST already tracks this WAL's first wal_index,
+    // recorded when the WAL first became durable. Guards the one tracking
+    // write per WAL; a rotation records the inactive entry separately.
+    bool manifest_first_durable_tracked = false;
 
    private:
     // true for some prefix of the partition's deque
@@ -3400,6 +3404,15 @@ class DBImpl : public DB
   // failure the indices stay pending and the DB stays write-stopped.
   Status ExplainBurnedWALIndices(const WriteOptions& write_options);
 
+  // Whether any burned WAL index still awaits explanation. The retry-flush
+  // recovery path rotates no WALs, so with burns pending Resume takes the
+  // full path instead, whose switches rotate. REQUIRES: mutex_ held.
+  bool BurnedWalIndicesPending() {
+    mutex_.AssertHeld();
+    InstrumentedMutexLock l(&sequence_wal_index_mutex_);
+    return !burned_wal_indices_.empty();
+  }
+
   // N>1 only. Fences every gate whose target is at or above `low`: a range
   // starting there failed (its append, or its memtable insert), so nothing
   // at or above it can ever be acknowledged (D-1). The fence stays open-ended
@@ -3430,6 +3443,42 @@ class DBImpl : public DB
   // returns to no mask. Called after each flush frees its memtables.
   // REQUIRES: mutex_ held.
   void MaybeRetireWalGateReadMasks();
+
+  // Registers a group that published with a completion gate but has not run
+  // it yet (wal_gate_published_groups_); returns its cookie. A failed sync
+  // snapshots every registered range and fences it together with its own
+  // range, so no published group can slip between the error and the fence.
+  uint64_t RegisterGatePublished(SequenceNumber low, SequenceNumber high);
+  // Unregisters a cookie from RegisterGatePublished: called when the
+  // group's gate ran (by GatePublishedGuard), or when the exit skipped the
+  // gate because the group already failed. Idempotent.
+  void UnregisterGatePublished(uint64_t cookie);
+  // Every [low, high] currently registered by RegisterGatePublished.
+  std::vector<std::pair<SequenceNumber, SequenceNumber>>
+  SnapshotWalGatePublished();
+  // Marks every group registered now as sharing this failed sync (see
+  // wal_gate_sync_failed_published_next_). Called in the error section that
+  // fences them. REQUIRES: mutex_ held.
+  void MarkGatePublishedFailed();
+
+  // Holds a RegisterGatePublished cookie for the duration of a completion
+  // gate, unregistering it when the gate finishes (or the write leaves). A
+  // null DB releases nothing: async groups never register.
+  struct GatePublishedGuard {
+    GatePublishedGuard(DBImpl* db, uint64_t cookie)
+        : db_(db), cookie_(cookie) {}
+    ~GatePublishedGuard() {
+      if (db_ != nullptr) {
+        db_->UnregisterGatePublished(cookie_);
+      }
+    }
+    GatePublishedGuard(const GatePublishedGuard&) = delete;
+    GatePublishedGuard& operator=(const GatePublishedGuard&) = delete;
+
+   private:
+    DBImpl* db_;
+    uint64_t cookie_;
+  };
 
   // The ranges InstallFailedGateSyncFence hid, or null when there are none
   // (always at one partition). One acquire load when null.
@@ -3485,9 +3534,13 @@ class DBImpl : public DB
   // `sync_micros` is the sync write's claim and fsync time so far, which the
   // gate's own sync adds to before recording WAL_SYNC_BARRIER_MICROS.
   // `low` is the group's first sequence, which a failed sync fences.
+  // `gate_published_cookie` is the group's RegisterGatePublished cookie (0
+  // when it never registered), passed to the gate's second sync so that sync
+  // shares a failure sectioned after the group published.
   Status RunCompletionGate(SequenceNumber low, SequenceNumber target, bool sync,
                            SequenceNumber pre_sync_safe_point,
-                           uint64_t sync_micros);
+                           uint64_t sync_micros,
+                           uint64_t gate_published_cookie);
 
   // N>1 only. A sync write's own fsync (D-G11 (c)), run from its completion
   // gate once its group has inserted and published, so no write on any
@@ -3507,14 +3560,41 @@ class DBImpl : public DB
   // that fails returns that sync's status. If `sync` fails, fences the group,
   // [low, target] (InstallFailedGateSyncFence), and every queued group, in the
   // mutex_ section that records the failure, before any waiter rechecks.
+  // `gate_published_cookie` is the caller's RegisterGatePublished cookie (0
+  // when it never registered): a cookie at or below
+  // wal_gate_sync_failed_published_next_ published before a failed sync's
+  // section and shares that failure instead of syncing or waiting.
   Status RunCoalescedGateSync(SequenceNumber low, SequenceNumber target,
                               SequenceNumber* covered,
-                              const std::function<Status()>& sync);
+                              const std::function<Status()>& sync,
+                              uint64_t gate_published_cookie);
+
+  // N>1 only. Fences every group queued on a failed gate sync except the
+  // runner itself (marked, so its shared path skips its own install).
+  // Called in the mutex_ section that records the failure and again when the
+  // failure is published, covering waiters that queued after the section.
+  // Repeats are no-ops inside InstallFailedGateSyncFence. REQUIRES: mutex_
+  // held.
+  void FenceGateSyncStragglers(const Status& status);
+  // N>1 only. Fences every group that published but has not run its gate
+  // yet, marking them as sharing the failure (MarkGatePublishedFailed).
+  // Called where a failure is recorded (the error section, or
+  // FenceFailedGateSync when no section ran) and again when the failure is
+  // published, covering groups that published after the section: each shares
+  // the failure via the mark and must fail closed, since a recovery flush
+  // may already hold its data. Groups that publish after the publication run
+  // fresh syncs and are safe from this failure. Repeats are no-ops inside
+  // InstallFailedGateSyncFence. REQUIRES: mutex_ held.
+  void FenceGatePublishedGroups(const Status& status);
 
   // N>1 only. A sync write's gate sync failed with `status` and no
   // WALIOStatusCheck installed its fence (the failure was an earlier one's,
-  // or not a WAL I/O error): installs it now (InstallFailedGateSyncFence).
-  // Takes mutex_.
+  // or not a WAL I/O error): installs it now (InstallFailedGateSyncFence),
+  // fences every group that published but has not run its gate yet, and
+  // marks them as sharing the failure (MarkGatePublishedFailed). Takes
+  // mutex_. A waiter that shared the failure but missed the section's fence
+  // installs only its own range (it must not fence groups that published
+  // after the failed sync); see RunCoalescedGateSync.
   void FenceFailedGateSync(SequenceNumber low, SequenceNumber target,
                            const Status& status);
 
@@ -4305,6 +4385,25 @@ class DBImpl : public DB
     bool fenced;
   };
   std::vector<WalGateSyncWaiter*> wal_gate_sync_waiters_;
+  // Groups that published with a completion gate but have not run it yet:
+  // cookie -> published-visible [low, high]. The group registers at WriteImpl
+  // (RegisterGatePublished) and unregisters when its gate finishes or the
+  // exit skips its gate; a failed sync snapshots every entry and fences each
+  // together with its own range, so no published group slips between the
+  // error section and a straggler's late fence. Leaf mutex: taken alone, or
+  // under mutex_; never take mutex_ under it.
+  InstrumentedMutex wal_gate_published_mutex_;
+  std::map<uint64_t, std::pair<SequenceNumber, SequenceNumber>>
+      wal_gate_published_groups_;
+  uint64_t wal_gate_published_next_ = 0;
+  // The registry counter as of the latest failed gate sync's error section.
+  // A group whose cookie is at or below it published before that sync's
+  // failed fsync returned, so its page may be lost: its gate shares the
+  // failure instead of running its own sync, like a waiter queued on the
+  // failed sync. Written in the error section (MarkGatePublishedFailed),
+  // read lock-free by RunCoalescedGateSync's loop (which holds
+  // wal_gate_sync_mutex_ and so cannot take mutex_).
+  std::atomic<uint64_t> wal_gate_sync_failed_published_next_{0};
 
   // Serializes sequence-block and WAL-index allocation across all WAL
   // partitions. It is never held across batch merging or I/O.
@@ -4347,9 +4446,10 @@ class DBImpl : public DB
   // (InstallFailedGateSyncFence). Copy-on-write under
   // wal_gate_read_mask_mutex_, a leaf taken below mutex_ and
   // sequence_wal_index_mutex_; the flag is set once the first range is in.
-  // Kept until no memtable that may hold a range is left
-  // (MaybeRetireWalGateReadMasks): an iterator or a flush may still hold
-  // one. The version moves whenever the ranges change.
+  // Kept until no unflushed memtable still hides a range
+  // (MaybeRetireWalGateReadMasks): flushed memtables dropped those ranges,
+  // and history memtables are invisible to normal reads. The version moves
+  // whenever the ranges change.
   mutable port::Mutex wal_gate_read_mask_mutex_;
   std::shared_ptr<const WalGateReadMask::Ranges> wal_gate_read_masks_;
   std::atomic<bool> wal_gate_read_masked_{false};
@@ -4358,6 +4458,13 @@ class DBImpl : public DB
   // once every one of those memtables is freed. Guarded by mutex_.
   std::weak_ptr<const ReadOnlyMemTable::MaskedSequenceRanges>
       wal_gate_masked_memtables_;
+  // Fence-only generation of the failed-sync mask: bumped by every
+  // InstallFailedGateSyncFence, never by a retire. A flush snapshots it
+  // with its drops; a change before the install means a fence landed
+  // mid-flush and the SST may hold failed data, so the mask must never
+  // retire (wal_gate_read_mask_unretireable_). Guarded by mutex_.
+  uint64_t wal_gate_fence_version_ = 0;
+  bool wal_gate_read_mask_unretireable_ = false;
   uint64_t next_wal_index_ = log::kWALIndexStartNumber;
 
   // If zero, manual compactions are allowed to proceed. If non-zero, manual

@@ -58,7 +58,8 @@ class PeriodicTaskScheduler {
   // Unregister the task. Thread safe call.
   Status Unregister(PeriodicTaskType task_type);
 
-#ifndef NDEBUG
+  // TEST_ helpers, unguarded with DBImpl's (see db_impl.h): inert accessors
+  // the opt build's TEST_ methods call.
   // Override the timer for the unittest
   void TEST_OverrideTimer(SystemClock* clock);
 
@@ -82,7 +83,6 @@ class PeriodicTaskScheduler {
     auto it = tasks_map_.find(task_type);
     return it != tasks_map_.end();
   }
-#endif  // NDEBUG
 
  private:
   // default global Timer instance

@@ -903,6 +903,35 @@ MemTable::NewTimestampStrippingRangeTombstoneIterator(
       is_range_del_table_empty_.LoadRelaxed()) {
     return nullptr;
   }
+  if (UNLIKELY(HasMaskedSequenceRanges())) {
+    // As in NewRangeTombstoneIteratorInternal: a failed gate sync's range
+    // tombstones must not reach the stripping flush path. The stripped keys
+    // keep their sequence trailer, so filter them the same way.
+    const std::shared_ptr<const MaskedSequenceRanges> masked =
+        AtomicSharedPtrLoad(&masked_ranges_, std::memory_order_acquire);
+    std::vector<std::string> keys;
+    std::vector<std::string> values;
+    TimestampStrippingIterator unfragmented(
+        MemTableIterator::kRangeDelEntries, *this, ReadOptions(),
+        /*seqno_to_time_mapping*/ nullptr, /* arena */ nullptr,
+        /* prefix_extractor */ nullptr, ts_sz);
+    for (unfragmented.SeekToFirst(); unfragmented.Valid();
+         unfragmented.Next()) {
+      const SequenceNumber seq = GetInternalKeySeqno(unfragmented.key());
+      if (std::none_of(masked->begin(), masked->end(), [seq](const auto& r) {
+            return r.first <= seq && seq <= r.second;
+          })) {
+        keys.push_back(unfragmented.key().ToString());
+        values.push_back(unfragmented.value().ToString());
+      }
+    }
+    auto tombstones = std::make_shared<FragmentedRangeTombstoneList>(
+        std::make_unique<VectorIterator>(std::move(keys), std::move(values),
+                                         &comparator_.comparator),
+        comparator_.comparator);
+    return new FragmentedRangeTombstoneIterator(
+        tombstones, comparator_.comparator, read_seq, read_options.timestamp);
+  }
   if (!timestamp_stripping_fragmented_range_tombstone_list_) {
     // TODO: plumb Env::IOActivity, Env::IOPriority
     auto* unfragmented_iter = new TimestampStrippingIterator(

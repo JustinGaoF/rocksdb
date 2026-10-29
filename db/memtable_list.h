@@ -514,6 +514,18 @@ class MemTableList {
     }
   }
 
+  // DB mutex held. Whether any memtable in the list still hides masked
+  // ranges: those memtables are unflushed and may hold failed-sync data.
+  // History memtables are not consulted.
+  bool HasMaskedSequenceRanges() {
+    for (ReadOnlyMemTable* mem : current_->memlist_) {
+      if (mem->HasMaskedSequenceRanges()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   void AssignAtomicFlushSeq(const SequenceNumber& seq) {
     const auto& memlist = current_->memlist_;
     // Scan the memtable list from new to old

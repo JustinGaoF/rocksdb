@@ -20,6 +20,7 @@
 #include "rocksdb/file_system.h"
 #include "rocksdb/write_buffer_manager.h"
 #include "table/mock_table.h"
+#include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
 #include "util/random.h"
@@ -303,6 +304,85 @@ TEST_F(FlushJobTest, NonEmpty) {
   ASSERT_EQ(1, file_meta.fd.smallest_seqno);
   ASSERT_EQ(10006, file_meta.fd.largest_seqno);
   ASSERT_EQ(17, file_meta.oldest_blob_file_number);
+  mock_table_factory_->AssertSingleFile(inserted_keys);
+  job_context.Clean();
+}
+
+// GC24 Q4: a memtable holding masked (failed-sync) sequences is not
+// MemPurged into a live unstamped memtable: the write-buffer-full flush
+// skips the purge and drops the masked point keys and range tombstones in
+// WriteLevel0Table instead. Neuter: remove the HasMaskedSequenceRanges skip
+// in FlushJob::MemPurge; the purge succeeds, no table is written, and the
+// skip SyncPoint never fires.
+TEST_F(FlushJobTest, MemPurgeSkipsMasked) {
+  JobContext job_context(0);
+  auto cfd = versions_->GetColumnFamilySet()->GetDefault();
+  {
+    InstrumentedMutexLock l(&mutex_);
+    ASSERT_OK(cfd->SetOptions(DBOptions(options_),
+                              {{"experimental_mempurge_threshold", "2.0"}}));
+  }
+  auto new_mem = cfd->ConstructNewMemtable(cfd->GetLatestMutableCFOptions(),
+                                           kMaxSequenceNumber);
+  new_mem->Ref();
+  auto inserted_keys = mock::MakeMockFile();
+  for (int i = 1; i <= 3; ++i) {
+    const std::string key = "k" + std::to_string(i);
+    ASSERT_OK(new_mem->Add(SequenceNumber(i), kTypeValue, key, "v" + key,
+                           nullptr /* kv_prot_info */));
+    InternalKey internal_key(key, SequenceNumber(i), kTypeValue);
+    inserted_keys.push_back({internal_key.Encode().ToString(), "v" + key});
+  }
+  {
+    MemTablePostProcessInfo post_process_info;
+    ASSERT_OK(new_mem->Add(SequenceNumber(4), kTypeRangeDeletion, "k1", "k3",
+                           nullptr /* kv_prot_info */,
+                           true /* allow_concurrent */, &post_process_info));
+    new_mem->BatchPostProcess(post_process_info);
+  }
+  ASSERT_OK(new_mem->Add(SequenceNumber(5), kTypeValue, "w", "vw",
+                         nullptr /* kv_prot_info */));
+  auto masked = std::make_shared<ReadOnlyMemTable::MaskedSequenceRanges>();
+  masked->emplace_back(4, 5);
+  new_mem->SetMaskedSequenceRanges(masked);
+  mock::SortKVVector(&inserted_keys);
+
+  autovector<ReadOnlyMemTable*> to_delete;
+  new_mem->ConstructFragmentedRangeTombstones();
+  cfd->imm()->Add(new_mem, &to_delete);
+  for (auto& m : to_delete) {
+    delete m;
+  }
+
+  SyncPoint::GetInstance()->EnableProcessing();
+  std::atomic<bool> skipped{false};
+  SyncPoint::GetInstance()->SetCallBack(
+      "FlushJob::MemPurge:SkippedMaskedEntries",
+      [&](void*) { skipped.store(true); });
+
+  EventLogger event_logger(db_options_.info_log.get());
+  job_context.InitSnapshotContext(nullptr, nullptr, kMaxSequenceNumber, {});
+  FlushJob flush_job(
+      dbname_, versions_->GetColumnFamilySet()->GetDefault(), db_options_,
+      cfd->GetLatestMutableCFOptions(),
+      std::numeric_limits<uint64_t>::max() /* memtable_id */, env_options_,
+      versions_.get(), &mutex_, &shutting_down_, &job_context,
+      FlushReason::kWriteBufferFull, nullptr, nullptr, nullptr, kNoCompression,
+      db_options_.statistics.get(), &event_logger, true,
+      true /* sync_output_directory */, true /* write_manifest */,
+      Env::Priority::USER, nullptr /*IOTracer*/, empty_seqno_to_time_mapping_);
+
+  FileMetaData file_meta;
+  mutex_.Lock();
+  // As Resume's flush sets it: drop the failed group's range.
+  flush_job.DropEntriesAtOrAbove(kMaxSequenceNumber, {{4, 5}});
+  flush_job.PickMemTable();
+  ASSERT_OK(flush_job.Run(nullptr, &file_meta));
+  mutex_.Unlock();
+  EXPECT_TRUE(skipped.load());
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  SyncPoint::GetInstance()->DisableProcessing();
+
   mock_table_factory_->AssertSingleFile(inserted_keys);
   job_context.Clean();
 }

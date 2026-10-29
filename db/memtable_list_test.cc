@@ -1326,6 +1326,62 @@ TEST_F(MemTableListWithTimestampTest, ConcurrentGetTableNewestUDT) {
   delete m;
 }
 
+// GC24 Q4: the timestamp-stripping range tombstone iterator drops masked
+// (failed-sync) sequences like the non-stripping one. A DB-level test is
+// impossible today: N > 1 requires allow_concurrent_memtable_write, which
+// persist_user_defined_timestamps=false forbids, and N=1 never stamps a
+// mask; the source fix is defense-in-depth for the stripping flush path.
+// Neuter: remove the masked-ranges branch in
+// MemTable::NewTimestampStrippingRangeTombstoneIterator; the masked
+// tombstone is returned.
+TEST_F(MemTableListTest, GC24StrippingRangeIteratorDropsMasked) {
+  auto factory = std::make_shared<SkipListFactory>();
+  options.memtable_factory = factory;
+  options.persist_user_defined_timestamps = false;
+  ImmutableOptions ioptions(options);
+  const Comparator* ucmp = test::BytewiseComparatorWithU64TsWrapper();
+  InternalKeyComparator cmp(ucmp);
+  WriteBufferManager wb(options.db_write_buffer_size);
+  MutableCFOptions mutable_cf_options(options);
+  MemTable* mem =
+      new MemTable(cmp, ioptions, mutable_cf_options, &wb, kMaxSequenceNumber,
+                   0 /* column_family_id */, nullptr /* flush_initiator */);
+  mem->Ref();
+  std::string ts;
+  PutFixed64(&ts, 1);
+  MemTablePostProcessInfo post_process_info;
+  ASSERT_OK(mem->Add(1, kTypeRangeDeletion, "a" + ts, "c" + ts,
+                     nullptr /* kv_prot_info */, true /* allow_concurrent */,
+                     &post_process_info));
+  mem->BatchPostProcess(post_process_info);
+  ASSERT_OK(mem->Add(2, kTypeRangeDeletion, "c" + ts, "e" + ts,
+                     nullptr /* kv_prot_info */, true /* allow_concurrent */,
+                     &post_process_info));
+  mem->BatchPostProcess(post_process_info);
+  auto masked = std::make_shared<ReadOnlyMemTable::MaskedSequenceRanges>();
+  masked->emplace_back(2, 2);
+  mem->SetMaskedSequenceRanges(masked);
+  ASSERT_TRUE(mem->HasMaskedSequenceRanges());
+  std::unique_ptr<FragmentedRangeTombstoneIterator> it(
+      mem->NewTimestampStrippingRangeTombstoneIterator(
+          ReadOptions(), kMaxSequenceNumber, sizeof(uint64_t)));
+  ASSERT_NE(it, nullptr);
+  std::vector<std::tuple<std::string, std::string, SequenceNumber>> tombstones;
+  for (it->SeekToFirst(); it->Valid(); it->Next()) {
+    const RangeTombstone tombstone = it->Tombstone();
+    tombstones.emplace_back(tombstone.start_key_.ToString(),
+                            tombstone.end_key_.ToString(), tombstone.seq_);
+  }
+  ASSERT_OK(it->status());
+  ASSERT_EQ(1U, tombstones.size());
+  std::string min_ts(8, '\0');
+  EXPECT_EQ("a" + min_ts, std::get<0>(tombstones[0]));
+  EXPECT_EQ("c" + min_ts, std::get<1>(tombstones[0]));
+  EXPECT_EQ(1U, std::get<2>(tombstones[0]));
+  ReadOnlyMemTable* m = mem->Unref();
+  delete m;
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

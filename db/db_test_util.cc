@@ -115,9 +115,12 @@ DBTestBase::DBTestBase(const std::string path, bool env_do_fsync)
 }
 
 DBTestBase::~DBTestBase() {
+#ifndef NDEBUG
+  // SyncPoint does not exist in opt builds; clearing it is vacuous there.
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->LoadDependency({});
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+#endif
   Close();
   Options options;
   options.db_paths.emplace_back(dbname_, 0);
@@ -373,7 +376,8 @@ Options DBTestBase::GetOptions(
   Options options = default_options;
   BlockBasedTableOptions table_options;
   bool set_block_based_table_factory = true;
-#if !defined(OS_MACOSX) && !defined(OS_WIN) && !defined(OS_AIX)
+#if !defined(NDEBUG) && !defined(OS_MACOSX) && !defined(OS_WIN) && \
+    !defined(OS_AIX)
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearCallBack(
       "NewRandomAccessFile:O_DIRECT");
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearCallBack(
@@ -443,7 +447,10 @@ Options DBTestBase::GetOptions(
       options.use_direct_reads = true;
       options.use_direct_io_for_flush_and_compaction = true;
       options.compaction_readahead_size = 2 * 1024 * 1024;
+#ifndef NDEBUG
+      // The mock-DIO sync points do not exist in opt builds.
       SetupSyncPointsToMockDirectIO();
+#endif
       break;
     }
     case kMergePut:
@@ -663,6 +670,8 @@ void DBTestBase::SetTimeElapseOnlySleepOnReopen(DBOptions* options) {
 }
 
 void DBTestBase::MaybeInstallTimeElapseOnlySleep(const DBOptions& options) {
+  // `options` is consulted only by asserts below; mark used for opt builds.
+  (void)options;
   if (time_elapse_only_sleep_on_reopen_) {
     assert(options.env == env_ ||
            static_cast_with_check<CompositeEnvWrapper>(options.env)

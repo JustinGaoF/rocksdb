@@ -1960,6 +1960,20 @@ Status DBImpl::ProcessLogFilesMerged(
   // Recovery reads every WAL at or above min_wal_number, so an attested
   // predecessor there that the merge does not hold is missing from disk.
   merger.SetRetirementBound(min_wal_number);
+  // A MANIFEST-tracked current WAL missing from disk leaves no attestation
+  // (it has no successor): bound the merge at its first index instead.
+  // Opener-N > 1 only; N == 1 never writes the tracking.
+  if (immutable_db_options_.wal_partitions > 1) {
+    for (const auto& [wal_number, wal_meta] :
+         versions_->GetWalSet().GetWals()) {
+      if (wal_meta.IsCurrentWAL() && wal_meta.HasFirstWALIndex() &&
+          wal_number >= min_wal_number && wal_number >= merge_from &&
+          !std::binary_search(wal_numbers.begin(), wal_numbers.end(),
+                              wal_number)) {
+        merger.AddLostCurrentWAL(wal_number, wal_meta.GetFirstWALIndex());
+      }
+    }
+  }
   // Until a flush persists a sequence (or the MANIFEST retires a WAL), no WAL
   // was retired, so no index below the held ones was either. A brand-new
   // DB's first WALs attest no predecessor, and with more than one partition
@@ -2423,6 +2437,10 @@ Status DBImpl::ProcessLogFilesMerged(
         msg += "; WAL " + std::to_string(merger.GetLostPredecessor()) +
                " is attested by its successor but missing";
       }
+      if (merger.GetLostCurrentWAL() != 0) {
+        msg += "; WAL " + std::to_string(merger.GetLostCurrentWAL()) +
+               " is MANIFEST-tracked as current but missing";
+      }
       if (wal_recovery_mode == WALRecoveryMode::kSkipAnyCorruptedRecords) {
         msg +=
             "; kSkipAnyCorruptedRecords does not skip unexplained holes in "
@@ -2443,6 +2461,19 @@ Status DBImpl::ProcessLogFilesMerged(
     // Point-in-time opens at the cut, attributed no later than any loss the
     // drive has not accounted for.
     cut_index = frontier;
+    // Seed past voids the drive read above the frontier before cutting (the
+    // cuts below clamp to the seed): the next write would otherwise reissue
+    // an index a void covers, which the next merge would reject. Voids hold
+    // no live records, so seeding past them skips no data.
+    for (const auto* reader : readers) {
+      const uint64_t void_hi = reader->reader()->GetMaxVoidWALIndexHi();
+      if (void_hi >= next_wal_index_) {
+        Status seed_status = SetNextWALIndexAfterRecovery(void_hi);
+        if (!seed_status.ok()) {
+          return seed_status;
+        }
+      }
+    }
     uint64_t cut_wal = kMaxSequenceNumber;
     for (const auto* reader : readers) {
       const uint64_t wal_number = reader->wal_number();
@@ -2452,6 +2483,13 @@ Status DBImpl::ProcessLogFilesMerged(
         cut_wal = std::min(cut_wal, wal_number);
       }
       if (end != log::WALIndexMerger::MemberEnd::kClean) {
+        record_cut(wal_number);
+      } else if (reader->LastIndexed() >= next_wal_index_) {
+        // A member read to its end can still hold unapplied records at or
+        // above the seed (a pending frontier sits below indices the drive
+        // already decided, and a ghost frontier leaves clean survivors
+        // above the cut), and those stay live without a cut. record_cut
+        // clamps the cut to the seed, preserving applied records below it.
         record_cut(wal_number);
       }
     }

@@ -611,6 +611,18 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
   if (s.ok()) {
     recovering_from_wal_write_error_ = context.IsWALWriteErrorRecovery();
     recover_wal_through_number_ = context.failed_wal_number;
+    // The retry path rotates no WALs and switches no memtables: with a
+    // burned index pending, the explanation would find partition 0's WAL
+    // below the burning one and fail closed. Take the full path instead,
+    // whose switches rotate. Above one partition only; at one partition
+    // burns are never explained and the retry path is unchanged. The reason
+    // is normalized too: the waits below treat only kErrorRecovery as
+    // resuming (WaitForFlushMemTables), and the work is a full recovery
+    // flush.
+    if (context.flush_reason == FlushReason::kErrorRecoveryRetryFlush &&
+        NumWalPartitions() > 1 && BurnedWalIndicesPending()) {
+      context.flush_reason = FlushReason::kErrorRecovery;
+    }
     if (context.flush_reason == FlushReason::kErrorRecoveryRetryFlush) {
       s = RetryFlushesForErrorRecovery(FlushReason::kErrorRecoveryRetryFlush,
                                        true /* wait */);
@@ -3001,17 +3013,37 @@ void DBImpl::FinishWalPartitionSync(size_t partition, uint64_t up_to,
       wal.synced_size = std::max(wal.synced_size, wal.GetPreSyncSize());
     }
   };
+  // N > 1 only: track the WAL's first wal_index once, when it first becomes
+  // durable. Sizeless (an active WAL's size is still growing), so the
+  // recording horizon does not apply: past-horizon active WALs track here
+  // too. One MANIFEST entry per WAL, never one per sync.
+  auto note_first_durable = [this, synced_wals](LogWriterNumber& wal) {
+    if (immutable_db_options_.track_and_verify_wals_in_manifest &&
+        NumWalPartitions() > 1 && !wal.manifest_first_durable_tracked &&
+        wal.GetPreSyncSize() > 0 &&
+        wal.writer->first_wal_index_recorded() != 0) {
+      WalMetadata meta;
+      meta.SetFirstWALIndex(wal.writer->first_wal_index_recorded());
+      meta.SetCurrentWAL(true);
+      synced_wals->AddWal(wal.number, std::move(meta));
+      wal.manifest_first_durable_tracked = true;
+    }
+  };
   for (auto it = logs_[partition].begin(); it != logs_[partition].end();) {
     auto& wal = *it;
     if (wal.number > up_to) {
       // Beyond the sync horizon: another partition's WAL, numbered above
       // cur_wal_number_ (the lowest live number at N > 1), or a WAL that
       // rotated in between the horizon snapshot and the claim. Never
-      // recorded or reclaimed here, but if marked it is this sync's (the
-      // claimed partition's front mark excludes every other marker), so it
-      // must still be finished: leaving it marked hangs the next sync's
-      // PreprocessWrite on WalSyncCV.
+      // recorded or reclaimed here, except an active WAL's sizeless
+      // first-durable tracking (note_first_durable), but if marked it is
+      // this sync's (the claimed partition's front mark excludes every
+      // other marker), so it must still be finished: leaving it marked
+      // hangs the next sync's PreprocessWrite on WalSyncCV.
       if (wal.IsSyncing()) {
+        if (wal.number == logs_[partition].back().number) {
+          note_first_durable(wal);
+        }
         note_synced(wal);
         wal.FinishSync();
       }
@@ -3030,7 +3062,16 @@ void DBImpl::FinishWalPartitionSync(size_t partition, uint64_t up_to,
       // Inactive WAL
       if (immutable_db_options_.track_and_verify_wals_in_manifest &&
           wal.GetPreSyncSize() > 0) {
-        synced_wals->AddWal(wal.number, WalMetadata(wal.GetPreSyncSize()));
+        WalMetadata meta(wal.GetPreSyncSize());
+        if (NumWalPartitions() > 1) {
+          // A rotation clears the current flag the first-durable edit set.
+          // The first index is immutable; recording it again keeps the
+          // entry complete when that edit applies out of order. Zero for
+          // unindexed WALs, which encodes nothing.
+          meta.SetFirstWALIndex(wal.writer->first_wal_index_recorded());
+          meta.SetCurrentWAL(false);
+        }
+        synced_wals->AddWal(wal.number, std::move(meta));
       }
       // Reclaim closed WALs (wal.writer->file() == nullptr), and if we
       // don't need to close before that (background_close_inactive_wals)
@@ -3052,6 +3093,7 @@ void DBImpl::FinishWalPartitionSync(size_t partition, uint64_t up_to,
     } else {
       assert(wal.number == logs_[partition].back().number);
       // Active WAL
+      note_first_durable(wal);
       note_synced(wal);
       wal.FinishSync();
       ++it;

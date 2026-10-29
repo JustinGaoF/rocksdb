@@ -3,8 +3,14 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
+#include <algorithm>
+#include <atomic>
 #include <cassert>
+#include <mutex>
+#include <string>
+#include <vector>
 
+#include "db/write_batch_internal.h"
 #include "util/cast_util.h"
 #include "utilities/transactions/transaction_test.h"
 
@@ -351,6 +357,9 @@ TEST_P(TransactionTest, MultipleTimestampedSnapshots) {
   auto* dbimpl = static_cast_with_check<DBImpl>(db->GetRootDB());
   assert(dbimpl);
   const bool seq_per_batch = dbimpl->seq_per_batch();
+  // Used only by the assert below; mark used for opt builds (assert is
+  // empty under NDEBUG, which -Werror would flag as unused).
+  (void)seq_per_batch;
   // TODO: remove the following assert(!seq_per_batch) once timestamped snapshot
   // is supported in write-prepared/write-unprepared transactions.
   assert(!seq_per_batch);
@@ -455,6 +464,168 @@ TEST_P(TransactionTest, MultipleTimestampedSnapshots) {
   ASSERT_OK(db->Close());
   delete db;
   db = nullptr;
+}
+
+// GC24 Q10: opt-capable twin of TransactionPartitionedWalTest.
+// GC23TimestampedSnapshotsSurviveFlushStress in transaction_test.cc (kept
+// there as the debug-canonical check). transaction_test does not build with
+// DEBUG_LEVEL=0 (SyncPoint and most TEST_ helpers are debug-only); this copy
+// uses none of those -- only the unguarded TEST_WalPartitionForWrite routing
+// query -- so the snapshot value check also runs in release builds. The body
+// is verbatim; keep the two in sync.
+//
+// GC23 Q9: GC22's compaction guarantee without SyncPoint, so nothing here
+// depends on a debug-only hook. At N in {2, 8}, synced committers on every
+// partition but 1 call CommitAndTryCreateSnapshot concurrently while a writer
+// keeps overwriting key "k" on partition 1 and a flusher keeps flushing and
+// compacting partition 1's column family. Before any committer starts, "k"
+// holds a version, so every timestamped snapshot must find "k". Each
+// snapshot reads "k" right after it is created and again after a final flush
+// and compaction, and both reads must agree; ordered by sequence, the
+// writer's counters they read never go backwards. Neuter: drop GC22's
+// reservation; a flush that starts between a commit's publication and its
+// snapshot drops the version the snapshot needs, and the snapshot's reads
+// change after the final compaction.
+TEST(TransactionPartitionedWalTest,
+     GC23TimestampedSnapshotsSurviveFlushStress) {
+  for (const size_t num_partitions : {size_t{2}, size_t{8}}) {
+    SCOPED_TRACE("wal_partitions=" + std::to_string(num_partitions));
+    const std::string dbname =
+        test::PerThreadDBPath("gc23_ts_snapshot_flush_stress");
+    Options options;
+    options.create_if_missing = true;
+    options.wal_partitions = static_cast<uint32_t>(num_partitions);
+    options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+    options.disable_auto_compactions = true;
+    options.track_and_verify_wals_in_manifest = true;
+    options.max_write_buffer_number = 8;
+    ASSERT_OK(DestroyDB(dbname, options));
+    TransactionDB* db = nullptr;
+    ASSERT_OK(
+        TransactionDB::Open(options, TransactionDBOptions(), dbname, &db));
+    std::vector<ColumnFamilyHandle*> handles;
+    std::vector<ColumnFamilyHandle*> cf_for_partition(num_partitions, nullptr);
+    size_t covered = 0;
+    while (covered < num_partitions) {
+      ColumnFamilyHandle* handle = nullptr;
+      ASSERT_OK(db->CreateColumnFamily(
+          ColumnFamilyOptions(options),
+          "cf" + std::to_string(handles.size() + 1), &handle));
+      handles.push_back(handle);
+      WriteBatch batch;
+      ASSERT_OK(
+          WriteBatchInternal::Put(&batch, handle->GetID(), "key", "value"));
+      size_t partition = num_partitions;
+      ASSERT_OK(
+          DBImpl::TEST_WalPartitionForWrite(batch, num_partitions, &partition));
+      if (cf_for_partition[partition] == nullptr) {
+        cf_for_partition[partition] = handle;
+        ++covered;
+      }
+    }
+    ColumnFamilyHandle* const hot = cf_for_partition[1];
+    // Counters are fixed width, so they order as strings.
+    auto counter_value = [](uint64_t counter) {
+      std::string value = std::to_string(counter);
+      return std::string(20 - value.size(), '0') + value;
+    };
+    ASSERT_OK(db->Put(WriteOptions(), hot, "k", counter_value(0)));
+
+    struct Taken {
+      std::shared_ptr<const Snapshot> snapshot;
+      std::string first_read;
+    };
+    std::mutex mu;
+    std::vector<Taken> taken;
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> next_ts{1};
+    std::atomic<uint64_t> missing{0};
+    // Synced commits: a commit whose predecessors on other partitions land
+    // after its fsync syncs again in its gate, between publishing and its
+    // snapshot, which widens the window the reservation covers.
+    WriteOptions synced;
+    synced.sync = true;
+    constexpr int kCommitters = 8;
+    constexpr int kCommitsPerThread = 100;
+    std::vector<port::Thread> committers;
+    for (int t = 0; t < kCommitters; ++t) {
+      size_t p = static_cast<size_t>(t) % num_partitions;
+      if (p == 1) {
+        p = 0;
+      }
+      committers.emplace_back([&, p, t] {
+        for (int i = 0; i < kCommitsPerThread; ++i) {
+          std::unique_ptr<Transaction> txn(db->BeginTransaction(synced));
+          ASSERT_OK(txn->Put(cf_for_partition[p],
+                             std::to_string(t) + "_" + std::to_string(i), "v"));
+          std::shared_ptr<const Snapshot> snapshot;
+          ASSERT_OK(txn->CommitAndTryCreateSnapshot(
+              nullptr, next_ts.fetch_add(1), &snapshot));
+          if (snapshot == nullptr) {
+            continue;  // Timestamp order disagreed with sequence order.
+          }
+          ReadOptions ro;
+          ro.snapshot = snapshot.get();
+          std::string value;
+          const Status s = db->Get(ro, hot, "k", &value);
+          if (!s.ok()) {
+            missing.fetch_add(1);
+            continue;
+          }
+          std::lock_guard<std::mutex> lock(mu);
+          taken.push_back({std::move(snapshot), value});
+        }
+      });
+    }
+    port::Thread writer([&] {
+      for (uint64_t counter = 1; !stop.load(); ++counter) {
+        ASSERT_OK(db->Put(WriteOptions(), hot, "k", counter_value(counter)));
+      }
+    });
+    port::Thread flusher([&] {
+      for (int round = 0; !stop.load(); ++round) {
+        ASSERT_OK(db->Flush(FlushOptions(), hot));
+        if (round % 8 == 0) {
+          ASSERT_OK(
+              db->CompactRange(CompactRangeOptions(), hot, nullptr, nullptr));
+        }
+      }
+    });
+    for (port::Thread& committer : committers) {
+      committer.join();
+    }
+    stop.store(true);
+    writer.join();
+    flusher.join();
+    ASSERT_OK(db->Flush(FlushOptions(), hot));
+    ASSERT_OK(db->CompactRange(CompactRangeOptions(), hot, nullptr, nullptr));
+
+    EXPECT_EQ(0u, missing.load()) << "snapshots that found no version of k";
+    EXPECT_FALSE(taken.empty());
+    std::sort(taken.begin(), taken.end(), [](const Taken& a, const Taken& b) {
+      return a.snapshot->GetSequenceNumber() < b.snapshot->GetSequenceNumber();
+    });
+    std::string previous;
+    for (const Taken& t : taken) {
+      ReadOptions ro;
+      ro.snapshot = t.snapshot.get();
+      std::string value;
+      ASSERT_OK(db->Get(ro, hot, "k", &value))
+          << "snapshot " << t.snapshot->GetSequenceNumber();
+      EXPECT_EQ(t.first_read, value)
+          << "snapshot " << t.snapshot->GetSequenceNumber();
+      EXPECT_LE(previous, value)
+          << "snapshot " << t.snapshot->GetSequenceNumber();
+      previous = value;
+    }
+    taken.clear();
+    db->ReleaseTimestampedSnapshotsOlderThan(next_ts.load());
+    for (ColumnFamilyHandle* handle : handles) {
+      ASSERT_OK(db->DestroyColumnFamilyHandle(handle));
+    }
+    delete db;
+    ASSERT_OK(DestroyDB(dbname, options));
+  }
 }
 
 }  // namespace ROCKSDB_NAMESPACE

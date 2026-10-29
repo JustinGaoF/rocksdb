@@ -19,6 +19,13 @@ void WalAddition::EncodeTo(std::string* dst) const {
     PutVarint64(dst, metadata_.GetSyncedSizeInBytes());
   }
 
+  if (metadata_.HasFirstWALIndex()) {
+    PutVarint32(dst, static_cast<uint32_t>(WalAdditionTag::kFirstWALIndex));
+    PutVarint64(dst, metadata_.GetFirstWALIndex());
+    PutVarint32(dst, static_cast<uint32_t>(WalAdditionTag::kCurrentWAL));
+    PutVarint32(dst, metadata_.IsCurrentWAL() ? 1 : 0);
+  }
+
   PutVarint32(dst, static_cast<uint32_t>(WalAdditionTag::kTerminate));
 }
 
@@ -44,6 +51,24 @@ Status WalAddition::DecodeFrom(Slice* src) {
         metadata_.SetSyncedSizeInBytes(size);
         break;
       }
+      case WalAdditionTag::kFirstWALIndex: {
+        uint64_t first_index = 0;
+        if (!GetVarint64(src, &first_index)) {
+          return Status::Corruption(class_name,
+                                    "Error decoding WAL first wal_index");
+        }
+        metadata_.SetFirstWALIndex(first_index);
+        break;
+      }
+      case WalAdditionTag::kCurrentWAL: {
+        uint32_t current = 0;
+        if (!GetVarint32(src, &current)) {
+          return Status::Corruption(class_name,
+                                    "Error decoding WAL current flag");
+        }
+        metadata_.SetCurrentWAL(current != 0);
+        break;
+      }
       // TODO: process future tags such as checksum.
       case WalAdditionTag::kTerminate:
         return Status::OK();
@@ -59,12 +84,20 @@ Status WalAddition::DecodeFrom(Slice* src) {
 JSONWriter& operator<<(JSONWriter& jw, const WalAddition& wal) {
   jw << "LogNumber" << wal.GetLogNumber() << "SyncedSizeInBytes"
      << wal.GetMetadata().GetSyncedSizeInBytes();
+  if (wal.GetMetadata().HasFirstWALIndex()) {
+    jw << "FirstWALIndex" << wal.GetMetadata().GetFirstWALIndex()
+       << "CurrentWAL" << wal.GetMetadata().IsCurrentWAL();
+  }
   return jw;
 }
 
 std::ostream& operator<<(std::ostream& os, const WalAddition& wal) {
   os << "log_number: " << wal.GetLogNumber()
      << " synced_size_in_bytes: " << wal.GetMetadata().GetSyncedSizeInBytes();
+  if (wal.GetMetadata().HasFirstWALIndex()) {
+    os << " first_wal_index: " << wal.GetMetadata().GetFirstWALIndex()
+       << " current_wal: " << wal.GetMetadata().IsCurrentWAL();
+  }
   return os;
 }
 
@@ -119,6 +152,23 @@ Status WalSet::AddWal(const WalAddition& wal) {
   }
 
   assert(existing);
+  // Merge the N > 1 current-WAL tracking ahead of the synced-size
+  // early-return below: a rotation's edit may carry the same synced size as
+  // the first-durable edit, and it must still clear the current flag.
+  if (wal.GetMetadata().HasFirstWALIndex()) {
+    if (!it->second.HasFirstWALIndex()) {
+      it->second.SetFirstWALIndex(wal.GetMetadata().GetFirstWALIndex());
+    } else {
+      assert(it->second.GetFirstWALIndex() ==
+             wal.GetMetadata().GetFirstWALIndex());
+    }
+  }
+  // False wins: a WAL never becomes current again, so a rotation's edit
+  // clears the flag even when it applies out of order, and a stale
+  // first-durable edit never re-arms it. Entries without the tag read as
+  // false, so an old-format rotation edit clears it too.
+  it->second.SetCurrentWAL(it->second.IsCurrentWAL() &&
+                           wal.GetMetadata().IsCurrentWAL());
   if (!wal.GetMetadata().HasSyncedSize()) {
     std::stringstream ss;
     ss << "WAL " << wal.GetLogNumber() << " is created more than once";

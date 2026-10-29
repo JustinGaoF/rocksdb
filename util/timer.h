@@ -156,7 +156,8 @@ class Timer {
     return false;
   }
 
-#ifndef NDEBUG
+  // TEST_ helpers, unguarded with DBImpl's (see db_impl.h): inert accessors
+  // the opt build's TEST_ methods call.
   // Wait until Timer starting waiting, call the optional callback, then wait
   // for Timer waiting again.
   // Tests can provide a custom Clock object to mock time, and use the callback
@@ -197,7 +198,6 @@ class Timer {
     InstrumentedMutexLock l(&mutex_);
     clock_ = clock;
   }
-#endif  // NDEBUG
 
  private:
   void Run() {

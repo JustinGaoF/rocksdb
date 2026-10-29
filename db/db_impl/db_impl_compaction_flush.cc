@@ -299,6 +299,7 @@ Status DBImpl::FlushMemTableToOutputFile(
                      job_context->job_id, s.ToString().c_str());
   }
 
+  const uint64_t gate_fence_version_before_drops = wal_gate_fence_version_;
   if (s.ok()) {
     flush_job.DropEntriesAtOrAbove(UnreleasedWalGateFenceLow(),
                                    FailedGateSyncFlushDrops());
@@ -362,6 +363,15 @@ Status DBImpl::FlushMemTableToOutputFile(
                       &error_handler_);
     need_cancel = false;
   }
+  if (s.ok() && gate_fence_version_before_drops != wal_gate_fence_version_) {
+    // A fence landed mid-flush: the SST may hold failed data its drops
+    // missed, so the mask must never retire.
+    wal_gate_read_mask_unretireable_ = true;
+  }
+  // Retire here, mutex-continuous with the install: a Flush() waiter
+  // unblocks on the memtable removal above, so retiring only at the end of
+  // BackgroundCallFlush races it.
+  MaybeRetireWalGateReadMasks();
 
   // Reserve a pending flush-completion notification before the DB mutex can be
   // released, so that a Flush(wait=true, listener_wait=true) caller cannot
@@ -681,6 +691,7 @@ Status DBImpl::AtomicFlushMemTablesToOutputFiles(
                      job_context->job_id, s.ToString().c_str());
   }
 
+  const uint64_t gate_fence_version_before_drops = wal_gate_fence_version_;
   if (s.ok()) {
     const SequenceNumber drop_floor = UnreleasedWalGateFenceLow();
     for (int i = 0; i != num_cfs; ++i) {
@@ -934,6 +945,15 @@ Status DBImpl::AtomicFlushMemTablesToOutputFiles(
         committed_flush_jobs_info, &job_context->memtables_to_free,
         directories_.GetDbDir(), log_buffer);
   }
+  if (s.ok() && gate_fence_version_before_drops != wal_gate_fence_version_) {
+    // A fence landed mid-flush: the SSTs may hold failed data their drops
+    // missed, so the mask must never retire.
+    wal_gate_read_mask_unretireable_ = true;
+  }
+  // Retire here, mutex-continuous with the install: a Flush() waiter
+  // unblocks on the memtable removal above, so retiring only at the end of
+  // BackgroundCallFlush races it.
+  MaybeRetireWalGateReadMasks();
 
   // Reserve a pending flush-completion notification for every CF that the
   // NotifyOnFlushCompleted loop below will service, while the DB mutex is still

@@ -10825,6 +10825,81 @@ TEST(TransactionPartitionedWalTest, FailedSyncPrepareLeavesNoStaleFence) {
   ASSERT_OK(DestroyDB(dbname, options));
 }
 
+// GC24 Q2: the failed-sync read mask retires once Resume's flush drops the
+// failed data, even when memtable history keeps the old memtables alive
+// (TransactionDB's default max_write_buffer_size_to_maintain), and in step
+// with the flush: no background wait. Neuter: today's weak_ptr wait; the
+// mask is still present after Resume() plus Flush().
+TEST(TransactionPartitionedWalTest, GC24FailedSyncMaskRetiresWithHistory) {
+  constexpr size_t kPartitions = 2;
+  const std::string dbname =
+      test::PerThreadDBPath("transaction_partitioned_wal_mask_retire");
+  Options options;
+  options.create_if_missing = true;
+  options.wal_partitions = kPartitions;
+  options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  options.track_and_verify_wals_in_manifest = true;
+  options.avoid_flush_during_shutdown = true;
+  options.max_bgerror_resume_count = 0;
+  ASSERT_OK(DestroyDB(dbname, options));
+  TransactionDB* db = nullptr;
+  ASSERT_OK(TransactionDB::Open(options, TransactionDBOptions(), dbname, &db));
+  DBImpl* db_impl = static_cast_with_check<DBImpl>(db->GetRootDB());
+  ASSERT_EQ(kPartitions, db_impl->TEST_NumWalPartitions());
+  ASSERT_OK(db->Put(WriteOptions(), "before", "v"));
+
+  std::atomic<bool> fail_sync{false};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SyncWalsFromCompletionGate:AfterGateSync", [&](void* arg) {
+        if (fail_sync.exchange(false)) {
+          IOStatus error = IOStatus::IOError("injected gate sync error");
+          error.SetRetryable(true);
+          *static_cast<IOStatus*>(arg) = error;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  WriteOptions sync_wo;
+  sync_wo.sync = true;
+  fail_sync = true;
+  const Status failed_status = db->Put(sync_wo, "failed", "v");
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_TRUE(failed_status.IsIOError()) << failed_status.ToString();
+  ASSERT_FALSE(fail_sync.load());
+  // The mask hides the failed write while the DB is stopped.
+  EXPECT_TRUE(db_impl->TEST_WalGateReadMaskRanges() != nullptr);
+  std::string value;
+  ASSERT_TRUE(db->Get(ReadOptions(), "failed", &value).IsNotFound());
+
+  ASSERT_OK(db->Resume());
+  ASSERT_OK(db->Flush(FlushOptions()));
+  // Retired in step with the flush: no background wait.
+  EXPECT_TRUE(db_impl->TEST_WalGateReadMaskRanges() == nullptr);
+
+  // The failed write stays absent through every read path.
+  ASSERT_TRUE(db->Get(ReadOptions(), "failed", &value).IsNotFound());
+  ASSERT_OK(db->Get(ReadOptions(), "before", &value));
+  ASSERT_EQ("v", value);
+  {
+    std::unique_ptr<Iterator> it(db->NewIterator(ReadOptions()));
+    for (it->SeekToFirst(); it->Valid(); it->Next()) {
+      EXPECT_NE("failed", it->key().ToString());
+    }
+    ASSERT_OK(it->status());
+  }
+  {
+    ReadOptions ro;
+    ro.tailing = true;
+    std::unique_ptr<Iterator> it(db->NewIterator(ro));
+    for (it->SeekToFirst(); it->Valid(); it->Next()) {
+      EXPECT_NE("failed", it->key().ToString());
+    }
+    ASSERT_OK(it->status());
+  }
+  delete db;
+  ASSERT_OK(DestroyDB(dbname, options));
+}
+
 // FU14 H2 repro: at N>1 CommitAndTryCreateSnapshot's post-memtable callback
 // runs from the completion gate, after the group's sequence S is published.
 // Another partition can publish past S and a reader can take a snapshot at

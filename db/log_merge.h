@@ -339,9 +339,24 @@ class WALIndexMerger {
   // WALs: a loss at the bottom of those then surfaces as a hole instead of
   // raising the bound past it. Call before the first Next().
   void SetHistoryFloor(uint64_t index) { history_floor_ = index; }
+  // A MANIFEST-tracked current WAL missing from disk, with the first
+  // wal_index it bore (`first_index` must be nonzero). The merge expects
+  // that index: missing with records above it, it is the frontier; missing
+  // with nothing above it, the lost tail stays a tail. Call before the
+  // first Next().
+  void AddLostCurrentWAL(uint64_t wal_number, uint64_t first_index) {
+    lost_current_wals_[wal_number] = first_index;
+    if (first_index < lost_current_floor_) {
+      lost_current_floor_ = first_index;
+      lost_current_wal_ = wal_number;
+    }
+  }
   // An attested predecessor the merge stopped for, or zero. Valid after
   // kFrontier.
   uint64_t GetLostPredecessor() const { return lost_predecessor_; }
+  // A MANIFEST-tracked current WAL missing from disk (lowest first index),
+  // or zero when none was added. Valid after AddLostCurrentWAL.
+  uint64_t GetLostCurrentWAL() const { return lost_current_wal_; }
   // Whether the drive skipped a superseded-only index that no void older
   // than its declaration explained: one re-trusted under
   // continue_past_discarded_holes, or one still pending at the end. A record
@@ -415,6 +430,19 @@ class WALIndexMerger {
   // the attestation checks when the lower bound is not set yet.
   Status CheckMemberCoherence(const MemberState& state);
 
+  // A void in a WAL older than the declaration predates the cut, and an
+  // open at N=1 seeds past such voids: the pending indices below it were
+  // never reissued.
+  void ClearPendingDiscardedOnPreDeclarerVoid(uint64_t index) {
+    for (auto& state : states_) {
+      if (pending_discarded_ != 0 &&
+          state.member->wal_number() < pending_declarer_ &&
+          state.member->VoidCovers(index)) {
+        pending_discarded_ = 0;
+      }
+    }
+  }
+
   // Derives the lower bound from first indices and attested spans, enforcing
   // the head-integrity gates. Sets kCleanEnd when nothing is indexed
   // anywhere.
@@ -462,6 +490,12 @@ class WALIndexMerger {
   // as a tail gap.
   uint64_t lost_floor_ = std::numeric_limits<uint64_t>::max();
   uint64_t lost_predecessor_ = 0;
+  // MANIFEST-tracked current WALs missing from disk, by WAL number, with
+  // the first wal_index each bore. `lost_current_floor_` is the minimum
+  // first index (max when none); `lost_current_wal_` its WAL.
+  std::map<uint64_t, uint64_t> lost_current_wals_;
+  uint64_t lost_current_floor_ = std::numeric_limits<uint64_t>::max();
+  uint64_t lost_current_wal_ = 0;
   std::set<uint64_t> attested_wals_;
   // [first, last] spans attested for predecessors below the retirement
   // bound. An index in one that no member holds or explains was the retired
