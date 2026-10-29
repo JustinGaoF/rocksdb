@@ -1747,15 +1747,19 @@ class DB {
     static const std::string kIsFileDeletionsEnabled;
 
     //  "rocksdb.num-snapshots" - returns number of unreleased snapshots of the
-    //      database.
+    //      database. Internal write reservations (a commit that published at
+    //      wal_partitions > 1 but whose snapshot callback has not run yet)
+    //      are excluded.
     static const std::string kNumSnapshots;
 
     //  "rocksdb.oldest-snapshot-time" - returns number representing unix
-    //      timestamp of oldest unreleased snapshot.
+    //      timestamp of oldest unreleased snapshot. Internal write
+    //      reservations (see num-snapshots) are excluded.
     static const std::string kOldestSnapshotTime;
 
     //  "rocksdb.oldest-snapshot-sequence" - returns number representing
-    //      sequence number of oldest unreleased snapshot.
+    //      sequence number of oldest unreleased snapshot. Internal write
+    //      reservations (see num-snapshots) are excluded.
     static const std::string kOldestSnapshotSequence;
 
     //  "rocksdb.num-live-versions" - returns number of live versions. `Version`

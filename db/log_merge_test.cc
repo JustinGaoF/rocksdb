@@ -1597,6 +1597,98 @@ TEST_P(LogMergeTest, DiscardedHoleSkipsWhenForgiving) {
   ASSERT_EQ(8U, forgiving->GetFrontier());
 }
 
+// GC23 Q1: a supersession after a data record is unrecorded and may postdate
+// indices the merge already decided (here index 4 emits before the pull that
+// reads the declaration), so the merge fails closed on it instead of
+// replaying records it would obsolete. Neuter: drop the misplaced check in
+// PullMembers; the merge drives to a clean end with index 5 emitted live.
+TEST_P(LogMergeTest, GC23MisplacedSupersessionFailsMerge) {
+  MemberFile old(120, recyclable());
+  MemberFile young(121, recyclable());
+  ASSERT_OK(old.Marker());
+  for (uint64_t i = 1; i <= 3; ++i) {
+    ASSERT_OK(old.Data("o" + std::to_string(i), i, i));
+  }
+  ASSERT_OK(old.Data("o5", 5, 5));
+  ASSERT_OK(young.Marker());
+  ASSERT_OK(young.Data("n4", 4, 4));
+  ASSERT_OK(young.Sup(120, 4));
+  ASSERT_OK(young.Data("n6", 6, 6));
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(old, old.Bytes()));
+  members.push_back(MakeMember(young, young.Bytes()));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kError, driven.outcome);
+  ASSERT_TRUE(merger->GetError().IsCorruption());
+  ASSERT_NE(std::string::npos,
+            merger->GetError().ToString().find("after a data record"));
+}
+
+// Ported from Muse's GC19 candidate. A superseded-only hole inside a live
+// stream: the cut discarded old's copy of 5, but young already emitted 4
+// above the cut, and young still holds live 6 above the hole. The reissued
+// copy of 5 was lost, so the strict merge stops at the frontier instead of
+// re-trusting the discard; the forgiving merge (skip-mode recovery) skips
+// it. Neuter: GC19's Q2 neuter (unconditional skip of superseded-only
+// holes); the strict merge drives to a clean end with 6 emitted.
+TEST_P(LogMergeTest, SupersededOnlyHoleInsideLiveStreamStops) {
+  auto old = std::unique_ptr<WALIndexMerger::Member>(
+      new ScriptMember(120, {Rec(1, 1), Rec(2, 2), Rec(3, 3), Rec(5, 5)}));
+  auto young = std::unique_ptr<WALIndexMerger::Member>(
+      new ScriptMember(121, {Rec(4, 4), Rec(6, 6)}));
+  static_cast<ScriptMember*>(young.get())->sups[120] = 4;
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(std::move(old));
+  members.push_back(std::move(young));
+  auto strict = MakeMerger(std::move(members), {120, 121});
+  DriveResult strict_driven = Drive(strict.get());
+  ASSERT_EQ(WALIndexMerger::Result::kFrontier, strict_driven.outcome);
+  ASSERT_EQ(5U, strict->GetFrontier());
+  ASSERT_EQ(std::vector<uint64_t>({1, 2, 3, 4}), DrivenIndices(strict_driven));
+  ASSERT_TRUE(strict_driven.gaps.empty());
+
+  auto old2 = std::unique_ptr<WALIndexMerger::Member>(
+      new ScriptMember(120, {Rec(1, 1), Rec(2, 2), Rec(3, 3), Rec(5, 5)}));
+  auto young2 = std::unique_ptr<WALIndexMerger::Member>(
+      new ScriptMember(121, {Rec(4, 4), Rec(6, 6)}));
+  static_cast<ScriptMember*>(young2.get())->sups[120] = 4;
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members2;
+  members2.push_back(std::move(old2));
+  members2.push_back(std::move(young2));
+  auto forgiving = MakeMerger(std::move(members2), {120, 121},
+                              /*continue_past_discarded_holes=*/true);
+  DriveResult forgiving_driven = Drive(forgiving.get());
+  ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, forgiving_driven.outcome);
+  ASSERT_EQ(std::vector<uint64_t>({1, 2, 3, 4, 6}),
+            DrivenIndices(forgiving_driven));
+  ASSERT_TRUE(forgiving_driven.gaps.empty());
+  ASSERT_EQ(7U, forgiving->GetFrontier());
+}
+
+// Ported from Muse's GC19 candidate. A superseded-only hole with live
+// records below it but none above: the trailing discards were never
+// reissued, so the merge re-trusts the cut and moves on. Neuter: GC19's Q2
+// pending-hole handling removed so every superseded-only index stops; the
+// merge reports a frontier at 5 instead of ending clean.
+TEST_P(LogMergeTest, TrailingSupersededHoleWithoutLiveAboveSkips) {
+  auto old = std::unique_ptr<WALIndexMerger::Member>(
+      new ScriptMember(120, {Rec(1, 1), Rec(2, 2), Rec(5, 5)}));
+  auto young = std::unique_ptr<WALIndexMerger::Member>(
+      new ScriptMember(121, {Rec(3, 3), Rec(4, 4)}));
+  static_cast<ScriptMember*>(young.get())->sups[120] = 3;
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(std::move(old));
+  members.push_back(std::move(young));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome);
+  ASSERT_EQ(std::vector<uint64_t>({1, 2, 3, 4}), DrivenIndices(driven));
+  ASSERT_TRUE(driven.gaps.empty());
+  ASSERT_EQ(6U, merger->GetFrontier());
+}
+
 // A merge handed a set containing an unindexed file fails instead of emitting
 // a stream that misplaces that file's records. Nothing is emitted first: the
 // gate runs inside the pull-down, ahead of the unindexed drain.

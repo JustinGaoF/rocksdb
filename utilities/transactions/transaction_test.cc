@@ -10972,6 +10972,193 @@ TEST(TransactionPartitionedWalTest,
   ASSERT_NO_FATAL_FAILURE(race.Close());
 }
 
+// GC23 Q7: while T1 is held between publication and its snapshot callback,
+// its reservation pins versions but stays out of user-visible snapshot
+// properties; after the callback the real snapshot shows up. Neuter: count
+// the reservation in the properties; num-snapshots reads 1 while held.
+TEST(TransactionPartitionedWalTest,
+     GC23SnapshotReservationHiddenFromProperties) {
+  FU14SnapshotRace race;
+  ASSERT_NO_FATAL_FAILURE(race.Open("gc23_snapshot_reservation_hidden"));
+  auto commit = [&](size_t partition, const std::string& key, TxnTimestamp ts,
+                    std::shared_ptr<const Snapshot>* snapshot) {
+    std::unique_ptr<Transaction> txn(race.db->BeginTransaction(WriteOptions()));
+    ASSERT_OK(txn->Put(race.cf_for_partition[partition], key, "v"));
+    ASSERT_OK(txn->CommitAndTryCreateSnapshot(nullptr, ts, snapshot));
+  };
+  auto int_prop = [&](const char* name) {
+    uint64_t value = 0;
+    EXPECT_TRUE(race.db->GetIntProperty(name, &value)) << name;
+    return value;
+  };
+  std::shared_ptr<const Snapshot> t1;
+  SequenceNumber held_seq = 0;
+  RunWithCommitHeldAtGate(
+      [&] { commit(0, "t1", 10, &t1); },
+      [&] {
+        // T1 published, callback pending: only the reservation is
+        // outstanding, and the properties do not show it.
+        held_seq = race.db->GetLatestSequenceNumber();
+        EXPECT_EQ(0u, int_prop("rocksdb.num-snapshots"));
+        EXPECT_EQ(0u, int_prop("rocksdb.oldest-snapshot-time"));
+        EXPECT_EQ(0u, int_prop("rocksdb.oldest-snapshot-sequence"));
+        // The full list still pins the sequence for compaction and flush.
+        std::vector<SequenceNumber> snaps;
+        race.db_impl->LoadSnapshots(&snaps, nullptr, kMaxSequenceNumber);
+        ASSERT_EQ(1u, snaps.size());
+        EXPECT_EQ(held_seq, snaps[0]);
+      });
+  ASSERT_NE(nullptr, t1);
+  EXPECT_EQ(held_seq, t1->GetSequenceNumber());
+  EXPECT_EQ(1u, int_prop("rocksdb.num-snapshots"));
+  EXPECT_EQ(held_seq, int_prop("rocksdb.oldest-snapshot-sequence"));
+  EXPECT_EQ(static_cast<uint64_t>(t1->GetUnixTime()),
+            int_prop("rocksdb.oldest-snapshot-time"));
+  t1.reset();
+  ASSERT_NO_FATAL_FAILURE(race.Close());
+}
+
+// GC23 Q9: no SyncPoint anywhere, so this also runs in release builds.
+// Committer threads hammer cross-partition snapshot commits (sync writes,
+// so their publication-to-callback windows overlap the compactor's work)
+// while a compactor thread writes a dense version history for one key and
+// flushes and compacts around them. Every timestamped snapshot still reads
+// the value its sequence pins: the pre-publish reservation keeps the
+// compactor from dropping the version between publication and the snapshot
+// callback. Neuter: drop the reservation; snapshots read too-new values
+// within the iteration budget.
+TEST(TransactionPartitionedWalTest,
+     GC23TimestampedSnapshotsSurviveCompactionStress) {
+  FU14SnapshotRace race;
+  ASSERT_NO_FATAL_FAILURE(race.Open("gc23_snapshot_compaction_stress"));
+  ColumnFamilyHandle* cf1 = race.cf_for_partition[1];
+
+  // The compactor's puts take exact sequences by briefly pausing commits.
+  std::atomic<bool> pause_commits{false};
+  std::atomic<int> commits_in_flight{0};
+  std::atomic<bool> done{false};
+  std::vector<std::pair<SequenceNumber, std::string>> history;
+  {
+    ASSERT_OK(race.db->Put(WriteOptions(), cf1, "k", "v0"));
+    history.emplace_back(race.db->GetLatestSequenceNumber(), "v0");
+    ASSERT_OK(race.db->Flush(FlushOptions(), cf1));
+  }
+
+  struct CommitterResult {
+    std::vector<std::pair<SequenceNumber, std::shared_ptr<const Snapshot>>>
+        snapshots;
+    int refused = 0;
+  };
+  std::atomic<TxnTimestamp> next_ts{1};
+  std::atomic<int> value_id{1};
+  auto committer = [&](int t) {
+    CommitterResult result;
+    WriteOptions sync_write;
+    sync_write.sync = true;
+    int i = 0;
+    while (!done.load(std::memory_order_acquire) && i < 3000) {
+      if (pause_commits.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+        continue;
+      }
+      commits_in_flight.fetch_add(1, std::memory_order_acq_rel);
+      std::unique_ptr<Transaction> txn(race.db->BeginTransaction(sync_write));
+      const std::string key = "t" + std::to_string(t) + "_" + std::to_string(i);
+      const int id = value_id.fetch_add(1, std::memory_order_relaxed);
+      Status s = txn->Put(race.cf_for_partition[static_cast<size_t>(t) % 2],
+                          key, "v" + std::to_string(id));
+      std::shared_ptr<const Snapshot> snapshot;
+      if (s.ok()) {
+        s = txn->CommitAndTryCreateSnapshot(
+            nullptr, next_ts.fetch_add(1, std::memory_order_relaxed),
+            &snapshot);
+      }
+      commits_in_flight.fetch_sub(1, std::memory_order_acq_rel);
+      if (!s.ok()) {
+        // Only committed transactions reach here; a failure is unexpected.
+        ADD_FAILURE() << s.ToString();
+        return result;
+      }
+      if (snapshot == nullptr) {
+        // Inverted timestamp order under concurrency: committed, but the
+        // snapshot was refused and pins nothing.
+        ++result.refused;
+      } else {
+        result.snapshots.emplace_back(snapshot->GetSequenceNumber(), snapshot);
+      }
+      ++i;
+    }
+    return result;
+  };
+
+  constexpr int kCommitters = 4;
+  std::vector<std::thread> threads;
+  std::vector<CommitterResult> results(kCommitters);
+  for (int t = 0; t < kCommitters; ++t) {
+    threads.emplace_back([&, t] { results[t] = committer(t); });
+  }
+  // The compactor: dense puts with exact sequences, then flush and compact
+  // around the committers' windows. Flushing and compacting never pause.
+  constexpr int kRounds = 60;
+  constexpr int kPutsPerRound = 10;
+  for (int r = 0; r < kRounds; ++r) {
+    pause_commits.store(true, std::memory_order_release);
+    while (commits_in_flight.load(std::memory_order_acquire) != 0) {
+      std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+    const SequenceNumber before = race.db->GetLatestSequenceNumber();
+    for (int i = 0; i < kPutsPerRound; ++i) {
+      const int id = value_id.fetch_add(1, std::memory_order_relaxed);
+      ASSERT_OK(
+          race.db->Put(WriteOptions(), cf1, "k", "v" + std::to_string(id)));
+      history.emplace_back(before + 1 + i, "v" + std::to_string(id));
+    }
+    ASSERT_EQ(before + kPutsPerRound, race.db->GetLatestSequenceNumber());
+    pause_commits.store(false, std::memory_order_release);
+    ASSERT_OK(race.db->Flush(FlushOptions(), cf1));
+    ASSERT_OK(
+        race.db->CompactRange(CompactRangeOptions(), cf1, nullptr, nullptr));
+  }
+  done.store(true, std::memory_order_release);
+  for (auto& thread : threads) {
+    thread.join();
+  }
+
+  size_t total = 0;
+  for (const auto& result : results) {
+    total += result.snapshots.size();
+  }
+  // Non-vacuity: enough snapshots raced the compactor to cover overlaps.
+  ASSERT_GT(total, 200u) << "too few snapshots to cover the race";
+  ASSERT_TRUE(
+      std::is_sorted(history.begin(), history.end(),
+                     [](const std::pair<SequenceNumber, std::string>& a,
+                        const std::pair<SequenceNumber, std::string>& b) {
+                       return a.first < b.first;
+                     }));
+  for (const auto& result : results) {
+    for (const auto& [seq, snapshot] : result.snapshots) {
+      // A snapshot sees versions at or below its sequence.
+      auto it = std::upper_bound(
+          history.begin(), history.end(), seq,
+          [](SequenceNumber s,
+             const std::pair<SequenceNumber, std::string>& entry) {
+            return s < entry.first;
+          });
+      ASSERT_NE(history.begin(), it);
+      --it;
+      ReadOptions read_options;
+      read_options.snapshot = snapshot.get();
+      std::string value;
+      ASSERT_OK(race.db->Get(read_options, cf1, "k", &value));
+      EXPECT_EQ(it->second, value) << "snapshot seq " << seq;
+    }
+  }
+  // Release every snapshot before closing; Close fails on unreleased ones.
+  results.clear();
+  ASSERT_NO_FATAL_FAILURE(race.Close());
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

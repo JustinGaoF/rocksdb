@@ -87,6 +87,11 @@ class WALIndexMerger {
     virtual bool VoidCovers(uint64_t index) const = 0;
     // Whether a supersession read so far obsoletes (`bearer`, `index`).
     virtual bool Supersedes(uint64_t bearer, uint64_t index) const = 0;
+    // Whether a supersession arrived after a data record or a progress
+    // assertion. Only real files can misplace one, so scripted members never
+    // do. A misplaced declaration is unrecorded and may postdate indices the
+    // merge already decided, so the merge fails closed on it.
+    virtual bool SawMisplacedSupersession() const { return false; }
     // Predecessor span attested by this member's head, if one was read.
     struct PredecessorSpan {
       uint64_t wal_number = 0;
@@ -172,6 +177,9 @@ class WALIndexMerger {
     uint64_t ProgressBound() const override;
     bool VoidCovers(uint64_t index) const override;
     bool Supersedes(uint64_t bearer, uint64_t index) const override;
+    bool SawMisplacedSupersession() const override {
+      return reader_->SawMisplacedSupersession();
+    }
     bool AttestedSpan(PredecessorSpan* span) const override;
     bool SwallowedCovers(uint64_t index) const override;
     bool TailImpure() const override;
@@ -348,12 +356,16 @@ class WALIndexMerger {
   // anchors was allocated before `wal_number` was created). A loss in a
   // bounded head surfaces as a hole instead of raising the bound. Valid once
   // the lower bound is set.
-  // With no attestation anywhere, the history floor bounds every head: the
-  // lower bound sits at the floor, below which no index was ever allocated.
+  // With no attestation anywhere, the history floor bounds every head while
+  // some member holds indexed data: the lower bound then sits at the floor,
+  // below which no index was ever allocated, so the loss surfaces as a hole.
+  // With no indexed data anywhere the drive ends clean without examining any
+  // index, and the floor bounds nothing.
   bool HeadBounded(uint64_t wal_number) const {
     return attested_wals_.count(wal_number) != 0 ||
            wal_number >= min_anchoring_wal_ ||
-           (history_floor_ != 0 && attested_wals_.empty());
+           (history_floor_ != 0 && attested_wals_.empty() &&
+            SomeMemberHoldsIndexedData());
   }
 
   // How a member finished, for the recovery-mode mapping: after kCleanEnd,
@@ -413,6 +425,19 @@ class WALIndexMerger {
   Status ComputeLowerBound();
 
   MemberState* FindState(uint64_t wal_number);
+
+  // Whether any member pulled an indexed record. Read at the head-integrity
+  // gate, after the pull-down to the first index, when every member either
+  // finished or holds a lookahead at or above it (or was cleared past it by
+  // a progress bound, in which case its data stays unexamined too).
+  bool SomeMemberHoldsIndexedData() const {
+    for (const auto& s : states_) {
+      if (s.member->FirstIndexed() != 0) {
+        return true;
+      }
+    }
+    return false;
+  }
 
   std::vector<std::unique_ptr<Member>> members_;
   std::set<uint64_t> expected_wals_;

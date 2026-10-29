@@ -1700,6 +1700,15 @@ IOStatus DBImpl::WriteWALIndexSupersessions(
   // cut. That repeat is idempotent: the declaration names one file and one
   // lower bound, and a reader folds the minimum per file.
   assert(new_log != nullptr);
+  // Recovery classifies a set from its WAL heads, so a declaration anywhere
+  // else would route wrong: the recovery set's supersessions are written only
+  // to this fresh log, before its first data record. (An indexed file's data
+  // records all carry an index, so a zero first index proves none precedes.)
+  assert(new_log->first_wal_index_recorded() == 0);
+  // The merge's pre-cut void rule treats a void in a WAL below the declarer
+  // as predating the cut, so the declarer is the lowest-numbered WAL this
+  // open creates: partition 0's, created first and still the lowest live.
+  assert(new_log->get_log_number() == cur_wal_number_);
   for (const WALIndexSupersession& supersession : supersessions) {
     IOStatus io_s = new_log->AddWALIndexSupersessionRecord(
         write_options, supersession.wal_number,
@@ -2426,6 +2435,26 @@ Status DBImpl::ProcessLogFilesMerged(
       }
       if (end != log::WALIndexMerger::MemberEnd::kClean) {
         record_cut(wal_number);
+      } else if (reader->LastIndexed() >= next_wal_index_) {
+        // As on the broke_early path: a member read to its end can still
+        // hold unapplied records at or above the seed (a pending frontier
+        // sits below indices the drive already decided), and those stay
+        // live without a cut.
+        record_cut(wal_number);
+        supersessions->back().first_obsolete_wal_index = std::max(
+            supersessions->back().first_obsolete_wal_index, next_wal_index_);
+      }
+    }
+    // Seed past voids the drive read above the frontier: the next write
+    // would otherwise reissue an index a void covers. (seed_past_voids only
+    // seeds N=1 stops; a frontier can sit below read voids at any N.)
+    for (const auto* reader : readers) {
+      const uint64_t void_hi = reader->reader()->GetMaxVoidWALIndexHi();
+      if (void_hi >= next_wal_index_) {
+        Status seed_status = SetNextWALIndexAfterRecovery(void_hi);
+        if (!seed_status.ok()) {
+          return seed_status;
+        }
       }
     }
     stop_at(cut_wal);
@@ -2672,6 +2701,16 @@ Status DBImpl::ProcessLogFile(
     bool read_record = reader->ReadRecord(
         &record, &scratch, immutable_db_options_.wal_recovery_mode,
         &record_checksum);
+
+    // A supersession after data arrives too late: routing already chose this
+    // sequential path from the heads, which cannot honor it. Fail closed in
+    // every mode rather than replaying records it would obsolete.
+    if (reader->SawMisplacedSupersession()) {
+      return Status::Corruption(
+          "WAL " + std::to_string(wal_number) +
+          " carries a WAL index supersession after a data record; "
+          "sequential replay cannot honor it");
+    }
 
     // `reader->ReadRecord` will change `status` through reporter in `reader`
     // when a corruption is encountered

@@ -49,6 +49,13 @@ class SnapshotImpl : public Snapshot {
 
   // Will this snapshot be used by a Transaction to do write-conflict checking?
   bool is_write_conflict_boundary_;
+
+  // Whether this entry is an internal write reservation (DBImpl::WriteImpl),
+  // standing for a timestamped snapshot whose commit published but whose
+  // callback has not run yet. It pins versions like a user snapshot, but
+  // users can neither see nor release it, so user-visible snapshot counts
+  // and listings skip it. Const after insertion into the list.
+  bool is_write_reservation_ = false;
 };
 
 class SnapshotList {
@@ -62,6 +69,7 @@ class SnapshotList {
     list_.unix_time_ = 0;
     list_.timestamp_ = 0;
     list_.is_write_conflict_boundary_ = false;
+    list_.is_write_reservation_ = false;
     count_ = 0;
   }
 
@@ -88,11 +96,13 @@ class SnapshotList {
 
   SnapshotImpl* New(SnapshotImpl* s, SequenceNumber seq, uint64_t unix_time,
                     bool is_write_conflict_boundary,
-                    uint64_t ts = std::numeric_limits<uint64_t>::max()) {
+                    uint64_t ts = std::numeric_limits<uint64_t>::max(),
+                    bool is_write_reservation = false) {
     s->number_ = seq;
     s->unix_time_ = unix_time;
     s->timestamp_ = ts;
     s->is_write_conflict_boundary_ = is_write_conflict_boundary;
+    s->is_write_reservation_ = is_write_reservation;
     s->list_ = this;
     // Kept in sequence order. Appending suffices except at N>1, where a write
     // group reserves its timestamped snapshot above the published sequence
@@ -189,6 +199,27 @@ class SnapshotList {
   }
 
   uint64_t count() const { return count_; }
+
+  // User-visible views of the list: like count() and the oldest-snapshot
+  // getters above, but skipping internal write reservations, which pin
+  // versions yet have no user handle. Compaction, flush and file marking
+  // keep reading the full list through GetAll()/oldest()/count().
+  uint64_t count_visible() const {
+    uint64_t visible = 0;
+    for (const SnapshotImpl* s = list_.next_; s != &list_; s = s->next_) {
+      visible += s->is_write_reservation_ ? 0 : 1;
+    }
+    return visible;
+  }
+
+  const SnapshotImpl* oldest_visible() const {
+    for (const SnapshotImpl* s = list_.next_; s != &list_; s = s->next_) {
+      if (!s->is_write_reservation_) {
+        return s;
+      }
+    }
+    return nullptr;
+  }
 
  private:
   // Dummy head of doubly-linked list of snapshots

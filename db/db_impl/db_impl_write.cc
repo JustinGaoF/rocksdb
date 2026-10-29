@@ -1753,8 +1753,12 @@ Status DBImpl::WriteImpl(
       SnapshotImpl* reserved = new SnapshotImpl;
       {
         InstrumentedMutexLock l(&mutex_);
+        // A reservation, not a user snapshot: user-visible snapshot counts
+        // and listings skip it, while compaction and flush still see it.
         snapshots_.New(reserved, last_sequence, unix_time,
-                       /*is_write_conflict_boundary=*/true);
+                       /*is_write_conflict_boundary=*/true,
+                       /*ts=*/std::numeric_limits<uint64_t>::max(),
+                       /*is_write_reservation=*/true);
       }
       std::shared_ptr<const Snapshot> reserved_snapshot(
           reserved, [this](const Snapshot* s) { ReleaseSnapshot(s); });

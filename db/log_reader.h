@@ -218,6 +218,12 @@ class Reader {
     return it == first_superseded_wal_indices_.end() ? 0 : it->second;
   }
 
+  // Whether a supersession record was read after a data record or a progress
+  // assertion. Such a record is reported as corruption and not recorded, so
+  // recovery paths that already routed on the head's declarations fail closed
+  // on this rather than replaying records the declaration would obsolete.
+  bool SawMisplacedSupersession() const { return saw_misplaced_supersession_; }
+
  protected:
   std::shared_ptr<Logger> info_log_;
   const std::unique_ptr<SequentialFileReader> file_;
@@ -316,6 +322,10 @@ class Reader {
   bool saw_wal_index_marker_ = false;
   // Whether this file's head attested a predecessor span.
   bool has_predecessor_span_ = false;
+  // Whether a supersession record followed a data record or a progress
+  // assertion. Sticky: once set, recovery fails closed on it (see the
+  // accessor above), in every recovery mode.
+  bool saw_misplaced_supersession_ = false;
   uint32_t wal_partition_ = 0;
 
   // Extend record types with the following special values

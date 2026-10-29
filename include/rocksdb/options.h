@@ -1560,7 +1560,12 @@ struct DBOptions {
   // checkpoint restore, RepairDB, secondary instances) must first be upgraded
   // to one that understands partitioned, indexed WALs, before any DB is
   // opened with wal_partitions > 1. Secondary instances and RepairDB refuse
-  // partitioned WAL files with Status::NotSupported.
+  // partitioned WAL files with Status::NotSupported. A secondary also
+  // refuses a catch-up round when the WAL set carries the WAL index but a
+  // WAL head in the round is empty: an empty head is indistinguishable from
+  // an unwritten one, so the round fails closed. This bites an N = 1
+  // indexed primary under manual_wal_flush whose newest WAL still buffers
+  // its marker; the next round succeeds after the primary's FlushWAL.
   //
   // Not dynamically changeable via SetOptions().
   //

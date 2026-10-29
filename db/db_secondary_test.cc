@@ -482,6 +482,76 @@ TEST_F(DBSecondaryTest, GC22RefusesMarkerlessIndexedWal) {
       << s.ToString();
 }
 
+// Ported from Muse's GC22 candidate (GC23 Q6): with manual_wal_flush at N=1
+// and unindexed WALs, a catch-up round whose WAL is still empty on disk
+// proceeds and applies nothing; an empty head with no index marker anywhere
+// is not a partitioned set. Pins the non-partitioned behavior the pre-scan
+// must preserve. Neuter: refuse on any empty head, regardless of indexing;
+// the first catch-up fails.
+TEST_F(DBSecondaryTest, CatchUpEmptyUnindexedWalAppliesNothing) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.manual_wal_flush = true;
+  Reopen(options);
+  Options secondary_options = options;
+  secondary_options.max_open_files = -1;
+  OpenSecondary(secondary_options);
+  ASSERT_OK(Put("buffered", "v"));
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  std::string value;
+  ASSERT_TRUE(
+      db_secondary_->Get(ReadOptions(), "buffered", &value).IsNotFound());
+  ASSERT_OK(db_->FlushWAL(/*sync=*/false));
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  ASSERT_OK(db_secondary_->Get(ReadOptions(), "buffered", &value));
+  ASSERT_EQ("v", value);
+  CloseSecondary();
+}
+
+// Ported from Muse's GC22 candidate (GC23 Q6, also Q8's test): at N=1 with
+// indexed WALs and manual_wal_flush, a round holding a WAL with an on-disk
+// marker plus an empty WAL is refused before anything is applied - the empty
+// head's partition is unknown, so the set may be partitioned. After FlushWAL
+// lands the empty WAL's own marker, the retry proceeds and applies the
+// records. Neuter: never refuse on an empty head (option (ii)'s behavior);
+// the first catch-up succeeds.
+TEST_F(DBSecondaryTest, CatchUpRefusesIndexedRoundWithEmptyHead) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  options.manual_wal_flush = true;
+  CreateAndReopenWithCF({"b"}, options);
+  Options secondary_options = options;
+  secondary_options.max_open_files = -1;
+  OpenSecondaryWithColumnFamilies({"b"}, secondary_options);
+  // Lands WAL #1's marker and column family "b"'s record on disk; the WAL
+  // stays live because "b" is never flushed.
+  ASSERT_OK(Put(1, "b_key", "v"));
+  ASSERT_OK(db_->FlushWAL(/*sync=*/false));
+  // Flushing the default column family switches to WAL #2, whose marker
+  // stays buffered under manual_wal_flush.
+  ASSERT_OK(Put("a_key", "v"));
+  ASSERT_OK(Flush());
+  uint64_t wal2_size = 0;
+  DBImpl* primary = dbfull();
+  ASSERT_OK(env_->GetFileSize(
+      LogFileName(dbname_, primary->TEST_GetCurrentLogNumber()), &wal2_size));
+  ASSERT_EQ(0u, wal2_size);
+
+  std::string value;
+  Status s = db_secondary_->TryCatchUpWithPrimary();
+  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+  ASSERT_TRUE(
+      db_secondary_->Get(ReadOptions(), handles_secondary_[1], "b_key", &value)
+          .IsNotFound());
+  ASSERT_OK(db_->FlushWAL(/*sync=*/false));
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  ASSERT_OK(db_secondary_->Get(ReadOptions(), handles_secondary_[1], "b_key",
+                               &value));
+  ASSERT_EQ("v", value);
+  CloseSecondary();
+}
+
 TEST_F(DBSecondaryTest, FailOpenIfLoggerCreationFail) {
   Options options = GetDefaultOptions();
   options.create_if_missing = true;

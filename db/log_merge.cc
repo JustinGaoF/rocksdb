@@ -293,6 +293,14 @@ Status WALIndexMerger::PullMembers(uint64_t threshold, PullOutcome* outcome) {
         break;
       }
       Member::PulledRecord pulled = s.member->PullNext();
+      // A supersession after data is unrecorded and may postdate decided
+      // indices, so it cannot be honored: fail closed in every mode rather
+      // than replaying records it would obsolete.
+      if (s.member->SawMisplacedSupersession()) {
+        return Status::Corruption(
+            "WAL index merge: WAL " + std::to_string(s.member->wal_number()) +
+            " carries a WAL index supersession after a data record");
+      }
       if (pulled.kind == Member::Pull::kRecord) {
         if (pulled.wal_index < s.member->ProgressBound()) {
           return Status::Corruption(

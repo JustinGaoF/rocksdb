@@ -1434,19 +1434,22 @@ bool InternalStats::HandleEstimateNumKeys(uint64_t* value, DBImpl* /*db*/,
 
 bool InternalStats::HandleNumSnapshots(uint64_t* value, DBImpl* db,
                                        Version* /*version*/) {
-  *value = db->snapshots().count();
+  *value = db->snapshots().count_visible();
   return true;
 }
 
 bool InternalStats::HandleOldestSnapshotTime(uint64_t* value, DBImpl* db,
                                              Version* /*version*/) {
-  *value = static_cast<uint64_t>(db->snapshots().GetOldestSnapshotTime());
+  const SnapshotImpl* oldest = db->snapshots().oldest_visible();
+  *value = static_cast<uint64_t>(oldest == nullptr ? 0 : oldest->GetUnixTime());
   return true;
 }
 
 bool InternalStats::HandleOldestSnapshotSequence(uint64_t* value, DBImpl* db,
                                                  Version* /*version*/) {
-  *value = static_cast<uint64_t>(db->snapshots().GetOldestSnapshotSequence());
+  const SnapshotImpl* oldest = db->snapshots().oldest_visible();
+  *value = static_cast<uint64_t>(
+      oldest == nullptr ? 0 : oldest->GetSequenceNumber());
   return true;
 }
 
