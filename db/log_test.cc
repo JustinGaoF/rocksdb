@@ -2170,6 +2170,33 @@ TEST_P(LogTest, WALIndexSecondPredecessorSpanReportsCorruption) {
   EXPECT_EQ(60U, last);
 }
 
+// GC26 Q2: a head may attest further spans in ascending WAL order, as the
+// first WAL an open at fewer partitions creates does for the chains it folds.
+TEST_P(LogTest, WALIndexFurtherPredecessorSpansAscend) {
+  EnableWALIndex();
+  ASSERT_OK(
+      writer_->AddWALIndexPredecessorSpanRecord(WriteOptions(), 120, 10, 60));
+  ASSERT_OK(
+      writer_->AddWALIndexPredecessorSpanRecord(WriteOptions(), 121, 30, 60));
+  ASSERT_OK(
+      writer_->AddWALIndexPredecessorSpanRecord(WriteOptions(), 122, 0, 0));
+  Write("after");
+
+  ASSERT_EQ("after", Read());
+  ASSERT_EQ("EOF", Read());
+  uint64_t pred = 0;
+  uint64_t first = 0;
+  uint64_t last = 0;
+  EXPECT_TRUE(reader_->GetWALIndexPredecessorSpan(&pred, &first, &last));
+  EXPECT_EQ(120U, pred);
+  EXPECT_EQ(10U, first);
+  EXPECT_EQ(60U, last);
+  const std::vector<std::array<uint64_t, 3>> further = {{121, 30, 60},
+                                                        {122, 0, 0}};
+  EXPECT_EQ(further, reader_->GetFurtherWALIndexPredecessorSpans());
+  ASSERT_EQ(0U, DroppedBytes());
+}
+
 TEST_P(LogTest, WALIndexProgressInsidePartialRecordReportsCorruption) {
   const bool recyclable = std::get<0>(GetParam()) != 0;
   const int header_size = recyclable ? kRecyclableHeaderSize : kHeaderSize;

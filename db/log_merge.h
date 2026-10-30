@@ -99,6 +99,15 @@ class WALIndexMerger {
       uint64_t last = 0;
     };
     virtual bool AttestedSpan(PredecessorSpan* span) const = 0;
+    // Every span this member's head attests: AttestedSpan's first, then any
+    // further ones, which a WAL opened at fewer partitions than wrote its
+    // predecessors attests for the chains it folds.
+    virtual void AttestedSpans(std::vector<PredecessorSpan>* spans) const {
+      PredecessorSpan span;
+      if (AttestedSpan(&span)) {
+        spans->push_back(span);
+      }
+    }
     // Whether the member observed and skipped corruption strictly between
     // two positioned pulls bounding `index`: it pulled an index below
     // `index`, then reported corruption, then pulled an index above `index`.
@@ -179,6 +188,7 @@ class WALIndexMerger {
     bool VoidCovers(uint64_t index) const override;
     bool Supersedes(uint64_t bearer, uint64_t index) const override;
     bool AttestedSpan(PredecessorSpan* span) const override;
+    void AttestedSpans(std::vector<PredecessorSpan>* spans) const override;
     bool SwallowedCovers(uint64_t index) const override;
     bool TailImpure() const override;
     bool TailReported() const override;
@@ -346,6 +356,15 @@ class WALIndexMerger {
   // WALs: a loss at the bottom of those then surfaces as a hole instead of
   // raising the bound past it. Call before the first Next().
   void SetHistoryFloor(uint64_t index) { history_floor_ = index; }
+  // Skips every unexplained hole, pristine or below a lost predecessor's
+  // first index, instead of stopping at the frontier, so the records above
+  // it are emitted. Recovery sets it only under kSkipAnyCorruptedRecords,
+  // which skips what it cannot read, as it does with one WAL. Superseded
+  // records are still never emitted. Call before the first Next().
+  void SetSkipUnexplainedHoles(bool skip) { skip_unexplained_holes_ = skip; }
+  // Holes skipped so far under SetSkipUnexplainedHoles, and the first one.
+  uint64_t GetSkippedHoles() const { return skipped_holes_; }
+  uint64_t GetFirstSkippedHole() const { return first_skipped_hole_; }
   // An attested predecessor the merge stopped for, or zero. Valid after
   // kFrontier.
   uint64_t GetLostPredecessor() const { return lost_predecessor_; }
@@ -404,6 +423,19 @@ class WALIndexMerger {
     error_ = status;
     terminal_ = Result::kError;
     return terminal_;
+  }
+
+  // Under SetSkipUnexplainedHoles, steps past expected_ and returns true;
+  // otherwise returns false and leaves the stop to the caller.
+  bool SkipUnexplainedHole() {
+    if (!skip_unexplained_holes_) {
+      return false;
+    }
+    if (skipped_holes_++ == 0) {
+      first_skipped_hole_ = expected_;
+    }
+    expected_++;
+    return true;
   }
 
   // Stops at expected_ with members holding records above it, or at the
@@ -471,6 +503,9 @@ class WALIndexMerger {
   Status error_ = Status::OK();
   uint64_t retirement_bound_ = std::numeric_limits<uint64_t>::max();
   uint64_t history_floor_ = 0;
+  bool skip_unexplained_holes_ = false;
+  uint64_t skipped_holes_ = 0;
+  uint64_t first_skipped_hole_ = 0;
   // First index a lost predecessor bore: no hole at or above it is explained
   // as a tail gap.
   uint64_t lost_floor_ = std::numeric_limits<uint64_t>::max();
