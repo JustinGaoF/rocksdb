@@ -53,14 +53,12 @@ namespace ROCKSDB_NAMESPACE {
 
 namespace {
 // Forward-only view of a flush's input that hides entries at or above
-// `floor`, and entries inside one of `ranges`, and counts them, so the flush
-// can still check that it read every memtable entry.
+// `floor` and counts them, so the flush can still check that it read every
+// memtable entry.
 class SequenceFloorIterator : public InternalIterator {
  public:
-  SequenceFloorIterator(
-      InternalIterator* input, SequenceNumber floor,
-      const std::vector<std::pair<SequenceNumber, SequenceNumber>>& ranges)
-      : input_(input), floor_(floor), ranges_(ranges) {}
+  SequenceFloorIterator(InternalIterator* input, SequenceNumber floor)
+      : input_(input), floor_(floor) {}
 
   bool Valid() const override { return input_->Valid(); }
   void SeekToFirst() override {
@@ -94,21 +92,10 @@ class SequenceFloorIterator : public InternalIterator {
     }
   }
 
-  bool Hidden(SequenceNumber seq) const {
-    if (seq >= floor_) {
-      return true;
-    }
-    for (const auto& range : ranges_) {
-      if (range.first <= seq && seq <= range.second) {
-        return true;
-      }
-    }
-    return false;
-  }
+  bool Hidden(SequenceNumber seq) const { return seq >= floor_; }
 
   InternalIterator* const input_;
   const SequenceNumber floor_;
-  const std::vector<std::pair<SequenceNumber, SequenceNumber>>& ranges_;
   uint64_t num_hidden_ = 0;
 };
 }  // namespace
@@ -496,8 +483,7 @@ Status FlushJob::MemPurge() {
   std::vector<std::unique_ptr<FragmentedRangeTombstoneIterator>>
       range_del_iters;
   // What a flush would drop, MemPurge drops too: entries at or above an
-  // unreleased fence, and failed gate syncs' entries (masked memtables hide
-  // their range tombstones themselves).
+  // unreleased fence.
   const SequenceNumber range_del_read_seq =
       drop_entries_at_or_above_ == kMaxSequenceNumber
           ? kMaxSequenceNumber
@@ -532,10 +518,9 @@ Status FlushJob::MemPurge() {
                          static_cast<int>(memtables.size()), &arena));
   std::unique_ptr<SequenceFloorIterator> floor_iter;
   InternalIterator* iter = merged.get();
-  if (drop_entries_at_or_above_ != kMaxSequenceNumber ||
-      !drop_entry_ranges_.empty()) {
-    floor_iter.reset(new SequenceFloorIterator(
-        merged.get(), drop_entries_at_or_above_, drop_entry_ranges_));
+  if (drop_entries_at_or_above_ != kMaxSequenceNumber) {
+    floor_iter.reset(
+        new SequenceFloorIterator(merged.get(), drop_entries_at_or_above_));
     iter = floor_iter.get();
   }
 
@@ -737,13 +722,6 @@ Status FlushJob::MemPurge() {
         // Take the latest memtable's next log number.
         new_mem->SetNextLogNumber(mems_.back()->GetNextLogNumber());
 
-        // A failed gate sync may have masked the inputs since they were
-        // picked (DBImpl::InstallFailedGateSyncFence). The output holds what
-        // they held, so it hides the same ranges and keeps the mask alive
-        // until it is released, as they would have.
-        if (auto masked = mems_.front()->GetMaskedSequenceRanges()) {
-          new_mem->SetMaskedSequenceRanges(std::move(masked));
-        }
         // This addition will not trigger another flush, because
         // we do not call EnqueuePendingFlush().
         cfd_->imm()->Add(new_mem, &job_context_->memtables_to_free);
@@ -1056,15 +1034,6 @@ Status FlushJob::WriteLevel0Table() {
         range_del_iters.emplace_back(range_del_iter);
       }
       total_num_input_entries += m->NumEntries();
-      if (range_del_iter != nullptr && m->HasMaskedSequenceRanges()) {
-        // Masked tombstones (failed sync writes) are hidden from the
-        // iterator, as SequenceFloorIterator hides their point entries.
-        assert(m->NumRangeDeletion() >=
-               range_del_iter->num_unfragmented_tombstones());
-        total_num_input_entries -=
-            m->NumRangeDeletion() -
-            range_del_iter->num_unfragmented_tombstones();
-      }
       total_num_deletes += m->NumDeletion();
       total_data_size += m->GetDataSize();
       total_memory_usage += m->ApproximateMemoryUsage();
@@ -1102,16 +1071,14 @@ Status FlushJob::WriteLevel0Table() {
                              static_cast<int>(memtables.size()), &arena));
       std::unique_ptr<SequenceFloorIterator> floor_iter;
       InternalIterator* input = iter.get();
-      if (drop_entries_at_or_above_ != kMaxSequenceNumber ||
-          !drop_entry_ranges_.empty()) {
+      if (drop_entries_at_or_above_ != kMaxSequenceNumber) {
         ROCKS_LOG_WARN(db_options_.info_log,
                        "[%s] [JOB %d] Flush drops entries at or above "
-                       "sequence %" PRIu64 " and in %" ROCKSDB_PRIszt
-                       " failed sync range(s)",
+                       "sequence %" PRIu64,
                        cfd_->GetName().c_str(), job_context_->job_id,
-                       drop_entries_at_or_above_, drop_entry_ranges_.size());
-        floor_iter.reset(new SequenceFloorIterator(
-            iter.get(), drop_entries_at_or_above_, drop_entry_ranges_));
+                       drop_entries_at_or_above_);
+        floor_iter.reset(
+            new SequenceFloorIterator(iter.get(), drop_entries_at_or_above_));
         input = floor_iter.get();
       }
       ROCKS_LOG_INFO(db_options_.info_log,

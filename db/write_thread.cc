@@ -324,6 +324,54 @@ void WriteThread::CompleteFollower(Writer* w, WriteGroup& write_group) {
   SetState(w, STATE_COMPLETED);
 }
 
+void WriteThread::UnlinkAndCompleteFollower(Writer* w,
+                                            WriteGroup& write_group) {
+  assert(write_group.size > 1);
+  assert(w != write_group.leader);
+  assert(w->link_older != nullptr);
+  Writer* const prev = w->link_older;
+  // Detach w from the waiters list first, while it is still parked: once
+  // completed, w's thread may return and destroy w, so no link may point at
+  // it afterwards. Still parked, w cannot be re-linked under us (no ABA on
+  // newest_writer_).
+  while (true) {
+    Writer* head = newest_writer_.load(std::memory_order_acquire);
+    if (head == w) {
+      // w is the head: no waiter arrived behind it. Swing the head to its
+      // predecessor; a concurrent arrival that wins the CAS retries below.
+      if (newest_writer_.compare_exchange_strong(head, prev)) {
+        break;
+      }
+    } else {
+      // w is below the head: exactly one waiter, its successor, points at
+      // it. Repoint that link; later arrivals link above the head, never
+      // onto w, and parked waiters never touch their own links.
+      Writer* s = head;
+      while (s->link_older != w) {
+        assert(s->link_older != nullptr);
+        s = s->link_older;
+      }
+      s->link_older = prev;
+      break;
+    }
+  }
+  // Detach w from the group chain. Only links inside the group are trusted
+  // here: a last writer's link_newer is built lazily at the exit, so it is
+  // still null even when the next leader waits behind the group; the exit
+  // rebuilds it from the list above instead.
+  Writer* const next_in_group =
+      (w == write_group.last_writer) ? nullptr : w->link_newer;
+  if (w == write_group.last_writer) {
+    write_group.last_writer = prev;
+  }
+  prev->link_newer = next_in_group;
+  if (next_in_group != nullptr) {
+    next_in_group->link_older = prev;
+  }
+  write_group.size -= 1;
+  SetState(w, STATE_COMPLETED);
+}
+
 void WriteThread::BeginWriteStall() {
   ++stall_begun_count_;
   LinkOne(&write_stall_dummy_, &newest_writer_);

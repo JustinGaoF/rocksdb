@@ -10675,6 +10675,126 @@ TEST(TransactionPartitionedWalTest,
   ASSERT_OK(DestroyDB(dbname, options));
 }
 
+// GC25 Q5 (review F005): an empty disableWAL commit that creates a snapshot
+// installs the publication-only gate, so its snapshot lands at or below the
+// published frontier. A on partition 1 is held in its append after
+// allocating; on partition 0 an empty disableWAL transaction commits with
+// snapshot creation. The commit parks until A is released, and its snapshot
+// sequence is at most LastSequence() when the call returns; reads through
+// the snapshot are repeatable.
+// Neuter: today's gate condition (no gate when seq_inc == 0); the commit
+// returns while A is held with a snapshot above LastSequence().
+TEST(TransactionPartitionedWalTest,
+     EmptyDisableWalSnapshotCommitWaitsForPublish) {
+  constexpr size_t kPartitions = 2;
+  const std::string dbname =
+      test::PerThreadDBPath("transaction_partitioned_wal_empty_snapshot");
+  Options options;
+  options.create_if_missing = true;
+  options.wal_partitions = kPartitions;
+  options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  options.track_and_verify_wals_in_manifest = true;
+  ASSERT_OK(DestroyDB(dbname, options));
+  TransactionDB* db = nullptr;
+  ASSERT_OK(TransactionDB::Open(options, TransactionDBOptions(), dbname, &db));
+  std::vector<ColumnFamilyHandle*> handles;
+  std::vector<ColumnFamilyHandle*> cf_for_partition(kPartitions, nullptr);
+  size_t num_covered = 0;
+  while (num_covered < kPartitions) {
+    ColumnFamilyHandle* handle = nullptr;
+    ASSERT_OK(db->CreateColumnFamily(ColumnFamilyOptions(options),
+                                     "cf" + std::to_string(handles.size() + 1),
+                                     &handle));
+    handles.push_back(handle);
+    WriteBatch batch;
+    ASSERT_OK(WriteBatchInternal::Put(&batch, handle->GetID(), "key", "value"));
+    size_t partition = kPartitions;
+    ASSERT_OK(
+        DBImpl::TEST_WalPartitionForWrite(batch, kPartitions, &partition));
+    if (cf_for_partition[partition] == nullptr) {
+      cf_for_partition[partition] = handle;
+      ++num_covered;
+    }
+  }
+  ASSERT_OK(db->Put(WriteOptions(), cf_for_partition[0], "k", "v"));
+
+  std::mutex mu;
+  std::condition_variable cv;
+  bool a_held = false;
+  bool release_a = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WriteToWAL:log_entry", [&](void*) {
+        std::unique_lock<std::mutex> lock(mu);
+        if (a_held) {
+          return;
+        }
+        a_held = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return release_a; });
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  Status a_status;
+  port::Thread a([&] {
+    a_status = db->Put(WriteOptions(), cf_for_partition[1], "a", "v");
+  });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    cv.wait(lock, [&] { return a_held; });
+  }
+  Status commit_status;
+  std::shared_ptr<const Snapshot> snapshot;
+  SequenceNumber latest_at_return = 0;
+  port::Thread committer([&] {
+    WriteOptions wo;
+    wo.disableWAL = true;
+    std::unique_ptr<Transaction> txn(db->BeginTransaction(wo));
+    commit_status = txn->CommitAndTryCreateSnapshot(nullptr, 10, &snapshot);
+    latest_at_return = db->GetLatestSequenceNumber();
+  });
+  DBImpl* db_impl = static_cast_with_check<DBImpl>(db->GetRootDB());
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while (db_impl->TEST_WalDurabilityWaiters() != 1 &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_EQ(1U, db_impl->TEST_WalDurabilityWaiters());
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    release_a = true;
+    cv.notify_all();
+  }
+  a.join();
+  committer.join();
+  ASSERT_OK(a_status);
+  ASSERT_OK(commit_status);
+  ASSERT_NE(nullptr, snapshot.get());
+  EXPECT_LE(snapshot->GetSequenceNumber(), latest_at_return);
+  // Repeatable reads through the snapshot: below (k, a) visible twice
+  // alike, above invisible.
+  ASSERT_OK(db->Put(WriteOptions(), cf_for_partition[0], "above", "v"));
+  ReadOptions ro;
+  ro.snapshot = snapshot.get();
+  std::string v1, v2, va, vabove;
+  ASSERT_OK(db->Get(ro, cf_for_partition[0], "k", &v1));
+  ASSERT_OK(db->Get(ro, cf_for_partition[0], "k", &v2));
+  EXPECT_EQ(v1, v2);
+  EXPECT_EQ("v", v1);
+  ASSERT_OK(db->Get(ro, cf_for_partition[1], "a", &va));
+  EXPECT_EQ("v", va);
+  EXPECT_TRUE(db->Get(ro, cf_for_partition[0], "above", &vabove).IsNotFound());
+  // The snapshot must die before the DB it belongs to.
+  ro.snapshot = nullptr;
+  snapshot.reset();
+  for (ColumnFamilyHandle* handle : handles) {
+    ASSERT_OK(db->DestroyColumnFamilyHandle(handle));
+  }
+  delete db;
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_OK(DestroyDB(dbname, options));
+}
+
 // FU14 H1: a WriteCommitted Prepare is a WAL-only write (kDisableMemtable)
 // and consumes no sequence number, so at N>1 its completion gate targets the
 // already-published last sequence L. Once a previous sync write has advanced
@@ -10767,7 +10887,12 @@ TEST(TransactionPartitionedWalTest, SyncPrepareAfterSyncCommitSurvivesCrash) {
 // nobody owns. After Resume(), the next write takes L + 1 and succeeds.
 // Neuter: GC18's unconditional fence (FenceFailedGateSync without the
 // low > target check); the write after Resume() fails at the stale fence.
-TEST(TransactionPartitionedWalTest, FailedSyncPrepareLeavesNoStaleFence) {
+// GC25 Q1/Q2 (reworked from FailedSyncPrepareLeavesNoStaleFence, whose
+// fenceless empty failure would let in-flight gates above it escape):
+// a failed sync Prepare installs the open D-1 fence like any failed sync,
+// holding every gate at or above it; Resume closes it to an empty range
+// holding nothing, and later writes are admitted (no stale fence).
+TEST(TransactionPartitionedWalTest, FailedSyncPrepareFenceClosesAtResume) {
   constexpr size_t kPartitions = 2;
   const std::string dbname =
       test::PerThreadDBPath("transaction_partitioned_wal_failed_prepare");
@@ -10810,12 +10935,24 @@ TEST(TransactionPartitionedWalTest, FailedSyncPrepareLeavesNoStaleFence) {
   ASSERT_TRUE(prepare_status.IsIOError()) << prepare_status.ToString();
   ASSERT_FALSE(fail_sync.load());
   EXPECT_EQ(last, db->GetLatestSequenceNumber());
-  EXPECT_TRUE(db_impl->TEST_WalGateFences().empty());
+  {
+    // The open fence holds every gate at or above the failed empty range.
+    const auto fences = db_impl->TEST_WalGateFences();
+    ASSERT_EQ(1U, fences.size());
+    EXPECT_EQ(last + 1, fences[0].first);
+    EXPECT_EQ(kMaxSequenceNumber, fences[0].second);
+  }
 
   ASSERT_OK(db->Resume());
   ASSERT_OK(db->Put(WriteOptions(), "after", "v"));
   EXPECT_EQ(last + 1, db->GetLatestSequenceNumber());
-  EXPECT_TRUE(db_impl->TEST_WalGateFences().empty());
+  {
+    // Closed to an empty range: the "after" write reused its low.
+    const auto fences = db_impl->TEST_WalGateFences();
+    ASSERT_EQ(1U, fences.size());
+    EXPECT_EQ(last + 1, fences[0].first);
+    EXPECT_EQ(last, fences[0].second);
+  }
   std::string value;
   ASSERT_OK(db->Get(ReadOptions(), "after", &value));
   ASSERT_EQ("v", value);

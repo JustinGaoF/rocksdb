@@ -1294,6 +1294,123 @@ TEST(WriteUnpreparedPartitionedWalTest, RecoversAcrossPartitions) {
   ASSERT_OK(DestroyDB(crash_dir, options));
 }
 
+// GC25 Q2: a WriteUnprepared sync commit whose leadership fsync fails runs
+// none of its 2PC callbacks, so nothing of it publishes: the commit returns
+// the error and the keys are never visible, before Resume(), after it, or
+// after a reopen. A later Rollback() succeeds.
+// Neuter: run the pre-release callbacks before the fsync, as before D-9;
+// the keys are visible right after the failure.
+TEST(WriteUnpreparedPartitionedWalTest,
+     SyncCommitFailureLeavesNothingCommitted) {
+  constexpr uint32_t kPartitions = 2;
+  const std::string dbname =
+      test::PerThreadDBPath("write_unprepared_partitioned_wal_sync_fail");
+  Options options;
+  options.create_if_missing = true;
+  options.create_missing_column_families = true;
+  options.max_bgerror_resume_count = 0;
+  test::SetWalPartitions(&options, kPartitions);
+  ASSERT_OK(DestroyDB(dbname, options));
+
+  // Two column families on different partitions.
+  std::vector<ColumnFamilyDescriptor> column_families = {
+      {kDefaultColumnFamilyName, options}};
+  uint32_t cf_a = 0;
+  uint32_t cf_b = 0;
+  size_t partition_of_a = kPartitions;
+  for (uint32_t cf_id = 1; cf_a == 0 || cf_b == 0; ++cf_id) {
+    column_families.emplace_back("cf" + std::to_string(cf_id), options);
+    WriteBatch batch;
+    ASSERT_OK(WriteBatchInternal::Put(&batch, cf_id, "key", "value"));
+    size_t partition = kPartitions;
+    ASSERT_OK(
+        DBImpl::TEST_WalPartitionForWrite(batch, kPartitions, &partition));
+    if (cf_a == 0) {
+      cf_a = cf_id;
+      partition_of_a = partition;
+    } else if (partition != partition_of_a) {
+      cf_b = cf_id;
+    }
+    ASSERT_LT(cf_id, 100U) << "every column family routes to one partition";
+  }
+  ASSERT_NE(0U, cf_b);
+
+  TransactionDBOptions txn_db_options;
+  txn_db_options.write_policy = WRITE_UNPREPARED;
+  std::vector<ColumnFamilyHandle*> handles;
+  TransactionDB* db = nullptr;
+  auto open = [&] {
+    ASSERT_OK(TransactionDB::Open(options, txn_db_options, dbname,
+                                  column_families, &handles, &db));
+  };
+  auto close = [&] {
+    for (ColumnFamilyHandle* handle : handles) {
+      ASSERT_OK(db->DestroyColumnFamilyHandle(handle));
+    }
+    handles.clear();
+    delete db;
+    db = nullptr;
+  };
+  open();
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  WriteOptions sync_wo;
+  sync_wo.sync = true;
+  Transaction* txn = db->BeginTransaction(sync_wo, TransactionOptions());
+  ASSERT_OK(txn->SetName("xid"));
+  ASSERT_OK(txn->Put(handles[cf_a], "k", "v"));
+  ASSERT_OK(txn->Put(handles[cf_b], "k", "v"));
+  // Prepare first, as wup_commit_fail_rollback does: Rollback needs the
+  // PREPARED state the failed commit leaves behind.
+  ASSERT_OK(txn->Prepare());
+
+  std::atomic<bool> fail_sync{true};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SyncWalsFromCompletionGate:AfterGateSync", [&](void* arg) {
+        if (fail_sync.exchange(false)) {
+          IOStatus s = IOStatus::IOError("injected gate sync error");
+          s.SetRetryable(true);
+          *static_cast<IOStatus*>(arg) = s;
+        }
+      });
+  const Status commit_s = txn->Commit();
+  SyncPoint::GetInstance()->ClearCallBack(
+      "DBImpl::SyncWalsFromCompletionGate:AfterGateSync");
+  ASSERT_FALSE(fail_sync.load());
+  ASSERT_NOK(commit_s);
+  EXPECT_TRUE(commit_s.IsIOError()) << commit_s.ToString();
+  std::string value;
+  EXPECT_TRUE(db->Get(ReadOptions(), handles[cf_a], "k", &value).IsNotFound());
+  EXPECT_TRUE(db->Get(ReadOptions(), handles[cf_b], "k", &value).IsNotFound());
+
+  ASSERT_OK(db->Resume());
+  ASSERT_OK(txn->Rollback());
+  delete txn;
+  EXPECT_TRUE(db->Get(ReadOptions(), handles[cf_a], "k", &value).IsNotFound());
+  EXPECT_TRUE(db->Get(ReadOptions(), handles[cf_b], "k", &value).IsNotFound());
+
+  const std::vector<WALRecoveryMode> recovery_modes = {
+      WALRecoveryMode::kAbsoluteConsistency,
+      WALRecoveryMode::kTolerateCorruptedTailRecords,
+      WALRecoveryMode::kPointInTimeRecovery,
+      WALRecoveryMode::kSkipAnyCorruptedRecords,
+  };
+  for (const WALRecoveryMode mode : recovery_modes) {
+    SCOPED_TRACE("mode=" + std::to_string(static_cast<int>(mode)));
+    options.wal_recovery_mode = mode;
+    close();
+    open();
+    EXPECT_TRUE(
+        db->Get(ReadOptions(), handles[cf_a], "k", &value).IsNotFound());
+    EXPECT_TRUE(
+        db->Get(ReadOptions(), handles[cf_b], "k", &value).IsNotFound());
+  }
+  close();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_OK(DestroyDB(dbname, options));
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

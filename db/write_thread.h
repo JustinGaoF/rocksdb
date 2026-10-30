@@ -458,6 +458,13 @@ class WriteThread {
   // (Does not require db mutex held)
   void WaitForStallEndedCount(uint64_t stall_count);
 
+  // Complete follower `w` of `write_group` during leadership, with its
+  // current status: unlink it and mark it completed. Unlike
+  // CompleteFollower, a next leader waiting behind the group keeps its link.
+  // Only an N>1 sync-led group's leader calls this, for each async member
+  // once it is published; the leader must own the group.
+  void UnlinkAndCompleteFollower(Writer* w, WriteGroup& write_group);
+
  private:
   // See AwaitState.
   const uint64_t max_yield_usec_;

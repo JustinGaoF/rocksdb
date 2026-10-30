@@ -300,8 +300,7 @@ Status DBImpl::FlushMemTableToOutputFile(
   }
 
   if (s.ok()) {
-    flush_job.DropEntriesAtOrAbove(UnreleasedWalGateFenceLow(),
-                                   FailedGateSyncFlushDrops());
+    flush_job.DropEntriesAtOrAbove(UnreleasedWalGateFenceLow());
     flush_job.PickMemTable();
     need_cancel = true;
   }
@@ -684,7 +683,7 @@ Status DBImpl::AtomicFlushMemTablesToOutputFiles(
   if (s.ok()) {
     const SequenceNumber drop_floor = UnreleasedWalGateFenceLow();
     for (int i = 0; i != num_cfs; ++i) {
-      jobs[i]->DropEntriesAtOrAbove(drop_floor, FailedGateSyncFlushDrops());
+      jobs[i]->DropEntriesAtOrAbove(drop_floor);
       jobs[i]->PickMemTable();
       pick_status[i] = true;
     }
@@ -4549,7 +4548,6 @@ void DBImpl::BackgroundCallFlush(Env::Priority thread_pri) {
       mutex_.Lock();
     }
     TEST_SYNC_POINT("DBImpl::BackgroundCallFlush:ContextCleanedUp");
-    MaybeRetireWalGateReadMasks();
 
     assert(num_running_flushes_ > 0);
     num_running_flushes_--;
@@ -5884,8 +5882,6 @@ void DBImpl::InstallSuperVersionAndScheduleWork(
   }
   cfd->InstallSuperVersion(sv_context, &mutex_,
                            std::move(new_seqno_to_time_mapping));
-  // The install may have released the last masked memtable, as a flush's does.
-  MaybeRetireWalGateReadMasks();
 
   // Refresh the seqno->time preserve-window bound used to gate bottommost file
   // marking, so a file whose largest seqno is still within the preserve window

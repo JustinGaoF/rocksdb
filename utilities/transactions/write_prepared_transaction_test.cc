@@ -5158,6 +5158,115 @@ TEST_F(WritePreparedPartitionedWalTest, ConcurrentPreparesAcrossPartitions) {
   Close();
 }
 
+// GC25 Q2 (subsumes G3-E-1): a WritePrepared sync commit whose leadership
+// fsync fails runs none of its 2PC callbacks, so nothing of it publishes:
+// the commit returns the error and the value is never visible, before
+// Resume(), after it, or after a reopen. A later Rollback() succeeds (no
+// partial commit state to abort on).
+// Neuter: run the pre-release callbacks before the fsync, as before D-9;
+// the value is visible right after the failure.
+TEST_F(WritePreparedPartitionedWalTest,
+       SyncCommitFailureLeavesNothingCommitted) {
+  constexpr size_t kPartitions = 2;
+  options_.max_bgerror_resume_count = 0;
+  Open(kPartitions);
+  ColumnFamilyHandle* cf = CfOnPartition(0);
+  WriteOptions sync_wo;
+  sync_wo.sync = true;
+  std::unique_ptr<Transaction> txn(
+      db_->BeginTransaction(sync_wo, TransactionOptions()));
+  ASSERT_OK(txn->SetName("xid"));
+  ASSERT_OK(txn->Put(cf, "k", "v"));
+  ASSERT_OK(txn->Prepare());
+
+  std::atomic<bool> fail_sync{true};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SyncWalsFromCompletionGate:AfterGateSync", [&](void* arg) {
+        if (fail_sync.exchange(false)) {
+          IOStatus s = IOStatus::IOError("injected gate sync error");
+          s.SetRetryable(true);
+          *static_cast<IOStatus*>(arg) = s;
+        }
+      });
+  const Status commit_s = txn->Commit();
+  SyncPoint::GetInstance()->ClearCallBack(
+      "DBImpl::SyncWalsFromCompletionGate:AfterGateSync");
+  ASSERT_FALSE(fail_sync.load());
+  ASSERT_NOK(commit_s);
+  EXPECT_TRUE(commit_s.IsIOError()) << commit_s.ToString();
+  std::string value;
+  EXPECT_TRUE(db_->Get(ReadOptions(), cf, "k", &value).IsNotFound());
+
+  ASSERT_OK(db_->Resume());
+  EXPECT_TRUE(db_->Get(ReadOptions(), cf, "k", &value).IsNotFound());
+  ASSERT_OK(txn->Rollback());
+  EXPECT_TRUE(db_->Get(ReadOptions(), cf, "k", &value).IsNotFound());
+  txn.reset();
+  EXPECT_EQ(nullptr, db_->GetTransactionByName("xid"));
+
+  const uint32_t cf_id = cf->GetID();
+  const std::vector<WALRecoveryMode> recovery_modes = {
+      WALRecoveryMode::kAbsoluteConsistency,
+      WALRecoveryMode::kTolerateCorruptedTailRecords,
+      WALRecoveryMode::kPointInTimeRecovery,
+      WALRecoveryMode::kSkipAnyCorruptedRecords,
+  };
+  for (const WALRecoveryMode mode : recovery_modes) {
+    SCOPED_TRACE("mode=" + std::to_string(static_cast<int>(mode)));
+    options_.wal_recovery_mode = mode;
+    Reopen();
+    EXPECT_TRUE(
+        db_->Get(ReadOptions(), handles_[cf_id], "k", &value).IsNotFound());
+    EXPECT_EQ(nullptr, db_->GetTransactionByName("xid"));
+  }
+  Close();
+}
+
+// GC25 Q2: a failed sync Prepare runs no 2PC callback either, so it leaves
+// no prepared-heap entry: the XID is unknown and reusable immediately.
+// Neuter: run AddPrepared before the fsync; the XID resolves.
+TEST_F(WritePreparedPartitionedWalTest, SyncPrepareFailureLeavesNoHeapEntry) {
+  constexpr size_t kPartitions = 2;
+  options_.max_bgerror_resume_count = 0;
+  Open(kPartitions);
+  ColumnFamilyHandle* cf = CfOnPartition(1);
+  WriteOptions sync_wo;
+  sync_wo.sync = true;
+  std::unique_ptr<Transaction> txn(
+      db_->BeginTransaction(sync_wo, TransactionOptions()));
+  ASSERT_OK(txn->SetName("xid"));
+  ASSERT_OK(txn->Put(cf, "k", "v"));
+
+  std::atomic<bool> fail_sync{true};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SyncWalsFromCompletionGate:AfterGateSync", [&](void* arg) {
+        if (fail_sync.exchange(false)) {
+          IOStatus s = IOStatus::IOError("injected gate sync error");
+          s.SetRetryable(true);
+          *static_cast<IOStatus*>(arg) = s;
+        }
+      });
+  const Status prepare_s = txn->Prepare();
+  SyncPoint::GetInstance()->ClearCallBack(
+      "DBImpl::SyncWalsFromCompletionGate:AfterGateSync");
+  ASSERT_FALSE(fail_sync.load());
+  ASSERT_NOK(prepare_s);
+  EXPECT_TRUE(prepare_s.IsIOError()) << prepare_s.ToString();
+
+  ASSERT_OK(db_->Resume());
+  // The live txn holds its name until destroyed; afterwards neither live
+  // tracking nor the prepared heap knows the XID, and it is reusable.
+  txn.reset();
+  EXPECT_EQ(nullptr, db_->GetTransactionByName("xid"));
+  {
+    std::unique_ptr<Transaction> txn2(
+        db_->BeginTransaction(WriteOptions(), TransactionOptions()));
+    EXPECT_OK(txn2->SetName("xid"));
+    EXPECT_OK(txn2->Rollback());
+  }
+  Close();
+}
+
 // N-5-4: with prepares pushed in place, PreparedHeap::top() moves backwards
 // when a prepare on one partition reaches AddPrepared after a higher prepare
 // on another. A snapshot taken in between still never sees the lower

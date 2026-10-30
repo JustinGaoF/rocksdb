@@ -405,10 +405,7 @@ void MemTableListVersion::Remove(ReadOnlyMemTable* m,
   memlist_.remove(m);
 
   m->MarkFlushed();
-  // A masked memtable may hold a failed gate sync's write. History would keep
-  // it alive, and with it the read mask, which retires only once every
-  // masked memtable is released (DBImpl::MaybeRetireWalGateReadMasks).
-  if (max_write_buffer_size_to_maintain_ > 0 && !m->HasMaskedSequenceRanges()) {
+  if (max_write_buffer_size_to_maintain_ > 0) {
     memlist_history_.push_front(m);
     // Unable to get size of mutable memtable at this point, pass 0 to
     // TrimHistory as a best effort.
