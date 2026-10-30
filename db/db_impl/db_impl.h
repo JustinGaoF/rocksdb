@@ -2850,10 +2850,13 @@ class DBImpl : public DB
   // takes no predecessor info.
   // WALs numbered below `merge_from` carry no index; they replay
   // sequentially, as ProcessLogFiles would, before the merge reads the rest.
+  // WALs numbered at or above a nonzero `merge_until` carry no index either,
+  // and every record in them is newer than every indexed one: they replay
+  // sequentially after the merge.
   Status ProcessLogFilesMerged(
       const std::vector<uint64_t>& wal_numbers, uint64_t merge_from,
-      bool read_only, bool is_retry, uint64_t min_wal_number, int job_id,
-      SequenceNumber* next_sequence,
+      uint64_t merge_until, bool read_only, bool is_retry,
+      uint64_t min_wal_number, int job_id, SequenceNumber* next_sequence,
       std::unordered_map<int, VersionEdit>* version_edits,
       bool* corrupted_wal_found, RecoveryContext* recovery_ctx,
       std::vector<WALIndexSupersession>* supersessions);
@@ -2863,11 +2866,16 @@ class DBImpl : public DB
   // live WAL carrying a marker or indexed data (UINT64_MAX when none). Fails
   // fast on indexed data without a marker over an intact head; a damaged
   // head stays merge-side for the attestation path. Sets *superseding when a
-  // head declares a supersession for a WAL in the set.
+  // head declares a supersession for a WAL in the set. Sets *indexed_high to
+  // the highest such indexed WAL (zero when none), and *unindexed_inside to
+  // the highest unindexed WAL numbered between two indexed ones (zero when
+  // none).
   Status CheckWALFilesCarryWALIndex(const std::vector<uint64_t>& wal_numbers,
                                     uint64_t min_wal_number, bool is_retry,
                                     uint64_t* unindexed_high,
-                                    uint64_t* indexed_low, bool* superseding);
+                                    uint64_t* indexed_low, bool* superseding,
+                                    uint64_t* indexed_high,
+                                    uint64_t* unindexed_inside);
 
   Status ProcessLogFile(uint64_t wal_number, uint64_t min_wal_number,
                         bool is_retry, bool read_only, int job_id,
@@ -3398,10 +3406,33 @@ class DBImpl : public DB
   // N>1 only. Writes a void cover for every index in burned_wal_indices_ into
   // partition 0's current WAL, which recovery's rotation installed, and syncs
   // it and the WAL directory, so no later recovery reads the burned index as
-  // an unexplained hole below writes admitted after it. Called by ResumeImpl,
+  // an unexplained hole below writes admitted after it. An index whose record
+  // landed whole (BurnedWALIndexLanded) gets no void, which would contradict
+  // it; the WAL holding it is synced instead. A torn record's bytes are
+  // zeroed, which every reader skips as padding, so no recovery mode reads
+  // them as a lost tail. Called by ResumeImpl,
   // with mutex_ held, before ClearBGError; releases mutex_ around the I/O. On
   // failure the indices stay pending and the DB stays write-stopped.
   Status ExplainBurnedWALIndices(const WriteOptions& write_options);
+
+  // Whether any burned WAL index still awaits explanation. The retry-flush
+  // recovery path rotates no WALs, so with burns pending Resume takes the
+  // full path instead, whose switches rotate. REQUIRES: mutex_ held.
+  bool BurnedWalIndicesPending() {
+    mutex_.AssertHeld();
+    InstrumentedMutexLock l(&sequence_wal_index_mutex_);
+    return !burned_wal_indices_.empty();
+  }
+
+  // N>1 only. Reads WAL `wal_number` back and sets *landed when a whole,
+  // checksummed record bearing `wal_index` is in it: an append can report
+  // failure after its bytes reached the file. A torn copy is not one: when
+  // the bytes from `wal_offset`, where the failed record began, do not read
+  // back cleanly, sets *torn_end to the file's size (zero otherwise). A WAL
+  // already gone from disk holds neither. Fails when the WAL cannot be read.
+  Status BurnedWALIndexLanded(uint64_t wal_number, uint64_t wal_index,
+                              uint64_t wal_offset, bool* landed,
+                              uint64_t* torn_end);
 
   // N>1 only. Fences every gate whose target is at or above `low`: a range
   // starting there failed (its append, or its memtable insert), so nothing
@@ -3941,11 +3972,24 @@ class DBImpl : public DB
                      const log::WALIndexPredecessorSpan& wal_index_predecessor,
                      size_t wal_partition, log::Writer** new_log);
 
-  // The span the first WAL Open creates for `wal_partition` attests: that
-  // partition's newest WAL recovered through the merge, placed as
-  // RestoreAliveLogFiles() places it. None when no such WAL was recovered.
+  // The span the first WAL Open creates for `wal_partition` attests, which
+  // CreateWAL() writes: the first of RecoveredWALIndexPredecessors(). None
+  // when no WAL placed there was recovered.
   log::WALIndexPredecessorSpan RecoveredWALIndexPredecessor(
       size_t wal_partition) const;
+  // Every span the first WAL Open creates for `wal_partition` attests, in
+  // ascending WAL order: the newest WAL recovered through the merge of each
+  // partition that wrote one (a chain head), placed as RestoreAliveLogFiles()
+  // places it. Only partition 0, which a lower wal_partitions folds the
+  // higher partitions into, can attest more than one: otherwise a retired
+  // folded head would leave its indices unexplained among a pinned WAL's.
+  std::vector<log::WALIndexPredecessorSpan> RecoveredWALIndexPredecessors(
+      size_t wal_partition) const;
+  // Writes the spans after the first of RecoveredWALIndexPredecessors(0)
+  // into partition 0's new WAL `new_log`, right after CreateWAL() wrote the
+  // first.
+  IOStatus WriteFurtherWALIndexPredecessors(const WriteOptions& write_options,
+                                            log::Writer* new_log);
 
   // Validate self-consistency of DB options
   static Status ValidateOptions(const DBOptions& db_options);
@@ -4504,7 +4548,7 @@ class DBImpl : public DB
   UnorderedMap<uint64_t, uint32_t> recovered_wal_partitions_;
   // First wal_index of each WAL recovered through the merge (zero when it
   // bears none), by WAL number. Filled by ProcessLogFilesMerged() and read by
-  // RecoveredWALIndexPredecessor(), both during Open with mutex_ held.
+  // RecoveredWALIndexPredecessors(), both during Open with mutex_ held.
   UnorderedMap<uint64_t, uint64_t> recovered_wal_first_indices_;
 
   // Total size of all "alive" WALs (for easy access without synchronization)
@@ -5021,12 +5065,15 @@ class DBImpl : public DB
     SequenceNumber high;
   };
   std::vector<FailedWalRange> failed_wal_ranges_;
-  // N>1 WAL indices whose append failed before the record landed, with the
-  // WAL that burned each, until ExplainBurnedWALIndices covers them durably.
+  // N>1 WAL indices whose append reported failure, with the WAL that burned
+  // each, until ExplainBurnedWALIndices explains them durably.
   // Guarded by sequence_wal_index_mutex_.
   struct BurnedWalIndex {
     uint64_t wal_number;
     uint64_t wal_index;
+    // The WAL's flushed size when the index burned: where the failed
+    // record's bytes begin, if any landed.
+    uint64_t wal_offset;
   };
   std::vector<BurnedWalIndex> burned_wal_indices_;
 

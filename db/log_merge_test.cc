@@ -1873,6 +1873,127 @@ TEST_P(LogMergeTest, DataLessMemberWithSkippedCorruptionFailsClosed) {
   }
 }
 
+// GC26 Q2: a span after the first one in a head explains a retired WAL's
+// indices too. 130 attests two retired chain heads, as the first WAL of an
+// open at fewer partitions does for the chains it folds: 119 first, then 120,
+// which bore index 3 before 119 bore anything. Both interleave with the held
+// 121. Neuter: read only the first span (Member::AttestedSpans); the merge
+// stops at index 3.
+TEST_P(LogMergeTest, FurtherSpanExplainsRetiredFoldedHead) {
+  MemberFile held(121, recyclable());
+  MemberFile next(130, recyclable());
+  ASSERT_OK(held.Marker());
+  ASSERT_OK(held.Data("h2", 2, 2));
+  ASSERT_OK(held.Data("h5", 5, 5));
+  ASSERT_OK(next.Marker());
+  ASSERT_OK(next.Span(119, 4, 6));
+  ASSERT_OK(next.Span(120, 3, 6));
+  ASSERT_OK(next.Data("n7", 7, 7));
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(held, held.Bytes()));
+  members.push_back(MakeMember(next, next.Bytes()));
+  auto merger = MakeMerger(std::move(members), {121, 130});
+  merger->SetRetirementBound(121);
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome);
+  ASSERT_EQ(std::vector<uint64_t>({2, 5, 7}), DrivenIndices(driven));
+}
+
+// GC26 Q4 (D-10): with SetSkipUnexplainedHoles, a pristine hole and the
+// indices a lost predecessor bore are skipped and the records above them
+// emitted; the stream still ends once nothing is left above. Superseded
+// copies are still never emitted. Without it the same sets stop at the
+// frontier.
+TEST_P(LogMergeTest, SkipUnexplainedHolesEmitsAboveThem) {
+  for (const bool skip : {false, true}) {
+    SCOPED_TRACE(skip ? "skip" : "strict");
+    {
+      // Pristine hole at 2.
+      MemberFile a(120, recyclable());
+      MemberFile b(121, recyclable());
+      ASSERT_OK(a.Marker());
+      ASSERT_OK(a.Data("a1", 1, 1));
+      ASSERT_OK(a.Data("a3", 3, 3));
+      ASSERT_OK(b.Marker());
+      ASSERT_OK(b.Data("b4", 4, 4));
+      std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+      members.push_back(MakeMember(a, a.Bytes()));
+      members.push_back(MakeMember(b, b.Bytes()));
+      auto merger = MakeMerger(std::move(members), {120, 121});
+      merger->SetSkipUnexplainedHoles(skip);
+      DriveResult driven = Drive(merger.get());
+      if (skip) {
+        ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome);
+        ASSERT_EQ(std::vector<uint64_t>({1, 3, 4}), DrivenIndices(driven));
+        ASSERT_EQ(1U, merger->GetSkippedHoles());
+        ASSERT_EQ(2U, merger->GetFirstSkippedHole());
+      } else {
+        ASSERT_EQ(WALIndexMerger::Result::kFrontier, driven.outcome);
+        ASSERT_EQ(2U, merger->GetFrontier());
+      }
+    }
+    {
+      // 120 is attested but lost; it bore 5 and 6, and 121 holds 7 to 9.
+      MemberFile b(121, recyclable());
+      MemberFile c(122, recyclable());
+      ASSERT_OK(b.Marker());
+      ASSERT_OK(b.Span(120, 5, 6));
+      for (uint64_t i = 7; i <= 9; ++i) {
+        ASSERT_OK(b.Data("b" + std::to_string(i), i, i));
+      }
+      ASSERT_OK(c.Marker());
+      ASSERT_OK(c.Span(119, 1, 3));
+      ASSERT_OK(c.Data("c4", 4, 4));
+      ASSERT_OK(c.Data("c6", 6, 6));
+      std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+      members.push_back(MakeMember(b, b.Bytes()));
+      members.push_back(MakeMember(c, c.Bytes()));
+      auto merger = MakeMerger(std::move(members), {121, 122});
+      merger->SetRetirementBound(120);
+      merger->SetSkipUnexplainedHoles(skip);
+      DriveResult driven = Drive(merger.get());
+      ASSERT_EQ(120U, merger->GetLostPredecessor());
+      if (skip) {
+        ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome);
+        ASSERT_EQ(std::vector<uint64_t>({4, 6, 7, 8, 9}),
+                  DrivenIndices(driven));
+        ASSERT_EQ(1U, merger->GetSkippedHoles());
+        ASSERT_EQ(5U, merger->GetFirstSkippedHole());
+        ASSERT_EQ(10U, merger->GetFrontier());
+      } else {
+        ASSERT_EQ(WALIndexMerger::Result::kFrontier, driven.outcome);
+        ASSERT_EQ(5U, merger->GetFrontier());
+      }
+    }
+    {
+      // 121 supersedes 120 from index 3 and reissues 4; 3 is lost.
+      MemberFile old(120, recyclable());
+      MemberFile young(121, recyclable());
+      ASSERT_OK(old.Marker());
+      for (uint64_t i = 1; i <= 4; ++i) {
+        ASSERT_OK(old.Data("o" + std::to_string(i), i, i));
+      }
+      ASSERT_OK(young.Marker());
+      ASSERT_OK(young.Sup(120, 3));
+      ASSERT_OK(young.Data("n4", 4, 5));
+      std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+      members.push_back(MakeMember(old, old.Bytes()));
+      members.push_back(MakeMember(young, young.Bytes()));
+      auto merger = MakeMerger(std::move(members), {120, 121},
+                               /*continue_past_discarded_holes=*/skip);
+      merger->SetSkipUnexplainedHoles(skip);
+      DriveResult driven = Drive(merger.get());
+      if (skip) {
+        ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome);
+        ASSERT_EQ(std::vector<uint64_t>({1, 2, 4}), DrivenIndices(driven));
+        ASSERT_EQ("n4", driven.records.back().payload.substr(kWALIndexSize));
+      } else {
+        ASSERT_EQ(WALIndexMerger::Result::kFrontier, driven.outcome);
+      }
+    }
+  }
+}
+
 INSTANTIATE_TEST_CASE_P(LogMerge, LogMergeTest,
                         ::testing::Combine(::testing::Values(0, 1),
                                            ::testing::Bool()));

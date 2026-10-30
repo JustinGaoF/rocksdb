@@ -696,12 +696,16 @@ void Reader::DecodeWALIndexPredecessorSpanRecord(const Slice& fragment) {
                      "WAL_Index predecessor span record has invalid size");
     return;
   }
-  if (has_predecessor_span_) {
+  const uint64_t predecessor_wal_number = DecodeFixed64(fragment.data());
+  const uint64_t previous_wal_number =
+      further_predecessor_spans_.empty() ? predecessor_span_wal_
+                                         : further_predecessor_spans_.back()[0];
+  if (has_predecessor_span_ && predecessor_wal_number <= previous_wal_number) {
     ReportCorruption(fragment.size(),
-                     "WAL_Index file attests two predecessor spans");
+                     "WAL_Index file attests two predecessor spans out of "
+                     "ascending WAL order");
     return;
   }
-  const uint64_t predecessor_wal_number = DecodeFixed64(fragment.data());
   const uint64_t first = DecodeFixed64(fragment.data() + kWALIndexSize);
   const uint64_t last = DecodeFixed64(fragment.data() + 2 * kWALIndexSize);
   if (predecessor_wal_number == 0 || predecessor_wal_number >= log_number_) {
@@ -716,6 +720,10 @@ void Reader::DecodeWALIndexPredecessorSpanRecord(const Slice& fragment) {
   }
   if (first > last) {
     ReportCorruption(fragment.size(), "WAL_Index predecessor span is reversed");
+    return;
+  }
+  if (has_predecessor_span_) {
+    further_predecessor_spans_.push_back({predecessor_wal_number, first, last});
     return;
   }
   has_predecessor_span_ = true;

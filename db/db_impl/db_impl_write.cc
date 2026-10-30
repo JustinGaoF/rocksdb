@@ -12,6 +12,7 @@
 #include <optional>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "db/blob/blob_file_partition_manager.h"
 #include "db/blob/blob_write_batch_transformer.h"
@@ -3043,7 +3044,8 @@ IOStatus DBImpl::CoverBurnedWALIndex(const WriteOptions& write_options,
     // never synced when it lands. Recovery explains the index again, durably,
     // before it admits writes above it (ExplainBurnedWALIndices).
     InstrumentedMutexLock l(&sequence_wal_index_mutex_);
-    burned_wal_indices_.push_back({log_writer->get_log_number(), wal_index});
+    burned_wal_indices_.push_back({log_writer->get_log_number(), wal_index,
+                                   log_writer->file()->GetFlushedSize()});
   }
 
   IOStatus io_s =
@@ -3360,6 +3362,67 @@ void DBImpl::ClearWalDurabilityBGError() {
   }
 }
 
+Status DBImpl::BurnedWALIndexLanded(uint64_t wal_number, uint64_t wal_index,
+                                    uint64_t wal_offset, bool* landed,
+                                    uint64_t* torn_end) {
+  assert(landed != nullptr);
+  assert(torn_end != nullptr);
+  *landed = false;
+  *torn_end = 0;
+  const std::string fname =
+      LogFileName(immutable_db_options_.GetWalDir(), wal_number);
+  std::unique_ptr<SequentialFileReader> file_reader;
+  Status s = OpenWALForRecovery(fname, /*is_retry=*/false, &file_reader);
+  TEST_SYNC_POINT_CALLBACK("DBImpl::BurnedWALIndexLanded:Open", &s);
+  if (s.IsNotFound() || s.IsPathNotFound()) {
+    // Retired: no recovery reads it, so nothing in it contradicts a void.
+    return Status::OK();
+  }
+  if (!s.ok()) {
+    return s;
+  }
+  // The failure poisoned the writer, so nothing but the failed record and
+  // the progress record Resume's rotation appends follows `wal_offset`.
+  struct ReadBackReporter : public log::Reader::Reporter {
+    Status io_error;
+    bool corrupt = false;
+    void Corruption(size_t /*bytes*/, const Status& status,
+                    uint64_t /*log_number*/) override {
+      if (!status.IsIOError()) {
+        corrupt = true;
+      } else if (io_error.ok()) {
+        io_error = status;
+      }
+    }
+  } reporter;
+  log::Reader reader(/*info_log=*/nullptr, std::move(file_reader), &reporter,
+                     /*checksum=*/true, wal_number);
+  std::string scratch;
+  Slice record;
+  while (reader.ReadRecord(&record, &scratch)) {
+    if (reader.GetLastReadWALIndex() >= wal_index) {
+      *landed = reader.GetLastReadWALIndex() == wal_index;
+      break;
+    }
+  }
+  TEST_SYNC_POINT_CALLBACK("DBImpl::BurnedWALIndexLanded:Read",
+                           &reporter.io_error);
+  if (*landed) {
+    return Status::OK();
+  }
+  if (!reporter.io_error.ok()) {
+    return reporter.io_error;
+  }
+  if (reporter.corrupt || reader.WALRecoveryStoppedBeforeEndOfFile()) {
+    uint64_t size = 0;
+    s = fs_->GetFileSize(fname, IOOptions(), &size, /*dbg=*/nullptr);
+    if (s.ok() && size > wal_offset) {
+      *torn_end = size;
+    }
+  }
+  return s;
+}
+
 Status DBImpl::ExplainBurnedWALIndices(const WriteOptions& write_options) {
   mutex_.AssertHeld();
   assert(NumWalPartitions() > 1);
@@ -3382,7 +3445,79 @@ Status DBImpl::ExplainBurnedWALIndices(const WriteOptions& write_options) {
   }
   mutex_.Unlock();
   IOStatus io_s;
+  // A record that landed whole although its append failed is recovered, as
+  // D-1 allows, and a void would contradict it, so it gets none. Its WAL,
+  // whose writer the failure poisoned, is synced through a fresh handle so
+  // that the record cannot vanish while writes above it survive. A torn copy
+  // never reads back as a record, so its void explains it once its bytes are
+  // durably zeroed.
+  std::unordered_set<uint64_t> landed;
   {
+    std::unordered_set<uint64_t> wals_to_sync;
+    for (const BurnedWalIndex& b : burned) {
+      bool b_landed = false;
+      uint64_t b_torn_end = 0;
+      io_s = status_to_io_status(BurnedWALIndexLanded(
+          b.wal_number, b.wal_index, b.wal_offset, &b_landed, &b_torn_end));
+      if (io_s.ok() && b_torn_end != 0) {
+        // Unreadable in every mode, but point-in-time and absolute read it
+        // as a lost tail below the writes Resume admits. Zeroes read as
+        // padding instead, and keep the size the MANIFEST may track.
+        ROCKS_LOG_WARN(immutable_db_options_.info_log,
+                       "[WAL recovery] Burned WAL index %" PRIu64
+                       " landed torn in WAL #%" PRIu64
+                       "; zeroing bytes %" PRIu64 " to %" PRIu64,
+                       b.wal_index, b.wal_number, b.wal_offset, b_torn_end);
+        IOOptions opts;
+        io_s = WritableFileWriter::PrepareIOOptions(write_options, opts);
+        std::unique_ptr<FSRandomRWFile> file;
+        if (io_s.ok()) {
+          io_s = fs_->NewRandomRWFile(
+              LogFileName(immutable_db_options_.GetWalDir(), b.wal_number),
+              file_options_, &file, /*dbg=*/nullptr);
+        }
+        if (io_s.ok()) {
+          const std::string zeroes(
+              static_cast<size_t>(b_torn_end - b.wal_offset), '\0');
+          io_s = file->Write(b.wal_offset, zeroes, opts, /*dbg=*/nullptr);
+        }
+        if (io_s.ok()) {
+          io_s = immutable_db_options_.use_fsync
+                     ? file->Fsync(opts, /*dbg=*/nullptr)
+                     : file->Sync(opts, /*dbg=*/nullptr);
+        }
+        if (io_s.ok()) {
+          io_s = file->Close(opts, /*dbg=*/nullptr);
+        }
+      }
+      if (!io_s.ok()) {
+        break;
+      }
+      if (b_landed) {
+        ROCKS_LOG_WARN(immutable_db_options_.info_log,
+                       "[WAL recovery] Burned WAL index %" PRIu64
+                       " landed whole in WAL #%" PRIu64
+                       "; it is recovered, not voided",
+                       b.wal_index, b.wal_number);
+        landed.insert(b.wal_index);
+        wals_to_sync.insert(b.wal_number);
+      }
+    }
+    for (const uint64_t wal_number : wals_to_sync) {
+      if (!io_s.ok()) {
+        break;
+      }
+      IOOptions opts;
+      io_s = WritableFileWriter::PrepareIOOptions(write_options, opts);
+      if (io_s.ok()) {
+        io_s = fs_->SyncFile(
+            LogFileName(immutable_db_options_.GetWalDir(), wal_number),
+            file_options_, opts, immutable_db_options_.use_fsync,
+            /*dbg=*/nullptr);
+      }
+    }
+  }
+  if (io_s.ok()) {
     // Recovery's rotation installed partition 0's current WAL above every WAL
     // that burned an index, so any recovery that reads such a WAL reads this
     // one too, and writes stay stopped until ClearBGError, so it holds no
@@ -3406,7 +3541,7 @@ Status DBImpl::ExplainBurnedWALIndices(const WriteOptions& write_options) {
                                &target->number);
       uint64_t last_voided = 0;
       for (const BurnedWalIndex& b : burned) {
-        if (b.wal_index == last_voided) {
+        if (b.wal_index == last_voided || landed.count(b.wal_index) != 0) {
           continue;
         }
         io_s = target->writer->AddWALIndexVoidRecord(write_options, b.wal_index,

@@ -158,6 +158,15 @@ bool WALIndexMerger::ReaderMember::AttestedSpan(PredecessorSpan* span) const {
                                              &span->last);
 }
 
+void WALIndexMerger::ReaderMember::AttestedSpans(
+    std::vector<PredecessorSpan>* spans) const {
+  Member::AttestedSpans(spans);
+  for (const auto& [wal_number, first, last] :
+       reader_->GetFurtherWALIndexPredecessorSpans()) {
+    spans->push_back({wal_number, first, last});
+  }
+}
+
 bool WALIndexMerger::ReaderMember::SwallowedCovers(uint64_t index) const {
   for (const auto& [lo, hi] : swallowed_) {
     if (index > lo && index < hi) {
@@ -365,16 +374,17 @@ Status WALIndexMerger::ComputeLowerBound() {
   // examines more indices, which is the fail-closed direction.
   std::map<uint64_t, std::pair<uint64_t, uint64_t>> attested;
   for (auto& s : states_) {
-    Member::PredecessorSpan span;
-    if (!s.member->AttestedSpan(&span)) {
-      continue;
-    }
-    const auto it = attested.find(span.wal_number);
-    if (it == attested.end()) {
-      attested.emplace(span.wal_number, std::make_pair(span.first, span.last));
-    } else {
-      it->second.first = std::min(it->second.first, span.first);
-      it->second.second = std::min(it->second.second, span.last);
+    std::vector<Member::PredecessorSpan> spans;
+    s.member->AttestedSpans(&spans);
+    for (const Member::PredecessorSpan& span : spans) {
+      const auto it = attested.find(span.wal_number);
+      if (it == attested.end()) {
+        attested.emplace(span.wal_number,
+                         std::make_pair(span.first, span.last));
+      } else {
+        it->second.first = std::min(it->second.first, span.first);
+        it->second.second = std::min(it->second.second, span.last);
+      }
     }
   }
   for (const auto& [pred, span] : attested) {
@@ -383,11 +393,14 @@ Status WALIndexMerger::ComputeLowerBound() {
   // A span anchors the bound unless it attests a held or lost predecessor
   // that bears no index.
   for (auto& s : states_) {
-    Member::PredecessorSpan span;
-    if (s.member->AttestedSpan(&span) &&
-        (span.first != 0 || (FindState(span.wal_number) == nullptr &&
-                             span.wal_number < retirement_bound_))) {
-      min_anchoring_wal_ = std::min(min_anchoring_wal_, s.member->wal_number());
+    std::vector<Member::PredecessorSpan> spans;
+    s.member->AttestedSpans(&spans);
+    for (const Member::PredecessorSpan& span : spans) {
+      if (span.first != 0 || (FindState(span.wal_number) == nullptr &&
+                              span.wal_number < retirement_bound_)) {
+        min_anchoring_wal_ =
+            std::min(min_anchoring_wal_, s.member->wal_number());
+      }
     }
   }
   for (auto& s : states_) {
@@ -666,9 +679,10 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
       expected_++;
       continue;
     }
-    if (expected_ >= lost_floor_) {
+    if (expected_ >= lost_floor_ && !skip_unexplained_holes_) {
       // Possibly borne by the lost file: no torn tail or supersession
-      // explains it.
+      // explains it. Skip mode goes on below, where the stream ends once
+      // nothing is left above.
       return StopAtFrontier();
     }
     // No live holder, no void cover, and no swallowed span. When every
@@ -762,6 +776,9 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
       continue;
     }
 #endif  // NDEBUG
+    if (SkipUnexplainedHole()) {
+      continue;
+    }
     return StopAtFrontier();
   }
 }
