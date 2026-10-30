@@ -2152,7 +2152,9 @@ TEST_P(LogTest, WALIndexPredecessorSpanAfterProgressReportsCorruption) {
   EXPECT_EQ(9U, reader_->GetWALIndexProgressBound());
 }
 
-TEST_P(LogTest, WALIndexSecondPredecessorSpanReportsCorruption) {
+TEST_P(LogTest, WALIndexSecondPredecessorSpanAccepted) {
+  // A new WAL attests one span per recovered chain head placed in its
+  // partition, so a head legitimately carries several span records.
   EnableWALIndex();
   ASSERT_OK(
       writer_->AddWALIndexPredecessorSpanRecord(WriteOptions(), 122, 30, 60));
@@ -2160,7 +2162,7 @@ TEST_P(LogTest, WALIndexSecondPredecessorSpanReportsCorruption) {
       writer_->AddWALIndexPredecessorSpanRecord(WriteOptions(), 121, 10, 29));
 
   ASSERT_EQ("EOF", Read());
-  EXPECT_EQ("OK", MatchError("attests two predecessor spans"));
+  EXPECT_TRUE(ReportMessage().empty()) << ReportMessage();
   uint64_t pred = 0;
   uint64_t first = 0;
   uint64_t last = 0;
@@ -2168,6 +2170,14 @@ TEST_P(LogTest, WALIndexSecondPredecessorSpanReportsCorruption) {
   EXPECT_EQ(122U, pred);
   EXPECT_EQ(30U, first);
   EXPECT_EQ(60U, last);
+  const auto& spans = reader_->GetWALIndexPredecessorSpans();
+  ASSERT_EQ(2U, spans.size());
+  EXPECT_EQ(122U, spans[0].wal_number);
+  EXPECT_EQ(30U, spans[0].first);
+  EXPECT_EQ(60U, spans[0].last);
+  EXPECT_EQ(121U, spans[1].wal_number);
+  EXPECT_EQ(10U, spans[1].first);
+  EXPECT_EQ(29U, spans[1].last);
 }
 
 TEST_P(LogTest, WALIndexProgressInsidePartialRecordReportsCorruption) {

@@ -316,10 +316,11 @@ class LogMergeTest : public ::testing::TestWithParam<std::tuple<int, bool>> {
   std::unique_ptr<WALIndexMerger> MakeMerger(
       std::vector<std::unique_ptr<WALIndexMerger::Member>> members,
       std::vector<uint64_t> expected_wals,
-      bool continue_past_discarded_holes = false) {
-    return std::unique_ptr<WALIndexMerger>(
-        new WALIndexMerger(std::move(members), std::move(expected_wals),
-                           TestSequenceOf, continue_past_discarded_holes));
+      bool continue_past_discarded_holes = false,
+      bool continue_past_unexplained_holes = false) {
+    return std::unique_ptr<WALIndexMerger>(new WALIndexMerger(
+        std::move(members), std::move(expected_wals), TestSequenceOf,
+        continue_past_discarded_holes, continue_past_unexplained_holes));
   }
 
   struct DrivenRecord {
@@ -861,6 +862,43 @@ TEST_P(LogMergeTest, SupersededOnlyWithLiveAboveStops) {
   ASSERT_EQ("n1", driven.records[10].payload.substr(kWALIndexSize));
 }
 
+// A superseded copy below a pristine hole: with skipping enabled the stale
+// copy still dies silently, the hole is skipped, and the live record above
+// is emitted. Without skipping, the merge stops at the hole's frontier.
+TEST_P(LogMergeTest, SupersededBelowPristineHoleSkipsPastIt) {
+  MemberFile old(120, recyclable());
+  MemberFile young(121, recyclable());
+  ASSERT_OK(old.Marker());
+  ASSERT_OK(old.Data("o1", 1, 1));
+  ASSERT_OK(young.Marker());
+  ASSERT_OK(young.Sup(120, 1));
+  ASSERT_OK(young.Data("n3", 3, 3));
+
+  {
+    std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+    members.push_back(MakeMember(old, old.Bytes()));
+    members.push_back(MakeMember(young, young.Bytes()));
+    auto merger = MakeMerger(std::move(members), {120, 121},
+                             /*continue_past_discarded_holes=*/true,
+                             /*continue_past_unexplained_holes=*/true);
+    DriveResult driven = Drive(merger.get());
+    ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome);
+    ASSERT_EQ(std::vector<uint64_t>({3}), DrivenIndices(driven));
+    ASSERT_EQ(1U, merger->SkippedUnexplainedHoles());
+    ASSERT_EQ(0U, merger->GetLostPredecessor());
+  }
+  {
+    std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+    members.push_back(MakeMember(old, old.Bytes()));
+    members.push_back(MakeMember(young, young.Bytes()));
+    auto merger = MakeMerger(std::move(members), {120, 121});
+    DriveResult driven = Drive(merger.get());
+    ASSERT_EQ(WALIndexMerger::Result::kFrontier, driven.outcome);
+    // The stop carries the pending superseded-only index below the hole.
+    ASSERT_EQ(1U, merger->GetFrontier());
+  }
+}
+
 // A torn tail with nothing above it ends the stream; the lossy member is
 // reported through its end state for the recovery-mode mapping.
 TEST_P(LogMergeTest, TornTailWithoutRewriteEndsClean) {
@@ -1039,6 +1077,40 @@ TEST_P(LogMergeTest, LostPredecessorStopsAtItsFirstIndex) {
         ASSERT_EQ(std::vector<uint64_t>({4, 7, 8, 9}), DrivenIndices(driven));
         ASSERT_EQ(2U, driven.gaps.size());
       }
+    }
+  }
+}
+
+// One head attesting two retired predecessors explains both: the fold sees
+// every span the head carries, not just the first. With only the newer span
+// the older head's indices are an unexplained hole below the pinned index.
+TEST_P(LogMergeTest, HeadAttestingTwoRetiredPredecessorsExplainsBoth) {
+  for (const bool both : {false, true}) {
+    SCOPED_TRACE(both ? "both spans" : "newer span only");
+    MemberFile a(118, recyclable());
+    ASSERT_OK(a.Marker());
+    ASSERT_OK(a.Data("a1", 1, 1));
+    MemberFile b(121, recyclable());
+    ASSERT_OK(b.Marker());
+    ASSERT_OK(b.Span(120, 4, 6));
+    if (both) {
+      ASSERT_OK(b.Span(119, 1, 3));
+    }
+    for (uint64_t i = 7; i <= 9; ++i) {
+      ASSERT_OK(b.Data("b" + std::to_string(i), i, i));
+    }
+    std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+    members.push_back(MakeMember(a, a.Bytes()));
+    members.push_back(MakeMember(b, b.Bytes()));
+    auto merger = MakeMerger(std::move(members), {118, 121});
+    merger->SetRetirementBound(121);
+    DriveResult driven = Drive(merger.get());
+    if (both) {
+      ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome);
+      ASSERT_EQ(std::vector<uint64_t>({1, 7, 8, 9}), DrivenIndices(driven));
+    } else {
+      ASSERT_EQ(WALIndexMerger::Result::kFrontier, driven.outcome);
+      ASSERT_EQ(2U, merger->GetFrontier());
     }
   }
 }

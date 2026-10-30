@@ -18,6 +18,7 @@
 #include "db/db_impl/db_impl.h"
 #include "db/error_handler.h"
 #include "db/event_helpers.h"
+#include "db/log_reader.h"
 #include "db/wide/wide_columns_helper.h"
 #include "file/filename.h"
 #include "logging/logging.h"
@@ -3360,6 +3361,60 @@ void DBImpl::ClearWalDurabilityBGError() {
   }
 }
 
+IOStatus DBImpl::ReadBackBurnedWALIndices(uint64_t wal_number,
+                                          const std::set<uint64_t>& wanted,
+                                          std::set<uint64_t>* landed) {
+  assert(landed != nullptr);
+  assert(!wanted.empty());
+  const std::string fname =
+      LogFileName(immutable_db_options_.GetWalDir(), wal_number);
+  std::unique_ptr<SequentialFileReader> file_reader;
+  Status open_status =
+      OpenWALForRecovery(fname, /*is_retry=*/false, &file_reader);
+  if (!open_status.ok()) {
+    if (open_status.IsNotFound() || open_status.IsPathNotFound()) {
+      // The purge already deleted the retired WAL (a background purge from
+      // the recovery flush runs ahead of this): no future recovery can read
+      // a record from it, so every index stays out of `landed` and takes
+      // the void, exactly as if its record never landed.
+      ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                     "[WAL recovery] Burning WAL #%" PRIu64
+                     " already purged; voiding its burned indices",
+                     wal_number);
+      return IOStatus::OK();
+    }
+    return status_to_io_status(std::move(open_status));
+  }
+  // Skip mode reads past corruption: a torn fragment of the failed record, or
+  // corruption in an earlier record, cannot hide a landed record from the
+  // scan. Checksums stay on: only a whole record counts as landed.
+  log::Reader reader(immutable_db_options_.info_log, std::move(file_reader),
+                     /*reporter=*/nullptr, /*checksum=*/true, wal_number);
+  std::string scratch;
+  Slice record;
+  while (reader.ReadRecord(&record, &scratch,
+                           WALRecoveryMode::kSkipAnyCorruptedRecords)) {
+    if (wanted.count(reader.GetLastReadWALIndex()) != 0) {
+      landed->insert(reader.GetLastReadWALIndex());
+    }
+  }
+  if (reader.hasReadError()) {
+    // The unread tail is unknown: every wanted index not already proven
+    // landed fails the read-back, so Resume fails and the DB stays stopped.
+    // An index proven landed above stays landed: its record was
+    // checksum-validated, and failing it could only strand the DB.
+    for (uint64_t wal_index : wanted) {
+      if (landed->count(wal_index) == 0) {
+        return IOStatus::IOError("WAL recovery could not read back WAL " +
+                                 std::to_string(wal_number) +
+                                 " for burned WAL index " +
+                                 std::to_string(wal_index));
+      }
+    }
+  }
+  return IOStatus::OK();
+}
+
 Status DBImpl::ExplainBurnedWALIndices(const WriteOptions& write_options) {
   mutex_.AssertHeld();
   assert(NumWalPartitions() > 1);
@@ -3382,6 +3437,35 @@ Status DBImpl::ExplainBurnedWALIndices(const WriteOptions& write_options) {
   }
   mutex_.Unlock();
   IOStatus io_s;
+  // A failed append may still have landed its bytes; a void over a landed
+  // record fails every later open ("bears records and a void cover"), while
+  // the record itself recovers (D-1). Read each burning WAL back once and
+  // void only the indices with no landed record. The writers were detached
+  // by recovery's rotation and the purge runs after this, so the files sit
+  // undisturbed in the WAL directory.
+  std::set<uint64_t> landed;
+  {
+    std::map<uint64_t, std::set<uint64_t>> wanted_by_wal;
+    for (const BurnedWalIndex& b : burned) {
+      wanted_by_wal[b.wal_number].insert(b.wal_index);
+    }
+    for (const auto& [wal_number, wanted] : wanted_by_wal) {
+      io_s = ReadBackBurnedWALIndices(wal_number, wanted, &landed);
+      TEST_SYNC_POINT_CALLBACK("DBImpl::ReadBackBurnedWALIndices:io_s", &io_s);
+      if (!io_s.ok()) {
+        break;
+      }
+      for (uint64_t wal_index : wanted) {
+        if (landed.count(wal_index) != 0) {
+          ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                         "[WAL recovery] Burned WAL index %" PRIu64
+                         " landed in WAL #%" PRIu64
+                         " despite the failed append; recovering the record",
+                         wal_index, wal_number);
+        }
+      }
+    }
+  }
   {
     // Recovery's rotation installed partition 0's current WAL above every WAL
     // that burned an index, so any recovery that reads such a WAL reads this
@@ -3393,20 +3477,22 @@ Status DBImpl::ExplainBurnedWALIndices(const WriteOptions& write_options) {
       WalSyncCV(0).Wait();
     }
     LogWriterNumber* target = CurrentWalOrNull(0);
-    if (target == nullptr || target->number <= newest_burning_wal ||
-        target->writer->file() == nullptr ||
-        target->writer->file()->seen_error() ||
-        target->writer->last_wal_index_recorded() >= burned.front().wal_index) {
+    if (io_s.ok() &&
+        (target == nullptr || target->number <= newest_burning_wal ||
+         target->writer->file() == nullptr ||
+         target->writer->file()->seen_error() ||
+         target->writer->last_wal_index_recorded() >=
+             burned.front().wal_index)) {
       io_s = IOStatus::Corruption(
           "WAL recovery found no healthy WAL to explain burned WAL index " +
           std::to_string(burned.front().wal_index));
-    } else {
+    } else if (io_s.ok()) {
       // Lets a test fault the target's real I/O.
       TEST_SYNC_POINT_CALLBACK("DBImpl::ExplainBurnedWALIndices:Target",
                                &target->number);
       uint64_t last_voided = 0;
       for (const BurnedWalIndex& b : burned) {
-        if (b.wal_index == last_voided) {
+        if (b.wal_index == last_voided || landed.count(b.wal_index) != 0) {
           continue;
         }
         io_s = target->writer->AddWALIndexVoidRecord(write_options, b.wal_index,

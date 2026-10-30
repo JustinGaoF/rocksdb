@@ -6728,8 +6728,9 @@ TEST_F(DBWALIndexTest, ShiftedIndexStartRecoversInAllModes) {
 }
 
 // A hole with live records above it and no explanation anywhere stops the
-// stream: point-in-time opens at the cut, every other mode fails.
-TEST_F(DBWALIndexTest, PristineHoleFailsExceptPointInTime) {
+// stream: point-in-time opens at the cut, tolerate and absolute fail, and
+// (D-10) skip skips it and applies the records above it.
+TEST_F(DBWALIndexTest, PristineHoleFailsExceptPointInTimeAndSkip) {
   const std::vector<WALRecoveryMode> recovery_modes = {
       WALRecoveryMode::kTolerateCorruptedTailRecords,
       WALRecoveryMode::kAbsoluteConsistency,
@@ -6745,8 +6746,10 @@ TEST_F(DBWALIndexTest, PristineHoleFailsExceptPointInTime) {
     WriteKeyRange(0, 4);
     const uint64_t wal_number = LatestWALNumber();
     Close();
-    // Moves index 3 to 30, leaving a pristine hole with index 4 above it.
+    // Moves indices 3 and 4 to 30 and 31, leaving a pristine hole with
+    // records above it. Both move together so the file stays ordered.
     OverwriteDataRecordWALIndexAt(WALPath(wal_number), 2, 30);
+    OverwriteDataRecordWALIndexAt(WALPath(wal_number), 3, 31);
 
     if (recovery_mode == WALRecoveryMode::kPointInTimeRecovery) {
       Reopen(options);
@@ -6762,6 +6765,22 @@ TEST_F(DBWALIndexTest, PristineHoleFailsExceptPointInTime) {
           {wal_number, 3}};
       EXPECT_EQ(supersessions, ReadWALSupersessions(WALPath(new_wal)));
       const std::vector<uint64_t> expected = {3, 4};
+      EXPECT_EQ(expected, ReadWALIndices(WALPath(new_wal), new_wal));
+      Destroy(options);
+      continue;
+    }
+    if (recovery_mode == WALRecoveryMode::kSkipAnyCorruptedRecords) {
+      Reopen(options);
+      EXPECT_EQ("value0", Get(Key(0)));
+      EXPECT_EQ("value1", Get(Key(1)));
+      EXPECT_EQ("value2", Get(Key(2)));
+      EXPECT_EQ("value3", Get(Key(3)));
+      const uint64_t new_wal = LatestWALNumber();
+      ASSERT_OK(Put(Key(10), "value10"));
+      EXPECT_EQ("value10", Get(Key(10)));
+      Close();
+      EXPECT_TRUE(ReadWALSupersessions(WALPath(new_wal)).empty());
+      const std::vector<uint64_t> expected = {32};
       EXPECT_EQ(expected, ReadWALIndices(WALPath(new_wal), new_wal));
       Destroy(options);
       continue;
@@ -7462,7 +7481,8 @@ TEST_F(DBWALIndexTest, TruncationSummaryCountsAndCleanCompletion) {
 }
 
 // One drive exercising both directions: a burn cover skipped mid-stream and
-// a pristine hole stopping it. Point-in-time opens at the cut; the rest fail.
+// a pristine hole stopping it. Point-in-time opens at the cut; tolerate and
+// absolute fail; (D-10) skip skips the hole and applies everything above it.
 TEST_F(DBWALIndexTest, MixedVoidAndHoleMapsPerMode) {
   const std::vector<WALRecoveryMode> recovery_modes = {
       WALRecoveryMode::kTolerateCorruptedTailRecords,
@@ -7510,6 +7530,21 @@ TEST_F(DBWALIndexTest, MixedVoidAndHoleMapsPerMode) {
           {wal_number, 6}};
       EXPECT_EQ(supersessions, ReadWALSupersessions(WALPath(new_wal)));
       const std::vector<uint64_t> expected = {6, 7};
+      EXPECT_EQ(expected, ReadWALIndices(WALPath(new_wal), new_wal));
+      Destroy(options);
+      continue;
+    }
+    if (recovery_mode == WALRecoveryMode::kSkipAnyCorruptedRecords) {
+      Reopen(options);
+      for (int i = 0; i <= 4; ++i) {
+        EXPECT_EQ("value" + std::to_string(i), Get(Key(i))) << "key " << i;
+      }
+      const uint64_t new_wal = LatestWALNumber();
+      ASSERT_OK(Put(Key(10), "value10"));
+      EXPECT_EQ("value10", Get(Key(10)));
+      Close();
+      EXPECT_TRUE(ReadWALSupersessions(WALPath(new_wal)).empty());
+      const std::vector<uint64_t> expected = {61};
       EXPECT_EQ(expected, ReadWALIndices(WALPath(new_wal), new_wal));
       Destroy(options);
       continue;
