@@ -6728,7 +6728,9 @@ TEST_F(DBWALIndexTest, ShiftedIndexStartRecoversInAllModes) {
 }
 
 // A hole with live records above it and no explanation anywhere stops the
-// stream: point-in-time opens at the cut, every other mode fails.
+// stream: point-in-time opens at the cut, tolerate and absolute fail. Skip
+// steps past the hole (GC26 Q4, D-10), then fails on index 4 following 30 in
+// the same file, which is a contradiction rather than a hole.
 TEST_F(DBWALIndexTest, PristineHoleFailsExceptPointInTime) {
   const std::vector<WALRecoveryMode> recovery_modes = {
       WALRecoveryMode::kTolerateCorruptedTailRecords,
@@ -6768,7 +6770,9 @@ TEST_F(DBWALIndexTest, PristineHoleFailsExceptPointInTime) {
     }
     const Status status = TryReopen(options);
     ASSERT_TRUE(status.IsCorruption()) << status.ToString();
-    EXPECT_NE(std::string::npos, status.ToString().find("unexplained hole"));
+    EXPECT_EQ(recovery_mode != WALRecoveryMode::kSkipAnyCorruptedRecords,
+              status.ToString().find("unexplained hole") != std::string::npos)
+        << status.ToString();
     Destroy(options);
   }
 }
@@ -7462,7 +7466,9 @@ TEST_F(DBWALIndexTest, TruncationSummaryCountsAndCleanCompletion) {
 }
 
 // One drive exercising both directions: a burn cover skipped mid-stream and
-// a pristine hole stopping it. Point-in-time opens at the cut; the rest fail.
+// a pristine hole stopping it. Point-in-time opens at the cut; tolerate and
+// absolute fail; skip skips the hole too and opens with every key (GC26 Q4,
+// D-10).
 TEST_F(DBWALIndexTest, MixedVoidAndHoleMapsPerMode) {
   const std::vector<WALRecoveryMode> recovery_modes = {
       WALRecoveryMode::kTolerateCorruptedTailRecords,
@@ -7511,6 +7517,15 @@ TEST_F(DBWALIndexTest, MixedVoidAndHoleMapsPerMode) {
       EXPECT_EQ(supersessions, ReadWALSupersessions(WALPath(new_wal)));
       const std::vector<uint64_t> expected = {6, 7};
       EXPECT_EQ(expected, ReadWALIndices(WALPath(new_wal), new_wal));
+      Destroy(options);
+      continue;
+    }
+    if (recovery_mode == WALRecoveryMode::kSkipAnyCorruptedRecords) {
+      Reopen(options);
+      for (int i = 0; i <= 4; ++i) {
+        EXPECT_EQ("value" + std::to_string(i), Get(Key(i))) << "key " << i;
+      }
+      Close();
       Destroy(options);
       continue;
     }

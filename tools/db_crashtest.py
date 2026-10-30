@@ -2085,6 +2085,10 @@ def finalize_and_sanitize(src_params):
             # Both ingest a WriteBatchWithIndex, which fails at N > 1.
             dest_params["ingest_wbwi_one_in"] = 0
             dest_params["commit_bypass_memtable_one_in"] = 0
+            # A secondary instance refuses partitioned WALs, and continuous
+            # verification reads through one.
+            dest_params["test_secondary"] = 0
+            dest_params["continuous_verification_interval"] = 0
 
     # `db_stress` rejects either verification knob when `skip_verifydb` is set.
     # Must stay last: sanitization above can turn a verification knob back on

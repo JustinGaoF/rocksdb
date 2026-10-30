@@ -10,6 +10,7 @@
 #pragma once
 #include <stdint.h>
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <unordered_map>
@@ -190,7 +191,8 @@ class Reader {
     return last_progress_bound_read_;
   }
 
-  // Predecessor span attested by this file's head, if one was read.
+  // Predecessor span attested by this file's head, if one was read: the
+  // first, naming the lowest WAL, when the head attests several.
   bool HasWALIndexPredecessorSpan() const { return has_predecessor_span_; }
   bool GetWALIndexPredecessorSpan(uint64_t* predecessor_wal_number,
                                   uint64_t* first_wal_index,
@@ -202,6 +204,13 @@ class Reader {
     *first_wal_index = predecessor_span_first_;
     *last_wal_index = predecessor_span_last_;
     return true;
+  }
+  // Every span after the first, as {wal_number, first, last}, in the
+  // ascending WAL order the head must give them in. A WAL that opened at
+  // fewer partitions than wrote its predecessors attests each folded chain.
+  const std::vector<std::array<uint64_t, 3>>&
+  GetFurtherWALIndexPredecessorSpans() const {
+    return further_predecessor_spans_;
   }
 
   // Returns whether a supersession record in this reader's WAL makes the
@@ -313,6 +322,8 @@ class Reader {
   uint64_t predecessor_span_wal_ = 0;
   uint64_t predecessor_span_first_ = 0;
   uint64_t predecessor_span_last_ = 0;
+  // Spans read after the first; see GetFurtherWALIndexPredecessorSpans().
+  std::vector<std::array<uint64_t, 3>> further_predecessor_spans_;
   // Valid void ranges read so far, in file order. Covers are order-constrained
   // (see log_format.h), so ranges arrive lo-ordered in a well-formed file.
   std::vector<std::pair<uint64_t, uint64_t>> wal_index_void_ranges_;
