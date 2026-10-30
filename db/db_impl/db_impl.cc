@@ -611,6 +611,18 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
   if (s.ok()) {
     recovering_from_wal_write_error_ = context.IsWALWriteErrorRecovery();
     recover_wal_through_number_ = context.failed_wal_number;
+    // The retry path rotates no WALs and switches no memtables: with a
+    // burned index pending, the explanation would find partition 0's WAL
+    // below the burning one and fail closed. Take the full path instead,
+    // whose switches rotate. Above one partition only; at one partition
+    // burns are never explained and the retry path is unchanged. The reason
+    // is normalized too: the waits below treat only kErrorRecovery as
+    // resuming (WaitForFlushMemTables), and the work is a full recovery
+    // flush.
+    if (context.flush_reason == FlushReason::kErrorRecoveryRetryFlush &&
+        NumWalPartitions() > 1 && BurnedWalIndicesPending()) {
+      context.flush_reason = FlushReason::kErrorRecovery;
+    }
     if (context.flush_reason == FlushReason::kErrorRecoveryRetryFlush) {
       s = RetryFlushesForErrorRecovery(FlushReason::kErrorRecoveryRetryFlush,
                                        true /* wait */);

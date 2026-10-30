@@ -10684,10 +10684,6 @@ TEST(TransactionPartitionedWalTest,
 // prepared.
 TEST(TransactionPartitionedWalTest, SyncPrepareAfterSyncCommitSurvivesCrash) {
   constexpr size_t kPartitions = 2;
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
   const std::string dbname =
       test::PerThreadDBPath("transaction_partitioned_wal_sync_prepare");
   // Drops every byte not synced when the DB closes (simulated power loss),
@@ -10755,8 +10751,6 @@ TEST(TransactionPartitionedWalTest, SyncPrepareAfterSyncCommitSurvivesCrash) {
     delete recovered;
   }
   delete db;
-  SyncPoint::GetInstance()->DisableProcessing();
-  SyncPoint::GetInstance()->ClearAllCallBacks();
   options.env = Env::Default();
   ASSERT_OK(DestroyDB(dbname, options));
 }
@@ -10844,9 +10838,6 @@ struct FU14SnapshotRace {
   SequenceNumber t1_seq = 0;
 
   void Open(const std::string& name) {
-    SyncPoint::GetInstance()->SetCallBack(
-        "DBImpl::ValidateOptions:AllowWalPartitions",
-        [](void* arg) { *static_cast<bool*>(arg) = true; });
     SyncPoint::GetInstance()->EnableProcessing();
     dbname = test::PerThreadDBPath(name);
     options.create_if_missing = true;

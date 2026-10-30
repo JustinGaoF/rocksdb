@@ -190,18 +190,32 @@ class Reader {
     return last_progress_bound_read_;
   }
 
-  // Predecessor span attested by this file's head, if one was read.
-  bool HasWALIndexPredecessorSpan() const { return has_predecessor_span_; }
+  // Predecessor spans attested by this file's head, in file order. A new WAL
+  // attests one span per recovered chain head placed in its partition, so
+  // after an N change or with several live WALs there is more than one.
+  struct PredecessorSpan {
+    uint64_t wal_number = 0;
+    uint64_t first = 0;
+    uint64_t last = 0;
+  };
+  bool HasWALIndexPredecessorSpan() const {
+    return !predecessor_spans_.empty();
+  }
+  // The first span attested: the head span over the partition's newest
+  // recovered WAL. False when the file attested none.
   bool GetWALIndexPredecessorSpan(uint64_t* predecessor_wal_number,
                                   uint64_t* first_wal_index,
                                   uint64_t* last_wal_index) const {
-    if (!has_predecessor_span_) {
+    if (predecessor_spans_.empty()) {
       return false;
     }
-    *predecessor_wal_number = predecessor_span_wal_;
-    *first_wal_index = predecessor_span_first_;
-    *last_wal_index = predecessor_span_last_;
+    *predecessor_wal_number = predecessor_spans_.front().wal_number;
+    *first_wal_index = predecessor_spans_.front().first;
+    *last_wal_index = predecessor_spans_.front().last;
     return true;
+  }
+  const std::vector<PredecessorSpan>& GetWALIndexPredecessorSpans() const {
+    return predecessor_spans_;
   }
 
   // Returns whether a supersession record in this reader's WAL makes the
@@ -308,11 +322,8 @@ class Reader {
   // record has been read. A nonzero bound also proves the head is complete:
   // supersessions and spans must precede the first progress record.
   uint64_t last_progress_bound_read_ = 0;
-  // Predecessor span attested by this file's head, if one was read. Valid
-  // only when has_predecessor_span_ below is set.
-  uint64_t predecessor_span_wal_ = 0;
-  uint64_t predecessor_span_first_ = 0;
-  uint64_t predecessor_span_last_ = 0;
+  // Predecessor spans attested by this file's head, in file order.
+  std::vector<PredecessorSpan> predecessor_spans_;
   // Valid void ranges read so far, in file order. Covers are order-constrained
   // (see log_format.h), so ranges arrive lo-ordered in a well-formed file.
   std::vector<std::pair<uint64_t, uint64_t>> wal_index_void_ranges_;
@@ -321,8 +332,6 @@ class Reader {
   // Whether a WAL index marker record has been consumed. Set by both
   // logical-reader implementations; never cleared.
   bool saw_wal_index_marker_ = false;
-  // Whether this file's head attested a predecessor span.
-  bool has_predecessor_span_ = false;
   // Whether a supersession record followed a data or progress record.
   bool saw_misplaced_supersession_ = false;
   uint32_t wal_partition_ = 0;

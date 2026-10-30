@@ -1448,13 +1448,17 @@ void DBOpenLogRecordReadReporter::OldLogRecord(size_t bytes) {
 
 Status DBImpl::CheckWALFilesCarryWALIndex(
     const std::vector<uint64_t>& wal_numbers, uint64_t min_wal_number,
-    bool is_retry, uint64_t* unindexed_high, uint64_t* indexed_low,
-    bool* superseding) {
+    bool is_retry, uint64_t* unindexed_high, uint64_t* unindexed_low,
+    uint64_t* indexed_low, uint64_t* indexed_high, bool* superseding) {
   assert(unindexed_high != nullptr);
+  assert(unindexed_low != nullptr);
   assert(indexed_low != nullptr);
+  assert(indexed_high != nullptr);
   assert(superseding != nullptr);
   *unindexed_high = 0;
+  *unindexed_low = std::numeric_limits<uint64_t>::max();
   *indexed_low = std::numeric_limits<uint64_t>::max();
+  *indexed_high = 0;
   *superseding = false;
   recovered_wal_partitions_.clear();
   for (uint64_t wal_number : wal_numbers) {
@@ -1499,6 +1503,7 @@ Status DBImpl::CheckWALFilesCarryWALIndex(
     if (reader->SawWALIndexMarker() ||
         pulled.kind == log::WALIndexMerger::Member::Pull::kRecord) {
       *indexed_low = std::min(*indexed_low, wal_number);
+      *indexed_high = std::max(*indexed_high, wal_number);
     }
     if (pulled.kind != log::WALIndexMerger::Member::Pull::kRecord &&
         pulled.kind != log::WALIndexMerger::Member::Pull::kUnindexed) {
@@ -1550,6 +1555,7 @@ Status DBImpl::CheckWALFilesCarryWALIndex(
                      wal_number);
     }
     *unindexed_high = wal_number;
+    *unindexed_low = std::min(*unindexed_low, wal_number);
   }
   TEST_SYNC_POINT("DBImpl::CheckWALFilesCarryWALIndex:AfterClassification");
   return Status::OK();
@@ -1586,16 +1592,22 @@ Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& wal_numbers,
     // one file's replay into the next, which the merge's concurrent pulls
     // cannot reproduce, so that combination keeps the sequential path.
     uint64_t unindexed_high = 0;
+    uint64_t unindexed_low = 0;
     uint64_t indexed_low = 0;
+    uint64_t indexed_high = 0;
     bool superseding = false;
-    status =
-        CheckWALFilesCarryWALIndex(wal_numbers, min_wal_number, is_retry,
-                                   &unindexed_high, &indexed_low, &superseding);
+    status = CheckWALFilesCarryWALIndex(
+        wal_numbers, min_wal_number, is_retry, &unindexed_high, &unindexed_low,
+        &indexed_low, &indexed_high, &superseding);
     // A set written with one partition replays in file order; one written
     // with more interleaves, and only the merge can order it.
     const bool partitioned = !recovered_wal_partitions_.empty();
+    // Every unindexed WAL above every indexed one: the indexed set merges,
+    // then the suffix replays sequentially. Anything else mixed fails closed.
+    const bool unindexed_suffix =
+        unindexed_high != 0 && partitioned && unindexed_low > indexed_high;
     if (status.ok() && unindexed_high != 0 && partitioned &&
-        unindexed_high > indexed_low) {
+        unindexed_high > indexed_low && !unindexed_suffix) {
       status = Status::Corruption(
           "WAL " + std::to_string(unindexed_high) +
           " carries no WAL index but follows indexed WAL " +
@@ -1630,10 +1642,14 @@ Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& wal_numbers,
                                  recovery_ctx, &wal_index_supersessions);
       } else if (unindexed_high == 0 || partitioned || legacy_prefix) {
         // An unindexed prefix (WALs written before indexing was enabled)
-        // replays sequentially ahead of the merge.
+        // replays sequentially ahead of the merge; an unindexed suffix (a
+        // rollback with WALs still live) replays sequentially behind it. A
+        // prefix and a suffix never coincide here: both sides mixed fails
+        // closed above.
         status = ProcessLogFilesMerged(
-            wal_numbers, unindexed_high == 0 ? 0 : indexed_low, read_only,
-            is_retry, min_wal_number, job_id, next_sequence, &version_edits,
+            wal_numbers, unindexed_high == 0 ? 0 : indexed_low,
+            unindexed_suffix ? unindexed_low : 0, read_only, is_retry,
+            min_wal_number, job_id, next_sequence, &version_edits,
             corrupted_wal_found, recovery_ctx, &wal_index_supersessions);
       } else {
         // Disabling indexing leaves unindexed files after indexed ones, and
@@ -1891,8 +1907,8 @@ static Status MergedSequenceOf(Slice payload, SequenceNumber* seq) {
 
 Status DBImpl::ProcessLogFilesMerged(
     const std::vector<uint64_t>& wal_numbers, uint64_t merge_from,
-    bool read_only, bool is_retry, uint64_t min_wal_number, int job_id,
-    SequenceNumber* next_sequence,
+    uint64_t merge_upto, bool read_only, bool is_retry, uint64_t min_wal_number,
+    int job_id, SequenceNumber* next_sequence,
     std::unordered_map<int, VersionEdit>* version_edits,
     bool* corrupted_wal_found, RecoveryContext* recovery_ctx,
     std::vector<WALIndexSupersession>* supersessions) {
@@ -1941,6 +1957,11 @@ Status DBImpl::ProcessLogFilesMerged(
       }
       continue;
     }
+    if (merge_upto != 0 && wal_number >= merge_upto) {
+      // Unindexed suffix: replays sequentially after the merge reaches a
+      // clean end. Not a member: the merge would drain its records first.
+      continue;
+    }
     if (wal_number < min_wal_number) {
       ROCKS_LOG_INFO(immutable_db_options_.info_log,
                      "Skipping log #%" PRIu64
@@ -1983,7 +2004,8 @@ Status DBImpl::ProcessLogFilesMerged(
   // With MANIFEST WAL tracking, every synced WAL the MANIFEST names at or
   // above the bound must be held. WALs it does not track (never synced) are
   // checked only through what the files attest. The unindexed prefix replayed
-  // above is not a member, so it is not demanded.
+  // above, and the unindexed suffix replayed below, are not members, so they
+  // are not demanded.
   std::vector<uint64_t> expected_wals = held_wals;
   if (immutable_db_options_.track_and_verify_wals_in_manifest) {
     expected_wals.clear();
@@ -1993,16 +2015,20 @@ Status DBImpl::ProcessLogFilesMerged(
           wal_number < merge_from &&
           std::binary_search(wal_numbers.begin(), wal_numbers.end(),
                              wal_number);
+      const bool replayed_behind =
+          merge_upto != 0 && wal_number >= merge_upto &&
+          std::binary_search(wal_numbers.begin(), wal_numbers.end(),
+                             wal_number);
       if (wal_number >= min_wal_number && wal_meta.HasSyncedSize() &&
-          !replayed_ahead) {
+          !replayed_ahead && !replayed_behind) {
         expected_wals.push_back(wal_number);
       }
     }
   }
+  const bool skip_holes = immutable_db_options_.wal_recovery_mode ==
+                          WALRecoveryMode::kSkipAnyCorruptedRecords;
   log::WALIndexMerger merger(std::move(members), expected_wals,
-                             MergedSequenceOf,
-                             immutable_db_options_.wal_recovery_mode ==
-                                 WALRecoveryMode::kSkipAnyCorruptedRecords);
+                             MergedSequenceOf, skip_holes, skip_holes);
   // Recovery reads every WAL at or above min_wal_number, so an attested
   // predecessor there that the merge does not hold is missing from disk.
   merger.SetRetirementBound(min_wal_number);
@@ -2471,12 +2497,8 @@ Status DBImpl::ProcessLogFilesMerged(
         msg += "; WAL " + std::to_string(merger.GetLostPredecessor()) +
                " is attested by its successor but missing";
       }
-      if (wal_recovery_mode == WALRecoveryMode::kSkipAnyCorruptedRecords) {
-        msg +=
-            "; kSkipAnyCorruptedRecords does not skip unexplained holes in "
-            "indexed WAL sets, reopen with kPointInTimeRecovery to recover "
-            "the prefix below the hole";
-      }
+      // Skip never reaches this branch: the merge skips unexplained holes
+      // for it instead of stopping at the frontier.
       return Status::Corruption(msg);
     }
     if (merger.FrontierIsPendingDiscard()) {
@@ -2589,6 +2611,21 @@ Status DBImpl::ProcessLogFilesMerged(
                    superseded_wals.empty() ? " none" : superseded_wals.c_str(),
                    discarded + tail_gaps);
   }
+  if (merger.SkippedUnexplainedHoles() > 0) {
+    ROCKS_LOG_WARN(immutable_db_options_.info_log,
+                   "Merged WAL recovery skipped %" PRIu64
+                   " unexplained hole indices and applied the records above "
+                   "them (kSkipAnyCorruptedRecords)",
+                   merger.SkippedUnexplainedHoles());
+  }
+  if (merger.SkippedTrailingLostWAL()) {
+    ROCKS_LOG_WARN(immutable_db_options_.info_log,
+                   "Merged WAL recovery ended with WAL %" PRIu64
+                   " attested by its successor but missing: it may have borne "
+                   "records at or above wal_index %" PRIu64
+                   " (kSkipAnyCorruptedRecords)",
+                   merger.GetLostPredecessor(), merger.GetFrontier());
+  }
 
   // Writes after this open take next_wal_index_ and up, so a record there
   // must be cut, or the next open finds two live records at one index.
@@ -2636,6 +2673,37 @@ Status DBImpl::ProcessLogFilesMerged(
             " at or above the next wal_index " +
             std::to_string(next_wal_index_) + "; a write would reissue it" +
             pending_stop);
+      }
+    }
+  }
+
+  // An unindexed suffix replays sequentially behind the merge, but only when
+  // the merge reached the end of the indexed history: a stop or a cut below
+  // (point-in-time, corruption, a WAL filter) leaves the suffix unreplayed.
+  if (status.ok() && merge_upto != 0 &&
+      result == log::WALIndexMerger::Result::kCleanEnd &&
+      !stop_replay_for_corruption && !stop_replay_by_wal_filter) {
+    for (uint64_t wal_number : wal_numbers) {
+      if (wal_number < merge_upto) {
+        continue;
+      }
+      SetupLogFileProcessing(wal_number);
+      const SequenceNumber prev_next_sequence = *next_sequence;
+      status =
+          ProcessLogFile(wal_number, min_wal_number, is_retry, read_only,
+                         job_id, next_sequence, &stop_replay_for_corruption,
+                         &stop_replay_by_wal_filter, &corrupted_wal_number,
+                         corrupted_wal_found, version_edits, &flushed,
+                         predecessor_wal_info, supersessions);
+      if (status.ok()) {
+        status = CheckSeqnoNotSetBackDuringRecovery(prev_next_sequence,
+                                                    *next_sequence);
+      }
+      if (!status.ok()) {
+        return status;
+      }
+      if (stop_replay_for_corruption || stop_replay_by_wal_filter) {
+        break;
       }
     }
   }
@@ -4046,29 +4114,70 @@ IOStatus DBImpl::CreateWAL(
 
 log::WALIndexPredecessorSpan DBImpl::RecoveredWALIndexPredecessor(
     size_t wal_partition) const {
-  log::WALIndexPredecessorSpan span;
-  if (!log::WALIndexEnabled(immutable_db_options_.partition_wal_usage)) {
-    return span;
+  const std::vector<log::WALIndexPredecessorSpan> spans =
+      RecoveredWALIndexPredecessors(wal_partition);
+  if (spans.empty()) {
+    return log::WALIndexPredecessorSpan();
   }
-  uint64_t newest = 0;
-  uint64_t first = 0;
+  return spans.front();
+}
+
+std::vector<log::WALIndexPredecessorSpan> DBImpl::RecoveredWALIndexPredecessors(
+    size_t wal_partition) const {
+  std::vector<log::WALIndexPredecessorSpan> spans;
+  if (!log::WALIndexEnabled(immutable_db_options_.partition_wal_usage)) {
+    return spans;
+  }
+  std::vector<std::pair<uint64_t, uint64_t>> placed;
   for (const auto& [wal_number, first_index] : recovered_wal_first_indices_) {
-    size_t placed = 0;
+    size_t partition = 0;
     const UnorderedMap<uint64_t, uint32_t>::const_iterator recorded =
         recovered_wal_partitions_.find(wal_number);
     if (recorded != recovered_wal_partitions_.end() &&
         recorded->second < NumWalPartitions()) {
-      placed = recorded->second;
+      partition = recorded->second;
     }
-    if (placed == wal_partition && wal_number > newest) {
-      newest = wal_number;
-      first = first_index;
+    if (partition == wal_partition) {
+      placed.emplace_back(wal_number, first_index);
     }
   }
-  if (newest != 0) {
-    span = log::MakeWALIndexPredecessorSpan(newest, first, next_wal_index_ - 1);
+  // Newest first, so the head span keeps attesting the newest recovered WAL;
+  // sorted for a deterministic head.
+  std::sort(
+      placed.begin(), placed.end(),
+      [](const std::pair<uint64_t, uint64_t>& a,
+         const std::pair<uint64_t, uint64_t>& b) { return a.first > b.first; });
+  for (const auto& [wal_number, first_index] : placed) {
+    const log::WALIndexPredecessorSpan span = log::MakeWALIndexPredecessorSpan(
+        wal_number, first_index, next_wal_index_ - 1);
+    if (span.wal_number != 0) {
+      spans.push_back(span);
+    }
   }
-  return span;
+  return spans;
+}
+
+IOStatus DBImpl::WriteExtraWALIndexPredecessorSpans(
+    const WriteOptions& write_options, log::Writer* new_log,
+    size_t wal_partition) {
+  assert(new_log);
+  const std::vector<log::WALIndexPredecessorSpan> spans =
+      RecoveredWALIndexPredecessors(wal_partition);
+  if (spans.size() < 2) {
+    return IOStatus::OK();
+  }
+  // Same suppression as StartWALFile: recycled files and the span-less
+  // self-tests write no span at all.
+  bool write_span = immutable_db_options_.recycle_log_file_num == 0;
+  TEST_SYNC_POINT_CALLBACK("DBImpl::StartWALFile:WriteSpan", &write_span);
+  IOStatus io_s;
+  if (write_span) {
+    for (size_t i = 1; i < spans.size() && io_s.ok(); ++i) {
+      io_s = new_log->AddWALIndexPredecessorSpanRecord(
+          write_options, spans[i].wal_number, spans[i].first, spans[i].last);
+    }
+  }
+  return io_s;
 }
 
 bool DBImpl::AsyncWALPrecreateEnabled() const {
@@ -4314,6 +4423,10 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
       impl->min_wal_number_to_recycle_ = new_log_number;
     }
     if (s.ok()) {
+      s = impl->WriteExtraWALIndexPredecessorSpans(write_options, new_log,
+                                                   /*wal_partition=*/0);
+    }
+    if (s.ok()) {
       DBImpl::WalWriteMutexLock wl(&impl->WalWriteMutex(0));
       impl->cur_wal_number_ = new_log_number;
       assert(new_log != nullptr);
@@ -4334,6 +4447,10 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
                           preallocate_block_size, PredecessorWALInfo(),
                           impl->RecoveredWALIndexPredecessor(p), p,
                           &partition_log);
+      if (s.ok()) {
+        s = impl->WriteExtraWALIndexPredecessorSpans(write_options,
+                                                     partition_log, p);
+      }
       if (s.ok()) {
         DBImpl::WalWriteMutexLock wl(&impl->WalWriteMutex(p));
         impl->InstallCurrentWal(p, partition_log_number, partition_log);

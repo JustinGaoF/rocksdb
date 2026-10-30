@@ -696,11 +696,6 @@ void Reader::DecodeWALIndexPredecessorSpanRecord(const Slice& fragment) {
                      "WAL_Index predecessor span record has invalid size");
     return;
   }
-  if (has_predecessor_span_) {
-    ReportCorruption(fragment.size(),
-                     "WAL_Index file attests two predecessor spans");
-    return;
-  }
   const uint64_t predecessor_wal_number = DecodeFixed64(fragment.data());
   const uint64_t first = DecodeFixed64(fragment.data() + kWALIndexSize);
   const uint64_t last = DecodeFixed64(fragment.data() + 2 * kWALIndexSize);
@@ -718,10 +713,11 @@ void Reader::DecodeWALIndexPredecessorSpanRecord(const Slice& fragment) {
     ReportCorruption(fragment.size(), "WAL_Index predecessor span is reversed");
     return;
   }
-  has_predecessor_span_ = true;
-  predecessor_span_wal_ = predecessor_wal_number;
-  predecessor_span_first_ = first;
-  predecessor_span_last_ = last;
+  PredecessorSpan span;
+  span.wal_number = predecessor_wal_number;
+  span.first = first;
+  span.last = last;
+  predecessor_spans_.push_back(span);
 }
 
 uint64_t Reader::LastRecordOffset() { return last_record_offset_; }

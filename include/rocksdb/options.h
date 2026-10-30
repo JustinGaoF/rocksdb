@@ -409,6 +409,14 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   void Dump(Logger* log) const;
 };
 
+// In a WAL set written with a partition_wal_usage other than kNone, recovery
+// merges the WAL files into one stream ordered by their WAL index, and each
+// mode treats a gap in that stream as follows: kSkipAnyCorruptedRecords skips
+// an unexplained hole (a missing, torn, or corrupted index spanned by no
+// surviving explanation) and applies the records above it;
+// kTolerateCorruptedTailRecords and kAbsoluteConsistency refuse to open when a
+// hole has records above it; kPointInTimeRecovery opens the prefix below the
+// hole. Superseded records are never replayed in any mode.
 enum class WALRecoveryMode : char {
   // Original levelDB recovery
   //
@@ -1576,6 +1584,11 @@ struct DBOptions {
   // partition_wal_usage other than kNone. Under manual_wal_flush a new WAL's
   // head stays buffered until FlushWAL(); the next round after it succeeds.
   //
+  // Recovery modes keep their N=1 meaning against the merged stream: skip
+  // mode skips an unexplained hole in the WAL index and applies the records
+  // above it, tolerate and absolute fail on a hole that has records above
+  // it, and point-in-time opens the prefix. See WALRecoveryMode.
+  //
   // Not dynamically changeable via SetOptions().
   //
   // Default: 1
@@ -1707,6 +1720,9 @@ struct DBOptions {
   // (default) keeps the vanilla WAL format for downgrade safety; see
   // `PartitionWALUsage` for the on-disk format change every other value
   // implies. Leaves the per-key sequence number and SST format untouched.
+  // Recovery modes apply to the merged WAL-index stream: skip skips an
+  // unexplained hole and applies the records above it, tolerate and absolute
+  // fail on a hole with records above it, and point-in-time opens the prefix.
   PartitionWALUsage partition_wal_usage = PartitionWALUsage::kNone;
 
   // Set to true to re-instate an old behavior of keeping complete, synced WAL

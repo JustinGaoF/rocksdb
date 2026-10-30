@@ -99,6 +99,15 @@ class WALIndexMerger {
       uint64_t last = 0;
     };
     virtual bool AttestedSpan(PredecessorSpan* span) const = 0;
+    // Every predecessor span attested by this member's head. The default
+    // returns the singular span; members whose files attest several heads
+    // override this.
+    virtual void AttestedSpans(std::vector<PredecessorSpan>* spans) const {
+      PredecessorSpan span;
+      if (AttestedSpan(&span)) {
+        spans->push_back(span);
+      }
+    }
     // Whether the member observed and skipped corruption strictly between
     // two positioned pulls bounding `index`: it pulled an index below
     // `index`, then reported corruption, then pulled an index above `index`.
@@ -179,6 +188,7 @@ class WALIndexMerger {
     bool VoidCovers(uint64_t index) const override;
     bool Supersedes(uint64_t bearer, uint64_t index) const override;
     bool AttestedSpan(PredecessorSpan* span) const override;
+    void AttestedSpans(std::vector<PredecessorSpan>* spans) const override;
     bool SwallowedCovers(uint64_t index) const override;
     bool TailImpure() const override;
     bool TailReported() const override;
@@ -283,10 +293,17 @@ class WALIndexMerger {
   // sets it only under skip: the discard was declared by an earlier
   // recovery, so re-trusting it extracts the surviving stream. Strict by
   // default.
+  //
+  // `continue_past_unexplained_holes` skips unexplained holes (pristine, or
+  // possibly borne by a lost file) instead of stopping at the frontier, and
+  // applies the records above them. Recovery sets it only under skip, as N=1
+  // skip does. Superseded copies still die silently; void covers and
+  // duplicate indices still fail. Strict by default.
   WALIndexMerger(std::vector<std::unique_ptr<Member>> members,
                  std::vector<uint64_t> expected_wals,
                  std::function<Status(Slice, SequenceNumber*)> sequence_of,
-                 bool continue_past_discarded_holes = false);
+                 bool continue_past_discarded_holes = false,
+                 bool continue_past_unexplained_holes = false);
 
   enum class Result {
     kRecord,  // *record set (indexed or unindexed; see GetLastEmittedWALIndex)
@@ -361,6 +378,16 @@ class WALIndexMerger {
   bool SkippedUnexplainedDiscard() const {
     return skipped_discard_ || pending_discarded_ != 0;
   }
+  // How many unexplained holes the merge skipped under
+  // continue_past_unexplained_holes. Valid after kCleanEnd.
+  uint64_t SkippedUnexplainedHoles() const {
+    return skipped_unexplained_holes_;
+  }
+  // Whether the stream ended cleanly past a lost predecessor's floor with
+  // members holding nothing above it, under
+  // continue_past_unexplained_holes: the trailing loss is dropped, not cut.
+  // Valid after kCleanEnd.
+  bool SkippedTrailingLostWAL() const { return skipped_trailing_lost_wal_; }
   // Whether the lower bound sits at or below every index `wal_number` could
   // have lost from its head: a successor attests it, or a member numbered no
   // higher anchors the bound through its span (every index such a span
@@ -438,6 +465,9 @@ class WALIndexMerger {
   std::set<uint64_t> expected_wals_;
   std::function<Status(Slice, SequenceNumber*)> sequence_of_;
   bool continue_past_discarded_holes_;
+  bool continue_past_unexplained_holes_ = false;
+  uint64_t skipped_unexplained_holes_ = 0;
+  bool skipped_trailing_lost_wal_ = false;
   std::vector<MemberState> states_;
   // Buffered unindexed payloads with their source member and record checksum
   // (payloads copied: member buffers do not outlive the pulls that produced

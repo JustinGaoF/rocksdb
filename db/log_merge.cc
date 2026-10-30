@@ -158,6 +158,17 @@ bool WALIndexMerger::ReaderMember::AttestedSpan(PredecessorSpan* span) const {
                                              &span->last);
 }
 
+void WALIndexMerger::ReaderMember::AttestedSpans(
+    std::vector<PredecessorSpan>* spans) const {
+  for (const auto& read : reader_->GetWALIndexPredecessorSpans()) {
+    PredecessorSpan span;
+    span.wal_number = read.wal_number;
+    span.first = read.first;
+    span.last = read.last;
+    spans->push_back(span);
+  }
+}
+
 bool WALIndexMerger::ReaderMember::SwallowedCovers(uint64_t index) const {
   for (const auto& [lo, hi] : swallowed_) {
     if (index > lo && index < hi) {
@@ -193,11 +204,12 @@ WALIndexMerger::WALIndexMerger(
     std::vector<std::unique_ptr<Member>> members,
     std::vector<uint64_t> expected_wals,
     std::function<Status(Slice, SequenceNumber*)> sequence_of,
-    bool continue_past_discarded_holes)
+    bool continue_past_discarded_holes, bool continue_past_unexplained_holes)
     : members_(std::move(members)),
       expected_wals_(expected_wals.begin(), expected_wals.end()),
       sequence_of_(std::move(sequence_of)),
-      continue_past_discarded_holes_(continue_past_discarded_holes) {
+      continue_past_discarded_holes_(continue_past_discarded_holes),
+      continue_past_unexplained_holes_(continue_past_unexplained_holes) {
   for (auto& m : members_) {
     states_.emplace_back(m.get());
   }
@@ -365,16 +377,17 @@ Status WALIndexMerger::ComputeLowerBound() {
   // examines more indices, which is the fail-closed direction.
   std::map<uint64_t, std::pair<uint64_t, uint64_t>> attested;
   for (auto& s : states_) {
-    Member::PredecessorSpan span;
-    if (!s.member->AttestedSpan(&span)) {
-      continue;
-    }
-    const auto it = attested.find(span.wal_number);
-    if (it == attested.end()) {
-      attested.emplace(span.wal_number, std::make_pair(span.first, span.last));
-    } else {
-      it->second.first = std::min(it->second.first, span.first);
-      it->second.second = std::min(it->second.second, span.last);
+    std::vector<Member::PredecessorSpan> spans;
+    s.member->AttestedSpans(&spans);
+    for (const auto& span : spans) {
+      const auto it = attested.find(span.wal_number);
+      if (it == attested.end()) {
+        attested.emplace(span.wal_number,
+                         std::make_pair(span.first, span.last));
+      } else {
+        it->second.first = std::min(it->second.first, span.first);
+        it->second.second = std::min(it->second.second, span.last);
+      }
     }
   }
   for (const auto& [pred, span] : attested) {
@@ -383,11 +396,15 @@ Status WALIndexMerger::ComputeLowerBound() {
   // A span anchors the bound unless it attests a held or lost predecessor
   // that bears no index.
   for (auto& s : states_) {
-    Member::PredecessorSpan span;
-    if (s.member->AttestedSpan(&span) &&
-        (span.first != 0 || (FindState(span.wal_number) == nullptr &&
-                             span.wal_number < retirement_bound_))) {
-      min_anchoring_wal_ = std::min(min_anchoring_wal_, s.member->wal_number());
+    std::vector<Member::PredecessorSpan> spans;
+    s.member->AttestedSpans(&spans);
+    for (const auto& span : spans) {
+      if (span.first != 0 || (FindState(span.wal_number) == nullptr &&
+                              span.wal_number < retirement_bound_)) {
+        min_anchoring_wal_ =
+            std::min(min_anchoring_wal_, s.member->wal_number());
+        break;
+      }
     }
   }
   for (auto& s : states_) {
@@ -666,14 +683,10 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
       expected_++;
       continue;
     }
-    if (expected_ >= lost_floor_) {
-      // Possibly borne by the lost file: no torn tail or supersession
-      // explains it.
-      return StopAtFrontier();
-    }
     // No live holder, no void cover, and no swallowed span. When every
-    // member finished, the trailing loss ends the stream; the frontier and
-    // the member end states carry it to the recovery-mode mapping.
+    // member finished, the trailing loss ends the stream, even past the
+    // lost file's floor: nothing survives above to bound it. The frontier
+    // and the member end states carry it to the recovery-mode mapping.
     bool any_unfinished = false;
     for (auto& state : states_) {
       if (!state.finished) {
@@ -681,7 +694,25 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
         break;
       }
     }
+    if (expected_ >= lost_floor_ && any_unfinished) {
+      // Possibly borne by the lost file: no torn tail or supersession
+      // explains it.
+      if (continue_past_unexplained_holes_) {
+        ++skipped_unexplained_holes_;
+        expected_++;
+        continue;
+      }
+      return StopAtFrontier();
+    }
     if (!any_unfinished) {
+      if (expected_ >= lost_floor_ && !continue_past_unexplained_holes_) {
+        // As before: outside skip, a trailing attested loss stops the
+        // stream rather than ending it.
+        return StopAtFrontier();
+      }
+      if (expected_ >= lost_floor_) {
+        skipped_trailing_lost_wal_ = true;
+      }
       frontier_ = expected_;
       terminal_ = Result::kCleanEnd;
       return terminal_;
@@ -762,6 +793,11 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
       continue;
     }
 #endif  // NDEBUG
+    if (continue_past_unexplained_holes_) {
+      ++skipped_unexplained_holes_;
+      expected_++;
+      continue;
+    }
     return StopAtFrontier();
   }
 }
