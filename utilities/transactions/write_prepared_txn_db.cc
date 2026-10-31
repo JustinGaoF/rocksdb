@@ -647,6 +647,17 @@ void WritePreparedTxnDB::AddCommitted(uint64_t prepare_seq, uint64_t commit_seq,
   TEST_SYNC_POINT("WritePreparedTxnDB::AddCommitted:end:pause");
 }
 
+void WritePreparedTxnDB::RetractCommitted(uint64_t prepare_seq,
+                                          uint64_t commit_seq) {
+  auto indexed_seq = prepare_seq % COMMIT_CACHE_SIZE;
+  CommitEntry64b expected(prepare_seq, commit_seq, FORMAT);
+  // Replace with an empty entry only if ours is still there: a colliding
+  // entry committed since must be kept, and ours was already evicted then.
+  CommitEntry64b empty;
+  commit_cache_[static_cast<size_t>(indexed_seq)].compare_exchange_strong(
+      expected, empty, std::memory_order_acq_rel, std::memory_order_acquire);
+}
+
 void WritePreparedTxnDB::RemovePrepared(const uint64_t prepare_seq,
                                         const size_t batch_cnt) {
   TEST_SYNC_POINT_CALLBACK(

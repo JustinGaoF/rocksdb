@@ -90,6 +90,25 @@ class WriteUnpreparedCommitEntryPreReleaseCallback : public PreReleaseCallback {
     return Status::OK();
   }
 
+  // Clears the commit-cache entries Callback added, with the same commit
+  // sequence it used. With one write queue (the only mode above one WAL
+  // partition) Callback touches nothing else.
+  void RetractOnAbortedWrite(SequenceNumber commit_seq) override {
+    const uint64_t last_commit_seq = LIKELY(data_batch_cnt_ <= 1)
+                                         ? commit_seq
+                                         : commit_seq + data_batch_cnt_ - 1;
+    for (const auto& s : unprep_seqs_) {
+      for (size_t i = 0; i < s.second; i++) {
+        db_->RetractCommitted(s.first + i, last_commit_seq);
+      }
+    }
+    if (includes_data_) {
+      for (size_t i = 0; i < data_batch_cnt_; i++) {
+        db_->RetractCommitted(commit_seq + i, last_commit_seq);
+      }
+    }
+  }
+
  private:
   WritePreparedTxnDB* db_;
   DBImpl* db_impl_;

@@ -1591,12 +1591,13 @@ Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& wal_numbers,
   // may have left indexed WALs.
   const bool indexed_opener =
       log::WALIndexEnabled(immutable_db_options_.partition_wal_usage);
-  if ((indexed_opener || versions_->wal_index_guard() != 0) &&
-      !immutable_db_options_.track_and_verify_wals) {
+  if (indexed_opener || versions_->wal_index_guard() != 0) {
     // Indexed WALs recover through the N-file merge, which reconstructs the
-    // single ordered history across files. Predecessor verification chains
-    // one file's replay into the next, which the merge's concurrent pulls
-    // cannot reproduce, so that combination keeps the sequential path.
+    // single ordered history across files. Classification runs whatever
+    // track_and_verify_wals says: a partitioned set always merges (the merge
+    // readers skip predecessor verification, which file order cannot
+    // reproduce), while an indexed single-chain set keeps the sequential
+    // path with verification.
     uint64_t unindexed_high = 0;
     uint64_t indexed_low = 0;
     bool superseding = false;
@@ -1639,8 +1640,15 @@ Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& wal_numbers,
         unindexed_high != 0 && unindexed_high < indexed_low &&
         indexed_low != std::numeric_limits<uint64_t>::max();
     if (status.ok()) {
-      if (unindexed_high == 0 && !indexed_opener && !partitioned &&
-          !superseding) {
+      if (!partitioned && immutable_db_options_.track_and_verify_wals) {
+        // An indexed single-chain set keeps the sequential path with
+        // verification; only a partitioned set merges under the option.
+        status = ProcessLogFiles(wal_numbers, read_only, is_retry,
+                                 min_wal_number, job_id, next_sequence,
+                                 &version_edits, corrupted_wal_found,
+                                 recovery_ctx, &wal_index_supersessions);
+      } else if (unindexed_high == 0 && !indexed_opener && !partitioned &&
+                 !superseding) {
         // An indexed set written with one partition replays in file order,
         // as before this opener wrote no index.
         status = ProcessLogFiles(wal_numbers, read_only, is_retry,
@@ -1650,6 +1658,12 @@ Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& wal_numbers,
       } else if (unindexed_high == 0 || partitioned || legacy_prefix) {
         // An unindexed prefix (WALs written before indexing was enabled)
         // replays sequentially ahead of the merge.
+        if (partitioned && immutable_db_options_.track_and_verify_wals) {
+          ROCKS_LOG_WARN(immutable_db_options_.info_log,
+                         "track_and_verify_wals is set but the recovery set "
+                         "is partitioned; merging and skipping "
+                         "predecessor verification");
+        }
         status = ProcessLogFilesMerged(
             wal_numbers, unindexed_high == 0 ? 0 : indexed_low, merge_until,
             read_only, is_retry, min_wal_number, job_id, next_sequence,
@@ -1899,7 +1913,7 @@ static Status MisplacedSupersessionStatus(uint64_t wal_number) {
 }
 
 // Projects the witness sequence number from a merged record's payload. The
-// merge checks it strictly increases across indexed emissions; sequence zero
+// merge checks it never decreases across indexed emissions; sequence zero
 // (an empty record) skips the check and is dropped by recovery.
 static Status MergedSequenceOf(Slice payload, SequenceNumber* seq) {
   if (payload.size() < WriteBatchInternal::kHeader) {
@@ -1907,6 +1921,35 @@ static Status MergedSequenceOf(Slice payload, SequenceNumber* seq) {
   }
   *seq = DecodeFixed64(payload.data());
   return Status::OK();
+}
+
+// Whether the batch holds a prepare section (any begin/end prepare marker).
+// Scanned with the low-level parser rather than a Handler: transaction
+// batches start with a Noop entry, whose default handler fails a debug
+// assert. Malformed content answers false (under-counts); replay fails
+// closed on it anyway.
+static bool BatchHoldsPrepareSection(const Slice& payload) {
+  if (payload.size() < WriteBatchInternal::kHeader) {
+    return false;
+  }
+  Slice input(payload.data() + WriteBatchInternal::kHeader,
+              payload.size() - WriteBatchInternal::kHeader);
+  while (!input.empty()) {
+    char tag = 0;
+    uint32_t column_family = 0;
+    Slice key, value, blob, xid;
+    uint64_t write_unix_time = 0;
+    if (!ReadRecordFromWriteBatch(&input, &tag, &column_family, &key, &value,
+                                  &blob, &xid, &write_unix_time)
+             .ok()) {
+      return false;
+    }
+    if (tag == kTypeBeginPrepareXID || tag == kTypeBeginPersistedPrepareXID ||
+        tag == kTypeBeginUnprepareXID || tag == kTypeEndPrepareXID) {
+      return true;
+    }
+  }
+  return false;
 }
 
 Status DBImpl::ProcessLogFilesMerged(
@@ -2086,6 +2129,17 @@ Status DBImpl::ProcessLogFilesMerged(
     // pins their values. Ported from D126193586.
     if (!recovered_wal_partitions_.empty()) {
       first_obsolete = std::max(first_obsolete, next_wal_index_);
+      // D-2: an explained void counts toward the member's applied high,
+      // so the cut above can start above a void at or above the seed.
+      // Widen it down to the seed, covering the void; below-seed applied
+      // records stay kept (nothing applied sits at or above the seed).
+      for (const auto* reader : readers) {
+        if (reader->wal_number() == wal_number &&
+            reader->MaxVoidWALIndexHi() >= next_wal_index_) {
+          first_obsolete = std::min(first_obsolete, next_wal_index_);
+          break;
+        }
+      }
     }
     supersessions->push_back({wal_number, first_obsolete});
   };
@@ -2237,6 +2291,20 @@ Status DBImpl::ProcessLogFilesMerged(
   };
 
   SequenceNumber last_seqno_observed = 0;
+  // Count-aware sequence witness (Q5b): consecutive records may not overlap
+  // once replay's drops are accounted for. `last_applied_end` is the replay
+  // frontier: *next_sequence after the last applied non-prepare record.
+  // Empty records carry no witness and skip the check; dropped records
+  // (filter-ignored, PIT-dropped) are checked but do not advance it, so the
+  // next applied record legitimately reuses their stamps; prepare-section
+  // batches under WriteCommitted consumed none (their writer ran with
+  // disable_memtable), so the frontier advances only to their stamp. The
+  // merge cannot enforce this: it does not know which records recovery
+  // drops. A violation is a corruption in every mode.
+  SequenceNumber last_applied_end = 0;
+  uint64_t last_witnessed_index = 0;
+  uint64_t last_witnessed_wal = 0;
+  SequenceNumber last_witnessed_seq = 0;
   Slice record;
   log::WALIndexMerger::Result result = log::WALIndexMerger::Result::kWaiting;
   bool broke_early = false;
@@ -2350,20 +2418,49 @@ Status DBImpl::ProcessLogFilesMerged(
       if (!process_status.ok()) {
         return process_status;
       }
-      if (Status seqno_check_status = CheckSeqnoNotSetBackDuringRecovery(
-              prev_next_sequence, *next_sequence);
-          !seqno_check_status.ok()) {
-        return seqno_check_status;
-      }
       // Applied unless next_sequence stood still on a non-empty batch: the
       // inserter advances it even for skipped column families, so stillness
       // means the record never reached the memtable.
       dropped = (*next_sequence == prev_next_sequence) &&
                 (!has_header || batch_count != 0);
+      if (has_header && batch_count != 0 && emitted_index != 0) {
+        if (batch_seq < last_applied_end) {
+          const SequenceNumber prev_end = last_applied_end - 1;
+          const SequenceNumber end =
+              (dropped || (!seq_per_batch_ && BatchHoldsPrepareSection(record)))
+                  ? batch_seq
+                  : *next_sequence - 1;
+          return Status::Corruption(
+              "WAL index merge: index " + std::to_string(emitted_index) +
+              " covering sequences " + std::to_string(batch_seq) + ".." +
+              std::to_string(end) + " (WAL " + std::to_string(wal_number) +
+              ") overlaps index " + std::to_string(last_witnessed_index) +
+              " covering sequences " + std::to_string(last_witnessed_seq) +
+              ".." + std::to_string(prev_end) + " (WAL " +
+              std::to_string(last_witnessed_wal) + ")");
+        }
+        if (!dropped) {
+          last_witnessed_index = emitted_index;
+          last_witnessed_wal = wal_number;
+          last_witnessed_seq = batch_seq;
+          last_applied_end =
+              (!seq_per_batch_ && BatchHoldsPrepareSection(record))
+                  ? batch_seq
+                  : *next_sequence;
+        }
+      }
+      if (Status seqno_check_status = CheckSeqnoNotSetBackDuringRecovery(
+              prev_next_sequence, *next_sequence);
+          !seqno_check_status.ok()) {
+        return seqno_check_status;
+      }
       if (status_before_ok && !status.ok()) {
-        // The filter or the batch parser reported on this record. Member
-        // reports cannot land here: the merge surfaces their gaps (which
-        // consume status) before any record pulled past them.
+        // The filter or the batch parser reported on this record. A member
+        // report can be pending here (its lookahead pull reported while this
+        // record emitted); the filter then overwrites it and the member's
+        // tail gap consumes the filter error and arms the stop, so the
+        // outcome is the same as handling it here. See
+        // GC27PerRecordFailureBelowPendingReportStopsPIT.
         status = handle_fresh_status(wal_number);
         if (!status.ok()) {
           return status;
@@ -2430,11 +2527,17 @@ Status DBImpl::ProcessLogFilesMerged(
       if (merger.GetMemberEnd(reader->wal_number()) !=
           log::WALIndexMerger::MemberEnd::kClean) {
         record_cut(reader->wal_number());
-      } else if (cut_past_seed && reader->LastIndexed() >= next_wal_index_) {
+      } else if (cut_past_seed &&
+                 (reader->LastIndexed() >= next_wal_index_ ||
+                  (!recovered_wal_partitions_.empty() &&
+                   reader->MaxVoidWALIndexHi() >= next_wal_index_))) {
         // A clean member was read to its end, so its records below the seed
         // were all emitted; the unapplied ones (empty or filter-ignored)
         // stay live, as the sequential path keeps them. Cutting below the
-        // seed would leave them as holes only supersession explains.
+        // seed would leave them as holes only supersession explains. At N>1
+        // the cut also covers a void at or above the seed (D-2): without it
+        // the end check below would fail the open on a void this open
+        // reissues over, instead of superseding it.
         record_cut(reader->wal_number());
         if (supersessions->back().wal_number == reader->wal_number()) {
           supersessions->back().first_obsolete_wal_index = std::max(
@@ -2529,6 +2632,12 @@ Status DBImpl::ProcessLogFilesMerged(
       }
       if (end != log::WALIndexMerger::MemberEnd::kClean) {
         record_cut(wal_number);
+      } else if (!recovered_wal_partitions_.empty() &&
+                 reader->MaxVoidWALIndexHi() >= next_wal_index_) {
+        // D-2: the frontier cut covers a void at or above the seed in an
+        // otherwise clean member, as the early-break cut above does.
+        // record_cut widens the cut down to the seed for it.
+        record_cut(wal_number);
       }
     }
     stop_at(cut_wal);
@@ -2553,6 +2662,15 @@ Status DBImpl::ProcessLogFilesMerged(
     for (const auto* reader : readers) {
       if (merger.GetMemberEnd(reader->wal_number()) ==
           log::WALIndexMerger::MemberEnd::kStop) {
+        record_cut(reader->wal_number());
+      } else if (!recovered_wal_partitions_.empty() &&
+                 reader->MaxVoidWALIndexHi() >= next_wal_index_) {
+        // D-2 (Q8(a)): a clean end can still seed below a read void. A
+        // member that ends (EOF-shaped corruption) leaves its index
+        // unexplained and blocks the frontier, while another member's void
+        // above it is read as metadata. New writes reissue from the seed,
+        // so cover the void as the early-break and frontier cuts do;
+        // record_cut widens the cut down to the seed for it.
         record_cut(reader->wal_number());
       }
     }
@@ -2639,10 +2757,19 @@ Status DBImpl::ProcessLogFilesMerged(
   if (status.ok() && !read_only) {
     for (const auto* reader : readers) {
       const uint64_t wal_number = reader->wal_number();
-      // A cut does not help a void: the merge rejects any record over a void,
-      // superseded or not.
-      const uint64_t void_hi = reader->reader()->GetMaxVoidWALIndexHi();
-      if (void_hi >= next_wal_index_) {
+      // D-2: a declaration supersedes voids as well as records, so a void
+      // this open superseded is obsolete and a write may reissue over it.
+      // Only a void no declaration covers still fails the open.
+      const uint64_t void_hi = reader->MaxVoidWALIndexHi();
+      bool void_superseded = false;
+      for (const WALIndexSupersession& supersession : *supersessions) {
+        if (supersession.wal_number == wal_number &&
+            supersession.first_obsolete_wal_index <= void_hi) {
+          void_superseded = true;
+          break;
+        }
+      }
+      if (void_hi >= next_wal_index_ && !void_superseded) {
         return Status::Corruption(
             "WAL index recovery: WAL " + std::to_string(wal_number) +
             " holds a void over wal_index " + std::to_string(void_hi) +

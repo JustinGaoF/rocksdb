@@ -3188,8 +3188,14 @@ void DumpWalFiles(Options options, const std::string& dir_or_file,
       return;
     }
     // Refused before anything is printed: partition 0's WAL comes first and
-    // would report the other partitions' sequences as gaps.
+    // would report the other partitions' sequences as gaps. A WAL whose head
+    // cannot be read is refused the same way when another WAL in the set
+    // proves it partitioned; with no such proof the set reads as unindexed,
+    // as today.
     WALFileIterator scan_iter(dir_or_file, filenames);
+    std::string unknown_wal;
+    std::string partitioned_wal;
+    uint32_t partitioned_wal_partition = 0;
     while (only_print_seqno_gaps && scan_iter.Valid()) {
       const std::string scanned = scan_iter.GetNextWAL();
       uint64_t log_number = 0;
@@ -3199,17 +3205,32 @@ void DumpWalFiles(Options options, const std::string& dir_or_file,
         log_number = 0;
       }
       uint32_t wal_partition = 0;
-      if (log::ReadWALPartition(options.env->GetFileSystem().get(), scanned,
-                                FileOptions(options), log_number,
-                                &wal_partition)
-              .ok() &&
-          wal_partition != 0) {
-        if (exec_state) {
-          *exec_state = LDBCommandExecuteResult::Failed(
-              PartitionedWalGapsRefusal(scanned, wal_partition));
-        }
-        return;
+      const Status partition_status = log::ReadWALPartition(
+          options.env->GetFileSystem().get(), scanned, FileOptions(options),
+          log_number, &wal_partition);
+      if (partition_status.ok() && wal_partition != 0 &&
+          partitioned_wal.empty()) {
+        partitioned_wal = scanned;
+        partitioned_wal_partition = wal_partition;
+      } else if (!partition_status.ok() && unknown_wal.empty()) {
+        unknown_wal = scanned;
       }
+    }
+    if (only_print_seqno_gaps && !partitioned_wal.empty()) {
+      // Partitioned proof first: an unknown head in a partitioned set names
+      // the unknown WAL, else the partitioned one. Unknown alone proceeds.
+      const std::string refusal =
+          unknown_wal.empty()
+              ? PartitionedWalGapsRefusal(partitioned_wal,
+                                          partitioned_wal_partition)
+              : "--only_print_seqno_gaps: " + unknown_wal +
+                    " cannot be read and the WAL set is partitioned; sequence "
+                    "numbers interleave across partitioned WALs, so gaps in "
+                    "file order are not real gaps";
+      if (exec_state) {
+        *exec_state = LDBCommandExecuteResult::Failed(refusal);
+      }
+      return;
     }
     std::string wal_file = wal_file_iter.GetNextWAL();
     while (!wal_file.empty()) {

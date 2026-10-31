@@ -394,6 +394,10 @@ class WritePreparedTxnDB : public WritePreparedTxnDBBase {
   // Note: must be called serially.
   void AddCommitted(uint64_t prepare_seq, uint64_t commit_seq,
                     uint8_t loop_cnt = 0);
+  // Undo an AddCommitted(prepare_seq, commit_seq) whose write group aborted
+  // (its completion gate failed): clears the commit-cache slot only if it
+  // still holds that entry, so a colliding entry committed since is kept.
+  void RetractCommitted(uint64_t prepare_seq, uint64_t commit_seq);
 
   struct CommitEntry {
     uint64_t prep_seq;
@@ -1000,6 +1004,14 @@ class AddPreparedCallback : public PreReleaseCallback {
     return Status::OK();
   }
 
+  // The prepare never landed (its group aborted above a failed range), so
+  // its heap entries would pin SmallestUnCommittedSeq forever; the record
+  // itself is dropped by the fence. The log's prep-section mark stays: it
+  // only pins the file.
+  void RetractOnAbortedWrite(SequenceNumber prepare_seq) override {
+    db_->RemovePrepared(prepare_seq, sub_batch_cnt_);
+  }
+
  private:
   WritePreparedTxnDB* db_;
   DBImpl* db_impl_;
@@ -1083,6 +1095,30 @@ class WritePreparedCommitEntryPreReleaseCallback : public PreReleaseCallback {
     // else SequenceNumber that is updated as part of the write already does the
     // publishing
     return Status::OK();
+  }
+
+  // Clears the commit-cache entries Callback added, with the same commit
+  // sequence it used. With one write queue (the only mode above one WAL
+  // partition) Callback touches nothing else.
+  void RetractOnAbortedWrite(SequenceNumber commit_seq) override {
+    const uint64_t last_commit_seq = LIKELY(data_batch_cnt_ <= 1)
+                                         ? commit_seq
+                                         : commit_seq + data_batch_cnt_ - 1;
+    if (prep_seq_ != kMaxSequenceNumber) {
+      for (size_t i = 0; i < prep_batch_cnt_; i++) {
+        db_->RetractCommitted(prep_seq_ + i, last_commit_seq);
+      }
+    }  // else there was no prepare phase
+    if (includes_aux_batch_) {
+      for (size_t i = 0; i < aux_batch_cnt_; i++) {
+        db_->RetractCommitted(aux_seq_ + i, last_commit_seq);
+      }
+    }
+    if (includes_data_) {
+      for (size_t i = 0; i < data_batch_cnt_; i++) {
+        db_->RetractCommitted(commit_seq + i, last_commit_seq);
+      }
+    }
   }
 
  private:

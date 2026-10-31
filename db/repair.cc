@@ -348,23 +348,42 @@ class Repairer {
 
   // Each WAL converts to a table on its own, which drops the cross-file order
   // of a set written with wal_partitions > 1 and can keep records above a
-  // hole. Checked before anything is changed.
+  // hole. Checked before anything is changed. A WAL whose head cannot be
+  // read is refused the same way when the DB is indexed (OPTIONS says
+  // wal_partitions > 1) instead of converting it on its own, which could
+  // bring back superseded records; an unindexed DB keeps today's behaviour.
   Status CheckWalsNotPartitioned() {
     const auto& fs = env_->GetFileSystem();
     const auto& wal_dir = immutable_db_options_.GetWalDir();
+    uint64_t partitioned_log = 0;
+    uint32_t partitioned_log_partition = 0;
+    uint64_t unknown_log = 0;
     for (uint64_t log : logs_) {
       uint32_t wal_partition = 0;
-      if (log::ReadWALPartition(fs.get(), LogFileName(wal_dir, log),
-                                fs->OptimizeForLogRead(file_options_), log,
-                                &wal_partition)
-              .ok() &&
-          wal_partition != 0) {
-        return Status::NotSupported(
-            "RepairDB: WAL " + std::to_string(log) +
-            " was written by partition " + std::to_string(wal_partition) +
-            " of a DB with wal_partitions > 1; RepairDB converts each WAL on "
-            "its own and does not support partitioned WALs");
+      const Status s = log::ReadWALPartition(
+          fs.get(), LogFileName(wal_dir, log),
+          fs->OptimizeForLogRead(file_options_), log, &wal_partition);
+      if (s.ok() && wal_partition != 0 && partitioned_log == 0) {
+        partitioned_log = log;
+        partitioned_log_partition = wal_partition;
+      } else if (!s.ok() && unknown_log == 0) {
+        unknown_log = log;
       }
+    }
+    if (unknown_log != 0 && immutable_db_options_.wal_partitions > 1) {
+      return Status::NotSupported(
+          "RepairDB: WAL " + std::to_string(unknown_log) +
+          " cannot be read and the DB is indexed (wal_partitions > 1); "
+          "RepairDB converts each WAL on its own and does not support "
+          "partitioned WALs");
+    }
+    if (partitioned_log != 0) {
+      return Status::NotSupported(
+          "RepairDB: WAL " + std::to_string(partitioned_log) +
+          " was written by partition " +
+          std::to_string(partitioned_log_partition) +
+          " of a DB with wal_partitions > 1; RepairDB converts each WAL on "
+          "its own and does not support partitioned WALs");
     }
     return Status::OK();
   }

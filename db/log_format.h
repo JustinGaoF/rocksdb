@@ -144,7 +144,10 @@ static_assert(kWALIndexMarkerType < kRecordTypeSafeIgnoreMask &&
                   kRecyclableWALIndexMiddleType < kRecordTypeSafeIgnoreMask &&
                   kRecyclableWALIndexLastType < kRecordTypeSafeIgnoreMask &&
                   kWALIndexVoidType < kRecordTypeSafeIgnoreMask &&
-                  kRecyclableWALIndexVoidType < kRecordTypeSafeIgnoreMask,
+                  kRecyclableWALIndexVoidType < kRecordTypeSafeIgnoreMask &&
+                  kWALIndexSupersessionType < kRecordTypeSafeIgnoreMask &&
+                  kWALIndexProgressType < kRecordTypeSafeIgnoreMask &&
+                  kWALIndexPredecessorSpanType < kRecordTypeSafeIgnoreMask,
               "WAL index record types must fail closed on older readers");
 static_assert(kRecyclableWALIndexSupersessionType < kRecordTypeSafeIgnoreMask,
               "WAL index supersession types must fail closed on older readers");

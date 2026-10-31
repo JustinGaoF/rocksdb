@@ -528,6 +528,28 @@ TEST_P(LogMergeTest, DuplicateLiveIndexFails) {
   ASSERT_NE(std::string::npos, merger->GetError().ToString().find("two live"));
 }
 
+// GC27 Q5 (c): the contradiction names every WAL involved. Neuter: the old
+// messages fail these assertions.
+TEST_P(LogMergeTest, GC27TwoLiveRecordsNameWals) {
+  MemberFile a(120, recyclable());
+  MemberFile b(121, recyclable());
+  ASSERT_OK(a.Marker());
+  ASSERT_OK(b.Marker());
+  ASSERT_OK(a.Data("a1", 1, 1));
+  ASSERT_OK(b.Data("b1", 1, 2));
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(a, a.Bytes()));
+  members.push_back(MakeMember(b, b.Bytes()));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kError, driven.outcome);
+  const std::string msg = merger->GetError().ToString();
+  EXPECT_NE(std::string::npos, msg.find("index 1")) << msg;
+  EXPECT_NE(std::string::npos, msg.find("120")) << msg;
+  EXPECT_NE(std::string::npos, msg.find("121")) << msg;
+}
+
 TEST_P(LogMergeTest, VoidCoverPlusDataFails) {
   MemberFile a(120, recyclable());
   MemberFile b(121, recyclable());
@@ -550,19 +572,16 @@ TEST_P(LogMergeTest, VoidCoverPlusDataFails) {
   ASSERT_EQ(std::vector<uint64_t>({1}), DrivenIndices(driven));
 }
 
-TEST_P(LogMergeTest, VoidCoverPlusSupersededDataFails) {
+TEST_P(LogMergeTest, GC27VoidCoverNamesWals) {
   MemberFile a(120, recyclable());
   MemberFile b(121, recyclable());
   ASSERT_OK(a.Marker());
-  ASSERT_OK(a.Data("a1", 1, 1));
-  ASSERT_OK(a.Data("a2", 2, 2));
-  ASSERT_OK(a.Data("a3", 3, 3));
-  ASSERT_OK(a.Void(4, 6));
-  ASSERT_OK(a.Data("a4", 4, 4));
-  ASSERT_OK(a.Data("a5", 5, 5));
-  ASSERT_OK(a.Data("a6", 6, 6));
   ASSERT_OK(b.Marker());
-  ASSERT_OK(b.Sup(120, 4));
+  ASSERT_OK(a.Data("a1", 1, 1));
+  ASSERT_OK(a.Void(2, 3));
+  ASSERT_OK(a.Data("a4", 4, 4));
+  ASSERT_OK(b.Data("b2", 2, 2));
+  ASSERT_OK(b.Data("b3", 3, 3));
 
   std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
   members.push_back(MakeMember(a, a.Bytes()));
@@ -570,10 +589,16 @@ TEST_P(LogMergeTest, VoidCoverPlusSupersededDataFails) {
   auto merger = MakeMerger(std::move(members), {120, 121});
   DriveResult driven = Drive(merger.get());
   ASSERT_EQ(WALIndexMerger::Result::kError, driven.outcome);
-  ASSERT_NE(std::string::npos,
-            merger->GetError().ToString().find("void cover"));
-  ASSERT_EQ(std::vector<uint64_t>({1, 2, 3}), DrivenIndices(driven));
+  const std::string msg = merger->GetError().ToString();
+  EXPECT_NE(std::string::npos, msg.find("index 2")) << msg;
+  EXPECT_NE(std::string::npos, msg.find("121")) << msg;
+  EXPECT_NE(std::string::npos, msg.find("120")) << msg;
+  ASSERT_EQ(std::vector<uint64_t>({1}), DrivenIndices(driven));
 }
+
+// D-2 reverses the rule VoidCoverPlusSupersededDataFails pinned (a
+// superseded void counts as live): the same layout now merges, covered by
+// GC27SupersededVoidPlusReissuedRecordMerges below.
 
 // A merge over a set including one idle member advances past that member's
 // last written index on the strength of its progress assertion alone. Real
@@ -816,6 +841,28 @@ TEST_P(LogMergeTest, SequenceWitnessRejectsReorder) {
   DriveResult driven = Drive(merger.get());
   ASSERT_EQ(WALIndexMerger::Result::kError, driven.outcome);
   ASSERT_NE(std::string::npos, merger->GetError().ToString().find("sequence"));
+  ASSERT_EQ(std::vector<uint64_t>({1}), DrivenIndices(driven));
+}
+
+TEST_P(LogMergeTest, GC27ReorderNamesWals) {
+  MemberFile a(120, recyclable());
+  MemberFile b(121, recyclable());
+  ASSERT_OK(a.Marker());
+  ASSERT_OK(b.Marker());
+  ASSERT_OK(a.Data("a1", 1, 100));
+  ASSERT_OK(b.Data("b2", 2, 50));
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(a, a.Bytes()));
+  members.push_back(MakeMember(b, b.Bytes()));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kError, driven.outcome);
+  const std::string msg = merger->GetError().ToString();
+  EXPECT_NE(std::string::npos, msg.find("index 2")) << msg;
+  EXPECT_NE(std::string::npos, msg.find("index 1")) << msg;
+  EXPECT_NE(std::string::npos, msg.find("120")) << msg;
+  EXPECT_NE(std::string::npos, msg.find("121")) << msg;
   ASSERT_EQ(std::vector<uint64_t>({1}), DrivenIndices(driven));
 }
 
@@ -1992,6 +2039,84 @@ TEST_P(LogMergeTest, SkipUnexplainedHolesEmitsAboveThem) {
       }
     }
   }
+}
+
+// GC27 Q1 (FU1, D-2): the inverted sibling of
+// VoidCoverPlusSupersededDataFails. A declaration supersedes voids as well as
+// records, so the void and the copies it covers are all obsolete and the
+// merge moves on. Neuter: void-before-supersession; the drive fails with
+// "bears records and a void cover".
+TEST_P(LogMergeTest, GC27SupersededVoidPlusReissuedRecordMerges) {
+  MemberFile a(120, recyclable());
+  MemberFile b(121, recyclable());
+  ASSERT_OK(a.Marker());
+  ASSERT_OK(a.Data("a1", 1, 1));
+  ASSERT_OK(a.Data("a2", 2, 2));
+  ASSERT_OK(a.Data("a3", 3, 3));
+  ASSERT_OK(a.Void(4, 6));
+  ASSERT_OK(a.Data("a4", 4, 4));
+  ASSERT_OK(a.Data("a5", 5, 5));
+  ASSERT_OK(a.Data("a6", 6, 6));
+  ASSERT_OK(b.Marker());
+  ASSERT_OK(b.Sup(120, 4));
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(a, a.Bytes()));
+  members.push_back(MakeMember(b, b.Bytes()));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome);
+  ASSERT_EQ(std::vector<uint64_t>({1, 2, 3}), DrivenIndices(driven));
+}
+
+// GC27 Q1 (FU1, D-2): rotation-time out-of-order stays corruption. A held
+// predecessor bearing an unsuperseded index above its successor's attested
+// last fails naming both WALs and the index. The superseded negation merges.
+// Neuter: no attested-last check; the first case drives to a clean end.
+TEST_P(LogMergeTest, GC27HeldPredecessorAboveAttestedLastFails) {
+  MemberFile old(120, recyclable());
+  MemberFile young(121, recyclable());
+  ASSERT_OK(old.Marker());
+  for (uint64_t i = 1; i <= 10; ++i) {
+    ASSERT_OK(old.Data("o" + std::to_string(i), i, i));
+  }
+  ASSERT_OK(young.Marker());
+  ASSERT_OK(young.Span(120, 1, 8));
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(old, old.Bytes()));
+  members.push_back(MakeMember(young, young.Bytes()));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kError, driven.outcome);
+  ASSERT_TRUE(merger->GetError().IsCorruption());
+  const std::string msg = merger->GetError().ToString();
+  EXPECT_NE(std::string::npos, msg.find("120")) << msg;
+  EXPECT_NE(std::string::npos, msg.find("121")) << msg;
+  EXPECT_NE(std::string::npos, msg.find("index 9")) << msg;
+  ASSERT_EQ(std::vector<uint64_t>({1, 2, 3, 4, 5, 6, 7, 8}),
+            DrivenIndices(driven));
+}
+
+TEST_P(LogMergeTest, GC27HeldPredecessorAboveAttestedLastSupersededMerges) {
+  MemberFile old(120, recyclable());
+  MemberFile young(121, recyclable());
+  ASSERT_OK(old.Marker());
+  for (uint64_t i = 1; i <= 10; ++i) {
+    ASSERT_OK(old.Data("o" + std::to_string(i), i, i));
+  }
+  ASSERT_OK(young.Marker());
+  ASSERT_OK(young.Span(120, 1, 8));
+  ASSERT_OK(young.Sup(120, 9));
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(old, old.Bytes()));
+  members.push_back(MakeMember(young, young.Bytes()));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome);
+  ASSERT_EQ(std::vector<uint64_t>({1, 2, 3, 4, 5, 6, 7, 8}),
+            DrivenIndices(driven));
 }
 
 INSTANTIATE_TEST_CASE_P(LogMerge, LogMergeTest,

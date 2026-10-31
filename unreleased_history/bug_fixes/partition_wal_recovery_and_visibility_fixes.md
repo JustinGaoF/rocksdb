@@ -1,0 +1,11 @@
+Fixed partitioned-WAL (`wal_partitions > 1`) recovery failing on a void it superseded. A recovery-start declaration (type-24 record) now supersedes voids as well as records at or above its start index, so a second point-in-time reopen after new writes reissue cut indices opens instead of failing with "bears records and a void cover". Recovery cuts every member holding a record or void at or above the seed (including orphan chains after an N decrease) from the seed, and the end-of-recovery check exempts superseded voids. Note: a binary without this fix reading such a set treats a superseded void as live and fails closed with "bears records and a void cover", as before.
+
+Fixed `LockWAL()`, `SetDBOptions`, and `CreateColumnFamilyWithImport` not waiting for unpublished sync groups: after `LockWAL()` returns, no write becomes visible and `LastSequence()` does not move until `UnlockWAL()`.
+
+Fixed tailing iterators at `wal_partitions > 1` showing a write that returned an error (inserted above a failed sync or failed append) before `Resume()`. Tailing reads are now bounded by the published sequence. An async 2PC write above a failed sync is never both failed and visible: when its completion gate fails, its pre-release callbacks are retracted, so the failed commit leaves no commit-cache entry behind.
+
+Fixed recovery and WAL consumers failing open on partitioned sets: a partitioned set always merges even with `track_and_verify_wals` (logging one warning), the merge enforces a count-aware sequence check (`seq(i+1) >= seq(i) + consumed(i)`, except for `seq_per_batch` openers), contradiction messages name every WAL involved, and RepairDB, `GetUpdatesSince`, and `ldb` refuse a damaged or unreadable WAL head with `NotSupported` instead of reading it as partition 0.
+
+Fixed `Resume()` zeroing a torn record from the writer's flushed size (which can lie inside the record after a partway flush) instead of from the last whole-record boundary, which failed `kTolerateCorruptedTailRecords` opens with a checksum mismatch.
+
+Fixed `DB::OpenAndCompact` on a partitioned primary running WAL-only validations although it reads no WAL: WAL-partition options are now validated only when the open recovers WALs.

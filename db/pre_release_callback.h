@@ -32,6 +32,14 @@ class PreReleaseCallback {
   // operations among the callbacks.
   virtual Status Callback(SequenceNumber seq, bool is_mem_disabled,
                           uint64_t log_number, size_t index, size_t total) = 0;
+
+  // Undoes Callback(seq, ...) after the write group aborted: with more than
+  // one WAL partition an async group runs its callbacks before its
+  // completion gate, so a gate failure (a lower range failed) leaves their
+  // effects behind while the write itself fails. Runs once per Callback
+  // invocation, with the same seq. The default is a no-op for callbacks
+  // with nothing to retract.
+  virtual void RetractOnAbortedWrite(SequenceNumber /*seq*/) {}
 };
 
 }  // namespace ROCKSDB_NAMESPACE

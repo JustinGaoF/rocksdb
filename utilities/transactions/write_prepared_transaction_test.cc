@@ -5498,6 +5498,356 @@ TEST_P(WritePreparedTransactionTest, PrepareBelowMaxEvictedAtNPartitions) {
   }
 }
 
+// GC27 Q2 (former M4-F1.1, G3-E-1): an async 2PC commit batched into a group
+// led by a sync write whose gate sync fails is never both failed and
+// visible. If it returned an error it is absent before and after Resume()
+// and after a reopen, and Rollback() works; if it returned OK it reads
+// back. A pin: the batching is forced by holding the sync leader in
+// JoinBatchGroup until the async follower links.
+// Neuter: complete the async writers after completion_gate() with the gate's
+// status; the commit returns the IOError yet reads back.
+TEST_F(WritePreparedPartitionedWalTest,
+       AsyncCommitUnderFailedSyncLeaderNeverVisibleAfterError) {
+  options_.paranoid_checks = true;
+  options_.max_bgerror_resume_count = 0;
+  for (const TxnDBWritePolicy policy : {WRITE_PREPARED, WRITE_UNPREPARED}) {
+    for (const size_t partitions : {size_t{2}, size_t{8}}) {
+      SCOPED_TRACE("policy=" + std::to_string(policy) +
+                   " partitions=" + std::to_string(partitions));
+      Close();
+      cf_names_.clear();
+      ASSERT_OK(DestroyDB(dbname_, options_));
+      txn_db_options_.write_policy = policy;
+      Open(partitions);
+      ColumnFamilyHandle* cf = CfOnPartition(0);
+      auto read = [&](const std::string& key) {
+        std::string value;
+        Status s = db_->Get(ReadOptions(), CfOnPartition(0), key, &value);
+        if (s.IsNotFound()) {
+          return std::string("NOT_FOUND");
+        }
+        EXPECT_OK(s);
+        return value;
+      };
+      std::atomic<int> fail_syncs{0};
+      SyncPoint::GetInstance()->SetCallBack(
+          "DBImpl::SyncWalsFromCompletionGate:AfterGateSync", [&](void* arg) {
+            if (fail_syncs.load() > 0) {
+              --fail_syncs;
+              IOStatus error = IOStatus::IOError("injected gate sync error");
+              error.SetRetryable(true);
+              *static_cast<IOStatus*>(arg) = error;
+            }
+          });
+      // Commit-marker batches route by XID hash, so pick a follower name
+      // colliding with the leader's at this N: both commits must share one
+      // write queue to batch. (The leaders assertion below guards this.)
+      std::string follower_name = "follower";
+      {
+        WriteBatch leader_batch;
+        ASSERT_OK(WriteBatchInternal::MarkCommit(&leader_batch, "leader"));
+        size_t leader_partition = 0;
+        ASSERT_OK(DBImpl::TEST_WalPartitionForWrite(leader_batch, partitions,
+                                                    &leader_partition));
+        bool found = false;
+        for (int i = 0; i < 10000 && !found; ++i) {
+          const std::string candidate = "follower" + std::to_string(i);
+          WriteBatch candidate_batch;
+          ASSERT_OK(
+              WriteBatchInternal::MarkCommit(&candidate_batch, candidate));
+          size_t candidate_partition = 0;
+          ASSERT_OK(DBImpl::TEST_WalPartitionForWrite(
+              candidate_batch, partitions, &candidate_partition));
+          if (candidate_partition == leader_partition) {
+            follower_name = candidate;
+            found = true;
+          }
+        }
+        ASSERT_TRUE(found);
+      }
+      WriteOptions sync_wo;
+      sync_wo.sync = true;
+      WriteOptions async_wo;
+      std::unique_ptr<Transaction> leader(db_->BeginTransaction(sync_wo));
+      ASSERT_OK(leader->SetName("leader"));
+      ASSERT_OK(leader->Put(cf, "leader_key", "v"));
+      ASSERT_OK(leader->Prepare());
+      std::unique_ptr<Transaction> follower(db_->BeginTransaction(async_wo));
+      ASSERT_OK(follower->SetName(follower_name));
+      ASSERT_OK(follower->Put(cf, "follower_key", "v"));
+      ASSERT_OK(follower->Prepare());
+
+      // Force the batching: the sync leader waits in JoinBatchGroup until
+      // the async follower links. The leader starts first, so the first
+      // hitter is the leader. Hooked only around the commits.
+      std::atomic<bool> leader_waiting{false};
+      std::atomic<bool> follower_linked{false};
+      std::atomic<int> leaders{0};
+      SyncPoint::GetInstance()->SetCallBack(
+          "WriteThread::JoinBatchGroup:Wait", [&](void* /*arg*/) {
+            if (!leader_waiting.load()) {
+              leader_waiting.store(true);
+              while (!follower_linked.load()) {
+                Env::Default()->SleepForMicroseconds(100);
+              }
+            } else {
+              follower_linked.store(true);
+            }
+          });
+      SyncPoint::GetInstance()->SetCallBack(
+          "WriteThread::EnterAsBatchGroupLeader:End",
+          [&](void* /*arg*/) { ++leaders; });
+      fail_syncs = 1;
+      Status leader_status;
+      Status follower_status;
+      port::Thread leader_thread([&] { leader_status = leader->Commit(); });
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(30);
+      while (!leader_waiting.load() &&
+             std::chrono::steady_clock::now() < deadline) {
+        Env::Default()->SleepForMicroseconds(1000);
+      }
+      ASSERT_TRUE(leader_waiting.load());
+      // The sync leader now waits for the async follower to link, so the
+      // group is led by the sync write.
+      port::Thread follower_thread(
+          [&] { follower_status = follower->Commit(); });
+      while (!follower_linked.load() &&
+             std::chrono::steady_clock::now() < deadline) {
+        Env::Default()->SleepForMicroseconds(1000);
+      }
+      ASSERT_TRUE(follower_linked.load());
+      leader_thread.join();
+      follower_thread.join();
+      SyncPoint::GetInstance()->ClearCallBack(
+          "WriteThread::JoinBatchGroup:Wait");
+      SyncPoint::GetInstance()->ClearCallBack(
+          "WriteThread::EnterAsBatchGroupLeader:End");
+      SyncPoint::GetInstance()->ClearCallBack(
+          "DBImpl::SyncWalsFromCompletionGate:AfterGateSync");
+      // Exactly one batch group formed: the follower did not lead its own.
+      ASSERT_EQ(1, leaders.load());
+      ASSERT_TRUE(leader_status.IsIOError()) << leader_status.ToString();
+      ASSERT_EQ(0, fail_syncs.load());
+      if (!follower_status.ok()) {
+        EXPECT_EQ("NOT_FOUND", read("follower_key"));
+        ASSERT_OK(db_->Resume());
+        EXPECT_EQ("NOT_FOUND", read("follower_key"));
+        ASSERT_OK(follower->Rollback());
+        EXPECT_EQ("NOT_FOUND", read("follower_key"));
+      } else {
+        EXPECT_EQ("v", read("follower_key"));
+        ASSERT_OK(db_->Resume());
+      }
+      // The leader always failed: roll it back so no prepare entry survives.
+      ASSERT_OK(leader->Rollback());
+      follower.reset();
+      leader.reset();
+      Reopen();
+      if (!follower_status.ok()) {
+        EXPECT_EQ("NOT_FOUND", read("follower_key"));
+        EXPECT_EQ(nullptr, db_->GetTransactionByName(follower_name));
+      } else {
+        EXPECT_EQ("v", read("follower_key"));
+      }
+      EXPECT_EQ("NOT_FOUND", read("leader_key"));
+    }
+  }
+}
+
+// GC27 Q4 (D-GC27a): an async 2PC write in its own group above a failed sync
+// is never both failed and visible. S (sync) is held in its fsync; C, an
+// async commit of a prepared transaction, forms its own group above S (S
+// already left its queue), inserts and parks in its gate; S's fsync then
+// fails, so both fail. C's callbacks ran before its gate, as always, but
+// the gate failure retracts them (RetractOnAbortedWrite), so the failed
+// commit changed nothing: the key is absent before and after Resume() and
+// after a reopen in every mode, the txn stays prepared, and Rollback()
+// works. At the base nothing retracted them: the key read back after
+// Resume() and Rollback() crashed in AddCommitted's re-add assert.
+// Neuter: no retraction on async-gate failure; same failures.
+TEST_F(WritePreparedPartitionedWalTest,
+       AsyncTwoPCWriteAboveFailedSyncNeverVisible) {
+  options_.paranoid_checks = true;
+  options_.max_bgerror_resume_count = 0;
+  for (const TxnDBWritePolicy policy : {WRITE_PREPARED, WRITE_UNPREPARED}) {
+    for (const size_t partitions : {size_t{2}, size_t{8}}) {
+      SCOPED_TRACE("policy=" + std::to_string(policy) +
+                   " partitions=" + std::to_string(partitions));
+      Close();
+      cf_names_.clear();
+      ASSERT_OK(DestroyDB(dbname_, options_));
+      txn_db_options_.write_policy = policy;
+      Open(partitions);
+      auto* impl = static_cast<DBImpl*>(db_->GetRootDB());
+      ColumnFamilyHandle* cf = CfOnPartition(0);
+      auto read = [&](const std::string& key) {
+        std::string value;
+        Status s = db_->Get(ReadOptions(), CfOnPartition(0), key, &value);
+        if (s.IsNotFound()) {
+          return std::string("NOT_FOUND");
+        }
+        EXPECT_OK(s);
+        return value;
+      };
+      WriteOptions async_wo;
+      std::unique_ptr<Transaction> solo(db_->BeginTransaction(async_wo));
+      ASSERT_OK(solo->SetName("solo"));
+      ASSERT_OK(solo->Put(cf, "solo_key", "v"));
+      ASSERT_OK(solo->Prepare());
+
+      std::atomic<int> fail_syncs{0};
+      SyncPoint::GetInstance()->SetCallBack(
+          "DBImpl::SyncWalsFromCompletionGate:AfterGateSync", [&](void* arg) {
+            if (fail_syncs.load() > 0) {
+              --fail_syncs;
+              IOStatus error = IOStatus::IOError("injected gate sync error");
+              error.SetRetryable(true);
+              *static_cast<IOStatus*>(arg) = error;
+            }
+          });
+      std::atomic<bool> s_in_fsync{false};
+      std::atomic<bool> release_fsync{false};
+      SyncPoint::GetInstance()->SetCallBack(
+          "DBImpl::CompletionGate:BeforeCoalescedSync", [&](void* /*arg*/) {
+            s_in_fsync.store(true);
+            while (!release_fsync.load()) {
+              Env::Default()->SleepForMicroseconds(1000);
+            }
+          });
+      Status s_status;
+      port::Thread s_thread([&] {
+        WriteOptions sync_wo;
+        sync_wo.sync = true;
+        s_status = db_->Put(sync_wo, cf, "s_key", "v");
+      });
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(30);
+      while (!s_in_fsync.load() &&
+             std::chrono::steady_clock::now() < deadline) {
+        Env::Default()->SleepForMicroseconds(1000);
+      }
+      ASSERT_TRUE(s_in_fsync.load());
+      // S left its queue, so the async commit forms its own group above S,
+      // runs its callbacks, inserts, then parks behind S's unpublished range.
+      Status commit_status;
+      port::Thread commit_thread([&] { commit_status = solo->Commit(); });
+      while (impl->TEST_WalDurabilityWaiters() != 1 &&
+             std::chrono::steady_clock::now() < deadline) {
+        Env::Default()->SleepForMicroseconds(1000);
+      }
+      ASSERT_EQ(1U, impl->TEST_WalDurabilityWaiters());
+      fail_syncs.store(1);
+      release_fsync.store(true);
+      s_thread.join();
+      commit_thread.join();
+      SyncPoint::GetInstance()->ClearCallBack(
+          "DBImpl::CompletionGate:BeforeCoalescedSync");
+      SyncPoint::GetInstance()->ClearCallBack(
+          "DBImpl::SyncWalsFromCompletionGate:AfterGateSync");
+      ASSERT_TRUE(s_status.IsIOError()) << s_status.ToString();
+      ASSERT_EQ(0, fail_syncs.load());
+      // The commit's gate waits on S's failed range, so it always fails here.
+      ASSERT_TRUE(commit_status.IsIOError()) << commit_status.ToString();
+      if (!commit_status.ok()) {
+        EXPECT_EQ("NOT_FOUND", read("solo_key"));
+        // Still prepared: the failed commit changed nothing.
+        EXPECT_NE(nullptr, db_->GetTransactionByName("solo"));
+        ASSERT_OK(db_->Resume());
+        EXPECT_EQ("NOT_FOUND", read("solo_key"));
+        ASSERT_OK(solo->Rollback());
+        EXPECT_EQ("NOT_FOUND", read("solo_key"));
+      } else {
+        EXPECT_EQ("v", read("solo_key"));
+        ASSERT_OK(db_->Resume());
+      }
+      solo.reset();
+      for (const WALRecoveryMode mode :
+           {WALRecoveryMode::kPointInTimeRecovery,
+            WALRecoveryMode::kTolerateCorruptedTailRecords,
+            WALRecoveryMode::kAbsoluteConsistency,
+            WALRecoveryMode::kSkipAnyCorruptedRecords}) {
+        SCOPED_TRACE("mode=" + std::to_string(static_cast<int>(mode)));
+        options_.wal_recovery_mode = mode;
+        Reopen();
+        if (!commit_status.ok()) {
+          EXPECT_EQ("NOT_FOUND", read("solo_key"));
+          EXPECT_EQ(nullptr, db_->GetTransactionByName("solo"));
+        } else {
+          EXPECT_EQ("v", read("solo_key"));
+        }
+      }
+    }
+  }
+}
+
+// GC27 Q5(b) (FU8, D-GC27c(i)): a seq_per_batch opener reopens a
+// partitioned set with multi-entry batches in every mode, at N=2 and at
+// N=1 indexed. Every batch consumes exactly one sequence however many
+// entries it holds, so the count-aware witness (which counts from replay)
+// accepts the consecutive stamps. Plain, prepared and committed writes on
+// both partitions are all present after every reopen.
+// Neuter: count entries instead of replay (ignore seq_per_batch_); the
+// reopens fail with a false overlap.
+TEST_F(WritePreparedPartitionedWalTest, GC27SeqPerBatchReopenEveryMode) {
+  for (const TxnDBWritePolicy policy : {WRITE_PREPARED, WRITE_UNPREPARED}) {
+    SCOPED_TRACE("policy=" + std::to_string(policy));
+    Close();
+    cf_names_.clear();
+    ASSERT_OK(DestroyDB(dbname_, options_));
+    txn_db_options_.write_policy = policy;
+    Open(2);
+    ColumnFamilyHandle* cf0 = CfOnPartition(0);
+    ColumnFamilyHandle* cf1 = CfOnPartition(1);
+    WriteBatch batch;
+    for (int i = 0; i < 4; ++i) {
+      ASSERT_OK(batch.Put(cf0, "four" + std::to_string(i), "v"));
+    }
+    ASSERT_OK(db_->Write(WriteOptions(), &batch));
+    std::unique_ptr<Transaction> txn(db_->BeginTransaction(WriteOptions()));
+    ASSERT_OK(txn->SetName("multi"));
+    for (int i = 0; i < 3; ++i) {
+      ASSERT_OK(txn->Put(cf1, "txn" + std::to_string(i), "v"));
+    }
+    ASSERT_OK(txn->Prepare());
+    ASSERT_OK(txn->Commit());
+    txn.reset();
+    ASSERT_OK(db_->Put(WriteOptions(), cf0, "plain", "v"));
+    Close();
+    for (const size_t partitions : {size_t{2}, size_t{1}}) {
+      for (const WALRecoveryMode mode :
+           {WALRecoveryMode::kPointInTimeRecovery,
+            WALRecoveryMode::kTolerateCorruptedTailRecords,
+            WALRecoveryMode::kAbsoluteConsistency,
+            WALRecoveryMode::kSkipAnyCorruptedRecords}) {
+        SCOPED_TRACE("partitions=" + std::to_string(partitions) +
+                     " mode=" + std::to_string(static_cast<int>(mode)));
+        options_.wal_partitions = static_cast<uint32_t>(partitions);
+        options_.wal_recovery_mode = mode;
+        Reopen();
+        for (int i = 0; i < 4; ++i) {
+          std::string value;
+          ASSERT_OK(db_->Get(ReadOptions(), CfOnPartition(0),
+                             "four" + std::to_string(i), &value));
+          EXPECT_EQ("v", value);
+        }
+        for (int i = 0; i < 3; ++i) {
+          std::string value;
+          ASSERT_OK(db_->Get(ReadOptions(), CfOnPartition(1),
+                             "txn" + std::to_string(i), &value));
+          EXPECT_EQ("v", value);
+        }
+        {
+          std::string value;
+          ASSERT_OK(db_->Get(ReadOptions(), CfOnPartition(0), "plain", &value));
+          EXPECT_EQ("v", value);
+        }
+        Close();
+      }
+    }
+  }
+}
+
 #if USE_COROUTINES
 TEST_P(WritePreparedTransactionTest, GetEntityCoroutine) {
   options.env = Env::Default();

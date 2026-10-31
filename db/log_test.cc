@@ -2252,6 +2252,133 @@ TEST_P(LogTest, WALIndexControlRecordsAreNoopWhenDisabled) {
   ASSERT_EQ(0U, WrittenBytes());
 }
 
+// GC27 Q9 (d): the control-record writers fail closed on invalid inputs. In
+// release builds (asserts compiled out) each returns Corruption naming the
+// record and values, and writes nothing; in debug builds the matching assert
+// fires. The fixture writer's log number is 123. Neuter (release build):
+// assert-only checks; the record is written and no Corruption returns.
+#ifdef NDEBUG
+TEST_P(LogTest, GC27WALIndexVoidWriterRejectsInvalidRange) {
+  EnableWALIndex();
+  const size_t before = WrittenBytes();
+  for (const auto& [lo, hi] :
+       {std::pair<uint64_t, uint64_t>{0, 5}, {9, 7}, {0, 0}}) {
+    const IOStatus s = writer_->AddWALIndexVoidRecord(WriteOptions(), lo, hi);
+    EXPECT_TRUE(s.IsCorruption()) << s.ToString();
+    EXPECT_NE(std::string::npos, s.ToString().find("void cover"))
+        << s.ToString();
+  }
+  EXPECT_EQ(before, WrittenBytes());
+  ASSERT_OK(writer_->AddWALIndexVoidRecord(WriteOptions(), 1, 2));
+  EXPECT_GT(WrittenBytes(), before);
+}
+
+TEST_P(LogTest, GC27WALIndexSupersessionWriterRejectsInvalidInput) {
+  EnableWALIndex();
+  const size_t before = WrittenBytes();
+  for (const auto& [wal, first] :
+       {std::pair<uint64_t, uint64_t>{0, 7}, {123, 7}, {124, 7}, {122, 0}}) {
+    const IOStatus s =
+        writer_->AddWALIndexSupersessionRecord(WriteOptions(), wal, first);
+    EXPECT_TRUE(s.IsCorruption()) << s.ToString();
+    EXPECT_NE(std::string::npos, s.ToString().find("supersession"))
+        << s.ToString();
+  }
+  EXPECT_EQ(before, WrittenBytes());
+  ASSERT_OK(writer_->AddWALIndexSupersessionRecord(WriteOptions(), 122, 7));
+  EXPECT_GT(WrittenBytes(), before);
+}
+
+TEST_P(LogTest, GC27WALIndexProgressWriterRejectsInvalidBound) {
+  EnableWALIndex();
+  const size_t before = WrittenBytes();
+  IOStatus s = writer_->AddWALIndexProgressRecord(WriteOptions(), 0);
+  EXPECT_TRUE(s.IsCorruption()) << s.ToString();
+  EXPECT_NE(std::string::npos, s.ToString().find("progress")) << s.ToString();
+  ASSERT_OK(writer_->AddWALIndexProgressRecord(WriteOptions(), 9));
+  s = writer_->AddWALIndexProgressRecord(WriteOptions(), 7);
+  EXPECT_TRUE(s.IsCorruption()) << s.ToString();
+  EXPECT_GT(WrittenBytes(), before);
+}
+
+TEST_P(LogTest, GC27WALIndexPredecessorSpanWriterRejectsInvalidInput) {
+  EnableWALIndex();
+  const size_t before = WrittenBytes();
+  for (const auto& [wal, first, last] :
+       {std::tuple<uint64_t, uint64_t, uint64_t>{0, 30, 60},
+        {123, 30, 60},
+        {122, 0, 60},
+        {122, 30, 0},
+        {122, 60, 30}}) {
+    const IOStatus s = writer_->AddWALIndexPredecessorSpanRecord(
+        WriteOptions(), wal, first, last);
+    EXPECT_TRUE(s.IsCorruption()) << s.ToString();
+    EXPECT_NE(std::string::npos, s.ToString().find("predecessor span"))
+        << s.ToString();
+  }
+  EXPECT_EQ(before, WrittenBytes());
+  ASSERT_OK(
+      writer_->AddWALIndexPredecessorSpanRecord(WriteOptions(), 122, 30, 60));
+  EXPECT_GT(WrittenBytes(), before);
+}
+#else
+TEST_P(LogTest, GC27WALIndexVoidWriterRejectsInvalidRange) {
+  EnableWALIndex();
+#ifdef GTEST_FLAG_SET
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+#else
+  ::testing::GTEST_FLAG(death_test_style) = "threadsafe";
+#endif
+  EXPECT_DEATH(writer_->AddWALIndexVoidRecord(WriteOptions(), 0, 5), "");
+  EXPECT_DEATH(writer_->AddWALIndexVoidRecord(WriteOptions(), 9, 7), "");
+}
+
+TEST_P(LogTest, GC27WALIndexSupersessionWriterRejectsInvalidInput) {
+  EnableWALIndex();
+#ifdef GTEST_FLAG_SET
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+#else
+  ::testing::GTEST_FLAG(death_test_style) = "threadsafe";
+#endif
+  EXPECT_DEATH(writer_->AddWALIndexSupersessionRecord(WriteOptions(), 0, 7),
+               "");
+  EXPECT_DEATH(writer_->AddWALIndexSupersessionRecord(WriteOptions(), 123, 7),
+               "");
+  EXPECT_DEATH(writer_->AddWALIndexSupersessionRecord(WriteOptions(), 122, 0),
+               "");
+}
+
+TEST_P(LogTest, GC27WALIndexProgressWriterRejectsInvalidBound) {
+  EnableWALIndex();
+#ifdef GTEST_FLAG_SET
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+#else
+  ::testing::GTEST_FLAG(death_test_style) = "threadsafe";
+#endif
+  EXPECT_DEATH(writer_->AddWALIndexProgressRecord(WriteOptions(), 0), "");
+}
+
+TEST_P(LogTest, GC27WALIndexPredecessorSpanWriterRejectsInvalidInput) {
+  EnableWALIndex();
+#ifdef GTEST_FLAG_SET
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+#else
+  ::testing::GTEST_FLAG(death_test_style) = "threadsafe";
+#endif
+  EXPECT_DEATH(
+      writer_->AddWALIndexPredecessorSpanRecord(WriteOptions(), 0, 30, 60), "");
+  EXPECT_DEATH(
+      writer_->AddWALIndexPredecessorSpanRecord(WriteOptions(), 123, 30, 60),
+      "");
+  EXPECT_DEATH(
+      writer_->AddWALIndexPredecessorSpanRecord(WriteOptions(), 122, 0, 60),
+      "");
+  EXPECT_DEATH(
+      writer_->AddWALIndexPredecessorSpanRecord(WriteOptions(), 122, 60, 30),
+      "");
+}
+#endif  // NDEBUG
+
 // Do NOT enable compression for this instantiation.
 INSTANTIATE_TEST_CASE_P(
     Log, LogTest,

@@ -384,8 +384,9 @@ def parse_run(output, cell):
         if not wals:
             raise ValueError("no per-WAL counters")
         metrics["wals"] = wals
-        metrics["fsyncs_per_write"] = (metrics["fs_syncs"] /
-                                      metrics["operations"])
+        metrics["fsyncs_per_write"] = (
+            metrics["fs_syncs"] / metrics["operations"]
+            if metrics["operations"] else 0.0)
     # One cap_excluded sample per group, and a group that hit the cap
     # excludes at least one writer, so SUM / COUNT bounds the fraction of
     # groups that hit it from above.

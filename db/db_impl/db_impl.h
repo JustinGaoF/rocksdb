@@ -3459,12 +3459,18 @@ class DBImpl : public DB
   // N>1 only. Reads WAL `wal_number` back and sets *landed when a whole,
   // checksummed record bearing `wal_index` is in it: an append can report
   // failure after its bytes reached the file. A torn copy is not one: when
-  // the bytes from `wal_offset`, where the failed record began, do not read
-  // back cleanly, sets *torn_end to the file's size (zero otherwise). A WAL
-  // already gone from disk holds neither. Fails when the WAL cannot be read.
+  // the bytes from `wal_offset`, the writer's flushed size at the failure,
+  // do not read back cleanly, sets *torn_end to the file's size (zero
+  // otherwise) and *torn_start to the end of the last whole record the
+  // read-back returned (0 if it returned none: then the torn record is the
+  // file's first). A failed record larger
+  // than the writer's buffer flushes partway, so `wal_offset` can lie
+  // inside it while its first fragments sit below; zeroing must start at
+  // *torn_start, not at `wal_offset`. A WAL already gone from disk holds
+  // neither. Fails when the WAL cannot be read.
   Status BurnedWALIndexLanded(uint64_t wal_number, uint64_t wal_index,
                               uint64_t wal_offset, bool* landed,
-                              uint64_t* torn_end);
+                              uint64_t* torn_start, uint64_t* torn_end);
 
   // N>1 only. Fences every gate whose target is at or above `low`: a range
   // starting there failed (its append, its gate sync, or its memtable

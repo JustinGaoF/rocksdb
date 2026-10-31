@@ -4167,6 +4167,60 @@ TEST_F(DBSecondaryTest, GetLiveFilesOnSecondary) {
   ASSERT_GT(live_files_after.size(), live_files.size());
 }
 
+// GC27 Q8 (b): OpenAndCompact on an N=2 indexed primary succeeds, with the
+// default override and with an override map that changes only a WAL-only
+// option the N>1 checks reject (track_and_verify_wals): the secondary open
+// reads no WAL, so WAL-partition validation must not refuse it. Base result:
+// the second leg fails with "wal_partitions > 1 is not supported with
+// track_and_verify_wals". Neuter: today's validation (unconditional);
+// the second leg fails.
+TEST_F(DBSecondaryTest, GC27OpenAndCompactAtPartitionedPrimary) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  test::SetWalPartitions(&options, 2);
+  options.disable_auto_compactions = true;
+  Reopen(options);
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(Put("foo", "foo_value" + std::to_string(i)));
+    ASSERT_OK(Put("bar", "bar_value" + std::to_string(i)));
+    ASSERT_OK(Flush());
+  }
+  CompactionServiceInput input;
+  ColumnFamilyMetaData meta;
+  db_->GetColumnFamilyMetaData(&meta);
+  for (auto& file : meta.levels[0].files) {
+    input.input_files.push_back(file.name);
+  }
+  ASSERT_EQ(input.input_files.size(), 3);
+  input.output_level = 1;
+  input.options_file_number = dbfull()->GetVersionSet()->options_file_number();
+  input.cf_name = kDefaultColumnFamilyName;
+  ASSERT_OK(db_->GetDbIdentity(input.db_id));
+  Close();
+  std::string compaction_input_binary;
+  ASSERT_OK(input.Write(&compaction_input_binary));
+
+  CompactionServiceOptionsOverride default_override;
+  default_override.env = env_;
+  default_override.table_factory.reset(
+      NewBlockBasedTableFactory(BlockBasedTableOptions()));
+  std::string default_result_binary;
+  ASSERT_OK(DB::OpenAndCompact(
+      OpenAndCompactOptions(), dbname_, "oac_partitioned_default",
+      compaction_input_binary, &default_result_binary, default_override));
+
+  CompactionServiceOptionsOverride wal_only_override;
+  wal_only_override.env = env_;
+  wal_only_override.table_factory.reset(
+      NewBlockBasedTableFactory(BlockBasedTableOptions()));
+  wal_only_override.options_map = {{"track_and_verify_wals", "true"}};
+  std::string wal_only_result_binary;
+  const Status wal_only = DB::OpenAndCompact(
+      OpenAndCompactOptions(), dbname_, "oac_partitioned_wal_only",
+      compaction_input_binary, &wal_only_result_binary, wal_only_override);
+  EXPECT_OK(wal_only) << wal_only.ToString();
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

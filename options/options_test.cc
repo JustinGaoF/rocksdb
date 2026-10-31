@@ -11,6 +11,7 @@
 #include <cinttypes>
 #include <cstring>
 #include <map>
+#include <set>
 #include <type_traits>
 #include <unordered_map>
 
@@ -1580,21 +1581,33 @@ TEST_F(OptionsTest, DBOptionsComposeImmutable) {
                                                   new_opts));
 }
 
-TEST_F(OptionsTest, PartitionWALUsageComposeImmutable) {
-  // partition_wal_usage is only carried by ImmutableDBOptions, and
-  // options_settable_test (which would otherwise catch a missing
-  // BuildDBOptions assignment) is compiled out under clang.
-  for (PartitionWALUsage usage :
-       {PartitionWALUsage::kNone,
-        PartitionWALUsage::kPartitionByColumnFamily}) {
+TEST_F(OptionsTest, PartitionWALUsageSerializeRoundTrip) {
+  // Every value serializes to one of its spellings and parses back.
+  // (Compose coverage comes from RandomInitDBOptions via
+  // DBOptionsComposeImmutable and DBOptionsSerialization.)
+  ConfigOptions config_options;
+  config_options.input_strings_escaped = false;
+  config_options.ignore_unknown_options = false;
+  const std::vector<std::pair<PartitionWALUsage, std::set<std::string>>>
+      kCases = {{PartitionWALUsage::kNone, {"kNone", "none"}},
+                {PartitionWALUsage::kPartitionByColumnFamily,
+                 {"kPartitionByColumnFamily", "partition_by_column_family"}}};
+  for (const auto& [usage, spellings] : kCases) {
     DBOptions base_opts;
     base_opts.partition_wal_usage = usage;
-
-    ImmutableDBOptions i_opts(base_opts);
-    ASSERT_EQ(i_opts.partition_wal_usage, usage);
-
-    MutableDBOptions m_opts(base_opts);
-    ASSERT_EQ(BuildDBOptions(i_opts, m_opts).partition_wal_usage, usage);
+    std::string opts_str;
+    ASSERT_OK(GetStringFromDBOptions(config_options, base_opts, &opts_str));
+    std::unordered_map<std::string, std::string> opts_map;
+    ASSERT_OK(StringToMap(opts_str, &opts_map));
+    const auto it = opts_map.find("partition_wal_usage");
+    ASSERT_NE(it, opts_map.end());
+    EXPECT_TRUE(spellings.count(it->second) != 0)
+        << "emitted spelling: " << it->second;
+    DBOptions parsed_opts;
+    ASSERT_OK(GetDBOptionsFromString(config_options, DBOptions(),
+                                     "partition_wal_usage=" + it->second,
+                                     &parsed_opts));
+    ASSERT_EQ(parsed_opts.partition_wal_usage, usage);
   }
 }
 

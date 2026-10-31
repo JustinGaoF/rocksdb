@@ -1694,6 +1694,8 @@ Status DBImpl::WriteImpl(
     // PreReleaseCallback is called after WAL write and before memtable write;
     // a sync group's sync writers' callbacks run from its completion gate,
     // once fsynced (RunSyncGate).
+    autovector<std::pair<PreReleaseCallback*, SequenceNumber>>
+        retractable_callbacks;
     if (status.ok()) {
       SequenceNumber next_sequence = current_sequence;
       size_t index = 0;
@@ -1717,6 +1719,10 @@ Status DBImpl::WriteImpl(
             if (!ws.ok()) {
               status = pre_release_cb_status = ws;
               break;
+            }
+            if (!sync_group) {
+              retractable_callbacks.emplace_back(writer->pre_release_callback,
+                                                 writer->sequence);
             }
           }
           if (seq_per_batch_) {
@@ -1751,11 +1757,22 @@ Status DBImpl::WriteImpl(
       // or below it to be written, and for its range to be published.
       const SequenceNumber gate_low = current_sequence;
       const SequenceNumber gate_target = last_sequence;
-      write_group.completion_gate = [this, gate_low, gate_target]() {
-        return RunCompletionGate(gate_low, gate_target, /*sync=*/false,
-                                 /*published=*/true,
-                                 /*pre_sync_safe_point=*/0,
-                                 /*sync_micros=*/0);
+      write_group.completion_gate = [this, gate_low, gate_target,
+                                     retractable_callbacks]() {
+        Status gate_status =
+            RunCompletionGate(gate_low, gate_target, /*sync=*/false,
+                              /*published=*/true,
+                              /*pre_sync_safe_point=*/0, /*sync_micros=*/0);
+        if (!gate_status.ok()) {
+          // The callbacks above already ran (insert included), but the write
+          // fails: a lower range failed. Undo their effects so the failed
+          // write is never visible and a later retry or rollback starts
+          // clean; the WAL record itself is covered by the fence.
+          for (const auto& entry : retractable_callbacks) {
+            entry.first->RetractOnAbortedWrite(entry.second);
+          }
+        }
+        return gate_status;
       };
     } else if (sync_group && io_s.ok()) {
       TEST_SYNC_POINT_CALLBACK("DBImpl::InstallCompletionGate", &last_sequence);
@@ -3422,10 +3439,12 @@ void DBImpl::ClearWalDurabilityBGError() {
 
 Status DBImpl::BurnedWALIndexLanded(uint64_t wal_number, uint64_t wal_index,
                                     uint64_t wal_offset, bool* landed,
-                                    uint64_t* torn_end) {
+                                    uint64_t* torn_start, uint64_t* torn_end) {
   assert(landed != nullptr);
+  assert(torn_start != nullptr);
   assert(torn_end != nullptr);
   *landed = false;
+  *torn_start = 0;
   *torn_end = 0;
   const std::string fname =
       LogFileName(immutable_db_options_.GetWalDir(), wal_number);
@@ -3458,6 +3477,12 @@ Status DBImpl::BurnedWALIndexLanded(uint64_t wal_number, uint64_t wal_index,
   std::string scratch;
   Slice record;
   while (reader.ReadRecord(&record, &scratch)) {
+    // At a true return the buffer sits exactly at the returned record's end.
+    // Every record returned here precedes the tear (the reader stops at it),
+    // so the largest end seen is the torn record's start. It stays 0 when
+    // nothing whole precedes the tear; then the torn record is the file's
+    // first and zeroing from 0 removes only its fragments.
+    *torn_start = std::max(*torn_start, reader.LastRecordEnd());
     if (reader.GetLastReadWALIndex() >= wal_index) {
       *landed = reader.GetLastReadWALIndex() == wal_index;
       break;
@@ -3514,18 +3539,22 @@ Status DBImpl::ExplainBurnedWALIndices(const WriteOptions& write_options) {
     std::unordered_set<uint64_t> wals_to_sync;
     for (const BurnedWalIndex& b : burned) {
       bool b_landed = false;
+      uint64_t b_torn_start = 0;
       uint64_t b_torn_end = 0;
-      io_s = status_to_io_status(BurnedWALIndexLanded(
-          b.wal_number, b.wal_index, b.wal_offset, &b_landed, &b_torn_end));
+      io_s = status_to_io_status(
+          BurnedWALIndexLanded(b.wal_number, b.wal_index, b.wal_offset,
+                               &b_landed, &b_torn_start, &b_torn_end));
       if (io_s.ok() && b_torn_end != 0) {
         // Unreadable in every mode, but point-in-time and absolute read it
         // as a lost tail below the writes Resume admits. Zeroes read as
-        // padding instead, and keep the size the MANIFEST may track.
+        // padding instead, and keep the size the MANIFEST may track. The
+        // zeroing starts at the last whole record's end, not at the flushed
+        // size, which can lie inside a record its append flushed partway.
         ROCKS_LOG_WARN(immutable_db_options_.info_log,
                        "[WAL recovery] Burned WAL index %" PRIu64
                        " landed torn in WAL #%" PRIu64
                        "; zeroing bytes %" PRIu64 " to %" PRIu64,
-                       b.wal_index, b.wal_number, b.wal_offset, b_torn_end);
+                       b.wal_index, b.wal_number, b_torn_start, b_torn_end);
         IOOptions opts;
         io_s = WritableFileWriter::PrepareIOOptions(write_options, opts);
         std::unique_ptr<FSRandomRWFile> file;
@@ -3536,8 +3565,8 @@ Status DBImpl::ExplainBurnedWALIndices(const WriteOptions& write_options) {
         }
         if (io_s.ok()) {
           const std::string zeroes(
-              static_cast<size_t>(b_torn_end - b.wal_offset), '\0');
-          io_s = file->Write(b.wal_offset, zeroes, opts, /*dbg=*/nullptr);
+              static_cast<size_t>(b_torn_end - b_torn_start), '\0');
+          io_s = file->Write(b_torn_start, zeroes, opts, /*dbg=*/nullptr);
         }
         if (io_s.ok()) {
           io_s = immutable_db_options_.use_fsync

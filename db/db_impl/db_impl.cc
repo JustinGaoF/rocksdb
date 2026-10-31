@@ -2331,6 +2331,9 @@ Status DBImpl::SetDBOptions(
       if (wal_other_option_changed || wal_size_option_changed) {
         AllPartitionsWriter w(this, /*nonmem=*/false);
         w.EnterUnbatched();
+        // N>1: wait out unpublished sync groups before SwitchWAL can move
+        // the memtable from under their inserts.
+        WaitForUnpublishedSyncGroups();
         if (wal_other_option_changed ||
             wals_total_size_.LoadRelaxed() > GetMaxTotalWalSize()) {
           Status purge_wal_status = SwitchWAL(&write_context);
@@ -2760,6 +2763,12 @@ Status DBImpl::LockWAL() {
       if (two_write_queues_) {
         nonmem_w.EnterUnbatched();
       }
+
+      // N>1: a sync group leaves its write queue before it inserts and
+      // publishes. Wait for it here so no write becomes visible and
+      // LastSequence() does not move under the lock. Not
+      // WaitForPendingWrites(): that would also change N=1.
+      WaitForUnpublishedSyncGroups();
 
       // NOTE: releasing mutex in EnterUnbatched might mean we are actually
       // now locked by another thread.
@@ -5554,11 +5563,21 @@ Iterator* DBImpl::NewIterator(const ReadOptions& _read_options,
     // TODO(cbi): Add support for `memtable_op_scan_flush_trigger` for tailing
     // iterator. This requires refreshing DBIter's pointer to active_mem when
     // tailing iterator refreshes to new memtable internally.
+    // At N>1 a write inserts before it publishes, so an unfiltered tailing
+    // read can show a write that then fails. Bound it by the published
+    // sequence, sampled live so new writes appear without a refresh.
+    ReadCallback* read_callback = nullptr;
+    if (NumWalPartitions() > 1) {
+      iter->SetReadCallback(std::make_unique<PublishedSequenceReadCallback>(
+          [this]() { return versions_->LastSequence(); }));
+      read_callback = iter->GetReadCallback();
+    }
     result = DBIter::NewIter(env_, read_options, cfd->ioptions(),
                              sv->mutable_cf_options, cfd->user_comparator(),
                              iter, sv->current, kMaxSequenceNumber,
-                             /*read_callback=*/nullptr, /*active_mem=*/nullptr,
-                             cfh, /*expose_blob_index=*/false);
+                             /*read_callback=*/read_callback,
+                             /*active_mem=*/nullptr, cfh,
+                             /*expose_blob_index=*/false);
   } else {
     // Note: no need to consider the special case of
     // last_seq_same_as_publish_seq_==false since NewIterator is overridden in
@@ -5843,13 +5862,21 @@ Status DBImpl::NewIterators(
       auto* iter = new ForwardIterator(this, options, cf_sv_pair.cfd,
                                        cf_sv_pair.super_version,
                                        /* allow_unprepared_value */ true);
-      iterators->push_back(DBIter::NewIter(
-          env_, options, cf_sv_pair.cfd->ioptions(),
-          cf_sv_pair.super_version->mutable_cf_options,
-          cf_sv_pair.cfd->user_comparator(), iter,
-          cf_sv_pair.super_version->current, kMaxSequenceNumber,
-          nullptr /* read_callback */, /* active_mem */ nullptr, cf_sv_pair.cfh,
-          /* expose_blob_index */ false, /* arena */ nullptr));
+      // As above: bound N>1 tailing reads by the live published sequence.
+      ReadCallback* read_callback = nullptr;
+      if (NumWalPartitions() > 1) {
+        iter->SetReadCallback(std::make_unique<PublishedSequenceReadCallback>(
+            [this]() { return versions_->LastSequence(); }));
+        read_callback = iter->GetReadCallback();
+      }
+      iterators->push_back(
+          DBIter::NewIter(env_, options, cf_sv_pair.cfd->ioptions(),
+                          cf_sv_pair.super_version->mutable_cf_options,
+                          cf_sv_pair.cfd->user_comparator(), iter,
+                          cf_sv_pair.super_version->current, kMaxSequenceNumber,
+                          read_callback /* read_callback */,
+                          /* active_mem */ nullptr, cf_sv_pair.cfh,
+                          /* expose_blob_index */ false, /* arena */ nullptr));
     }
   } else {
     for (size_t i = 0; i < cf_sv_pairs.size(); ++i) {
@@ -8565,6 +8592,11 @@ Status DBImpl::CreateColumnFamilyWithImport(
       if (two_write_queues_) {
         nonmem_w.EnterUnbatched();
       }
+
+      // N>1: the import below can stamp SetLastAllocatedSequence, so no
+      // group may hold an allocated sequence above LastSequence().
+      WaitForUnpublishedSyncGroups();
+      AssertLastSequenceCoversAllocated();
 
       num_running_ingest_file_++;
       assert(!cfd->IsDropped());

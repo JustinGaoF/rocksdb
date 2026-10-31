@@ -16,6 +16,7 @@
 #include "db/job_context.h"
 #include "db/range_del_aggregator.h"
 #include "db/range_tombstone_fragmenter.h"
+#include "db/read_callback.h"
 #include "rocksdb/env.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/slice_transform.h"

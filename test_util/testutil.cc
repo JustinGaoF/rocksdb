@@ -346,6 +346,11 @@ void RandomInitDBOptions(DBOptions* db_opt, Random* rnd) {
 
   // uint32_t options
   db_opt->max_subcompactions = rnd->Uniform(100000);
+  // 1..64, the valid wal_partitions range (db_impl_open.cc ValidateOptions).
+  db_opt->wal_partitions = 1 + rnd->Uniform(64);
+  db_opt->partition_wal_usage =
+      rnd->Uniform(2) == 0 ? PartitionWALUsage::kNone
+                           : PartitionWALUsage::kPartitionByColumnFamily;
 
   // uint64_t options
   static const uint64_t uint_max = static_cast<uint64_t>(UINT_MAX);

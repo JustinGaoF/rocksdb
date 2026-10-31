@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <functional>
+
 #include "db/dbformat.h"
 #include "rocksdb/types.h"
 
@@ -78,6 +80,26 @@ class ReadCallback {
   SequenceNumber max_visible_seq_ = kMaxSequenceNumber;
   // Any seq less than min_uncommitted_ is committed.
   const SequenceNumber min_uncommitted_ = kMinUnCommittedSeq;
+};
+
+// A tailing-iterator bound at N>1: a write there inserts before it is
+// published, so visibility follows the published sequence, sampled live on
+// every check so newly published writes appear without a refresh. (As a side
+// effect DBIter skips inserting logically redundant range tombstones for
+// these iterators, which is a read optimization, not a behavior change.)
+class PublishedSequenceReadCallback : public ReadCallback {
+ public:
+  explicit PublishedSequenceReadCallback(
+      std::function<SequenceNumber()> published_sequence)
+      : ReadCallback(kMaxSequenceNumber),
+        published_sequence_(std::move(published_sequence)) {}
+
+  bool IsVisibleFullCheck(SequenceNumber seq) override {
+    return seq <= published_sequence_();
+  }
+
+ private:
+  std::function<SequenceNumber()> published_sequence_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -37,8 +37,9 @@ namespace log {
 // finished member's torn or swallowed tail (a tail gap, surfaced for the
 // recovery-mode mapping, then skipped), or the frontier (stop). A record
 // covered by a supersession for its bearer is consumed silently and never
-// emitted; two live records at one index fail closed rather than being chosen
-// between.
+// emitted, and so is a void cover one covers (D-2): only an unsuperseded
+// void contradicts holders or explains a hole. Two live records at one
+// index fail closed rather than being chosen between.
 //
 // Emitted records stay valid until the next call into the merger, mirroring
 // Reader's lifetime contract.
@@ -186,6 +187,12 @@ class WALIndexMerger {
     uint64_t ProgressBound() const override;
     uint64_t HeadFloor() const override;
     bool VoidCovers(uint64_t index) const override;
+    // Highest wal_index covered by any valid void record read so far, or zero
+    // if none was read. Recovery cuts clean members holding a void at or
+    // above its seed, so the declaration covers voids too (D-2).
+    uint64_t MaxVoidWALIndexHi() const {
+      return reader_->GetMaxVoidWALIndexHi();
+    }
     bool Supersedes(uint64_t bearer, uint64_t index) const override;
     bool AttestedSpan(PredecessorSpan* span) const override;
     void AttestedSpans(std::vector<PredecessorSpan>* spans) const override;
@@ -286,7 +293,9 @@ class WALIndexMerger {
   // record's payload. The merge checks it never decreases across indexed
   // emissions (unindexed records are skipped) and fails closed otherwise; it
   // returns non-OK when the payload holds no readable sequence. Equal is
-  // allowed: empty batches consume an index but no sequence.
+  // allowed: empty batches consume an index but no sequence. The
+  // count-aware rule (no overlap once replay's drops are accounted for)
+  // lives in recovery, which alone knows which records it dropped.
   //
   // `continue_past_discarded_holes` skips superseded-only holes even when a
   // torn tail covers them, instead of stopping at the frontier. Recovery
@@ -489,6 +498,20 @@ class WALIndexMerger {
   uint64_t lower_ = 0;
   uint64_t expected_ = 0;
   uint64_t last_sequence_ = 0;
+  // Most recent indexed emission with a nonzero witness, for the reorder
+  // message (empty records skip the witness without moving it).
+  uint64_t last_witness_index_ = 0;
+  const Member* last_witness_member_ = nullptr;
+  // Every predecessor span read so far, with the WAL that attested it, for
+  // the attested-last check: a held predecessor bearing an unsuperseded
+  // index above its last is rotation-time out-of-order, not a reissue.
+  struct AttestedSpan {
+    uint64_t attester = 0;
+    uint64_t wal_number = 0;
+    uint64_t first = 0;
+    uint64_t last = 0;
+  };
+  std::vector<AttestedSpan> attested_spans_;
   uint64_t last_emitted_index_ = 0;
   const Member* last_emitted_member_ = nullptr;
   uint64_t last_emitted_checksum_ = 0;

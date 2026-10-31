@@ -466,11 +466,13 @@ enum class WALRecoveryMode : char {
   kSkipAnyCorruptedRecords = 0x03,
 };
 
-// EXPERIMENTAL. Controls whether WAL records carry a persisted monotonically
-// increasing ordering number (internally: wal_index), and how WAL files are
-// laid out. Every value other than `kNone` prefixes each WAL record with that
-// ordering number and tags the file with an identifying marker record; both
-// change the on-disk WAL format. A RocksDB version that predates this option
+// EXPERIMENTAL. Chooses the WAL record format, independently of how many WAL
+// files writes spread across (see `DBOptions::wal_partitions`). `kNone` keeps
+// today's format; `kPartitionByColumnFamily` prefixes each WAL record with a
+// persisted monotonically increasing ordering number (internally: wal_index)
+// and tags the file with an identifying marker record; both change the on-disk
+// WAL format. The indexed format is required for more than one WAL, but one
+// WAL may use it too. A RocksDB version that predates this option
 // only reports such records: under kPointInTimeRecovery (the default),
 // kSkipAnyCorruptedRecords, or with paranoid_checks=false, it opens the DB and
 // discards the contents of those WALs, including acknowledged writes not yet
@@ -1542,6 +1544,12 @@ struct DBOptions {
   // EXPERIMENTAL
   //
   // The number of WAL files ("partitions") that writes are spread across.
+  // This and `partition_wal_usage` are two independent settings: this chooses
+  // how many WAL files writes spread across (1 by default), while
+  // `partition_wal_usage` chooses the WAL record format (`kNone`: today's
+  // format; `kPartitionByColumnFamily`: indexed records, required for more
+  // than one WAL). `kPartitionByColumnFamily` at `wal_partitions` 1 only turns
+  // on the indexed format; it does not partition anything.
   //
   // A single WAL file admits only one append in flight at a time, because
   // durability granularity is per file descriptor. On storage where append
@@ -1575,6 +1583,8 @@ struct DBOptions {
   // the records below it, and kSkipAnyCorruptedRecords skips it and applies
   // the records above it; see WALRecoveryMode. A loss at the end of the
   // stream is a tail, handled as each mode handles a torn tail with one WAL.
+  // A recovery start supersedes older voids as well as records, so a reopen
+  // after a point-in-time cut never fails on a void it superseded.
   //
   // manual_wal_flush is supported but not recommended with more than one
   // partition: FlushWAL() flushes every partition's buffer while holding every
@@ -1605,6 +1615,14 @@ struct DBOptions {
   // WAL index, even when the primary runs one partition with a
   // partition_wal_usage other than kNone. Under manual_wal_flush a new WAL's
   // head stays buffered until FlushWAL(); the next round after it succeeds.
+  // RepairDB, GetUpdatesSince and ldb refuse with Status::NotSupported,
+  // naming the WAL, when a WAL head is damaged or unreadable in an indexed
+  // DB, instead of reading it as partition 0.
+  //
+  // Tailing iterators (ReadOptions::tailing) at more than one partition read
+  // at the published sequence: they never show a write that returned an
+  // error, and they keep showing newly published writes without a refresh.
+  // With one partition tailing is unchanged.
   //
   // Not dynamically changeable via SetOptions().
   //
@@ -1738,7 +1756,9 @@ struct DBOptions {
   // `PartitionWALUsage` for the on-disk format change every other value
   // implies. Leaves the per-key sequence number and SST format untouched.
   // Every other value also lets recovery find a record lost from the middle of
-  // the WAL; see `WALRecoveryMode` for what each mode does then.
+  // the WAL; see `WALRecoveryMode` for what each mode does then. Independent
+  // of `wal_partitions`, which chooses how many WAL files writes spread
+  // across.
   PartitionWALUsage partition_wal_usage = PartitionWALUsage::kNone;
 
   // Set to true to re-instate an old behavior of keeping complete, synced WAL

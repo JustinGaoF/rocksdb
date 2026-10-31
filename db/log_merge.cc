@@ -385,6 +385,8 @@ Status WALIndexMerger::ComputeLowerBound() {
         it->second.first = std::min(it->second.first, span.first);
         it->second.second = std::min(it->second.second, span.last);
       }
+      attested_spans_.push_back(
+          {s.member->wal_number(), span.wal_number, span.first, span.last});
     }
   }
   for (const auto& [pred, span] : attested) {
@@ -586,36 +588,56 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
         holders.push_back(&state);
       }
     }
+    // Whether any declaration read so far obsoletes (`bearer`, `index`).
+    auto superseded = [&](uint64_t bearer, uint64_t index) {
+      for (auto& state : states_) {
+        if (state.member->Supersedes(bearer, index)) {
+          return true;
+        }
+      }
+      return false;
+    };
+    // D-2: a declaration supersedes voids as well as records. A void it
+    // covers is obsolete, like a record, so only an unsuperseded void
+    // contradicts holders. (A superseded void still skips and clears
+    // pending below exactly like a live one: its bearer predates the
+    // pending declarer, so it predates the cut, and N=1 may have seeded
+    // past it while it was live. GC19's exception needs no change.)
     bool void_covered = false;
+    std::vector<MemberState*> live_void_states;
     for (auto& state : states_) {
       if (state.member->VoidCovers(expected_)) {
         void_covered = true;
-        break;
+        if (!superseded(state.member->wal_number(), expected_)) {
+          live_void_states.push_back(&state);
+        }
       }
     }
-    if (!holders.empty() && void_covered) {
-      return Fail(Status::Corruption("WAL index merge: index " +
-                                     std::to_string(expected_) +
-                                     " bears records and a void cover"));
+    // Names the WALs of `bearer_states` for a contradiction message.
+    auto wal_list = [&](const std::vector<MemberState*>& bearer_states) {
+      std::string out;
+      for (const auto* b : bearer_states) {
+        out += (out.empty() ? "WAL " : ", WAL ") +
+               std::to_string(b->member->wal_number());
+      }
+      return out;
+    };
+    if (!holders.empty() && !live_void_states.empty()) {
+      return Fail(Status::Corruption(
+          "WAL index merge: index " + std::to_string(expected_) +
+          " bears records and a void cover; records in " + wal_list(holders) +
+          ", void in " + wal_list(live_void_states)));
     }
     std::vector<MemberState*> live;
     for (auto* h : holders) {
-      bool superseded = false;
-      for (auto& state : states_) {
-        if (state.member->Supersedes(h->member->wal_number(), expected_)) {
-          superseded = true;
-          break;
-        }
-      }
-      if (!superseded) {
+      if (!superseded(h->member->wal_number(), expected_)) {
         live.push_back(h);
       }
     }
     if (live.size() > 1) {
-      return Fail(
-          Status::Corruption("WAL index merge: two live records share "
-                             "index " +
-                             std::to_string(expected_)));
+      return Fail(Status::Corruption(
+          "WAL index merge: two live records share index " +
+          std::to_string(expected_) + "; " + wal_list(live)));
     }
     if (live.size() == 1 && pending_discarded_ != 0) {
       // A live record above a skipped superseded-only index: writes after the
@@ -624,6 +646,20 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
     }
     if (live.size() == 1) {
       MemberState* winner = live[0];
+      // A held predecessor bearing an unsuperseded index above its
+      // successor's attested last is rotation-time out-of-order, not a
+      // reissue after a cut (a declaration would have obsoleted it).
+      for (const AttestedSpan& span : attested_spans_) {
+        if (span.wal_number == winner->member->wal_number() &&
+            span.first != 0 && expected_ > span.last) {
+          return Fail(Status::Corruption(
+              "WAL index merge: WAL " +
+              std::to_string(winner->member->wal_number()) + " bears index " +
+              std::to_string(expected_) + " above its attested span [" +
+              std::to_string(span.first) + ", " + std::to_string(span.last) +
+              "] (attested by WAL " + std::to_string(span.attester) + ")"));
+        }
+      }
       SequenceNumber seq = 0;
       s = sequence_of_(winner->lookahead.payload, &seq);
       if (!s.ok()) {
@@ -637,12 +673,21 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
       } else if (seq < last_sequence_) {
         // Non-decreasing, not strictly increasing: an empty batch consumes
         // an index but no sequence, so the recovery dummy and a user-written
-        // empty batch both repeat the sequence the next record reuses.
-        return Fail(Status::Corruption("WAL index merge: index " +
-                                       std::to_string(expected_) +
-                                       " does not advance the sequence"));
+        // empty batch both repeat the sequence the next record reuses. (The
+        // count-aware rule lives in recovery, which alone knows which
+        // records it dropped.)
+        return Fail(Status::Corruption(
+            "WAL index merge: index " + std::to_string(expected_) +
+            " at sequence " + std::to_string(seq) + " (WAL " +
+            std::to_string(winner->member->wal_number()) +
+            ") does not advance past index " +
+            std::to_string(last_witness_index_) + " at sequence " +
+            std::to_string(last_sequence_) + " (WAL " +
+            std::to_string(last_witness_member_->wal_number()) + ")"));
       } else {
         last_sequence_ = seq;
+        last_witness_index_ = expected_;
+        last_witness_member_ = winner->member;
       }
       *record = winner->lookahead.payload;
       last_emitted_index_ = expected_;

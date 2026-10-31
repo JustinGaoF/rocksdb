@@ -4,6 +4,7 @@
 //  (found in the LICENSE.Apache file in the root directory).
 #pragma once
 
+#include <memory>
 #include <queue>
 #include <string>
 #include <vector>
@@ -19,6 +20,7 @@ namespace ROCKSDB_NAMESPACE {
 
 class DBImpl;
 class Env;
+class ReadCallback;
 struct SuperVersion;
 class ColumnFamilyData;
 class ForwardLevelIterator;
@@ -86,6 +88,14 @@ class ForwardIterator : public InternalIterator {
 
   bool TEST_CheckDeletedIters(int* deleted_iters, int* num_iters);
 
+  // Owns the visibility bound the wrapping DBIter reads through (at N>1 a
+  // live published-sequence callback; null reads at kMaxSequenceNumber). The
+  // wrapping DBIter owns this iterator, so the callback outlives every use.
+  void SetReadCallback(std::unique_ptr<ReadCallback> read_callback) {
+    read_callback_ = std::move(read_callback);
+  }
+  ReadCallback* GetReadCallback() const { return read_callback_.get(); }
+
  private:
   void Cleanup(bool release_sv);
   // Unreference and, if needed, clean up the current SuperVersion. This is
@@ -123,6 +133,7 @@ class ForwardIterator : public InternalIterator {
 
   DBImpl* const db_;
   ReadOptions read_options_;
+  std::unique_ptr<ReadCallback> read_callback_;
   ColumnFamilyData* const cfd_;
   const SliceTransform* const prefix_extractor_;
   const Comparator* user_comparator_;

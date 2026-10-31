@@ -329,6 +329,11 @@ IOStatus Writer::AddWALIndexVoidRecord(const WriteOptions& write_options,
   }
   assert(lo != 0);
   assert(lo <= hi);
+  if (lo == 0 || lo > hi) {
+    return IOStatus::Corruption("WAL index void cover has invalid range [" +
+                                std::to_string(lo) + ", " + std::to_string(hi) +
+                                "]");
+  }
 
   std::string payload;
   payload.reserve(kWALIndexVoidPayloadSize);
@@ -349,6 +354,14 @@ IOStatus Writer::AddWALIndexSupersessionRecord(
   assert(superseded_wal_number != 0);
   assert(superseded_wal_number < log_number_);
   assert(first_superseded_wal_index != 0);
+  if (superseded_wal_number == 0 || superseded_wal_number >= log_number_ ||
+      first_superseded_wal_index == 0) {
+    return IOStatus::Corruption("WAL index supersession names invalid WAL " +
+                                std::to_string(superseded_wal_number) +
+                                " from WAL " + std::to_string(log_number_) +
+                                " with first index " +
+                                std::to_string(first_superseded_wal_index));
+  }
 
   std::string payload;
   payload.reserve(kWALIndexSupersessionPayloadSize);
@@ -367,6 +380,9 @@ IOStatus Writer::AddWALIndexProgressRecord(const WriteOptions& write_options,
     return IOStatus::OK();
   }
   assert(bound != 0);
+  if (bound == 0) {
+    return IOStatus::Corruption("WAL index progress bound is zero");
+  }
   if (bound < last_progress_bound_recorded_) {
     return IOStatus::Corruption(
         "WAL index progress bound moves backward: " + std::to_string(bound) +
@@ -397,6 +413,16 @@ IOStatus Writer::AddWALIndexPredecessorSpanRecord(
   assert(predecessor_wal_number < log_number_);
   assert((first_wal_index == 0) == (last_wal_index == 0));
   assert(first_wal_index <= last_wal_index);
+  if (predecessor_wal_number == 0 || predecessor_wal_number >= log_number_ ||
+      (first_wal_index == 0) != (last_wal_index == 0) ||
+      first_wal_index > last_wal_index) {
+    return IOStatus::Corruption(
+        "WAL index predecessor span names invalid WAL " +
+        std::to_string(predecessor_wal_number) + " from WAL " +
+        std::to_string(log_number_) + " with span [" +
+        std::to_string(first_wal_index) + ", " +
+        std::to_string(last_wal_index) + "]");
+  }
 
   std::string payload;
   payload.reserve(kWALIndexPredecessorSpanPayloadSize);
