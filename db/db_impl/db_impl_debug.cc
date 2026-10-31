@@ -304,6 +304,17 @@ uint64_t DBImpl::TEST_CurrentWalNumber(size_t partition) {
   return CurrentWal(partition).number;
 }
 
+bool DBImpl::TEST_WalBufferEmpty(size_t partition) {
+  WalWriteMutexLock wl(&WalWriteMutex(partition));
+  const LogWriterNumber* current_wal = CurrentWalOrNull(partition);
+  return current_wal == nullptr || current_wal->writer->BufferIsEmpty();
+}
+
+size_t DBImpl::TEST_NumOpenWals(size_t partition) {
+  WalWriteMutexLock wl(&WalWriteMutex(partition));
+  return logs_[partition].size();
+}
+
 std::vector<std::pair<uint64_t, bool>> DBImpl::TEST_WalSyncMarks(
     size_t partition) {
   WalWriteMutexLock wl(&WalWriteMutex(partition));

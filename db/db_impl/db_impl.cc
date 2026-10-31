@@ -930,7 +930,7 @@ void DBImpl::CancelAllBackgroundWork(bool wait) {
   if (NumWalPartitions() > 1) {
     // Writes parked in their completion gate return ShutdownInProgress
     // unless already covered, as a stalled write does.
-    InstrumentedMutexLock seq_lock(&sequence_wal_index_mutex_);
+    InstrumentedMutexLock seq_lock(&wal_wait_mutex_);
     wal_durability_cv_.SignalAll();
   }
   env_->UnSchedule(&bg_async_file_open_state_, Env::Priority::HIGH);
@@ -1204,7 +1204,7 @@ Status DBImpl::CloseHelper() {
     // the gate's mutex and cv are freed with this DB, so wait for them to
     // leave. A write reaching its gate after this point is a write
     // concurrent with Close(), which is unsupported.
-    InstrumentedMutexLock seq_lock(&sequence_wal_index_mutex_);
+    InstrumentedMutexLock seq_lock(&wal_wait_mutex_);
     while (wal_durability_waiters_.load(std::memory_order_relaxed) > 0) {
       wal_durability_cv_.Wait();
     }
@@ -2402,14 +2402,25 @@ Status DBImpl::FlushWAL(const WriteOptions& write_options, bool sync) {
   if (manual_wal_flush_) {
     IOStatus io_s;
     uint64_t failed_wal_number = 0;
-    {
-      // We need to lock since the WAL writers might change concurrently.
-      // Every partition's current WAL is flushed: the application-visible
-      // "flush the buffered WAL data" covers all partitions, and holding
-      // all N excludes a concurrent AddRecord on any of them (see
-      // WriteToWAL).
+    if (NumWalPartitions() == 1) {
+      // Unchanged: the single current WAL is flushed under all N (one).
       AllWalWriteMutexesLock wl(this);
-      for (size_t p = 0; p < NumWalPartitions(); ++p) {
+      const LogWriterNumber* current_wal = CurrentWalOrNull(0);
+      if (current_wal != nullptr) {
+        io_s = current_wal->writer->WriteBuffer(write_options);
+        if (!io_s.ok()) {
+          failed_wal_number = current_wal->number;
+        }
+      }
+    } else {
+      // Above one partition each non-empty partition buffer is written
+      // once, holding only that partition's WAL mutex, one partition at a
+      // time: an append on another partition never waits for this flush
+      // (see WriteToWAL). A partition that rotates mid-flush keeps its new
+      // current WAL's later appends buffered, exactly as an append racing
+      // the old all-N flush stayed buffered on the next file.
+      for (size_t p = 0; p < NumWalPartitions() && io_s.ok(); ++p) {
+        WalWriteMutexLock wl(&WalWriteMutex(p));
         const LogWriterNumber* current_wal = CurrentWalOrNull(p);
         if (current_wal == nullptr) {
           continue;
@@ -2417,7 +2428,6 @@ Status DBImpl::FlushWAL(const WriteOptions& write_options, bool sync) {
         io_s = current_wal->writer->WriteBuffer(write_options);
         if (!io_s.ok()) {
           failed_wal_number = current_wal->number;
-          break;
         }
       }
     }
@@ -2880,7 +2890,19 @@ bool DBImpl::ClaimWalPartitionForSyncWalImpl(
   const bool claim_front =
       include_current_wal ||
       logs_[partition].front().number != logs_[partition].back().number;
-  while (claim_front && logs_[partition].front().IsSyncing()) {
+  auto any_marked = [this, partition]() {
+    for (auto& log : logs_[partition]) {
+      if (log.IsSyncing()) {
+        return true;
+      }
+    }
+    return false;
+  };
+  // Any mark, not just the front's: the targeted gate claim marks only the
+  // files it fsyncs, so the front's mark no longer implies the absence of
+  // every other marker. At N=1 all markers still mark every file, so this
+  // waits exactly when the front wait did.
+  while (claim_front && any_marked()) {
     TEST_SYNC_POINT("DBImpl::ClaimWalPartitionForSyncWalImpl:Wait");
     WalSyncCV(partition).Wait();
   }
@@ -3010,7 +3032,16 @@ void DBImpl::FinishWalPartitionSync(size_t partition, uint64_t up_to,
   // synced through at least its size at the mark.
   auto note_synced = [this](LogWriterNumber& wal) {
     if (wal.number > wal_recovery_cutoff_.load(std::memory_order_acquire)) {
-      wal.synced_size = std::max(wal.synced_size, wal.GetPreSyncSize());
+      const uint64_t pre_sync_size = wal.GetPreSyncSize();
+      wal.synced_size = std::max(wal.synced_size, pre_sync_size);
+      // Prune the targeted-sync tracker: every record fully within the size
+      // captured at claim time is now synced, and anything appended later
+      // stays tracked for the next sync that covers it.
+      uint64_t flushed_size = pre_sync_size;
+      if (wal.writer->file() != nullptr) {
+        flushed_size = wal.writer->file()->GetFlushedSize();
+      }
+      wal.NoteWalSyncedThrough(pre_sync_size, flushed_size);
     }
   };
   for (auto it = logs_[partition].begin(); it != logs_[partition].end();) {
@@ -3030,7 +3061,11 @@ void DBImpl::FinishWalPartitionSync(size_t partition, uint64_t up_to,
       ++it;
       continue;
     }
-    assert(wal.IsSyncing());
+    // Targeted gate claims leave files unmarked; only marked files finish.
+    if (!wal.IsSyncing()) {
+      ++it;
+      continue;
+    }
 
     if (wal.number <= wal_recovery_cutoff_.load(std::memory_order_acquire)) {
       wal.FinishSync();
@@ -3083,7 +3118,10 @@ void DBImpl::CancelWalPartitionSync(size_t partition, uint64_t up_to) {
       }
       continue;
     }
-    wal.FinishSync();
+    // As in FinishWalPartitionSync: targeted claims leave files unmarked.
+    if (wal.IsSyncing()) {
+      wal.FinishSync();
+    }
   }
 }
 
