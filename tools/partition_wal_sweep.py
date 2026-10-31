@@ -95,7 +95,7 @@ TRIGGER_VALUE_SIZE = 1024
 TRIGGER_THRESHOLD = 0.10
 # Thread counts the trigger table covers at N=8 for every sync mode: the
 # --threads cells plus extra N=8 cells at each count below that differs.
-TRIGGER_THREAD_COUNTS = (16, 32)
+TRIGGER_THREAD_COUNTS = (8, 16, 32)
 
 # Comparison verdicts against an N=1 baseline of the same latency profile,
 # from the throughput ratio N>1 / N=1.
@@ -293,6 +293,9 @@ def cell_command(args, cell, cell_dir):
         "--seed=%d" % cell["seed"],
         "--db=%s" % db_dir,
         "--statistics", "--histogram",
+        # kExceptTimeForMutex: keeps the join-wait columns filled now that
+        # the join timer records only above kExceptDetailedTimers (GC28 Q6).
+        "--stats_level=4",
         "--disable_auto_compactions=1",
         "--report_interval_seconds=1",
         "--report_file=%s" % os.path.join(cell_dir, "report.csv"),
@@ -551,7 +554,7 @@ def compute_trigger(aggregates, threads):
     """
     rows = []
     for key, agg in sorted(aggregates.items()):
-        n, _usage, lat, sync, size, slow, injected, threads = key
+        n, _usage, lat, sync, size, slow, injected, cell_threads = key
         if n != 8 or slow >= 0:
             continue
         if not injected:
@@ -559,7 +562,7 @@ def compute_trigger(aggregates, threads):
         gate = agg["gate_wait_p99"]["median"]
         write = agg["write_p99_us"]["median"]
         rows.append({"append_us": lat, "sync": sync, "value_size": size,
-                     "threads": threads, "cell": cell_label(key),
+                     "threads": cell_threads, "cell": cell_label(key),
                      "gate_p99_us": gate, "write_p99_us": write,
                      "ratio": gate / write if write else None})
     verdict = None

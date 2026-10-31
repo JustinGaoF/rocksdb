@@ -876,7 +876,9 @@ enum Histograms : uint32_t {
   WRITE_GROUP_CAP_EXCLUDED,
   // Time (microseconds) a write spends blocked in WriteThread::JoinBatchGroup
   // waiting to join or lead a write batch group. One sample per write;
-  // writers that link uncontended record ~0. In the same unit as
+  // writers that link uncontended record ~0. Recorded only when the stats
+  // level is above kExceptDetailedTimers; at the default level no clock is
+  // read and nothing is recorded. In the same unit as
   // WAL_DURABILITY_WAIT_MICROS, so the two wait distributions can be compared
   // directly: this one is the queueing that write-partition routing could
   // relieve, the durability wait is what it cannot touch.
@@ -894,13 +896,14 @@ enum Histograms : uint32_t {
   // Number of WAL partitions a sync=true write group fsynced. One sample per
   // such group.
   WAL_SYNC_FSYNCED_PARTITIONS,
-  // Number of WAL partitions that held bytes not covered by an earlier sync
-  // when a sync=true write group claimed them: an upper bound on the
+  // Number of WAL partitions that held an unsynced record at or below a
+  // sync=true write group's coalesced threshold when it claimed them: the
   // partitions that sync had to persist. One sample per such group.
   WAL_SYNC_UNSYNCED_PARTITIONS,
   // Time (microseconds) a sync=true write group spends syncing across WAL
-  // partitions: claiming every partition, the fsyncs, and the completion
-  // gate's second sync when it runs. One sample per such group.
+  // partitions: waiting for every record at or below its target to be
+  // written, then claiming and fsyncing the partitions holding them. One
+  // sample per such group.
   WAL_SYNC_BARRIER_MICROS,
   // Time (microseconds) external file ingestion holds writers out of every
   // WAL partition's write queue. One sample per ingestion.

@@ -39,14 +39,13 @@ namespace ROCKSDB_NAMESPACE {
 // instance whose ranges complete after the memtable insert instead; that
 // instance's safe point bounds what N>1 publishes (see PublishAppliedPrefix).
 //
-// Threading: same-partition Register/Complete calls must be externally
-// synchronized (in DBImpl, sequence_wal_index_mutex_ serializes every tracker
-// op, which also orders each registration before any later scan so no scan
-// can miss an outstanding range). Cross-partition concurrency is lock-free:
-// pending_low/durable_upto use release stores on the completing writer and
-// acquire loads on the scanner, so observing an advanced frontier observes
-// the WAL append that advanced it. min_owner_ is a relaxed hint; a stale read
-// only costs an extra rescan or a conservatively delayed advance, both safe.
+// Threading: Register/Complete/Release calls must be externally
+// synchronized (in DBImpl, wal_tracker_mutex_ serializes every tracker op,
+// which also orders each registration before any later scan so no scan can
+// miss an outstanding range, and keeps the min-owner hint exact so every
+// quiescent prefix ends with a rescan). The hint still tolerates relaxed
+// reads: a stale read only costs an extra rescan or a conservatively
+// delayed advance, both safe.
 class WalDurabilityTracker {
  public:
   // Idle partitions contribute infinity to the minimum. A separate in-flight
@@ -120,8 +119,12 @@ class WalDurabilityTracker {
   // to duplicates and does not advance past the shared value until every
   // entry carrying it completes, which is correct since an undurable commit
   // marker strands its transaction. Recomputes the safe point unless the
-  // partition's minimum is provably unchanged and unowned.
-  void Complete(size_t partition, uint64_t low, uint64_t high) {
+  // partition's minimum is provably unchanged and unowned. Returns whether
+  // the safe point may have advanced: callers wake frontier waiters only
+  // then. A true return is conservative (another thread may have advanced
+  // further, or the recompute may find no advance); a false return means
+  // this completion provably advanced nothing.
+  bool Complete(size_t partition, uint64_t low, uint64_t high) {
     assert(partition < partitions_.size());
     std::vector<Range>& fifo = partitions_[partition].inflight;
     size_t found = fifo.size();
@@ -135,7 +138,7 @@ class WalDurabilityTracker {
       // Unpaired completion: a bug in the caller. Assert in debug; tolerate
       // in release rather than corrupting the frontier.
       assert(false);
-      return;
+      return false;
     }
     const uint64_t old_pending =
         partitions_[partition].pending_low.load(std::memory_order_relaxed);
@@ -158,9 +161,9 @@ class WalDurabilityTracker {
     if (new_pending == old_pending) {
       // Minimum unchanged (a duplicate remains, or several entries shared
       // the old minimum): the global frontier cannot have moved.
-      return;
+      return false;
     }
-    Recompute(partition, new_pending);
+    return Recompute(partition, new_pending);
   }
 
   // Drops [low, high] on partition p as Complete does, if it is still
@@ -168,14 +171,15 @@ class WalDurabilityTracker {
   // failure succeeded: it holds no data, so it must stop holding the frontier
   // below every later write. Unlike Complete, an absent range is not a bug (a
   // group whose append landed and whose sync failed completed it already).
-  void Release(size_t partition, uint64_t low, uint64_t high) {
+  // Returns Complete's answer, or false when the range was already gone.
+  bool Release(size_t partition, uint64_t low, uint64_t high) {
     assert(partition < partitions_.size());
     for (const Range& r : partitions_[partition].inflight) {
       if (r.low == low && r.high == high) {
-        Complete(partition, low, high);
-        return;
+        return Complete(partition, low, high);
       }
     }
+    return false;
   }
 
   // Current durability frontier: every sequence at or below it is durable.
@@ -249,16 +253,18 @@ class WalDurabilityTracker {
   // new_pending. A linear scan over the contiguous atomic array beats a heap
   // at N = 4-32 on cache locality; when p does not own the minimum and is
   // still at or above it, the minimum is unchanged and the scan is skipped.
-  void Recompute(size_t completed_partition, uint64_t new_pending) {
+  // Returns whether a recompute ran (the safe point may have advanced).
+  bool Recompute(size_t completed_partition, uint64_t new_pending) {
     const size_t owner = min_owner_.load(std::memory_order_relaxed);
     if (completed_partition != owner) {
       const uint64_t owner_pending =
           partitions_[owner].pending_low.load(std::memory_order_acquire);
       if (new_pending >= owner_pending) {
-        return;
+        return false;
       }
     }
     ForceRecalculate();
+    return true;
   }
 
   // One partition's state, written by that partition's leader on every

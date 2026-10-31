@@ -1577,9 +1577,9 @@ struct DBOptions {
   // stream is a tail, handled as each mode handles a torn tail with one WAL.
   //
   // manual_wal_flush is supported but not recommended with more than one
-  // partition: FlushWAL() flushes every partition's buffer while holding every
-  // partition's WAL write lock, which re-imposes the coordinated flushing that
-  // partitions exist to avoid.
+  // partition: FlushWAL() flushes every partition's buffer, one partition at
+  // a time while holding only that partition's WAL write lock. A sync write
+  // flushes and fsyncs only the partitions holding records it depends on.
   //
   // With more than one partition, writes become visible in sequence order,
   // and a sync write becomes visible only once its record, and every record
