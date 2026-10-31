@@ -1576,14 +1576,16 @@ struct DBOptions {
   // the records above it; see WALRecoveryMode. A loss at the end of the
   // stream is a tail, handled as each mode handles a torn tail with one WAL.
   //
-  // manual_wal_flush is supported but not recommended with more than one
-  // partition: FlushWAL() flushes every partition's buffer while holding every
-  // partition's WAL write lock, which re-imposes the coordinated flushing that
-  // partitions exist to avoid.
+  // manual_wal_flush is supported with more than one partition. FlushWAL()
+  // writes each partition's buffer in turn, holding only that partition's
+  // WAL write lock, and a sync write writes only the buffers of the
+  // partitions holding records ordered before it.
   //
   // With more than one partition, writes become visible in sequence order,
   // and a sync write becomes visible only once its record, and every record
-  // ordered before it on any partition, is synced, as with one WAL. An
+  // ordered before it on any partition, is synced, as with one WAL. A sync
+  // write syncs only the partitions holding such records, so records
+  // ordered after it may stay unsynced, as any async write does. An
   // async write batched with a sync write is ordered before it and returns
   // without waiting for its sync; a write ordered after a pending sync write
   // becomes visible, and returns, only after that sync. If the sync fails,
