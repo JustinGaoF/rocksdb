@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <cstddef>
@@ -15,6 +16,7 @@
 #include "port/port.h"
 #include "rocksdb/rocksdb_namespace.h"
 #include "test_util/sync_point.h"
+#include "util/mutexlock.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -39,14 +41,17 @@ namespace ROCKSDB_NAMESPACE {
 // instance whose ranges complete after the memtable insert instead; that
 // instance's safe point bounds what N>1 publishes (see PublishAppliedPrefix).
 //
-// Threading: same-partition Register/Complete calls must be externally
-// synchronized (in DBImpl, sequence_wal_index_mutex_ serializes every tracker
-// op, which also orders each registration before any later scan so no scan
-// can miss an outstanding range). Cross-partition concurrency is lock-free:
-// pending_low/durable_upto use release stores on the completing writer and
-// acquire loads on the scanner, so observing an advanced frontier observes
-// the WAL append that advanced it. min_owner_ is a relaxed hint; a stale read
-// only costs an extra rescan or a conservatively delayed advance, both safe.
+// Threading: each partition's in-flight ranges are guarded by that
+// partition's own mutex, so its Register/Complete/Release calls may come
+// from any thread. Ranges must be registered in allocation order (in DBImpl,
+// under sequence_wal_index_mutex_, which issues them). Cross-partition
+// concurrency is lock-free: a scan first reads the highest registered
+// sequence, then every partition's pending low. A range registered before
+// that read is visible to the scan, and one registered after it lies above
+// it, so bounding the safe point by it means no scan passes an outstanding
+// range. Pending lows are stored and loaded sequentially consistent, so of
+// two partitions completing at once, the later scan sees both; observing an
+// advanced frontier observes the WAL append that advanced it.
 class WalDurabilityTracker {
  public:
   // Idle partitions contribute infinity to the minimum. A separate in-flight
@@ -70,7 +75,7 @@ class WalDurabilityTracker {
       partitions_[p].inflight.reserve(4);
     }
     safe_point_.store(0, std::memory_order_relaxed);
-    min_owner_.store(0, std::memory_order_relaxed);
+    registered_high_.store(0, std::memory_order_relaxed);
   }
 
   // No copying or moving: DBImpl owns one instance sized at construction.
@@ -79,14 +84,13 @@ class WalDurabilityTracker {
 
   size_t num_partitions() const { return partitions_.size(); }
 
-  // Records [low, high] as outstanding on partition p. Must be called before
-  // the allocation's counter advance is visible to other partitions' scans;
-  // in DBImpl this runs inside AllocateSequenceAndWALIndex under
-  // sequence_wal_index_mutex_. Never lowers the safe point: a newly allocated
-  // range is the highest yet, so the global minimum is unchanged (or moves
-  // from infinity to low - 1 == old maximum when leaving all-idle, which is
-  // also unchanged). Updates min_owner_ on that leaving-all-idle transition
-  // so a later Complete by another partition does not skip its rescan.
+  // Records [low, high] as outstanding on partition p. Ranges register in
+  // allocation order; in DBImpl this runs inside AllocateSequenceAndWALIndex
+  // under sequence_wal_index_mutex_, before the allocating writer does
+  // anything a scan could observe. Never lowers the safe point: a newly
+  // allocated range is the highest yet, so the global minimum is unchanged
+  // (or moves from infinity to low - 1 == old maximum when leaving
+  // all-idle, which is also unchanged).
   // high == low - 1 is an empty range (a record that consumes no sequence):
   // it pins low while outstanding, and completes durable only through
   // low - 1, the last sequence allocated when it registered.
@@ -94,22 +98,23 @@ class WalDurabilityTracker {
     assert(partition < partitions_.size());
     assert(low <= high + 1);
     assert(high != kIdle);
-    std::vector<Range>& fifo = partitions_[partition].inflight;
-    fifo.push_back({low, high});
-    uint64_t new_pending = kIdle;
-    for (const Range& r : fifo) {
-      if (r.low < new_pending) {
-        new_pending = r.low;
+    Partition& part = partitions_[partition];
+    {
+      MutexLock lock(&part.mu);
+      part.inflight.push_back({low, high});
+      uint64_t new_pending = kIdle;
+      for (const Range& r : part.inflight) {
+        if (r.low < new_pending) {
+          new_pending = r.low;
+        }
       }
+      part.pending_low.store(new_pending, std::memory_order_seq_cst);
     }
-    partitions_[partition].pending_low.store(new_pending,
-                                             std::memory_order_release);
-    // Leaving all-idle: the minimum was infinity, so it is now this range.
-    size_t owner = min_owner_.load(std::memory_order_relaxed);
-    if (partitions_[owner].pending_low.load(std::memory_order_acquire) ==
-            kIdle &&
-        new_pending != kIdle) {
-      min_owner_.store(partition, std::memory_order_relaxed);
+    // After the pending low: a scan that reads this bound sees the range.
+    uint64_t cur = registered_high_.load(std::memory_order_relaxed);
+    while (high > cur && !registered_high_.compare_exchange_weak(
+                             cur, high, std::memory_order_seq_cst,
+                             std::memory_order_relaxed)) {
     }
   }
 
@@ -120,47 +125,16 @@ class WalDurabilityTracker {
   // to duplicates and does not advance past the shared value until every
   // entry carrying it completes, which is correct since an undurable commit
   // marker strands its transaction. Recomputes the safe point unless the
-  // partition's minimum is provably unchanged and unowned.
+  // partition's minimum is unchanged.
   void Complete(size_t partition, uint64_t low, uint64_t high) {
     assert(partition < partitions_.size());
-    std::vector<Range>& fifo = partitions_[partition].inflight;
-    size_t found = fifo.size();
-    for (size_t i = 0; i < fifo.size(); ++i) {
-      if (fifo[i].low == low && fifo[i].high == high) {
-        found = i;
-        break;
-      }
+    bool found = false;
+    if (Remove(partition, low, high, &found)) {
+      ForceRecalculate();
     }
-    if (found == fifo.size()) {
-      // Unpaired completion: a bug in the caller. Assert in debug; tolerate
-      // in release rather than corrupting the frontier.
-      assert(false);
-      return;
-    }
-    const uint64_t old_pending =
-        partitions_[partition].pending_low.load(std::memory_order_relaxed);
-    fifo[found] = fifo.back();
-    fifo.pop_back();
-    const uint64_t cur_durable =
-        partitions_[partition].durable_upto.load(std::memory_order_relaxed);
-    if (high > cur_durable) {
-      partitions_[partition].durable_upto.store(high,
-                                                std::memory_order_release);
-    }
-    uint64_t new_pending = kIdle;
-    for (const Range& r : fifo) {
-      if (r.low < new_pending) {
-        new_pending = r.low;
-      }
-    }
-    partitions_[partition].pending_low.store(new_pending,
-                                             std::memory_order_release);
-    if (new_pending == old_pending) {
-      // Minimum unchanged (a duplicate remains, or several entries shared
-      // the old minimum): the global frontier cannot have moved.
-      return;
-    }
-    Recompute(partition, new_pending);
+    // Unpaired completion: a bug in the caller. Assert in debug; tolerate in
+    // release rather than corrupting the frontier.
+    assert(found);
   }
 
   // Drops [low, high] on partition p as Complete does, if it is still
@@ -170,11 +144,9 @@ class WalDurabilityTracker {
   // group whose append landed and whose sync failed completed it already).
   void Release(size_t partition, uint64_t low, uint64_t high) {
     assert(partition < partitions_.size());
-    for (const Range& r : partitions_[partition].inflight) {
-      if (r.low == low && r.high == high) {
-        Complete(partition, low, high);
-        return;
-      }
+    bool found = false;
+    if (Remove(partition, low, high, &found)) {
+      ForceRecalculate();
     }
   }
 
@@ -194,22 +166,20 @@ class WalDurabilityTracker {
     return partitions_[partition].durable_upto.load(std::memory_order_acquire);
   }
 
-  // Full rescan ignoring the min-owner shortcut. Tests use it after joining
-  // concurrent threads to shake out stale-hint delays deterministically; the
-  // write path never needs it because the owning partition's own completion
-  // always rescans.
+  // Full rescan, which every completion that moved its partition's minimum
+  // runs. Tests also call it after joining concurrent threads.
   void ForceRecalculate() {
+    // First: every range at or below it is visible below (see Threading).
+    const uint64_t registered =
+        registered_high_.load(std::memory_order_seq_cst);
     uint64_t min_pending = kIdle;
-    size_t owner = 0;
     for (size_t p = 0; p < partitions_.size(); ++p) {
       const uint64_t v =
-          partitions_[p].pending_low.load(std::memory_order_acquire);
+          partitions_[p].pending_low.load(std::memory_order_seq_cst);
       if (v < min_pending) {
         min_pending = v;
-        owner = p;
       }
     }
-    min_owner_.store(owner, std::memory_order_relaxed);
     if (min_pending == kIdle) {
       uint64_t max_durable = 0;
       for (size_t p = 0; p < partitions_.size(); ++p) {
@@ -219,9 +189,9 @@ class WalDurabilityTracker {
           max_durable = d;
         }
       }
-      AdvanceSafePoint(max_durable);
+      AdvanceSafePoint(std::min(max_durable, registered));
     } else {
-      uint64_t candidate = min_pending - 1;
+      uint64_t candidate = std::min(min_pending - 1, registered);
       if (safe_point_test_hook_) {
         // Lets the prefix oracle's self-test shift the safe point by one.
         TEST_SYNC_POINT_CALLBACK(
@@ -240,32 +210,56 @@ class WalDurabilityTracker {
   void AdvanceSafePoint(uint64_t candidate) {
     uint64_t cur = safe_point_.load(std::memory_order_acquire);
     while (candidate > cur && !safe_point_.compare_exchange_weak(
-                                  cur, candidate, std::memory_order_release,
+                                  cur, candidate, std::memory_order_seq_cst,
                                   std::memory_order_acquire)) {
     }
   }
 
-  // Recomputes W = min(pending_low) after partition p advanced to
-  // new_pending. A linear scan over the contiguous atomic array beats a heap
-  // at N = 4-32 on cache locality; when p does not own the minimum and is
-  // still at or above it, the minimum is unchanged and the scan is skipped.
-  void Recompute(size_t completed_partition, uint64_t new_pending) {
-    const size_t owner = min_owner_.load(std::memory_order_relaxed);
-    if (completed_partition != owner) {
-      const uint64_t owner_pending =
-          partitions_[owner].pending_low.load(std::memory_order_acquire);
-      if (new_pending >= owner_pending) {
-        return;
+  // Removes one occurrence of [low, high] from partition p, setting *found.
+  // Returns whether p's minimum moved, so the global frontier may have.
+  bool Remove(size_t partition, uint64_t low, uint64_t high, bool* found) {
+    Partition& part = partitions_[partition];
+    MutexLock lock(&part.mu);
+    std::vector<Range>& fifo = part.inflight;
+    size_t index = fifo.size();
+    for (size_t i = 0; i < fifo.size(); ++i) {
+      if (fifo[i].low == low && fifo[i].high == high) {
+        index = i;
+        break;
       }
     }
-    ForceRecalculate();
+    *found = index != fifo.size();
+    if (!*found) {
+      return false;
+    }
+    const uint64_t old_pending =
+        part.pending_low.load(std::memory_order_relaxed);
+    fifo[index] = fifo.back();
+    fifo.pop_back();
+    const uint64_t cur_durable =
+        part.durable_upto.load(std::memory_order_relaxed);
+    if (high > cur_durable) {
+      part.durable_upto.store(high, std::memory_order_release);
+    }
+    uint64_t new_pending = kIdle;
+    for (const Range& r : fifo) {
+      if (r.low < new_pending) {
+        new_pending = r.low;
+      }
+    }
+    part.pending_low.store(new_pending, std::memory_order_seq_cst);
+    // Minimum unchanged (a duplicate remains, or several entries shared the
+    // old minimum): the global frontier cannot have moved.
+    return new_pending != old_pending;
   }
 
-  // One partition's state, written by that partition's leader on every
-  // register and complete. Each starts its own cache line, so leaders of
-  // different partitions never write a shared line (no false sharing); the
-  // rescan reads one line per partition.
+  // One partition's state, written on every register and complete of its
+  // ranges. Each starts its own cache line, so leaders of different
+  // partitions never write a shared line (no false sharing); the rescan
+  // reads one line per partition.
   struct ALIGN_AS(CACHE_LINE_SIZE) Partition {
+    // Guards `inflight` and orders the stores below for one partition.
+    port::Mutex mu;
     // Lowest outstanding low, or kIdle when empty.
     std::atomic<uint64_t> pending_low{kIdle};
     // Highest completed high. Only read when all partitions are idle, where
@@ -284,7 +278,8 @@ class WalDurabilityTracker {
 
   std::vector<Partition> partitions_;
   std::atomic<uint64_t> safe_point_{0};
-  std::atomic<size_t> min_owner_{0};
+  // The highest sequence registered so far, which bounds every scan.
+  std::atomic<uint64_t> registered_high_{0};
   const bool safe_point_test_hook_;
 };
 

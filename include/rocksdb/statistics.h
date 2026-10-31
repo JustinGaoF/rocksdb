@@ -879,7 +879,9 @@ enum Histograms : uint32_t {
   // writers that link uncontended record ~0. In the same unit as
   // WAL_DURABILITY_WAIT_MICROS, so the two wait distributions can be compared
   // directly: this one is the queueing that write-partition routing could
-  // relieve, the durability wait is what it cannot touch.
+  // relieve, the durability wait is what it cannot touch. Recorded only at
+  // stats levels above kExceptDetailedTimers; at or below it no clock is
+  // read.
   JOIN_BATCH_GROUP_WAIT_MICROS,
 
   // The histograms below record only with wal_partitions > 1 (EXPERIMENTAL).
@@ -891,16 +893,19 @@ enum Histograms : uint32_t {
   // Time (microseconds) from the start of a write group's WAL append to the
   // durability tracker marking its range complete. One sample per group.
   WAL_PARTITION_COMPLETION_MICROS,
-  // Number of WAL partitions a sync=true write group fsynced. One sample per
-  // such group.
+  // Number of WAL partitions a sync=true write group's sync fsynced: only
+  // those holding unsynced data the group depends on. One sample per sync
+  // the group runs.
   WAL_SYNC_FSYNCED_PARTITIONS,
-  // Number of WAL partitions that held bytes not covered by an earlier sync
-  // when a sync=true write group claimed them: an upper bound on the
-  // partitions that sync had to persist. One sample per such group.
+  // Number of WAL partitions holding an unsynced record at or below a
+  // sync=true write group's sequence when its sync claimed them: the
+  // partitions that sync had to persist. One sample per sync the group runs.
   WAL_SYNC_UNSYNCED_PARTITIONS,
   // Time (microseconds) a sync=true write group spends syncing across WAL
-  // partitions: claiming every partition, the fsyncs, and the completion
-  // gate's second sync when it runs. One sample per such group.
+  // partitions: the wait for every lower sequence number to reach the WAL,
+  // then one sync of the partitions holding records it depends on (claim
+  // and fsyncs); for a WAL-only write, its sync and the completion gate's
+  // second sync when it runs. One sample per such group.
   WAL_SYNC_BARRIER_MICROS,
   // Time (microseconds) external file ingestion holds writers out of every
   // WAL partition's write queue. One sample per ingestion.

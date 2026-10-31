@@ -265,6 +265,8 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
     wals_to_free_ = decltype(wals_to_free_)(num_wal_partitions);
     last_batch_group_size_ =
         decltype(last_batch_group_size_)(num_wal_partitions);
+    leaders_past_switch_gate_ =
+        decltype(leaders_past_switch_gate_)(num_wal_partitions);
   }
   for (size_t p = 0; p < num_wal_partitions; ++p) {
     write_threads_.emplace_back(
@@ -930,7 +932,7 @@ void DBImpl::CancelAllBackgroundWork(bool wait) {
   if (NumWalPartitions() > 1) {
     // Writes parked in their completion gate return ShutdownInProgress
     // unless already covered, as a stalled write does.
-    InstrumentedMutexLock seq_lock(&sequence_wal_index_mutex_);
+    InstrumentedMutexLock seq_lock(&wal_durability_wait_mutex_);
     wal_durability_cv_.SignalAll();
   }
   env_->UnSchedule(&bg_async_file_open_state_, Env::Priority::HIGH);
@@ -1204,7 +1206,7 @@ Status DBImpl::CloseHelper() {
     // the gate's mutex and cv are freed with this DB, so wait for them to
     // leave. A write reaching its gate after this point is a write
     // concurrent with Close(), which is unsupported.
-    InstrumentedMutexLock seq_lock(&sequence_wal_index_mutex_);
+    InstrumentedMutexLock seq_lock(&wal_durability_wait_mutex_);
     while (wal_durability_waiters_.load(std::memory_order_relaxed) > 0) {
       wal_durability_cv_.Wait();
     }
@@ -2405,15 +2407,17 @@ Status DBImpl::FlushWAL(const WriteOptions& write_options, bool sync) {
     {
       // We need to lock since the WAL writers might change concurrently.
       // Every partition's current WAL is flushed: the application-visible
-      // "flush the buffered WAL data" covers all partitions, and holding
-      // all N excludes a concurrent AddRecord on any of them (see
-      // WriteToWAL).
-      AllWalWriteMutexesLock wl(this);
+      // "flush the buffered WAL data" covers all partitions. Each buffer is
+      // written under its own partition's mutex only, which excludes a
+      // concurrent AddRecord on it (see WriteToWAL), one partition at a
+      // time (D-F2d).
       for (size_t p = 0; p < NumWalPartitions(); ++p) {
+        WalWriteMutexLock wl(&WalWriteMutex(p));
         const LogWriterNumber* current_wal = CurrentWalOrNull(p);
         if (current_wal == nullptr) {
           continue;
         }
+        TEST_SYNC_POINT_CALLBACK("DBImpl::FlushWAL:BeforeWriteBuffer", &p);
         io_s = current_wal->writer->WriteBuffer(write_options);
         if (!io_s.ok()) {
           failed_wal_number = current_wal->number;
@@ -2862,6 +2866,65 @@ bool DBImpl::ClaimWalPartitionForLeadershipSync(size_t partition,
   return true;
 }
 
+bool DBImpl::ClaimWalPartitionForGateSync(size_t partition,
+                                          SequenceNumber claim_bound,
+                                          uint32_t* unsynced_partitions,
+                                          std::vector<GateSyncPartition>* claim,
+                                          bool* previously_failed) {
+  wal_sync_mark_mutex_.AssertHeld();
+  WalWriteMutex(partition).AssertHeld();
+  std::deque<LogWriterNumber>& logs = logs_[partition];
+  // The number of WALs to mark: the prefix through the last one that needs
+  // this sync. Unsynced records are a suffix of each file, and a file's
+  // records lie below the next file's, so every WAL ahead of a needed one
+  // either needs the sync too or holds nothing unsynced.
+  auto claim_length = [&logs, claim_bound]() {
+    size_t length = 0;
+    for (size_t i = 0; i < logs.size(); ++i) {
+      if (logs[i].NeedsGateSync(claim_bound)) {
+        length = i + 1;
+      }
+    }
+    return length;
+  };
+  if (claim_length() == 0) {
+    return false;
+  }
+  while (logs.front().IsSyncing()) {
+    WalSyncCV(partition).Wait();
+  }
+  // The wait can sync or retire what needed this sync.
+  const size_t length = claim_length();
+  if (length == 0) {
+    return false;
+  }
+  GateSyncPartition claimed;
+  claimed.partition = partition;
+  bool unsynced = false;
+  for (size_t i = 0; i < length; ++i) {
+    LogWriterNumber& log = logs[i];
+    const bool is_current = i + 1 == logs.size();
+    unsynced = unsynced || log.HoldsUnsyncedRecordUpTo(claim_bound);
+    log.PrepareForSync();
+    if (log.number <= wal_recovery_cutoff_.load(std::memory_order_acquire)) {
+      // As in SyncWalImpl: a failed handle is unusable, and recovery
+      // persists what this WAL holds. The caller reports the stored
+      // background error instead.
+      *previously_failed = true;
+      continue;
+    }
+    if (log.writer->file() != nullptr &&
+        log.writer->file()->GetFileSize() > log.synced_size) {
+      claimed.files.push_back({log.writer, log.number, is_current, {}});
+    }
+  }
+  *unsynced_partitions += unsynced ? 1 : 0;
+  if (!claimed.files.empty()) {
+    claim->push_back(std::move(claimed));
+  }
+  return true;
+}
+
 bool DBImpl::ClaimWalPartitionForSyncWalImpl(
     size_t partition, bool include_current_wal,
     autovector<std::pair<log::Writer*, bool>, 1>* wals_to_sync) {
@@ -3011,10 +3074,16 @@ void DBImpl::FinishWalPartitionSync(size_t partition, uint64_t up_to,
   auto note_synced = [this](LogWriterNumber& wal) {
     if (wal.number > wal_recovery_cutoff_.load(std::memory_order_acquire)) {
       wal.synced_size = std::max(wal.synced_size, wal.GetPreSyncSize());
+      wal.NoteSynced();
     }
   };
   for (auto it = logs_[partition].begin(); it != logs_[partition].end();) {
     auto& wal = *it;
+    if (!wal.IsSyncing()) {
+      // The marks are a prefix of the deque, which a gate sync may end
+      // early (ClaimWalPartitionForGateSync): nothing past it is this sync's.
+      break;
+    }
     if (wal.number > up_to) {
       // Beyond the sync horizon: another partition's WAL, numbered above
       // cur_wal_number_ (the lowest live number at N > 1), or a WAL that
@@ -3075,6 +3144,10 @@ void DBImpl::CancelWalPartitionSync(size_t partition, uint64_t up_to) {
   WalWriteMutex(partition).AssertHeld();
   for (auto it = logs_[partition].begin(); it != logs_[partition].end(); ++it) {
     auto& wal = *it;
+    if (!wal.IsSyncing()) {
+      // As in FinishWalPartitionSync: the marks are a prefix.
+      break;
+    }
     // As in FinishWalPartitionSync: logs past the horizon are never the
     // failure's, but a mark left on them hangs the next sync all the same.
     if (wal.number > up_to) {

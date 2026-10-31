@@ -314,6 +314,12 @@ std::vector<std::pair<uint64_t, bool>> DBImpl::TEST_WalSyncMarks(
   return marks;
 }
 
+bool DBImpl::TEST_WalBufferIsEmpty(size_t partition) {
+  WalWriteMutexLock wl(&WalWriteMutex(partition));
+  const LogWriterNumber* current_wal = CurrentWalOrNull(partition);
+  return current_wal == nullptr || current_wal->writer->BufferIsEmpty();
+}
+
 bool DBImpl::TEST_IsRecoveryInProgress() {
   InstrumentedMutexLock l(&mutex_);
   return error_handler_.IsRecoveryInProgress();
