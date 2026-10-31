@@ -146,12 +146,16 @@ static_assert(kWALIndexMarkerType < kRecordTypeSafeIgnoreMask &&
                   kWALIndexVoidType < kRecordTypeSafeIgnoreMask &&
                   kRecyclableWALIndexVoidType < kRecordTypeSafeIgnoreMask,
               "WAL index record types must fail closed on older readers");
-static_assert(kRecyclableWALIndexSupersessionType < kRecordTypeSafeIgnoreMask,
+static_assert(kWALIndexSupersessionType < kRecordTypeSafeIgnoreMask &&
+                  kRecyclableWALIndexSupersessionType <
+                      kRecordTypeSafeIgnoreMask,
               "WAL index supersession types must fail closed on older readers");
-static_assert(kRecyclableWALIndexProgressType < kRecordTypeSafeIgnoreMask,
+static_assert(kWALIndexProgressType < kRecordTypeSafeIgnoreMask &&
+                  kRecyclableWALIndexProgressType < kRecordTypeSafeIgnoreMask,
               "WAL index progress types must fail closed on older readers");
-static_assert(kRecyclableWALIndexPredecessorSpanType <
-                  kRecordTypeSafeIgnoreMask,
+static_assert(kWALIndexPredecessorSpanType < kRecordTypeSafeIgnoreMask &&
+                  kRecyclableWALIndexPredecessorSpanType <
+                      kRecordTypeSafeIgnoreMask,
               "WAL index predecessor span types must fail closed on older "
               "readers");
 

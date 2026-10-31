@@ -1694,6 +1694,26 @@ Status DBImpl::WriteImpl(
     // PreReleaseCallback is called after WAL write and before memtable write;
     // a sync group's sync writers' callbacks run from its completion gate,
     // once fsynced (RunSyncGate).
+    // Above one partition a range below this group can still fail (a sync
+    // write's fsync), and this group with it. Its async writers' callbacks
+    // (2PC: AddCommitted, AddPrepared) cannot be undone, so they run only
+    // once every range below the group is published: a failure there fails
+    // the group before any callback runs (D-GC27a).
+    if (status.ok() && NumWalPartitions() > 1 &&
+        (sync_group ? async_pre_release_callback_cnt
+                    : pre_release_callback_cnt) > 0) {
+      // A disableWAL group registered no record, so the frontier may never
+      // pass its own range; publication of the ranges below is what it needs.
+      status = WaitForWalDurability(current_sequence - 1,
+                                    /*wal_record=*/!write_options.disableWAL,
+                                    /*published=*/true);
+      if (!status.ok() && !status.IsShutdownInProgress() &&
+          WalGateFenceStatus(current_sequence).ok()) {
+        // The fence ends below this group: Resume() covered the failure
+        // before this group allocated, so it cannot fail with it.
+        status = Status::OK();
+      }
+    }
     if (status.ok()) {
       SequenceNumber next_sequence = current_sequence;
       size_t index = 0;
@@ -3422,10 +3442,12 @@ void DBImpl::ClearWalDurabilityBGError() {
 
 Status DBImpl::BurnedWALIndexLanded(uint64_t wal_number, uint64_t wal_index,
                                     uint64_t wal_offset, bool* landed,
-                                    uint64_t* torn_end) {
+                                    uint64_t* torn_begin, uint64_t* torn_end) {
   assert(landed != nullptr);
+  assert(torn_begin != nullptr);
   assert(torn_end != nullptr);
   *landed = false;
+  *torn_begin = wal_offset;
   *torn_end = 0;
   const std::string fname =
       LogFileName(immutable_db_options_.GetWalDir(), wal_number);
@@ -3457,11 +3479,14 @@ Status DBImpl::BurnedWALIndexLanded(uint64_t wal_number, uint64_t wal_index,
                      /*checksum=*/true, wal_number);
   std::string scratch;
   Slice record;
+  // End of the last whole record read back, where a torn one begins.
+  uint64_t whole_end = 0;
   while (reader.ReadRecord(&record, &scratch)) {
     if (reader.GetLastReadWALIndex() >= wal_index) {
       *landed = reader.GetLastReadWALIndex() == wal_index;
       break;
     }
+    whole_end = reader.LastRecordEnd();
   }
   TEST_SYNC_POINT_CALLBACK("DBImpl::BurnedWALIndexLanded:Read",
                            &reporter.io_error);
@@ -3476,6 +3501,9 @@ Status DBImpl::BurnedWALIndexLanded(uint64_t wal_number, uint64_t wal_index,
     s = fs_->GetFileSize(fname, IOOptions(), &size, /*dbg=*/nullptr);
     if (s.ok() && size > wal_offset) {
       *torn_end = size;
+      if (whole_end != 0 && whole_end < wal_offset) {
+        *torn_begin = whole_end;
+      }
     }
   }
   return s;
@@ -3514,9 +3542,11 @@ Status DBImpl::ExplainBurnedWALIndices(const WriteOptions& write_options) {
     std::unordered_set<uint64_t> wals_to_sync;
     for (const BurnedWalIndex& b : burned) {
       bool b_landed = false;
+      uint64_t b_torn_begin = 0;
       uint64_t b_torn_end = 0;
-      io_s = status_to_io_status(BurnedWALIndexLanded(
-          b.wal_number, b.wal_index, b.wal_offset, &b_landed, &b_torn_end));
+      io_s = status_to_io_status(
+          BurnedWALIndexLanded(b.wal_number, b.wal_index, b.wal_offset,
+                               &b_landed, &b_torn_begin, &b_torn_end));
       if (io_s.ok() && b_torn_end != 0) {
         // Unreadable in every mode, but point-in-time and absolute read it
         // as a lost tail below the writes Resume admits. Zeroes read as
@@ -3525,7 +3555,7 @@ Status DBImpl::ExplainBurnedWALIndices(const WriteOptions& write_options) {
                        "[WAL recovery] Burned WAL index %" PRIu64
                        " landed torn in WAL #%" PRIu64
                        "; zeroing bytes %" PRIu64 " to %" PRIu64,
-                       b.wal_index, b.wal_number, b.wal_offset, b_torn_end);
+                       b.wal_index, b.wal_number, b_torn_begin, b_torn_end);
         IOOptions opts;
         io_s = WritableFileWriter::PrepareIOOptions(write_options, opts);
         std::unique_ptr<FSRandomRWFile> file;
@@ -3536,8 +3566,8 @@ Status DBImpl::ExplainBurnedWALIndices(const WriteOptions& write_options) {
         }
         if (io_s.ok()) {
           const std::string zeroes(
-              static_cast<size_t>(b_torn_end - b.wal_offset), '\0');
-          io_s = file->Write(b.wal_offset, zeroes, opts, /*dbg=*/nullptr);
+              static_cast<size_t>(b_torn_end - b_torn_begin), '\0');
+          io_s = file->Write(b_torn_begin, zeroes, opts, /*dbg=*/nullptr);
         }
         if (io_s.ok()) {
           io_s = immutable_db_options_.use_fsync

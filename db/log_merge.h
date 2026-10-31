@@ -283,10 +283,12 @@ class WALIndexMerger {
   // be bounded and fails the open rather than being skipped.
   //
   // `sequence_of` projects the witness sequence number from an emitted
-  // record's payload. The merge checks it never decreases across indexed
-  // emissions (unindexed records are skipped) and fails closed otherwise; it
-  // returns non-OK when the payload holds no readable sequence. Equal is
-  // allowed: empty batches consume an index but no sequence.
+  // record's payload. The merge checks that each indexed emission starts at
+  // or above the previous one's sequence plus what NoteConsumed reported for
+  // it (unindexed records are skipped) and fails closed otherwise; it returns
+  // non-OK when the payload holds no readable sequence. Equal is allowed
+  // after a record that consumed no sequence: empty batches and prepare
+  // sections take an index but no sequence.
   //
   // `continue_past_discarded_holes` skips superseded-only holes even when a
   // torn tail covers them, instead of stopping at the frontier. Recovery
@@ -323,6 +325,18 @@ class WALIndexMerger {
   // set, valid until the next call. Terminal results (kCleanEnd, kFrontier,
   // kError) are sticky; kWaiting and kTailGap resume on the next call.
   Result Next(Slice* record);
+
+  // How many sequences the record just emitted consumed, as replaying it
+  // advanced the next sequence. The next indexed emission must start at or
+  // above its sequence plus `consumed`. Without a call (as for empty and
+  // unindexed records, or a caller that cannot count) it is zero, and only
+  // first sequences are compared. Under-counting can only miss an overlap.
+  void NoteConsumed(uint64_t consumed) {
+    if (consumed_pending_) {
+      last_consumed_ = consumed;
+      consumed_pending_ = false;
+    }
+  }
 
   // First unexplained index. Valid after kFrontier; after kCleanEnd it is one
   // past the highest explained index, or zero when no index was explained.
@@ -466,6 +480,16 @@ class WALIndexMerger {
 
   MemberState* FindState(uint64_t wal_number);
 
+  // Whether a declaration obsoletes the void `wal_number` holds over `index`
+  // (D-2). A supersession record names a file and the first obsolete index,
+  // and reaches the file's voids from the declaring WAL's start index on:
+  // its span's last plus one, or its head floor. An open seeds past every
+  // void below that start, so those voids still explain their indices; the
+  // ones at or above it may have been reissued. A declarer attesting no
+  // start supersedes no void. Sets *declarer to the lowest declaring WAL.
+  bool VoidSuperseded(uint64_t wal_number, uint64_t index,
+                      uint64_t* declarer) const;
+
   std::vector<std::unique_ptr<Member>> members_;
   std::set<uint64_t> expected_wals_;
   std::function<Status(Slice, SequenceNumber*)> sequence_of_;
@@ -489,6 +513,12 @@ class WALIndexMerger {
   uint64_t lower_ = 0;
   uint64_t expected_ = 0;
   uint64_t last_sequence_ = 0;
+  // The last record that advanced last_sequence_: its index, its WAL, and
+  // the sequences NoteConsumed reported for it while consumed_pending_.
+  uint64_t last_sequence_index_ = 0;
+  uint64_t last_sequence_wal_ = 0;
+  uint64_t last_consumed_ = 0;
+  bool consumed_pending_ = false;
   uint64_t last_emitted_index_ = 0;
   const Member* last_emitted_member_ = nullptr;
   uint64_t last_emitted_checksum_ = 0;
@@ -511,6 +541,10 @@ class WALIndexMerger {
   uint64_t lost_floor_ = std::numeric_limits<uint64_t>::max();
   uint64_t lost_predecessor_ = 0;
   std::set<uint64_t> attested_wals_;
+  // For each held predecessor a span attests: the lowest attested last and
+  // the attesting WAL. A live record above it was written after its
+  // successor's creation, which excluded every writer.
+  std::map<uint64_t, std::pair<uint64_t, uint64_t>> attested_last_;
   // [first, last] spans attested for predecessors below the retirement
   // bound. An index in one that no member holds or explains was the retired
   // file's.

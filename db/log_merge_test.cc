@@ -1994,6 +1994,303 @@ TEST_P(LogMergeTest, SkipUnexplainedHolesEmitsAboveThem) {
   }
 }
 
+namespace {
+// Drives `merger` to a terminal result, reporting each emitted indexed
+// record's consumption from `consumed` (by index) as recovery reports what
+// replay advanced, and collecting the emitted indices.
+WALIndexMerger::Result DriveNoting(WALIndexMerger* merger,
+                                   const std::map<uint64_t, uint64_t>& consumed,
+                                   std::vector<uint64_t>* indices) {
+  Slice record;
+  for (int rounds = 0; rounds < 10000; ++rounds) {
+    const WALIndexMerger::Result r = merger->Next(&record);
+    if (r == WALIndexMerger::Result::kRecord) {
+      const uint64_t index = merger->GetLastEmittedWALIndex();
+      indices->push_back(index);
+      const auto it = consumed.find(index);
+      if (it != consumed.end()) {
+        merger->NoteConsumed(it->second);
+      }
+    } else if (r != WALIndexMerger::Result::kTailGap &&
+               r != WALIndexMerger::Result::kWaiting) {
+      return r;
+    }
+  }
+  ADD_FAILURE() << "merge did not terminate";
+  return WALIndexMerger::Result::kWaiting;
+}
+}  // namespace
+
+// GC27 Q1 (D-2): a recovery start supersedes the voids of the files it
+// declares as well as their records. 121 starts at index 4 (its span's last
+// is 3) and declares 120 obsolete from 4; 120's records 4 and 5 and its void
+// over 6 are all obsolete, so 121's reissued 4..7 merge. Neuter: check voids
+// before supersession (as before); the merge fails at 6.
+TEST_P(LogMergeTest, GC27SupersededVoidPlusReissuedRecordMerges) {
+  MemberFile old(120, recyclable());
+  MemberFile young(121, recyclable());
+  ASSERT_OK(old.Marker());
+  for (uint64_t i = 1; i <= 5; ++i) {
+    ASSERT_OK(old.Data("o" + std::to_string(i), i, i));
+  }
+  ASSERT_OK(old.Void(6, 6));
+  ASSERT_OK(young.Marker());
+  ASSERT_OK(young.Span(120, 1, 3));
+  ASSERT_OK(young.Sup(120, 4));
+  for (uint64_t i = 4; i <= 7; ++i) {
+    ASSERT_OK(young.Data("n" + std::to_string(i), i, i));
+  }
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(old, old.Bytes()));
+  members.push_back(MakeMember(young, young.Bytes()));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome)
+      << merger->GetError().ToString();
+  ASSERT_EQ(std::vector<uint64_t>({1, 2, 3, 4, 5, 6, 7}),
+            DrivenIndices(driven));
+  for (size_t i = 3; i < 7; ++i) {
+    EXPECT_EQ("n" + std::to_string(i + 1),
+              driven.records[i].payload.substr(kWALIndexSize));
+  }
+}
+
+// A void stays live below its declarer's start: an open seeds past every void
+// below its start, so such a void explains its index and still contradicts
+// a record there. 121 starts at 7 (span last 6) and declares 120 obsolete
+// from 4, which reaches 120's records 4 and 5 but not its void over 6, so
+// 121's record at 6 contradicts it. The message names both WALs (Q5 (c)).
+TEST_P(LogMergeTest, GC27UnsupersededVoidPlusRecordStillFails) {
+  MemberFile old(120, recyclable());
+  MemberFile young(121, recyclable());
+  ASSERT_OK(old.Marker());
+  for (uint64_t i = 1; i <= 5; ++i) {
+    ASSERT_OK(old.Data("o" + std::to_string(i), i, i));
+  }
+  ASSERT_OK(old.Void(6, 6));
+  ASSERT_OK(young.Marker());
+  ASSERT_OK(young.Span(120, 1, 6));
+  ASSERT_OK(young.Sup(120, 4));
+  ASSERT_OK(young.Data("n6", 6, 6));
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(old, old.Bytes()));
+  members.push_back(MakeMember(young, young.Bytes()));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kError, driven.outcome);
+  EXPECT_NE(std::string::npos,
+            merger->GetError().ToString().find(
+                "index 6 bears records (WAL 121) and a void cover (WAL 120)"))
+      << merger->GetError().ToString();
+}
+
+// The inverted sibling of VoidCoverPlusSupersededDataFails: the same layout,
+// with the declarer attesting its start at 4 (span last 3). The void over 4..6
+// that shares a file with the data is then obsolete with it, and the merge
+// ends clean after 1..3, the superseded indices never reissued. The original
+// keeps failing: its declarer attests no start, so its supersession reaches
+// records only.
+TEST_P(LogMergeTest, GC27VoidCoverPlusSupersededDataFromStartMerges) {
+  for (const bool attests_start : {false, true}) {
+    SCOPED_TRACE(attests_start ? "declarer attests its start" : "no start");
+    MemberFile a(120, recyclable());
+    MemberFile b(121, recyclable());
+    ASSERT_OK(a.Marker());
+    ASSERT_OK(a.Data("a1", 1, 1));
+    ASSERT_OK(a.Data("a2", 2, 2));
+    ASSERT_OK(a.Data("a3", 3, 3));
+    ASSERT_OK(a.Void(4, 6));
+    ASSERT_OK(a.Data("a4", 4, 4));
+    ASSERT_OK(a.Data("a5", 5, 5));
+    ASSERT_OK(a.Data("a6", 6, 6));
+    ASSERT_OK(b.Marker());
+    if (attests_start) {
+      ASSERT_OK(b.Span(120, 1, 3));
+    }
+    ASSERT_OK(b.Sup(120, 4));
+
+    std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+    members.push_back(MakeMember(a, a.Bytes()));
+    members.push_back(MakeMember(b, b.Bytes()));
+    auto merger = MakeMerger(std::move(members), {120, 121});
+    DriveResult driven = Drive(merger.get());
+    ASSERT_EQ(std::vector<uint64_t>({1, 2, 3}), DrivenIndices(driven));
+    if (attests_start) {
+      ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome)
+          << merger->GetError().ToString();
+      EXPECT_EQ(7U, merger->GetFrontier());
+    } else {
+      ASSERT_EQ(WALIndexMerger::Result::kError, driven.outcome);
+      EXPECT_NE(std::string::npos,
+                merger->GetError().ToString().find("void cover"));
+    }
+  }
+}
+
+// A superseded void explains nothing: its index is superseded-only, so a live
+// record above it, with the reissue of the void's index missing, stops the
+// merge there rather than skipping it as a void would. GC19's exception (a
+// void below the declarer clears a pending index) counts live voids only.
+// Neuter: let a superseded void explain its index; 4 is emitted.
+TEST_P(LogMergeTest, GC27SupersededVoidDoesNotExplainItsIndex) {
+  MemberFile old(120, recyclable());
+  MemberFile young(121, recyclable());
+  ASSERT_OK(old.Marker());
+  ASSERT_OK(old.Data("o1", 1, 1));
+  ASSERT_OK(old.Data("o2", 2, 2));
+  ASSERT_OK(old.Void(3, 3));
+  ASSERT_OK(young.Marker());
+  ASSERT_OK(young.Span(120, 1, 2));
+  ASSERT_OK(young.Sup(120, 3));
+  ASSERT_OK(young.Data("n4", 4, 4));
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(old, old.Bytes()));
+  members.push_back(MakeMember(young, young.Bytes()));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kFrontier, driven.outcome);
+  EXPECT_EQ(3U, merger->GetFrontier());
+  EXPECT_TRUE(merger->FrontierIsPendingDiscard());
+  ASSERT_EQ(std::vector<uint64_t>({1, 2}), DrivenIndices(driven));
+}
+
+// Detection kept (Q1): rotation excludes every writer, so a held predecessor
+// bears nothing above the last index its successor attests. 121 attests 120
+// as [1, 2]; 120's live record at 3 fails, naming both WALs and the index.
+// Neuter: drop the check; the merge emits 1..4.
+TEST_P(LogMergeTest, GC27HeldPredecessorAboveAttestedLastFails) {
+  MemberFile pred(120, recyclable());
+  MemberFile succ(121, recyclable());
+  ASSERT_OK(pred.Marker());
+  ASSERT_OK(pred.Data("p1", 1, 1));
+  ASSERT_OK(pred.Data("p2", 2, 2));
+  ASSERT_OK(pred.Data("p3", 3, 3));
+  ASSERT_OK(succ.Marker());
+  ASSERT_OK(succ.Span(120, 1, 2));
+  ASSERT_OK(succ.Data("s4", 4, 4));
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(pred, pred.Bytes()));
+  members.push_back(MakeMember(succ, succ.Bytes()));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kError, driven.outcome);
+  EXPECT_NE(std::string::npos,
+            merger->GetError().ToString().find(
+                "WAL 120 bears live index 3 above the last index 2 that WAL "
+                "121 attests for it"))
+      << merger->GetError().ToString();
+  ASSERT_EQ(std::vector<uint64_t>({1, 2}), DrivenIndices(driven));
+}
+
+// GC27 Q5 (b) (D-GC27c): with the consumption recovery reports, each record
+// starts at or above the previous one's sequence plus what it consumed.
+// Index 1 at sequence 3 consuming 4 covers 3..6. Without a report (a
+// seq_per_batch opener, or a record whose replay advanced nothing, such as a
+// prepare section) only first sequences are compared. Neuter: compare first
+// sequences only; the overlap passes.
+TEST_P(LogMergeTest, GC27SequenceCheckCountsConsumedSequences) {
+  struct Case {
+    const char* name;
+    uint64_t second_seq;
+    bool report;
+    uint64_t consumed;
+    bool ok;
+  };
+  for (const Case& c :
+       {Case{"reorder", 2, true, 4, false}, Case{"overlap", 5, true, 4, false},
+        Case{"exact follow-on", 7, true, 4, true},
+        Case{"upward gap", 20, true, 4, true},
+        Case{"seq_per_batch overlap", 5, false, 0, true},
+        Case{"prepare section, same stamp", 3, true, 0, true},
+        Case{"unreported, same stamp", 3, false, 0, true}}) {
+    SCOPED_TRACE(c.name);
+    MemberFile a(120, recyclable());
+    MemberFile b(121, recyclable());
+    ASSERT_OK(a.Marker());
+    ASSERT_OK(b.Marker());
+    ASSERT_OK(a.Data("a1", 1, 3));
+    ASSERT_OK(a.Data("e2", 2, 0));
+    ASSERT_OK(b.Data("b3", 3, c.second_seq));
+
+    std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+    members.push_back(MakeMember(a, a.Bytes()));
+    members.push_back(MakeMember(b, b.Bytes()));
+    auto merger = MakeMerger(std::move(members), {120, 121});
+    std::map<uint64_t, uint64_t> consumed;
+    if (c.report) {
+      consumed[1] = c.consumed;
+    }
+    std::vector<uint64_t> indices;
+    const WALIndexMerger::Result r =
+        DriveNoting(merger.get(), consumed, &indices);
+    if (c.ok) {
+      ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, r)
+          << merger->GetError().ToString();
+      ASSERT_EQ(std::vector<uint64_t>({1, 2, 3}), indices);
+    } else {
+      ASSERT_EQ(WALIndexMerger::Result::kError, r);
+      ASSERT_EQ(std::vector<uint64_t>({1, 2}), indices);
+      // Q5 (c): both WALs, both indices and both ranges.
+      const std::string range = c.consumed > 1 ? "3..6" : "3";
+      EXPECT_NE(std::string::npos, merger->GetError().ToString().find(
+                                       "index 3 in WAL 121 at sequence " +
+                                       std::to_string(c.second_seq) +
+                                       " does not advance past sequence " +
+                                       range + " of index 1 in WAL 120"))
+          << merger->GetError().ToString();
+    }
+  }
+}
+
+// GC27 Q5 (c): two live records at one index name both WALs.
+TEST_P(LogMergeTest, GC27DuplicateLiveIndexNamesWals) {
+  MemberFile a(120, recyclable());
+  MemberFile b(121, recyclable());
+  ASSERT_OK(a.Marker());
+  ASSERT_OK(b.Marker());
+  ASSERT_OK(a.Data("a1", 1, 1));
+  ASSERT_OK(b.Data("b1", 1, 2));
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(a, a.Bytes()));
+  members.push_back(MakeMember(b, b.Bytes()));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kError, driven.outcome);
+  EXPECT_NE(std::string::npos,
+            merger->GetError().ToString().find(
+                "two live records share index 1 (WAL 120, WAL 121)"))
+      << merger->GetError().ToString();
+}
+
+// GC27 Q5 (c): a record over a void names the holder and the void's file.
+TEST_P(LogMergeTest, GC27VoidCoverPlusDataNamesWals) {
+  MemberFile a(120, recyclable());
+  MemberFile b(121, recyclable());
+  ASSERT_OK(a.Marker());
+  ASSERT_OK(b.Marker());
+  ASSERT_OK(a.Data("a1", 1, 1));
+  ASSERT_OK(a.Void(2, 3));
+  ASSERT_OK(a.Data("a4", 4, 4));
+  ASSERT_OK(b.Data("b2", 2, 2));
+  ASSERT_OK(b.Data("b3", 3, 3));
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(a, a.Bytes()));
+  members.push_back(MakeMember(b, b.Bytes()));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kError, driven.outcome);
+  EXPECT_NE(std::string::npos,
+            merger->GetError().ToString().find(
+                "index 2 bears records (WAL 121) and a void cover (WAL 120)"))
+      << merger->GetError().ToString();
+}
+
 INSTANTIATE_TEST_CASE_P(LogMerge, LogMergeTest,
                         ::testing::Combine(::testing::Values(0, 1),
                                            ::testing::Bool()));

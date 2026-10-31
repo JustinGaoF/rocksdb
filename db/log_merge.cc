@@ -234,7 +234,37 @@ WALIndexMerger::MemberState* WALIndexMerger::FindState(uint64_t wal_number) {
   return nullptr;
 }
 
+bool WALIndexMerger::VoidSuperseded(uint64_t wal_number, uint64_t index,
+                                    uint64_t* declarer) const {
+  bool superseded = false;
+  for (const auto& d : states_) {
+    if (!d.member->Supersedes(wal_number, index)) {
+      continue;
+    }
+    uint64_t start = d.member->HeadFloor();
+    Member::PredecessorSpan span;
+    if (d.member->AttestedSpan(&span) &&
+        span.last != std::numeric_limits<uint64_t>::max()) {
+      start = std::max(start, span.last + 1);
+    }
+    if (start != 0 && index >= start) {
+      superseded = true;
+      *declarer = std::min(*declarer, d.member->wal_number());
+    }
+  }
+  return superseded;
+}
+
 namespace {
+// "WAL a, WAL b" for a contradiction's message.
+std::string WalList(const std::vector<uint64_t>& wals) {
+  std::string list;
+  for (uint64_t wal : wals) {
+    list += (list.empty() ? "WAL " : ", WAL ") + std::to_string(wal);
+  }
+  return list;
+}
+
 // Indexed data from a file whose intact head shows no marker: the writer
 // emits the marker first, so it would have survived. Shared by the
 // lower-bound check and the late-data check so both fail identically.
@@ -385,6 +415,11 @@ Status WALIndexMerger::ComputeLowerBound() {
         it->second.first = std::min(it->second.first, span.first);
         it->second.second = std::min(it->second.second, span.last);
       }
+      const auto [last_it, inserted] = attested_last_.emplace(
+          span.wal_number, std::make_pair(span.last, s.member->wal_number()));
+      if (!inserted && span.last < last_it->second.first) {
+        last_it->second = {span.last, s.member->wal_number()};
+      }
     }
   }
   for (const auto& [pred, span] : attested) {
@@ -502,6 +537,8 @@ Status WALIndexMerger::ComputeLowerBound() {
 }
 
 WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
+  // NoteConsumed applies only to the record the previous call emitted.
+  consumed_pending_ = false;
   if (terminal_ != Result::kWaiting) {
     return terminal_;
   }
@@ -586,17 +623,32 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
         holders.push_back(&state);
       }
     }
-    bool void_covered = false;
+    // Voids a declaration supersedes are obsolete like superseded records
+    // (D-2): they neither contradict a holder nor explain the index, which is
+    // then superseded-only.
+    std::vector<uint64_t> void_wals;
+    bool superseded_void = false;
+    uint64_t void_declarer = std::numeric_limits<uint64_t>::max();
     for (auto& state : states_) {
       if (state.member->VoidCovers(expected_)) {
-        void_covered = true;
-        break;
+        if (VoidSuperseded(state.member->wal_number(), expected_,
+                           &void_declarer)) {
+          superseded_void = true;
+        } else {
+          void_wals.push_back(state.member->wal_number());
+        }
       }
     }
+    const bool void_covered = !void_wals.empty();
     if (!holders.empty() && void_covered) {
-      return Fail(Status::Corruption("WAL index merge: index " +
-                                     std::to_string(expected_) +
-                                     " bears records and a void cover"));
+      std::vector<uint64_t> holder_wals;
+      for (auto* h : holders) {
+        holder_wals.push_back(h->member->wal_number());
+      }
+      return Fail(Status::Corruption(
+          "WAL index merge: index " + std::to_string(expected_) +
+          " bears records (" + WalList(holder_wals) + ") and a void cover (" +
+          WalList(void_wals) + ")"));
     }
     std::vector<MemberState*> live;
     for (auto* h : holders) {
@@ -612,10 +664,13 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
       }
     }
     if (live.size() > 1) {
-      return Fail(
-          Status::Corruption("WAL index merge: two live records share "
-                             "index " +
-                             std::to_string(expected_)));
+      std::vector<uint64_t> live_wals;
+      for (auto* h : live) {
+        live_wals.push_back(h->member->wal_number());
+      }
+      return Fail(Status::Corruption(
+          "WAL index merge: two live records share index " +
+          std::to_string(expected_) + " (" + WalList(live_wals) + ")"));
     }
     if (live.size() == 1 && pending_discarded_ != 0) {
       // A live record above a skipped superseded-only index: writes after the
@@ -624,6 +679,19 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
     }
     if (live.size() == 1) {
       MemberState* winner = live[0];
+      const uint64_t winner_wal = winner->member->wal_number();
+      if (const auto it = attested_last_.find(winner_wal);
+          it != attested_last_.end() && expected_ > it->second.first) {
+        // Rotation excludes every writer, so a held predecessor bears nothing
+        // above the last index its successor attests, and a recovery start
+        // supersedes what it bore at or above the start.
+        return Fail(Status::Corruption(
+            "WAL index merge: WAL " + std::to_string(winner_wal) +
+            " bears live index " + std::to_string(expected_) +
+            " above the last index " + std::to_string(it->second.first) +
+            " that WAL " + std::to_string(it->second.second) +
+            " attests for it"));
+      }
       SequenceNumber seq = 0;
       s = sequence_of_(winner->lookahead.payload, &seq);
       if (!s.ok()) {
@@ -634,15 +702,27 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
       if (seq == 0) {
         // An empty record occupies its index but carries no witness: emit
         // it without advancing the sequence check. Recovery drops it.
-      } else if (seq < last_sequence_) {
-        // Non-decreasing, not strictly increasing: an empty batch consumes
-        // an index but no sequence, so the recovery dummy and a user-written
-        // empty batch both repeat the sequence the next record reuses.
-        return Fail(Status::Corruption("WAL index merge: index " +
-                                       std::to_string(expected_) +
-                                       " does not advance the sequence"));
+      } else if (seq < last_sequence_ ||
+                 seq - last_sequence_ < last_consumed_) {
+        // Equal is allowed when the previous record consumed no sequence: an
+        // empty batch or a prepare section takes an index but no sequence, so
+        // the next record reuses its stamp.
+        std::string range = std::to_string(last_sequence_);
+        if (last_consumed_ > 1) {
+          range += ".." + std::to_string(last_sequence_ + last_consumed_ - 1);
+        }
+        return Fail(Status::Corruption(
+            "WAL index merge: index " + std::to_string(expected_) + " in WAL " +
+            std::to_string(winner_wal) + " at sequence " + std::to_string(seq) +
+            " does not advance past sequence " + range + " of index " +
+            std::to_string(last_sequence_index_) + " in WAL " +
+            std::to_string(last_sequence_wal_)));
       } else {
         last_sequence_ = seq;
+        last_sequence_index_ = expected_;
+        last_sequence_wal_ = winner_wal;
+        last_consumed_ = 0;
+        consumed_pending_ = true;
       }
       *record = winner->lookahead.payload;
       last_emitted_index_ = expected_;
@@ -654,7 +734,7 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
       expected_++;
       return Result::kRecord;
     }
-    const bool had_holders = !holders.empty();
+    const bool had_holders = !holders.empty() || superseded_void;
     for (auto* h : holders) {
       h->has_lookahead = false;  // superseded copies explain themselves.
     }
@@ -672,7 +752,8 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
       for (auto& state : states_) {
         if (pending_discarded_ != 0 &&
             state.member->wal_number() < pending_declarer_ &&
-            state.member->VoidCovers(expected_)) {
+            std::find(void_wals.begin(), void_wals.end(),
+                      state.member->wal_number()) != void_wals.end()) {
           pending_discarded_ = 0;
         }
       }
@@ -740,6 +821,7 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
             }
           }
         }
+        pending_declarer_ = std::min(pending_declarer_, void_declarer);
         expected_++;
         continue;
       }

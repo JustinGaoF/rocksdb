@@ -150,11 +150,20 @@ Status WalManager::GetUpdatesSince(SequenceNumber seq,
             ? LogFileName(wal_dir_, wal->LogNumber())
             : ArchivedLogFileName(wal_dir_, wal->LogNumber());
     uint32_t wal_partition = 0;
-    if (log::ReadWALPartition(fs_.get(), fname,
-                              fs_->OptimizeForLogRead(file_options_),
-                              wal->LogNumber(), &wal_partition)
-            .ok() &&
-        wal_partition != 0) {
+    const Status head = log::ReadWALPartition(
+        fs_.get(), fname, fs_->OptimizeForLogRead(file_options_),
+        wal->LogNumber(), &wal_partition);
+    if (!head.ok() && !head.IsNotFound() &&
+        (db_options_.wal_partitions > 1 ||
+         (version_set != nullptr && version_set->wal_index_guard() != 0))) {
+      // An indexed DB: which partition wrote it is unknown (D-GC27b).
+      return Status::NotSupported(
+          "GetUpdatesSince: WAL " + std::to_string(wal->LogNumber()) + ": " +
+          head.ToString() +
+          "; it may be a partitioned WAL, whose sequences interleave across "
+          "files");
+    }
+    if (head.ok() && wal_partition != 0) {
       return Status::NotSupported(
           "GetUpdatesSince: WAL " + std::to_string(wal->LogNumber()) +
           " was written by partition " + std::to_string(wal_partition) +
