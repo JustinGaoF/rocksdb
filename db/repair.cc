@@ -354,11 +354,19 @@ class Repairer {
     const auto& wal_dir = immutable_db_options_.GetWalDir();
     for (uint64_t log : logs_) {
       uint32_t wal_partition = 0;
-      if (log::ReadWALPartition(fs.get(), LogFileName(wal_dir, log),
-                                fs->OptimizeForLogRead(file_options_), log,
-                                &wal_partition)
-              .ok() &&
-          wal_partition != 0) {
+      const Status head = log::ReadWALPartition(
+          fs.get(), LogFileName(wal_dir, log),
+          fs->OptimizeForLogRead(file_options_), log, &wal_partition);
+      if (!head.ok() && !head.IsNotFound() &&
+          immutable_db_options_.wal_partitions > 1) {
+        // Which partition wrote it is unknown, so it may be a partitioned
+        // WAL (D-GC27b).
+        return Status::NotSupported(
+            "RepairDB: WAL " + std::to_string(log) + ": " + head.ToString() +
+            "; with wal_partitions > 1 RepairDB does not convert a WAL "
+            "that may be partitioned");
+      }
+      if (head.ok() && wal_partition != 0) {
         return Status::NotSupported(
             "RepairDB: WAL " + std::to_string(log) +
             " was written by partition " + std::to_string(wal_partition) +

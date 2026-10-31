@@ -360,6 +360,15 @@ void RandomInitDBOptions(DBOptions* db_opt, Random* rnd) {
 
   // unsigned int options
   db_opt->stats_dump_period_sec = rnd->Uniform(100000);
+
+  // WAL format and partition count; more than one WAL needs the index
+  db_opt->partition_wal_usage =
+      rnd->Uniform(2) ? PartitionWALUsage::kPartitionByColumnFamily
+                      : PartitionWALUsage::kNone;
+  db_opt->wal_partitions =
+      db_opt->partition_wal_usage == PartitionWALUsage::kNone
+          ? 1
+          : 1 + rnd->Uniform(64);
 }
 
 void RandomInitCFOptions(ColumnFamilyOptions* cf_opt, DBOptions& db_options,

@@ -398,6 +398,78 @@ TEST_P(LdbCmdWalPartitionsTest, DumpWalAtWalPartitions) {
   ASSERT_OK(DestroyDB(dbname, opts));
 }
 
+// GC27 Q5 (d) (L13, K4; D-GC27b): a WAL whose head cannot be read is of an
+// unknown partition, not partition 0. With every nonzero partition's WAL head
+// damaged, `--only_print_seqno_gaps` on a DB written with wal_partitions = 8
+// refuses the directory before printing anything, naming a damaged WAL. At
+// the base the damaged heads read as partition 0, and the set was checked in
+// file order. Neuter: read a damaged head as partition 0 (as before).
+TEST_F(LdbCmdTest, DumpWalRefusesDamagedHeadOfPartitionedWal) {
+  Env* env = TryLoadCustomOrDefaultEnv();
+  Options opts;
+  opts.env = env;
+  opts.create_if_missing = true;
+  opts.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  opts.track_and_verify_wals_in_manifest = true;
+  opts.avoid_flush_during_shutdown = true;
+  constexpr size_t kPartitions = 8;
+  opts.wal_partitions = kPartitions;
+  const std::string dbname = test::PerThreadDBPath(env, "ldb_cmd_test");
+  ASSERT_OK(DestroyDB(dbname, opts));
+  std::vector<uint64_t> current_wals(kPartitions);
+  {
+    std::unique_ptr<DB> db;
+    ASSERT_OK(DB::Open(opts, dbname, &db));
+    std::vector<std::unique_ptr<ColumnFamilyHandle>> handles;
+    std::vector<bool> covered(kPartitions, false);
+    size_t num_covered = 0;
+    for (uint32_t cf_id = 1; num_covered < kPartitions; ++cf_id) {
+      ColumnFamilyHandle* handle = nullptr;
+      ASSERT_OK(
+          db->CreateColumnFamily(opts, "cf" + std::to_string(cf_id), &handle));
+      handles.emplace_back(handle);
+      WriteBatch batch;
+      ASSERT_OK(WriteBatchInternal::Put(&batch, cf_id, "key", "value"));
+      size_t partition = kPartitions;
+      ASSERT_OK(
+          DBImpl::TEST_WalPartitionForWrite(batch, kPartitions, &partition));
+      if (!covered[partition]) {
+        covered[partition] = true;
+        ++num_covered;
+        ASSERT_OK(db->Put(WriteOptions(), handle, "key", "value"));
+      }
+    }
+    for (size_t p = 0; p < kPartitions; ++p) {
+      current_wals[p] =
+          static_cast<DBImpl*>(db.get())->TEST_CurrentWalNumber(p);
+    }
+    for (auto& handle : handles) {
+      ASSERT_OK(db->DestroyColumnFamilyHandle(handle.release()));
+    }
+  }
+  for (size_t p = 1; p < kPartitions; ++p) {
+    const std::string fname = LogFileName(dbname, current_wals[p]);
+    std::string contents;
+    ASSERT_OK(ReadFileToString(env, fname, &contents));
+    ASSERT_FALSE(contents.empty());
+    contents[0] ^= 0x5a;
+    ASSERT_OK(WriteStringToFile(env, contents, fname, /*should_sync=*/true));
+  }
+  const std::string wal_arg = "--walfile=" + dbname;
+  const char* argv[] = {"./ldb", "dump_wal", wal_arg.c_str(),
+                        "--only_print_seqno_gaps"};
+  testing::internal::CaptureStdout();
+  testing::internal::CaptureStderr();
+  const int code =
+      LDBCommandRunner::RunCommand(4, argv, opts, LDBOptions(), nullptr);
+  std::string output = testing::internal::GetCapturedStderr();
+  output += testing::internal::GetCapturedStdout();
+  EXPECT_NE(0, code);
+  EXPECT_NE(std::string::npos, output.find("head damaged")) << output;
+  EXPECT_EQ(std::string::npos, output.find("Checking wal file")) << output;
+  ASSERT_OK(DestroyDB(dbname, opts));
+}
+
 class FileChecksumTestHelper {
  private:
   Options options_;

@@ -3199,11 +3199,20 @@ void DumpWalFiles(Options options, const std::string& dir_or_file,
         log_number = 0;
       }
       uint32_t wal_partition = 0;
-      if (log::ReadWALPartition(options.env->GetFileSystem().get(), scanned,
-                                FileOptions(options), log_number,
-                                &wal_partition)
-              .ok() &&
-          wal_partition != 0) {
+      const Status head = log::ReadWALPartition(
+          options.env->GetFileSystem().get(), scanned, FileOptions(options),
+          log_number, &wal_partition);
+      if (!head.ok() && !head.IsNotFound() && options.wal_partitions > 1) {
+        // Which partition wrote it is unknown (D-GC27b).
+        if (exec_state) {
+          *exec_state = LDBCommandExecuteResult::Failed(
+              "--only_print_seqno_gaps: " + scanned + ": " + head.ToString() +
+              "; with wal_partitions > 1 it may be a partitioned WAL, whose "
+              "sequence numbers interleave across files");
+        }
+        return;
+      }
+      if (head.ok() && wal_partition != 0) {
         if (exec_state) {
           *exec_state = LDBCommandExecuteResult::Failed(
               PartitionedWalGapsRefusal(scanned, wal_partition));

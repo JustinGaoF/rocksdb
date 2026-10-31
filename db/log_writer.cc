@@ -327,8 +327,11 @@ IOStatus Writer::AddWALIndexVoidRecord(const WriteOptions& write_options,
   if (!WALIndexEnabled()) {
     return IOStatus::OK();
   }
-  assert(lo != 0);
-  assert(lo <= hi);
+  if (lo == 0 || lo > hi) {
+    return IOStatus::Corruption("invalid WAL index void [" +
+                                std::to_string(lo) + ", " + std::to_string(hi) +
+                                "]");
+  }
 
   std::string payload;
   payload.reserve(kWALIndexVoidPayloadSize);
@@ -346,9 +349,14 @@ IOStatus Writer::AddWALIndexSupersessionRecord(
   if (!WALIndexEnabled()) {
     return IOStatus::OK();
   }
-  assert(superseded_wal_number != 0);
-  assert(superseded_wal_number < log_number_);
-  assert(first_superseded_wal_index != 0);
+  if (superseded_wal_number == 0 || superseded_wal_number >= log_number_ ||
+      first_superseded_wal_index == 0) {
+    return IOStatus::Corruption("invalid WAL index supersession of WAL " +
+                                std::to_string(superseded_wal_number) +
+                                " from wal_index " +
+                                std::to_string(first_superseded_wal_index) +
+                                " in WAL " + std::to_string(log_number_));
+  }
 
   std::string payload;
   payload.reserve(kWALIndexSupersessionPayloadSize);
@@ -393,10 +401,15 @@ IOStatus Writer::AddWALIndexPredecessorSpanRecord(
   if (!WALIndexEnabled()) {
     return IOStatus::OK();
   }
-  assert(predecessor_wal_number != 0);
-  assert(predecessor_wal_number < log_number_);
-  assert((first_wal_index == 0) == (last_wal_index == 0));
-  assert(first_wal_index <= last_wal_index);
+  if (predecessor_wal_number == 0 || predecessor_wal_number >= log_number_ ||
+      (first_wal_index == 0) != (last_wal_index == 0) ||
+      first_wal_index > last_wal_index) {
+    return IOStatus::Corruption("invalid WAL index predecessor span of WAL " +
+                                std::to_string(predecessor_wal_number) + " [" +
+                                std::to_string(first_wal_index) + ", " +
+                                std::to_string(last_wal_index) + "] in WAL " +
+                                std::to_string(log_number_));
+  }
 
   std::string payload;
   payload.reserve(kWALIndexPredecessorSpanPayloadSize);

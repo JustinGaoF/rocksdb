@@ -451,7 +451,9 @@ enum class WALRecoveryMode : char {
   //
   // With a `partition_wal_usage` other than `kNone`, playback stops at the
   // first hole (see `kTolerateCorruptedTailRecords`) and the DB opens with
-  // the records below it.
+  // the records below it. The cut also holds for every record and void above
+  // it in any WAL, so the next open, in any mode, opens with that prefix and
+  // the writes made after it.
   kPointInTimeRecovery = 0x02,
   // Recovery after a disaster
   // We ignore any corruption in the WAL and try to salvage as much data as
@@ -479,6 +481,14 @@ enum class WALRecoveryMode : char {
 // that older versions reject, and their DB::Open fails in every recovery mode
 // instead. Backups and checkpoints taken in that state carry it too: restoring
 // them needs a version that supports this option.
+//
+// This option and `DBOptions::wal_partitions` are two independent settings.
+// `partition_wal_usage` chooses the WAL record format: `kNone` is the vanilla
+// format, and `kPartitionByColumnFamily` writes indexed records, which more
+// than one WAL requires. `wal_partitions` chooses how many WAL files writes
+// spread across (1 by default; above 1 requires the indexed format). So
+// `kPartitionByColumnFamily` with `wal_partitions = 1` writes one WAL in the
+// indexed format; it does not partition anything.
 //
 // To roll back:
 //   1. Reopen with this option set to `kNone`.
@@ -1543,6 +1553,12 @@ struct DBOptions {
   //
   // The number of WAL files ("partitions") that writes are spread across.
   //
+  // This and `partition_wal_usage` are two independent settings:
+  // `partition_wal_usage` chooses the WAL record format (`kNone`: the vanilla
+  // format; `kPartitionByColumnFamily`: indexed records), and
+  // `wal_partitions` chooses how many WAL files writes spread across, 1 by
+  // default. Values above 1 require the indexed format.
+  //
   // A single WAL file admits only one append in flight at a time, because
   // durability granularity is per file descriptor. On storage where append
   // latency is high relative to bandwidth, that single outstanding I/O bounds
@@ -1575,6 +1591,12 @@ struct DBOptions {
   // the records below it, and kSkipAnyCorruptedRecords skips it and applies
   // the records above it; see WALRecoveryMode. A loss at the end of the
   // stream is a tail, handled as each mode handles a torn tail with one WAL.
+  // A point-in-time cut is durable before the open returns: the new WAL
+  // supersedes every record and void above the cut in every WAL, so the next
+  // open, in any mode, recovers the prefix below the cut and the writes made
+  // after it. An open with track_and_verify_wals merges a WAL set written
+  // with more than one partition like any other opener, and verifies no
+  // predecessor WAL information for it.
   //
   // manual_wal_flush is supported with more than one partition. FlushWAL()
   // writes each partition's buffer in turn, holding only that partition's
@@ -1601,12 +1623,21 @@ struct DBOptions {
   // checkpoint restore, RepairDB, secondary instances) must first be upgraded
   // to one that understands partitioned, indexed WALs, before any DB is
   // opened with wal_partitions > 1. Secondary instances and RepairDB refuse
-  // partitioned WAL files with Status::NotSupported. A secondary cannot tell
+  // partitioned WAL files with Status::NotSupported. RepairDB,
+  // GetUpdatesSince() and `ldb dump_wal` also fail, naming the WAL, on a WAL
+  // of an indexed DB whose head cannot be read, since they cannot tell which
+  // partition wrote it. A secondary cannot tell
   // the partition of a WAL whose head is not on disk yet, so it also refuses
   // a catch-up round in which such a WAL sits beside one that carries the
   // WAL index, even when the primary runs one partition with a
   // partition_wal_usage other than kNone. Under manual_wal_flush a new WAL's
   // head stays buffered until FlushWAL(); the next round after it succeeds.
+  //
+  // With more than one partition, a tailing iterator (ReadOptions::tailing)
+  // shows only writes at or below the published sequence, checked on every
+  // Seek() and Next(), so it never shows a write that returned an error,
+  // before or after DB::Resume(), and it shows newly published writes without
+  // a Refresh(). With one partition, tailing iterators are unchanged.
   //
   // Not dynamically changeable via SetOptions().
   //

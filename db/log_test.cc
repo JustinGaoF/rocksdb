@@ -2252,6 +2252,49 @@ TEST_P(LogTest, WALIndexControlRecordsAreNoopWhenDisabled) {
   ASSERT_EQ(0U, WrittenBytes());
 }
 
+// GC27 Q9 (d): an invalid control record fails the write with Corruption
+// before any byte reaches the file, rather than writing a record the reader
+// rejects at the next open. The writer's own WAL is 123.
+TEST_P(LogTest, GC27InvalidWALIndexControlRecordsFailBeforeWriting) {
+  EnableWALIndex();
+  Write("before");
+  const size_t written = WrittenBytes();
+  auto expect_corruption = [&](const IOStatus& s, const char* what) {
+    ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+    ASSERT_NE(std::string::npos, s.ToString().find(what)) << s.ToString();
+    ASSERT_EQ(written, WrittenBytes());
+  };
+  expect_corruption(writer_->AddWALIndexVoidRecord(WriteOptions(), 0, 2),
+                    "invalid WAL index void [0, 2]");
+  expect_corruption(writer_->AddWALIndexVoidRecord(WriteOptions(), 5, 4),
+                    "invalid WAL index void [5, 4]");
+  expect_corruption(
+      writer_->AddWALIndexSupersessionRecord(WriteOptions(), 0, 7),
+      "supersession of WAL 0 from wal_index 7 in WAL 123");
+  expect_corruption(
+      writer_->AddWALIndexSupersessionRecord(WriteOptions(), 123, 7),
+      "supersession of WAL 123 from wal_index 7 in WAL 123");
+  expect_corruption(
+      writer_->AddWALIndexSupersessionRecord(WriteOptions(), 122, 0),
+      "supersession of WAL 122 from wal_index 0 in WAL 123");
+  expect_corruption(
+      writer_->AddWALIndexPredecessorSpanRecord(WriteOptions(), 0, 30, 60),
+      "predecessor span of WAL 0 [30, 60] in WAL 123");
+  expect_corruption(
+      writer_->AddWALIndexPredecessorSpanRecord(WriteOptions(), 124, 30, 60),
+      "predecessor span of WAL 124 [30, 60] in WAL 123");
+  expect_corruption(
+      writer_->AddWALIndexPredecessorSpanRecord(WriteOptions(), 122, 0, 60),
+      "predecessor span of WAL 122 [0, 60] in WAL 123");
+  expect_corruption(
+      writer_->AddWALIndexPredecessorSpanRecord(WriteOptions(), 122, 61, 60),
+      "predecessor span of WAL 122 [61, 60] in WAL 123");
+
+  ASSERT_EQ("before", Read());
+  ASSERT_EQ("EOF", Read());
+  ASSERT_EQ(0U, DroppedBytes());
+}
+
 // Do NOT enable compression for this instantiation.
 INSTANTIATE_TEST_CASE_P(
     Log, LogTest,

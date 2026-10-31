@@ -158,8 +158,9 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch,
           ReportCorruption(fragment.size(),
                            "missing start of fragmented record(1)");
         } else {
-          const bool fragment_has_wal_index = IsWALIndexRecordType(record_type);
-          if (fragment_has_wal_index != fragmented_record_has_wal_index) {
+          const bool is_wal_index_fragment_type =
+              IsWALIndexRecordType(record_type);
+          if (is_wal_index_fragment_type != fragmented_record_has_wal_index) {
             ReportCorruption(fragment.size(),
                              "inconsistent WAL index fragment types");
           }
@@ -178,8 +179,9 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch,
           ReportCorruption(fragment.size(),
                            "missing start of fragmented record(2)");
         } else {
-          const bool fragment_has_wal_index = IsWALIndexRecordType(record_type);
-          if (fragment_has_wal_index != fragmented_record_has_wal_index) {
+          const bool is_wal_index_fragment_type =
+              IsWALIndexRecordType(record_type);
+          if (is_wal_index_fragment_type != fragmented_record_has_wal_index) {
             ReportCorruption(fragment.size(),
                              "inconsistent WAL index fragment types");
           }
@@ -1127,9 +1129,9 @@ bool FragmentBufferedReader::ReadRecord(Slice* record, std::string* scratch,
           ReportCorruption(fragment.size(),
                            "missing start of fragmented record(1)");
         } else {
-          const bool fragment_has_wal_index =
+          const bool is_wal_index_fragment_type =
               IsWALIndexRecordType(fragment_type_or_err);
-          if (fragment_has_wal_index != fragmented_record_has_wal_index_) {
+          if (is_wal_index_fragment_type != fragmented_record_has_wal_index_) {
             ReportCorruption(fragment.size(),
                              "inconsistent WAL index fragment types");
           }
@@ -1145,9 +1147,9 @@ bool FragmentBufferedReader::ReadRecord(Slice* record, std::string* scratch,
           ReportCorruption(fragment.size(),
                            "missing start of fragmented record(2)");
         } else {
-          const bool fragment_has_wal_index =
+          const bool is_wal_index_fragment_type =
               IsWALIndexRecordType(fragment_type_or_err);
-          if (fragment_has_wal_index != fragmented_record_has_wal_index_) {
+          if (is_wal_index_fragment_type != fragmented_record_has_wal_index_) {
             ReportCorruption(fragment.size(),
                              "inconsistent WAL index fragment types");
           }
@@ -1533,6 +1535,23 @@ bool FragmentBufferedReader::TryReadFragment(Slice* fragment, size_t* drop_size,
   }
 }
 
+namespace {
+// Keeps the first corruption the head read reports.
+class HeadReadReporter : public Reader::Reporter {
+ public:
+  void Corruption(size_t /*bytes*/, const Status& status,
+                  uint64_t /*log_number*/) override {
+    if (first_.ok()) {
+      first_ = status;
+    }
+  }
+  const Status& first() const { return first_; }
+
+ private:
+  Status first_;
+};
+}  // namespace
+
 Status ReadWALPartition(FileSystem* fs, const std::string& fname,
                         const FileOptions& file_options, uint64_t log_number,
                         uint32_t* wal_partition) {
@@ -1542,15 +1561,28 @@ Status ReadWALPartition(FileSystem* fs, const std::string& fname,
   if (!s.ok()) {
     return s;
   }
+  HeadReadReporter reporter;
   Reader reader(/*info_log=*/nullptr,
                 std::make_unique<SequentialFileReader>(std::move(file), fname),
-                /*reporter=*/nullptr, /*checksum=*/true, log_number);
+                &reporter, /*checksum=*/true, log_number);
   std::string scratch;
   Slice record;
   // The marker is the file's first record, so the first data record (or the
-  // end of a file holding none) comes after it.
-  reader.ReadRecord(&record, &scratch);
+  // end of a file holding none) comes after it. Any damage before either is
+  // reported, a torn record at the end included.
+  reader.ReadRecord(&record, &scratch, WALRecoveryMode::kAbsoluteConsistency);
   *wal_partition = reader.WALPartition();
+  if (reader.SawWALIndexMarker()) {
+    return Status::OK();
+  }
+  if (reader.hasReadError()) {
+    return Status::IOError(
+        "head unreadable; the partition that wrote it is unknown");
+  }
+  if (!reporter.first().ok()) {
+    return Status::Corruption("head damaged (" + reporter.first().ToString() +
+                              "); the partition that wrote it is unknown");
+  }
   return Status::OK();
 }
 

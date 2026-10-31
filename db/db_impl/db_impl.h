@@ -2892,8 +2892,13 @@ class DBImpl : public DB
       const WriteOptions& write_options, log::Writer* new_log,
       const std::vector<WALIndexSupersession>& supersessions);
   // With more than one partition, writes the index floor into the head of
-  // every WAL Open created whose predecessor span carries none.
-  IOStatus WriteWALIndexHeadFloors(const WriteOptions& write_options);
+  // every WAL Open created whose predecessor span carries none. With
+  // `declared` (WriteWALIndexSupersessions wrote declarations into partition
+  // 0's new WAL), partition 0's floor is that WAL's start, from which the
+  // declarations reach voids: it is also written at one partition when the
+  // recovered set was partitioned, and synced.
+  IOStatus WriteWALIndexHeadFloors(const WriteOptions& write_options,
+                                   bool declared);
 
   void SetupLogFilesRecovery(
       const std::vector<uint64_t>& wal_numbers,
@@ -3560,12 +3565,16 @@ class DBImpl : public DB
   // N>1 only. Reads WAL `wal_number` back and sets *landed when a whole,
   // checksummed record bearing `wal_index` is in it: an append can report
   // failure after its bytes reached the file. A torn copy is not one: when
-  // the bytes from `wal_offset`, where the failed record began, do not read
-  // back cleanly, sets *torn_end to the file's size (zero otherwise). A WAL
-  // already gone from disk holds neither. Fails when the WAL cannot be read.
+  // the bytes from `wal_offset`, the writer's flushed size at the failure, do
+  // not read back cleanly, sets *torn_end to the file's size (zero otherwise)
+  // and *torn_begin to where the torn record begins: the end of the last
+  // whole record read back, or `wal_offset` when none was. A record larger
+  // than the writer's buffer flushes partway before its append fails, so
+  // `wal_offset` can lie inside it. A WAL already gone from disk holds
+  // neither. Fails when the WAL cannot be read.
   Status BurnedWALIndexLanded(uint64_t wal_number, uint64_t wal_index,
                               uint64_t wal_offset, bool* landed,
-                              uint64_t* torn_end);
+                              uint64_t* torn_begin, uint64_t* torn_end);
 
   // N>1 only. Fences every gate whose target is at or above `low`: a range
   // starting there failed (its append, its gate sync, or its memtable

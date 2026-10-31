@@ -1266,8 +1266,9 @@ Status DBImplSecondary::OpenAsSecondaryImpl(
     std::vector<ColumnFamilyHandle*>* handles, std::unique_ptr<DB>* dbptr,
     bool recover_wal, bool trust_manifest_recovery) {
   *dbptr = nullptr;
-  if (db_options.wal_partitions != 1) {
-    // The same wal_partitions checks a read-write open applies.
+  if (recover_wal && db_options.wal_partitions != 1) {
+    // The same wal_partitions checks a read-write open applies. An open that
+    // reads no WAL (OpenAndCompact) is not refused over WAL-only options.
     Status s = ValidateOptions(db_options);
     if (!s.ok()) {
       return s;
