@@ -1517,6 +1517,11 @@ std::vector<uint32_t> ColumnFamilyIdsCoveringWalPartitions(
 std::vector<std::string> ColumnFamilyNamesThrough(
     const std::vector<uint32_t>& cf_ids);
 
+// The number of WAL partitions that completed a WAL append since `db` (a
+// DBImpl, or a DB stacked over one) was opened. Always 0 with one partition,
+// which tracks no per-partition durability.
+size_t WalPartitionsAppendedTo(DB* db);
+
 // Opens the DB at `dbname` read-only once in each WALRecoveryMode. In every
 // open, column family cf_ids[p] holds "key0", "key1", ... with value "value<i>"
 // as a prefix: keys up to some point and none after, and at least the first

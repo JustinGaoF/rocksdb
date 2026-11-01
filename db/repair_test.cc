@@ -66,6 +66,8 @@ class RepairTest : public DBTestBase {
 class RepairWalPartitionsTest : public RepairTest,
                                 public testing::WithParamInterface<uint32_t> {};
 
+// The N=8 leg cannot spread writes and then repair: RepairDB refuses
+// partitioned WALs (Review-M3 T1).
 INSTANTIATE_TEST_CASE_P(WalPartitions1, RepairWalPartitionsTest,
                         testing::Values(1U));
 INSTANTIATE_TEST_CASE_P(WalPartitions8, RepairWalPartitionsTest,

@@ -404,6 +404,9 @@ TEST_P(ExternalSSTFileTestN, IngestionConcurrentWritesAtWalPartitions) {
     writers.Stop();
     acked = writers.Acked();
   }
+  if (options.wal_partitions > 1) {
+    EXPECT_EQ(options.wal_partitions, WalPartitionsAppendedTo(db_.get()));
+  }
   Close();
   AssertKeyPrefixesInEveryRecoveryMode(options, dbname_, cf_ids, acked,
                                        kMaxKeys);

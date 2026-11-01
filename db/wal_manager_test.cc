@@ -330,6 +330,8 @@ TEST_P(WalManagerTest, WALArchivalTtlClockGoesBackwards) {
             ListSpecificFiles(env_.get(), archive_dir, kWalFile).size());
 }
 
+// The N=8 leg drives WalManager over synthetic WAL files, never a DB's write
+// path, so no record spreads across partitions (Review-M3 T1).
 INSTANTIATE_TEST_CASE_P(WalPartitions1, WalManagerTest, testing::Values(1U));
 INSTANTIATE_TEST_CASE_P(WalPartitions8, WalManagerTest,
                         testing::Values(test::kTestWalPartitions));

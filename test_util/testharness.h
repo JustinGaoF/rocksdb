@@ -85,7 +85,12 @@ int RandomSeed();
 bool HasBigMem();
 
 // The WAL partition count that the WAL consumer and transaction suites also
-// run at, besides 1.
+// run at, besides 1. Writes route by column family, so an N=8 leg that writes
+// only the default column family appends to one partition; the suites that
+// can (backup, checkpoint, ingestion, transactions, optimistic transactions,
+// secondary, ldb) also run a case that writes to column families on several
+// partitions (see WalPartitionsAppendedTo in db/db_test_util.h), and the
+// rest say why they cannot.
 constexpr uint32_t kTestWalPartitions = 8;
 
 // The WAL partition count for the running test: kTestWalPartitions when it is

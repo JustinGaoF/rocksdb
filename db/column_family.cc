@@ -1535,6 +1535,16 @@ Status ColumnFamilyData::ValidateOptions(
     s = Status::NotSupported(
         "wal_partitions > 1 is not supported with enable_blob_direct_write");
   }
+  // The user-defined timestamp checks below reject this with concurrent
+  // memtable writes, which more than one partition requires.
+  if (s.ok() && db_options.wal_partitions > 1 &&
+      db_options.allow_concurrent_memtable_write &&
+      cf_options.comparator->timestamp_size() > 0 &&
+      !cf_options.persist_user_defined_timestamps) {
+    s = Status::NotSupported(
+        "wal_partitions > 1 is not supported with "
+        "persist_user_defined_timestamps = false");
+  }
   if (s.ok() && db_options.allow_concurrent_memtable_write) {
     s = CheckConcurrentWritesSupported(cf_options);
   }

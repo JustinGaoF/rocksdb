@@ -14154,6 +14154,10 @@ TEST_P(DBWritePartitionTest, ChangeStreamStopsBelowHeldLowerWrite) {
   ReopenWithPartitions(kPartitions, options);
   EXPECT_EQ("v", Get(cf_for_partition_[0], "k0"));
   EXPECT_EQ("v", Get(cf_for_partition_[1], "k1"));
+  // Review-M3 T7: A never landed, and B, above it, is not recovered across
+  // the hole.
+  EXPECT_EQ("NOT_FOUND", Get(cf_for_partition_[0], "key_a"));
+  EXPECT_EQ("NOT_FOUND", Get(cf_for_partition_[1], "key_b"));
 }
 
 // G-36: a secondary instance replays WALs one file at a time, which is not
@@ -15391,6 +15395,26 @@ TEST_P(DBWalAppendFailureTest, FenceHidesFailedWriteFromWalIterator) {
   std::unique_ptr<TransactionLogIterator> iter;
   const Status s = db_->GetUpdatesSince(first, &iter);
   EXPECT_TRUE(s.IsNotSupported()) << s.ToString();
+
+  // Review-M3 T7: the failed write is absent while writes are stopped.
+  // Resume() cannot recover from a file-scoped WAL error with MANIFEST WAL
+  // tracking, which more than one partition requires, so writes stay
+  // stopped and the write stays absent after it too.
+  EXPECT_EQ("NOT_FOUND", Get(cf_b, "failed"));
+  const Status resume = dbfull()->Resume();
+  EXPECT_TRUE(resume.IsNotSupported()) << resume.ToString();
+  EXPECT_EQ("NOT_FOUND", Get(cf_b, "failed"));
+  for (int i = 0; i < 3; ++i) {
+    EXPECT_EQ("value", Get(cf_b, "k" + std::to_string(i)));
+  }
+  // A reopen without a successful Resume() may recover a failed write whose
+  // record reached the WAL whole, as with one WAL (D-1, documented with
+  // wal_partitions); this one landed whole before the injected failure.
+  ReopenWithPartitions(2, options);
+  EXPECT_EQ("value", Get(cf_b, "failed"));
+  for (int i = 0; i < 3; ++i) {
+    EXPECT_EQ("value", Get(cf_b, "k" + std::to_string(i)));
+  }
 }
 
 // Q6 (G-14, F003): after live recovery succeeds, writes on every partition
@@ -17234,11 +17258,11 @@ TEST_P(DBWalAppendFailureTest, RetryFlushResumeExplainsBurnedIndex) {
   }
 }
 
-// GC24 Q4: the timestamp-stripping flush path never meets a read mask. Masks
-// exist only above one partition, which requires concurrent memtable writes;
-// not persisting user-defined timestamps, the only setting that strips them
-// in a flush, rejects those. This pins the refusal, so the path needs no
-// masking of its own while it holds.
+// GC24 Q4: more than one partition refuses not persisting user-defined
+// timestamps, the only setting that strips them in a flush, so the stripping
+// flush path never runs above one partition. With concurrent memtable writes
+// the refusal names wal_partitions and persist_user_defined_timestamps;
+// without them, Open refuses allow_concurrent_memtable_write = false first.
 TEST_P(DBWalAppendFailureTest, StrippingFlushNeverMeetsAMask) {
   Options options = FailureOptions();
   options.comparator = test::BytewiseComparatorWithU64TsWrapper();
@@ -17250,9 +17274,11 @@ TEST_P(DBWalAppendFailureTest, StrippingFlushNeverMeetsAMask) {
     options.create_if_missing = true;
     const Status s = DB::Open(options, dbname_ + "_strip", &db_);
     EXPECT_TRUE(s.IsNotSupported()) << s.ToString();
-    EXPECT_NE(std::string::npos,
-              s.ToString().find(concurrent ? "user-defined timestamps"
-                                           : "allow_concurrent_memtable_write"))
+    EXPECT_NE(
+        std::string::npos,
+        s.ToString().find(concurrent ? "wal_partitions > 1 is not supported "
+                                       "with persist_user_defined_timestamps"
+                                     : "allow_concurrent_memtable_write"))
         << s.ToString();
     if (s.ok()) {
       Close();
@@ -22330,7 +22356,9 @@ TEST_P(DBWritePartitionTest, GC26ColumnFamilyRefusalsHoldAfterOpen) {
          o->comparator = test::BytewiseComparatorWithU64TsWrapper();
          o->persist_user_defined_timestamps = false;
        },
-       Status::kNotSupported, "concurrent memtable write"},
+       Status::kNotSupported,
+       "wal_partitions > 1 is not supported with "
+       "persist_user_defined_timestamps = false"},
   };
   for (const Case& c : cases) {
     SCOPED_TRACE(c.name);
