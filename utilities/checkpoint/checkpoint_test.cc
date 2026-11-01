@@ -1431,6 +1431,9 @@ TEST_P(CheckpointTest, CheckpointIncludesEveryPartitionCurrentWal) {
         ASSERT_OK(Put(static_cast<int>(cf_id), "key1", "value1"));
       }
     }
+    if (GetParam() > 1) {
+      EXPECT_EQ(GetParam(), WalPartitionsAppendedTo(db_.get()));
+    }
     LiveFilesStorageInfoOptions info_options;
     info_options.wal_size_for_flush = std::numeric_limits<uint64_t>::max();
     std::vector<LiveFileStorageInfo> live_files;

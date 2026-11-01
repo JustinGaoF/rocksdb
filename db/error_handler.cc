@@ -937,9 +937,10 @@ void ErrorHandler::CheckAndSetRecoveryAndBGError(
   // from spinning on a flag that GetBGError cannot back.
   if (!bg_error_.ok() && bg_err.severity() >= bg_error_.severity()) {
     // Whatever the source (WAL, flush, compaction, MANIFEST): parked
-    // completion gates must fail on it instead of waiting out a frontier
-    // that can never cover them. mutex_ is held; the wake takes
-    // sequence_wal_index_mutex_ below it (see the LOCK ORDER note).
+    // completion gates wake to recheck their exits. A gate fails only on a
+    // fence covering its range or at shutdown; otherwise it parks again and
+    // is acknowledged once covered. mutex_ is held; the wake takes
+    // wal_durability_wait_mutex_ below it (see the LOCK ORDER note).
     db_->SignalWalDurabilityWaitersOnBGError();
   }
   if (bg_error_.severity() >= Status::Severity::kHardError) {

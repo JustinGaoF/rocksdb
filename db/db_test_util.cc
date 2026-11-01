@@ -1978,6 +1978,17 @@ std::vector<std::string> ColumnFamilyNamesThrough(
   return names;
 }
 
+size_t WalPartitionsAppendedTo(DB* db) {
+  DBImpl* impl = static_cast_with_check<DBImpl>(db->GetRootDB());
+  size_t appended = 0;
+  for (size_t p = 0;
+       impl->TEST_NumWalPartitions() > 1 && p < impl->TEST_NumWalPartitions();
+       ++p) {
+    appended += impl->TEST_WalDurabilityDurableUpto(p) > 0 ? 1 : 0;
+  }
+  return appended;
+}
+
 void AssertKeyPrefixesInEveryRecoveryMode(const Options& options,
                                           const std::string& dbname,
                                           const std::vector<uint32_t>& cf_ids,

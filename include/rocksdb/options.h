@@ -491,9 +491,14 @@ enum class WALRecoveryMode : char {
 // indexed format; it does not partition anything.
 //
 // To roll back:
-//   1. Reopen with this option set to `kNone`.
+//   1. Reopen with this option set to `kNone` and `DBOptions::wal_partitions`
+//      set to 1 (Open() rejects `kNone` with more than one partition).
 //   2. Flush every column family.
-//   3. Wait for the WAL files written before step 1 to be deleted.
+//   3. Commit or roll back every prepared transaction (a WAL holding an
+//      unresolved prepare, and every WAL written before step 1 with it, stays
+//      live). If any was outstanding, flush again, after at least one write
+//      if no memtable holds data (a flush with nothing to write records no
+//      progress). Wait for the WAL files written before step 1 to be deleted.
 //   4. If `WAL_ttl_seconds` or `WAL_size_limit_MB` keeps an archive, purge
 //      `archive/` or wait until those limits expire the same WAL files there.
 //   5. Close, reopen once more with `kNone`, and close. The MANIFEST record
@@ -505,6 +510,10 @@ enum class WALRecoveryMode : char {
 //   7. Require that it also reports `WAL index guard: clear`; it exits 0 only
 //      when 6 and 7 both hold.
 //   8. Downgrade the RocksDB binary.
+// Do not set this option back to a value other than `kNone` until step 7
+// holds: if a prepare still keeps a WAL written before step 1 live, the open
+// after re-enabling finds unindexed WALs between indexed ones and fails in
+// every recovery mode.
 enum class PartitionWALUsage : char {
   // Disabled. The WAL keeps the vanilla on-disk format so that files stay
   // readable by (and are bit-for-bit compatible with) older RocksDB versions.
@@ -1578,6 +1587,7 @@ struct DBOptions {
   // track_and_verify_wals_in_manifest = false, and, per column family,
   // inplace_update_support, enable_blob_direct_write, max_successive_merges > 0
   // and any memtable other than the skip list, as well as
+  // persist_user_defined_timestamps = false with a timestamp comparator, and
   // OptimisticTransactionDB with serial validation; each message names the
   // conflicting option. WriteWithCallback() with a callback,
   // WriteBatchWithIndex ingestion and GetUpdatesSince() return
@@ -1640,6 +1650,9 @@ struct DBOptions {
   // a Refresh(). With one partition, tailing iterators are unchanged.
   //
   // Not dynamically changeable via SetOptions().
+  //
+  // To go back to one WAL in the vanilla format, follow the rollback
+  // procedure in the `PartitionWALUsage` comment.
   //
   // Default: 1
   uint32_t wal_partitions = 1;

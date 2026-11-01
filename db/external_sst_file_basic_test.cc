@@ -228,6 +228,39 @@ INSTANTIATE_TEST_CASE_P(WalPartitions1, ExternalSSTFileBasicTestN,
 INSTANTIATE_TEST_CASE_P(WalPartitions8, ExternalSSTFileBasicTestN,
                         testing::Values(false));
 
+// Review-M3 T1: writes to column families covering every partition, so the
+// WalPartitions8 leg holds unflushed records on more than one partition while
+// a file is ingested into each family; every write and ingested key survives
+// a reopen.
+TEST_P(ExternalSSTFileBasicTestN, IngestBesideWritesOnEveryPartition) {
+  Options options = CurrentOptions();
+  const std::vector<uint32_t> cf_ids =
+      ColumnFamilyIdsCoveringWalPartitions(options.wal_partitions);
+  const std::vector<std::string> cf_names = ColumnFamilyNamesThrough(cf_ids);
+  CreateAndReopenWithCF({cf_names.begin() + 1, cf_names.end()}, options);
+  for (uint32_t cf_id : cf_ids) {
+    ASSERT_OK(Put(static_cast<int>(cf_id), "written", "value"));
+  }
+  if (options.wal_partitions > 1) {
+    ASSERT_GE(WalPartitionsAppendedTo(db_.get()), 2u);
+  }
+  for (uint32_t cf_id : cf_ids) {
+    const std::string file =
+        sst_files_dir_ + "every_partition_" + std::to_string(cf_id) + ".sst";
+    SstFileWriter sst_file_writer(EnvOptions(), options);
+    ASSERT_OK(sst_file_writer.Open(file));
+    ASSERT_OK(sst_file_writer.Put("ingested", "value"));
+    ASSERT_OK(sst_file_writer.Finish());
+    ASSERT_OK(db_->IngestExternalFile(handles_[cf_id], {file},
+                                      IngestExternalFileOptions()));
+  }
+  ReopenWithColumnFamilies(cf_names, options);
+  for (uint32_t cf_id : cf_ids) {
+    EXPECT_EQ("value", Get(static_cast<int>(cf_id), "written"));
+    EXPECT_EQ("value", Get(static_cast<int>(cf_id), "ingested"));
+  }
+}
+
 TEST_P(ExternalSSTFileBasicTestN, ReopenWithoutFinishIsRejected) {
   Options options = CurrentOptions();
   SstFileWriter sst_file_writer(EnvOptions(), options);
