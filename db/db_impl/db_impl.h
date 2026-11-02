@@ -3574,7 +3574,12 @@ class DBImpl : public DB
   // them as a lost tail. Called by ResumeImpl,
   // with mutex_ held, before ClearBGError; releases mutex_ around the I/O. On
   // failure the indices stay pending and the DB stays write-stopped.
-  Status ExplainBurnedWALIndices(const WriteOptions& write_options);
+  // An index burned in a WAL numbered below `retired_below` is dropped with
+  // no I/O and no void: no recovery reads that WAL again, and its successors'
+  // predecessor spans put every index it burned below every recovery's
+  // lower bound (WALIndexMerger::ComputeLowerBound).
+  Status ExplainBurnedWALIndices(const WriteOptions& write_options,
+                                 uint64_t retired_below);
 
   // Whether any burned WAL index still awaits explanation. The retry-flush
   // recovery path rotates no WALs, so with burns pending Resume takes the
@@ -3773,11 +3778,14 @@ class DBImpl : public DB
   // which the failed group registered [failed_wal_sequence_start,
   // failed_wal_sequence] for N>1 durability and publication; the range is
   // kept in failed_wal_ranges_ until recovery clears the error.
+  // `pinned_sync_first_sequence`, when nonzero, is where a sync-led group's
+  // sync writers' applied range begins (see FailedWalRange).
   static constexpr size_t kNoPinnedWalRange = SIZE_MAX;
   void WALIOStatusCheck(const IOStatus& status, uint64_t failed_wal_number = 0,
                         SequenceNumber failed_wal_sequence = 0,
                         SequenceNumber failed_wal_sequence_start = 0,
-                        size_t pinned_wal_partition = kNoPinnedWalRange);
+                        size_t pinned_wal_partition = kNoPinnedWalRange,
+                        SequenceNumber pinned_sync_first_sequence = 0);
 
   // Extends the inclusive WAL-number cutoff that must not receive more I/O.
   // This is lock-free because a WAL error can race with public SyncWAL().
@@ -5435,6 +5443,11 @@ class DBImpl : public DB
     size_t partition;
     SequenceNumber low;
     SequenceNumber high;
+    // Nonzero for a sync-led group with async writers whose append failed:
+    // its one durability range is [low, high], but the applied tracker holds
+    // [low, sync_first_sequence - 1] and [sync_first_sequence, high]
+    // (AllocateSequenceAndWALIndex).
+    SequenceNumber sync_first_sequence = 0;
   };
   std::vector<FailedWalRange> failed_wal_ranges_;
   // N>1 WAL indices whose append reported failure, with the WAL that burned
