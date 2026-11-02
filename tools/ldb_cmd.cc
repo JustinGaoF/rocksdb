@@ -196,7 +196,8 @@ std::string WALFileIterator::GetNextWAL() {
 
 void DumpWalFiles(Options options, const std::string& dir_or_file,
                   bool print_header, bool print_values,
-                  bool only_print_seqno_gaps, bool is_write_committed,
+                  bool only_print_seqno_gaps, bool wal_index_guard_set,
+                  bool is_write_committed,
                   const std::map<uint32_t, const Comparator*>& ucmps,
                   LDBCommandExecuteResult* exec_state);
 
@@ -2494,6 +2495,7 @@ void DBDumperCommand::DoCommand() {
         DumpWalFiles(options_, path_, /* print_header_ */ true,
                      /* print_values_ */ true,
                      /* only_print_seqno_gaps */ false,
+                     /* wal_index_guard_set */ false,
                      true /* is_write_commited */, ucmps_, &exec_state_);
         break;
       case kTableFile:
@@ -3146,7 +3148,8 @@ std::string PartitionedWalGapsRefusal(const std::string& wal_file,
 
 void DumpWalFiles(Options options, const std::string& dir_or_file,
                   bool print_header, bool print_values,
-                  bool only_print_seqno_gaps, bool is_write_committed,
+                  bool only_print_seqno_gaps, bool wal_index_guard_set,
+                  bool is_write_committed,
                   const std::map<uint32_t, const Comparator*>& ucmps,
                   LDBCommandExecuteResult* exec_state) {
   std::vector<std::string> filenames;
@@ -3202,13 +3205,18 @@ void DumpWalFiles(Options options, const std::string& dir_or_file,
       const Status head = log::ReadWALPartition(
           options.env->GetFileSystem().get(), scanned, FileOptions(options),
           log_number, &wal_partition);
-      if (!head.ok() && !head.IsNotFound() && options.wal_partitions > 1) {
-        // Which partition wrote it is unknown (D-GC27b).
+      if (!head.ok() && !head.IsNotFound() &&
+          (options.wal_partitions > 1 || wal_index_guard_set)) {
+        // An indexed DB: which partition wrote it is unknown (D-GC27b).
         if (exec_state) {
           *exec_state = LDBCommandExecuteResult::Failed(
-              "--only_print_seqno_gaps: " + scanned + ": " + head.ToString() +
-              "; with wal_partitions > 1 it may be a partitioned WAL, whose "
-              "sequence numbers interleave across files");
+              Status::NotSupported(
+                  "--only_print_seqno_gaps: " + scanned + ": " +
+                  head.ToString() +
+                  "; the DB is indexed (wal_partitions > 1 or the MANIFEST "
+                  "WAL index guard), so it may be a partitioned WAL, whose "
+                  "sequence numbers interleave across files")
+                  .ToString());
         }
         return;
       }
@@ -3483,16 +3491,30 @@ void WALDumperCommand::Help(std::string& ret) {
   ret.append(" [--" + ARG_PRINT_HEADER + "] ");
   ret.append(" [--" + ARG_PRINT_VALUE + "] ");
   ret.append(" [--" + ARG_ONLY_PRINT_SEQNO_GAPS +
-             "] (only correct if not using pessimistic transactions)");
+             "] (only correct if not using pessimistic transactions; reads "
+             "the MANIFEST in --db, else in the --walfile directory, to tell "
+             "a partitioned WAL set)");
   ret.append(" [--" + ARG_WRITE_COMMITTED + "=true|false] ");
   ret.append("\n");
 }
 
 void WALDumperCommand::DoCommand() {
   PrepareOptions();
+  // The DB is indexed when the options say wal_partitions > 1 or the MANIFEST
+  // WAL index guard is set, which covers the default wal_partitions of 1.
+  // The guard is read from --db, else from the --walfile directory; with no
+  // readable MANIFEST there, the options alone decide.
+  bool wal_index_guard_set = false;
+  if (only_print_seqno_gaps_) {
+    uint64_t guard = 0;
+    const Status s = VersionSet::ReadWALIndexGuard(
+        db_path_.empty() ? wal_file_ : db_path_,
+        options_.env->GetFileSystem().get(), &guard);
+    wal_index_guard_set = s.ok() && guard != 0;
+  }
   DumpWalFiles(options_, wal_file_, print_header_, print_values_,
-               only_print_seqno_gaps_, is_write_committed_, ucmps_,
-               &exec_state_);
+               only_print_seqno_gaps_, wal_index_guard_set, is_write_committed_,
+               ucmps_, &exec_state_);
 }
 
 // ----------------------------------------------------------------------------

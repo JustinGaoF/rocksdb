@@ -888,7 +888,11 @@ enum Histograms : uint32_t {
   //
   // Time (microseconds) a write group waits in its completion gate for every
   // lower sequence number to reach the WAL. One sample per group that runs
-  // the gate; a group whose predecessors already landed records ~0.
+  // the gate; a group whose predecessors already landed records ~0. With
+  // more than one WAL partition, a wait that cannot end before a running
+  // gate sync does (a sync group's wait for the records below it to be
+  // written, or a wait to become visible behind that sync) includes the time
+  // the group spends fsyncing partitions of that sync.
   WAL_DURABILITY_WAIT_MICROS,
   // Time (microseconds) from the start of a write group's WAL append to the
   // durability tracker marking its range complete. One sample per group.

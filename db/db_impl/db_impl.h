@@ -2403,6 +2403,8 @@ class DBImpl : public DB
   friend class XFTransactionWriteHandler;
   friend class DBBlobIndexTest;
   friend class WriteUnpreparedTransactionTest_RecoveryTest_Test;
+  friend class
+      WritePreparedPartitionedWalTest_SyncCommitCallbacksWaitUntilGroupCannotFail_Test;
   friend class CompactionServiceTest_PreservedOptionsLocalCompaction_Test;
   friend class CompactionServiceTest_PreservedOptionsRemoteCompaction_Test;
 #endif
@@ -3294,11 +3296,11 @@ class DBImpl : public DB
     WaitForUnpublishedSyncGroups();
   }
 
-  // N>1: a sync group leaves its write queue before its sync writers'
-  // batches are fsynced, inserted and published (RunSyncGate). Waits until
+  // N>1: a sync group leaves its write queue with its sync writers' batches
+  // inserted but not yet fsynced or published (RunSyncGate). Waits until
   // each such group published or fenced them, so no memtable switch comes
-  // between their allocation and their insert, and no write in flight holds
-  // a sequence above LastSequence() (AssertLastSequenceCoversAllocated).
+  // while their range can still fail, and no write in flight holds a
+  // sequence above LastSequence() (AssertLastSequenceCoversAllocated).
   // REQUIRES: mutex_ held, and every write queue (or the closed memtable
   // switch gate), so no group can start counting meanwhile.
   void WaitForUnpublishedSyncGroups() {
@@ -3622,34 +3624,47 @@ class DBImpl : public DB
                            uint64_t sync_micros);
 
   // N>1 only. The completion gate of a sync group's sync writers, whose
-  // range [low, target] on `wal_partition` is written to the WAL but neither
-  // inserted nor published (D-9): waits until every record at or below
-  // `target` is written, then runs one coalesced gate sync of the WALs
-  // holding what it needs (D-GC28b (i)), runs the sync writers' pre-release
-  // callbacks,
-  // inserts their batches (with the leader's `write_options`), then
-  // publishes the range and waits until it is visible, as one partition
-  // does in its write group. On any failure the range is never published
-  // (FailUnpublishedSyncRange, or HandleMemTableInsertFailure). Either way
-  // it leaves unpublished_sync_groups_ before the visibility wait.
+  // range [low, target] on `wal_partition` is written to the WAL and
+  // inserted (`inserted`: whether it has any memtable entry) but not
+  // published (D-9): waits until every record at or below `target` is
+  // written, then runs one coalesced gate sync of the WALs holding what it
+  // needs (D-GC28b (i)). Then, once every range below `low` is published, so
+  // the group can no longer fail, runs the sync writers' pre-release
+  // callbacks (D-GC30c (i)), publishes the range and waits until it is
+  // visible, as one partition does in its write group. On any failure the
+  // range is never published (FailUnpublishedSyncRange). Either way it
+  // leaves unpublished_sync_groups_ before the visibility wait.
   // `write_group` holds only the leader and the sync writers by then.
   Status RunSyncGate(size_t wal_partition, SequenceNumber low,
-                     SequenceNumber target, const WriteOptions& write_options,
+                     SequenceNumber target,
                      const WriteThread::WriteGroup& write_group,
-                     bool disable_memtable, size_t pre_release_callback_cnt);
+                     bool disable_memtable, size_t pre_release_callback_cnt,
+                     bool inserted);
 
-  // N>1 only. A sync group's range [low, high] failed before it was
-  // published. After a failed fsync, or a failed pre-release callback (which
-  // sets the background error from `status` when none is set), handles it
-  // as WALIOStatusCheck handles a failed append's range: pinned in
-  // failed_wal_ranges_ under an open fence at `low`, so it and every write
-  // above it fail, and every flush drops their entries until recovery
-  // releases it. Otherwise no background error is set (the MANIFEST record
-  // of the sync failed, or shutdown began): publishes the range as a hole,
-  // as one partition's failed write inserts nothing. Takes mutex_.
+  // N>1 only. A registered range [low, high] whose WAL record landed failed
+  // before it was published: a sync group's sync writers' range, or a write
+  // group's range whose pre-release callbacks, or the wait before them,
+  // failed (WriteImpl). After a failed fsync, a failed pre-release callback
+  // (which sets the background error from `status` when none is set), or
+  // once entries of the range may be in a memtable (`inserted`, D-GC30d
+  // (ii); likewise), handles it as WALIOStatusCheck handles a failed
+  // append's range: pinned in failed_wal_ranges_ under an open fence at
+  // `low`, so it and every write above it fail, and every flush drops their
+  // entries until recovery releases it. Otherwise no background error is set
+  // and nothing was inserted (the MANIFEST record of the sync failed, or
+  // shutdown began): publishes the range as a hole, as one partition's
+  // failed write inserts nothing. Takes mutex_.
   void FailUnpublishedSyncRange(size_t wal_partition, SequenceNumber low,
                                 SequenceNumber high, const Status& status,
-                                bool callback_failed);
+                                bool callback_failed, bool inserted);
+
+  // N>1 only. Waits until every range below `low` is published (and, with
+  // `wal_record`, every record below it written): from then on no fence can
+  // reach a group whose range starts at `low`, so callbacks it cannot undo
+  // may run. Returns the fence holding `low - 1` if a range below failed,
+  // unless recovery released it before the group allocated, or
+  // ShutdownInProgress.
+  Status WaitUntilRangesBelowPublished(SequenceNumber low, bool wal_record);
 
   // Leaves unpublished_sync_groups_, waking WaitForPendingWrites at zero.
   // Takes mutex_ then; call without it.
@@ -3699,14 +3714,18 @@ class DBImpl : public DB
   // Fsyncs the WALs a gate sync claimed, each partition with no WAL mutex
   // held (or, when its current WAL is not IsSyncThreadSafe(), under that
   // partition's mutex alone). The partitions are fsynced concurrently: the
-  // gates waiting in RunCoalescedGateSync each take one (D-GC28c (ii)), and
-  // the caller takes whatever none took, so with no waiter it runs them in
-  // turn. No partition starts after one failed; the first failure is the
+  // gates waiting in RunCoalescedGateSync each take one (D-GC28c (ii)), as
+  // do the writers parked in WaitForWalDurability whose acknowledgment
+  // waits for this sync anyway (their target is above `claim_bound`, the
+  // sync's claim bound), and the caller takes whatever none took, so with
+  // no helper it runs them in turn. No partition starts after one failed;
+  // the first failure is the
   // result, naming its WAL in `*failed_wal_number`. Counts the partitions
   // fsynced. `previously_failed` as for SyncWalPartitionFiles.
   // REQUIRES: called by the running gate sync (RunCoalescedGateSync).
   IOStatus SyncClaimedWalPartitions(const WriteOptions& write_options,
                                     const std::vector<GateSyncPartition>& claim,
+                                    SequenceNumber claim_bound,
                                     uint64_t* failed_wal_number,
                                     uint64_t* fsynced_partitions,
                                     bool* previously_failed);
@@ -4542,6 +4561,9 @@ class DBImpl : public DB
   // parked in WaitForWalDurability, most of them waiting for this very sync
   // to publish, take one too (HelpRunningGateSync).
   std::atomic<bool> wal_gate_sync_help_wanted_{false};
+  // The claim bound of the sync that last wanted help: a writer parked for
+  // publication helps only if its target is above it (WaitForWalDurability).
+  std::atomic<SequenceNumber> wal_gate_sync_help_above_{kMaxSequenceNumber};
   // Runs claimed partition `index` of wal_gate_sync_work_ with the mutex
   // released, and records its outcome.
   // REQUIRES: wal_gate_sync_mutex_ held, index taken from work.next.
@@ -4561,8 +4583,8 @@ class DBImpl : public DB
   // N>1: sync groups counted from their completion gate's install, in their
   // write group, until RunSyncGate publishes or fences their sync writers'
   // range (or their group fails before the gate runs). While one is
-  // counted, its range is allocated but neither inserted nor published, so
-  // WaitForPendingWrites waits for zero before any memtable switch.
+  // counted, its range is inserted but can still fail and is not published,
+  // so WaitForPendingWrites waits for zero before any memtable switch.
   std::atomic<uint32_t> unpublished_sync_groups_{0};
 
   // Serializes sequence-block and WAL-index allocation across all WAL

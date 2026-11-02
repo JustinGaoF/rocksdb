@@ -83,6 +83,10 @@ class WalManager {
  private:
   Status GetSortedWalsOfType(const std::string& path, VectorWalPtr& log_files,
                              WalFileType type, bool need_seqnos);
+  // OK to read the WALs in file order, or NotSupported naming a WAL that is
+  // partitioned or, in an indexed DB, unreadable.
+  Status CheckWalsReadableAndUnpartitioned(const VectorWalPtr& wal_files,
+                                           VersionSet* version_set);
   // Requires: all_logs should be sorted with earliest log file first
   // Retains all log files in all_logs which contain updates with seq no.
   // Greater Than or Equal to the requested SequenceNumber.

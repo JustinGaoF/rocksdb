@@ -1639,6 +1639,12 @@ struct DBOptions {
   // before or after DB::Resume(), and it shows newly published writes without
   // a Refresh(). With one partition, tailing iterators are unchanged.
   //
+  // With more than one partition, a write group inserts into the memtables
+  // while its WAL record is appended, and becomes visible only once both are
+  // done. Batches with Merge operations are inserted concurrently like any
+  // other batch (with one partition, a Merge makes its group insert serially),
+  // which is why max_successive_merges must be 0.
+  //
   // Not dynamically changeable via SetOptions().
   //
   // Default: 1

@@ -96,6 +96,31 @@ class SequenceFloorIterator : public InternalIterator {
   const SequenceNumber floor_;
   uint64_t num_hidden_ = 0;
 };
+
+// The range tombstones `iter` (a memtable's, without a sequence bound)
+// holds below `floor`, again without a sequence bound, which the flush's
+// CompactionRangeDelAggregator requires: a bound would only limit what
+// readers see, not what the flush writes. Takes ownership of `iter`. Sets
+// `*replaced` to the tombstones `iter` held if it was replaced (they count as
+// read once the replacement's are), else 0.
+FragmentedRangeTombstoneIterator* RangeTombstonesBelow(
+    FragmentedRangeTombstoneIterator* iter, SequenceNumber floor,
+    const InternalKeyComparator& icmp, uint64_t* replaced) {
+  *replaced = 0;
+  if (iter == nullptr || floor == kMaxSequenceNumber) {
+    return iter;
+  }
+  std::unique_ptr<FragmentedRangeTombstoneIterator> all(iter);
+  *replaced = all->num_unfragmented_tombstones();
+  auto below = std::make_shared<FragmentedRangeTombstoneList>(
+      std::unique_ptr<InternalIterator>(
+          new SequenceFloorIterator(all.get(), floor)),
+      icmp);
+  if (below->empty()) {
+    return nullptr;
+  }
+  return new FragmentedRangeTombstoneIterator(below, icmp, kMaxSequenceNumber);
+}
 }  // namespace
 
 const char* GetFlushReasonString(FlushReason flush_reason) {
@@ -482,16 +507,16 @@ Status FlushJob::MemPurge() {
       range_del_iters;
   // What a flush would drop, MemPurge drops too: entries at or above an
   // unreleased fence.
-  const SequenceNumber range_del_read_seq =
-      drop_entries_at_or_above_ == kMaxSequenceNumber
-          ? kMaxSequenceNumber
-          : drop_entries_at_or_above_ - 1;
   for (ReadOnlyMemTable* m : mems_) {
     memtables.push_back(m->NewIterator(ro, /*seqno_to_time_mapping=*/nullptr,
                                        &arena, /*prefix_extractor=*/nullptr,
                                        /*for_flush=*/true));
-    auto* range_del_iter = m->NewRangeTombstoneIterator(
-        ro, range_del_read_seq, true /* immutable_memtable */);
+    uint64_t replaced_range_deletions = 0;
+    auto* range_del_iter = RangeTombstonesBelow(
+        m->NewRangeTombstoneIterator(ro, kMaxSequenceNumber,
+                                     true /* immutable_memtable */),
+        drop_entries_at_or_above_, cfd_->internal_comparator(),
+        &replaced_range_deletions);
     if (range_del_iter != nullptr) {
       range_del_iters.emplace_back(range_del_iter);
     }
@@ -1018,20 +1043,27 @@ Status FlushJob::WriteLevel0Table() {
             m->NewIterator(ro, /*seqno_to_time_mapping=*/nullptr, &arena,
                            /*prefix_extractor=*/nullptr, /*for_flush=*/true));
       }
-      const SequenceNumber range_del_read_seq =
-          drop_entries_at_or_above_ == kMaxSequenceNumber
-              ? kMaxSequenceNumber
-              : drop_entries_at_or_above_ - 1;
-      auto* range_del_iter =
+      uint64_t replaced_range_deletions = 0;
+      auto* range_del_iter = RangeTombstonesBelow(
           logical_strip_timestamp
               ? m->NewTimestampStrippingRangeTombstoneIterator(
-                    ro, range_del_read_seq, ts_sz)
-              : m->NewRangeTombstoneIterator(ro, range_del_read_seq,
-                                             true /* immutable_memtable */);
+                    ro, kMaxSequenceNumber, ts_sz)
+              : m->NewRangeTombstoneIterator(ro, kMaxSequenceNumber,
+                                             true /* immutable_memtable */),
+          drop_entries_at_or_above_, cfd_->internal_comparator(),
+          &replaced_range_deletions);
+      total_num_input_entries += m->NumEntries();
+      if (replaced_range_deletions > 0) {
+        // BuildTable counts the replacement's tombstones as read instead.
+        total_num_input_entries -= replaced_range_deletions;
+        if (range_del_iter != nullptr) {
+          total_num_input_entries +=
+              range_del_iter->num_unfragmented_tombstones();
+        }
+      }
       if (range_del_iter != nullptr) {
         range_del_iters.emplace_back(range_del_iter);
       }
-      total_num_input_entries += m->NumEntries();
       total_num_deletes += m->NumDeletion();
       total_data_size += m->GetDataSize();
       total_memory_usage += m->ApproximateMemoryUsage();
