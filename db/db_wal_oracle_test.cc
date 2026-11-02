@@ -23,7 +23,9 @@
 //    recovery cut agree.
 //  - Power loss (unsynced data dropped): every acknowledged sync=true write is
 //    recovered, and with it everything acknowledged below it.
-//  - Published but lost (off by default, see kCheckPublished below).
+//  - Published but lost (on by default, see kCheckPublished below): nothing
+//    observed through GetLatestSequenceNumber() before a process crash is
+//    missing after it.
 // A hole entirely below the lowest sequence recovery replayed from the WALs
 // fails like any other.
 //
@@ -36,8 +38,9 @@
 // Environment variables:
 //   ROCKSDB_WAL_ORACLE_CYCLES  cycles to run (default kDefaultCycles)
 //   ROCKSDB_WAL_ORACLE_SEED    seed of the first cycle; cycle i uses seed + i
-//   ROCKSDB_WAL_ORACLE_CHECK_PUBLISHED  1 turns the published-but-lost check
-//                              on (see kCheckPublished)
+//   ROCKSDB_WAL_ORACLE_CHECK_PUBLISHED  =0 turns the published-but-lost
+//                              check off for a diagnosis, =1 forces it on
+//                              (see kCheckPublished)
 
 #include <algorithm>
 #include <atomic>
@@ -47,6 +50,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <set>
@@ -84,11 +88,12 @@ constexpr uint64_t kSelfTestMaxCycles = 400;
 
 // Published but lost (I2): a sequence a reader could observe through
 // GetLatestSequenceNumber() before a process crash is missing after it.
-// Off by default under D-G54 (a): visibility is not yet bounded by the
-// durability safe point (G-10, N-2-1), so publication can run ahead of
-// durability until GC07 lands. GC07 turns it on. Cycles where it would fail
-// are counted and printed either way.
-constexpr bool kCheckPublished = false;
+// Publication is bounded by the WAL-written prefix
+// (PublishAppliedFrontierLocked publishes only what reached a WAL, asserted
+// in debug builds), and a process crash drops nothing written, so every
+// published sequence is recovered. Cycles where it would fail are counted
+// and printed either way.
+constexpr bool kCheckPublished = true;
 
 // A seed whose single cycle loses a partition's lowest live records in flight
 // while another partition keeps a higher one (G-20): 44 of 60 reruns violated
@@ -98,6 +103,14 @@ constexpr uint64_t kLowerBoundSeed = 20261809;
 uint64_t EnvU64(const char* name, uint64_t default_value) {
   const char* value = getenv(name);
   return value == nullptr ? default_value : std::strtoull(value, nullptr, 10);
+}
+
+// Whether the published-but-lost check runs: kCheckPublished unless the
+// environment overrides it (any value other than 0 forces it on).
+bool CheckPublished() {
+  const char* value = getenv("ROCKSDB_WAL_ORACLE_CHECK_PUBLISHED");
+  return value == nullptr ? kCheckPublished
+                          : std::strtoull(value, nullptr, 10) != 0;
 }
 
 enum class CrashKind {
@@ -267,6 +280,8 @@ std::string ValueFor(uint64_t seed, int thread, int index) {
 
 struct CycleResult {
   std::vector<std::string> violations;
+  // The crash fired while writers were still running, not at quiescence.
+  bool crashed_mid_run = false;
   bool published_lost = false;
   // A power-loss cycle lost an acknowledged write (see Verify): the proof
   // the crash actually dropped unsynced data (G-54).
@@ -294,16 +309,22 @@ class DBWalOracleTest : public DBTestBase {
   // first cycle with a violation, or 0 when every cycle passed. With
   // `stop_at_violation` false every cycle runs and each violation is reported
   // as a test failure. The out-parameters report how many power-loss cycles
-  // ran and how many of them lost an acknowledged write.
+  // ran, how many of them lost an acknowledged write, and how many cycles
+  // crashed mid-run.
   uint64_t RunCycles(uint64_t seed, uint64_t cycles,
                      const std::function<void(CycleConfig*)>& adjust,
                      bool stop_at_violation,
                      uint64_t* power_loss_cycles_out = nullptr,
-                     uint64_t* power_loss_lost_out = nullptr);
+                     uint64_t* power_loss_lost_out = nullptr,
+                     uint64_t* mid_run_crashes_out = nullptr);
 
   // Self-test only: the recovery's merge treats the first unexplained hole
   // as explained, stopping one index late.
   bool inject_merge_stop_off_by_one_ = false;
+
+  // Self-test only: after the writers finish and before the crash, publish
+  // one write that never reaches a WAL (see CatchesPublishedButLost).
+  bool inject_published_but_lost_ = false;
 
  private:
   // Creates column families until every partition has one, and returns the
@@ -492,6 +513,19 @@ CycleResult DBWalOracleTest::RunCycle(const CycleConfig& config) {
   for (port::Thread& t : writers) {
     t.join();
   }
+  if (inject_published_but_lost_ && !crashed.load()) {
+    // A disableWAL write is published (visible through
+    // GetLatestSequenceNumber()) but never reaches a WAL, so the crash
+    // below loses it. The self-test's cycles crash at quiescence, so this
+    // is the only violation they can report.
+    WriteOptions no_wal;
+    no_wal.disableWAL = true;
+    EXPECT_OK(db_->Put(no_wal, handles_[cf_for_partition[0]],
+                       "published_but_lost_probe", "value"));
+  }
+  // Whether the crash fired mid-run is read here: the quiescent crash below
+  // sets the flag too.
+  result.crashed_mid_run = crashed.load();
   // Every writer finished before the crash point (or writes failed first):
   // crash at quiescence.
   crash();
@@ -646,8 +680,7 @@ void DBWalOracleTest::Verify(
     }
     if (published > max_recovered) {
       result->published_lost = true;
-      if (kCheckPublished ||
-          EnvU64("ROCKSDB_WAL_ORACLE_CHECK_PUBLISHED", 0) != 0) {
+      if (CheckPublished()) {
         violation("published sequence " + std::to_string(published) +
                   " is above the recovered prefix " +
                   std::to_string(max_recovered));
@@ -659,7 +692,8 @@ void DBWalOracleTest::Verify(
 uint64_t DBWalOracleTest::RunCycles(
     uint64_t seed, uint64_t cycles,
     const std::function<void(CycleConfig*)>& adjust, bool stop_at_violation,
-    uint64_t* power_loss_cycles_out, uint64_t* power_loss_lost_out) {
+    uint64_t* power_loss_cycles_out, uint64_t* power_loss_lost_out,
+    uint64_t* mid_run_crashes_out) {
   uint64_t first_violation = 0;
   uint64_t published_lost = 0;
   uint64_t cycles_with_holes = 0;
@@ -670,6 +704,8 @@ uint64_t DBWalOracleTest::RunCycles(
   uint64_t ran = 0;
   uint64_t acked = 0;
   uint64_t recovered = 0;
+  uint64_t mid_run_crashes = 0;
+  uint64_t mid_run_by_trigger[4] = {0, 0, 0, 0};
   const uint64_t start = SystemClock::Default()->NowMicros();
   for (uint64_t i = 0; i < cycles; ++i) {
     CycleConfig config = ConfigForSeed(seed + i);
@@ -678,6 +714,10 @@ uint64_t DBWalOracleTest::RunCycles(
     }
     const CycleResult result = RunCycle(config);
     ++ran;
+    if (result.crashed_mid_run) {
+      ++mid_run_crashes;
+      ++mid_run_by_trigger[static_cast<int>(config.trigger)];
+    }
     two_partition_cycles += config.partitions == 2 ? 1 : 0;
     power_loss_cycles += config.crash == CrashKind::kPowerLoss ? 1 : 0;
     power_loss_lost +=
@@ -717,19 +757,26 @@ uint64_t DBWalOracleTest::RunCycles(
           " in %" PRIu64 " process-crash cycles (check %s); N=2 in %" PRIu64
           ", N=8 in %" PRIu64 ", power loss in %" PRIu64
           ", a slow partition in %" PRIu64
-          "; power loss lost an acknowledged write in %" PRIu64 "\n",
+          "; power loss lost an acknowledged write in %" PRIu64
+          "; crashed mid-run in %" PRIu64 " (ack %" PRIu64 ", append %" PRIu64
+          ", gate_sync %" PRIu64 ", park %" PRIu64 ")\n",
           ran, seed, (SystemClock::Default()->NowMicros() - start) / 1e6, acked,
           recovered, cycles_with_holes, published_lost,
-          kCheckPublished || EnvU64("ROCKSDB_WAL_ORACLE_CHECK_PUBLISHED", 0)
-              ? "on"
-              : "off",
-          two_partition_cycles, ran - two_partition_cycles, power_loss_cycles,
-          slow_cycles, power_loss_lost);
+          CheckPublished() ? "on" : "off", two_partition_cycles,
+          ran - two_partition_cycles, power_loss_cycles, slow_cycles,
+          power_loss_lost, mid_run_crashes,
+          mid_run_by_trigger[static_cast<int>(CrashTrigger::kAck)],
+          mid_run_by_trigger[static_cast<int>(CrashTrigger::kAppend)],
+          mid_run_by_trigger[static_cast<int>(CrashTrigger::kGateSync)],
+          mid_run_by_trigger[static_cast<int>(CrashTrigger::kPark)]);
   if (power_loss_cycles_out != nullptr) {
     *power_loss_cycles_out = power_loss_cycles;
   }
   if (power_loss_lost_out != nullptr) {
     *power_loss_lost_out = power_loss_lost;
+  }
+  if (mid_run_crashes_out != nullptr) {
+    *mid_run_crashes_out = mid_run_crashes;
   }
   return first_violation;
 }
@@ -737,10 +784,11 @@ uint64_t DBWalOracleTest::RunCycles(
 TEST_F(DBWalOracleTest, RecoveredStateIsPrefixOfHistory) {
   uint64_t power_loss_cycles = 0;
   uint64_t power_loss_lost = 0;
-  RunCycles(EnvU64("ROCKSDB_WAL_ORACLE_SEED", kDefaultSeed),
-            EnvU64("ROCKSDB_WAL_ORACLE_CYCLES", kDefaultCycles),
+  uint64_t mid_run_crashes = 0;
+  const uint64_t cycles = EnvU64("ROCKSDB_WAL_ORACLE_CYCLES", kDefaultCycles);
+  RunCycles(EnvU64("ROCKSDB_WAL_ORACLE_SEED", kDefaultSeed), cycles,
             /*adjust=*/nullptr, /*stop_at_violation=*/false, &power_loss_cycles,
-            &power_loss_lost);
+            &power_loss_lost, &mid_run_crashes);
   // The crashes prove they lose data (G-54): when power-loss cycles ran, at
   // least one must have lost an acknowledged write, or every cycle was a
   // clean restart. Skipped when no power-loss cycle ran (single-cycle
@@ -749,11 +797,17 @@ TEST_F(DBWalOracleTest, RecoveredStateIsPrefixOfHistory) {
     EXPECT_GT(power_loss_lost, 0u)
         << "no power-loss cycle lost an acknowledged write";
   }
+  // The crashes prove they fire mid-run: with at least 10 cycles, at least
+  // one must have crashed while writers were still running, or every cycle
+  // was a quiescent restart. Skipped for short reruns.
+  if (cycles >= 10) {
+    EXPECT_GT(mid_run_crashes, 0u) << "no cycle crashed mid-run";
+  }
 }
 
-// The two tests below are the oracle's neuter: each injects an off-by-one
-// through a test-only sync point and requires the oracle to report it, then
-// requires the same cycles to pass with the injection off.
+// The tests below are the oracle's neuter: each injects a fault and requires
+// the oracle to report it, then requires the same cycles to pass with the
+// injection off.
 
 TEST_F(DBWalOracleTest, CatchesSafePointOffByOne) {
   // Runtime site: the tracker's safe point computation reports min_pending
@@ -842,6 +896,40 @@ TEST_F(DBWalOracleTest, CatchesLowerBoundWithoutSpans) {
   ASSERT_NE(0u, caught_at);
   EXPECT_EQ(
       0u, RunCycles(seed, caught_at, rerun_seed, /*stop_at_violation=*/false));
+}
+
+TEST_F(DBWalOracleTest, CatchesPublishedButLost) {
+  // Published but lost: after the writers finish and before a quiescent
+  // process crash, one disableWAL Put on a covered column family. It is
+  // published (visible through GetLatestSequenceNumber()) and never reaches
+  // a WAL, so the crash loses it. The oracle must report exactly the
+  // published-sequence violation: no "hole" and no "acknowledged ... lost".
+  const uint64_t seed = EnvU64("ROCKSDB_WAL_ORACLE_SEED", kDefaultSeed);
+  auto quiescent_process_crash = [](CycleConfig* config) {
+    config->crash = CrashKind::kProcessCrash;
+    config->trigger = CrashTrigger::kAck;
+    // Past any run's acknowledgements, so the crash fires at quiescence.
+    config->crash_at = std::numeric_limits<uint64_t>::max();
+  };
+  CycleConfig first = ConfigForSeed(seed);
+  quiescent_process_crash(&first);
+  inject_published_but_lost_ = true;
+  const CycleResult caught = RunCycle(first);
+  inject_published_but_lost_ = false;
+  ASSERT_EQ(1u, caught.violations.size())
+      << "expected only the published-sequence violation";
+  EXPECT_NE(std::string::npos, caught.violations[0].find("published sequence"))
+      << caught.violations[0];
+  inject_published_but_lost_ = true;
+  const uint64_t caught_at =
+      RunCycles(seed, kSelfTestMaxCycles, quiescent_process_crash,
+                /*stop_at_violation=*/true);
+  inject_published_but_lost_ = false;
+  fprintf(stderr, "published-but-lost caught at cycle %" PRIu64 "\n",
+          caught_at);
+  ASSERT_NE(0u, caught_at);
+  EXPECT_EQ(0u, RunCycles(seed, caught_at, quiescent_process_crash,
+                          /*stop_at_violation=*/false));
 }
 
 }  // namespace ROCKSDB_NAMESPACE

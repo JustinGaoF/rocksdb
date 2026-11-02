@@ -29,6 +29,7 @@
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
 #include "test_util/transaction_test_util.h"
+#include "util/defer.h"
 #include "util/random.h"
 #include "util/string_util.h"
 #include "utilities/fault_injection_env.h"
@@ -10428,14 +10429,25 @@ TEST(TransactionPartitionedWalTest, SwitchWALFindsOldestWalAcrossPartitions) {
   options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
   options.track_and_verify_wals_in_manifest = true;
   ASSERT_OK(DestroyDB(dbname, options));
+  std::vector<ColumnFamilyHandle*> handles;
   TransactionDB* db = nullptr;
   ASSERT_OK(TransactionDB::Open(options, TransactionDBOptions(), dbname, &db));
+  // Q6: release on every exit; the explicit cleanup below still runs first.
+  Defer close_db_on_exit([&] {
+    if (db == nullptr) {
+      return;
+    }
+    for (ColumnFamilyHandle* handle : handles) {
+      db->DestroyColumnFamilyHandle(handle).PermitUncheckedError();
+    }
+    delete db;
+    db = nullptr;
+  });
   DBImpl* db_impl = static_cast_with_check<DBImpl>(db->GetRootDB());
   ASSERT_EQ(kPartitions, db_impl->TEST_NumWalPartitions());
 
   // Column family ids follow creation order; create until one routes to
   // each partition.
-  std::vector<ColumnFamilyHandle*> handles;
   std::vector<ColumnFamilyHandle*> cf_for_partition(kPartitions, nullptr);
   size_t num_covered = 0;
   while (num_covered < kPartitions) {
@@ -10461,7 +10473,7 @@ TEST(TransactionPartitionedWalTest, SwitchWALFindsOldestWalAcrossPartitions) {
     }
   };
 
-  Transaction* txn = db->BeginTransaction(WriteOptions());
+  std::unique_ptr<Transaction> txn(db->BeginTransaction(WriteOptions()));
   ASSERT_OK(txn->SetName("xid"));
   ASSERT_OK(txn->Put(cf_for_partition[1], "prepared", "value"));
   ASSERT_OK(txn->Prepare());
@@ -10489,11 +10501,12 @@ TEST(TransactionPartitionedWalTest, SwitchWALFindsOldestWalAcrossPartitions) {
   ASSERT_EQ(prep_log, db_impl->TEST_AliveWalFiles(1).front().first);
 
   ASSERT_OK(txn->Commit());
-  delete txn;
+  txn.reset();
   for (ColumnFamilyHandle* handle : handles) {
     ASSERT_OK(db->DestroyColumnFamilyHandle(handle));
   }
   delete db;
+  db = nullptr;
   ASSERT_OK(DestroyDB(dbname, options));
 }
 
@@ -10551,22 +10564,34 @@ TEST(TransactionPartitionedWalTest, PreparedUnindexedWalSurvivesPartitioning) {
     delete db;
     db = nullptr;
   };
+  // Q6: release on every exit; close() still runs first and nulls db.
+  Defer close_db_on_exit([&] {
+    if (db == nullptr) {
+      return;
+    }
+    for (ColumnFamilyHandle* handle : handles) {
+      db->DestroyColumnFamilyHandle(handle).PermitUncheckedError();
+    }
+    handles.clear();
+    delete db;
+    db = nullptr;
+  });
 
   open(1, PartitionWALUsage::kNone);
-  Transaction* txn = db->BeginTransaction(WriteOptions());
+  std::unique_ptr<Transaction> txn(db->BeginTransaction(WriteOptions()));
   ASSERT_OK(txn->SetName("xid"));
   ASSERT_OK(txn->Put(handles[cf_for_partition[1]], "prepared", "value"));
   ASSERT_OK(txn->Prepare());
   ASSERT_OK(db->Put(WriteOptions(), handles[cf_for_partition[0]], "unindexed",
                     "value"));
-  delete txn;
+  txn.reset();
   close();
 
   open(kPartitions, PartitionWALUsage::kPartitionByColumnFamily);
-  txn = db->GetTransactionByName("xid");
-  ASSERT_NE(nullptr, txn);
+  txn.reset(db->GetTransactionByName("xid"));
+  ASSERT_NE(nullptr, txn.get());
   ASSERT_OK(txn->Commit());
-  delete txn;
+  txn.reset();
   for (size_t p = 0; p < kPartitions; ++p) {
     ASSERT_OK(db->Put(WriteOptions(), handles[cf_for_partition[p]],
                       "indexed" + std::to_string(p), "value"));
@@ -10602,9 +10627,21 @@ TEST(TransactionPartitionedWalTest,
   options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
   options.track_and_verify_wals_in_manifest = true;
   ASSERT_OK(DestroyDB(dbname, options));
+  std::vector<ColumnFamilyHandle*> handles;
   TransactionDB* db = nullptr;
   ASSERT_OK(TransactionDB::Open(options, TransactionDBOptions(), dbname, &db));
-  std::vector<ColumnFamilyHandle*> handles;
+  // Q6: release on every exit; the explicit cleanup below still runs first.
+  Defer close_db_on_exit([&] {
+    if (db != nullptr) {
+      for (ColumnFamilyHandle* handle : handles) {
+        db->DestroyColumnFamilyHandle(handle).PermitUncheckedError();
+      }
+      delete db;
+      db = nullptr;
+    }
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
   std::vector<ColumnFamilyHandle*> cf_for_partition(kPartitions, nullptr);
   size_t num_covered = 0;
   while (num_covered < kPartitions) {
@@ -10670,6 +10707,7 @@ TEST(TransactionPartitionedWalTest,
     ASSERT_OK(db->DestroyColumnFamilyHandle(handle));
   }
   delete db;
+  db = nullptr;
   SyncPoint::GetInstance()->DisableProcessing();
   SyncPoint::GetInstance()->ClearAllCallBacks();
   ASSERT_OK(DestroyDB(dbname, options));
@@ -10685,6 +10723,14 @@ TEST(TransactionPartitionedWalTest,
 TEST(TransactionPartitionedWalTest, SyncPrepareAfterSyncCommitSurvivesCrash) {
   constexpr size_t kPartitions = 2;
   SyncPoint::GetInstance()->EnableProcessing();
+  TransactionDB* db = nullptr;
+  // Q6: release on every exit; the explicit cleanup below still runs first.
+  Defer close_db_on_exit([&] {
+    delete db;
+    db = nullptr;
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
   const std::string dbname =
       test::PerThreadDBPath("transaction_partitioned_wal_sync_prepare");
   // Drops every byte not synced when the DB closes (simulated power loss),
@@ -10703,7 +10749,6 @@ TEST(TransactionPartitionedWalTest, SyncPrepareAfterSyncCommitSurvivesCrash) {
   ASSERT_OK(DestroyDB(dbname, options));
   TransactionDBOptions txn_db_options;
   txn_db_options.write_policy = WRITE_COMMITTED;
-  TransactionDB* db = nullptr;
   ASSERT_OK(TransactionDB::Open(options, txn_db_options, dbname, &db));
   ASSERT_EQ(
       kPartitions,
@@ -10711,14 +10756,14 @@ TEST(TransactionPartitionedWalTest, SyncPrepareAfterSyncCommitSurvivesCrash) {
 
   WriteOptions sync_wo;
   sync_wo.sync = true;
-  Transaction* txn1 = db->BeginTransaction(sync_wo);
+  std::unique_ptr<Transaction> txn1(db->BeginTransaction(sync_wo));
   ASSERT_OK(txn1->SetName("xid1"));
   ASSERT_OK(txn1->Put("k1", "v1"));
   ASSERT_OK(txn1->Prepare());
   ASSERT_OK(txn1->Commit());
-  delete txn1;
+  txn1.reset();
 
-  Transaction* txn2 = db->BeginTransaction(sync_wo);
+  std::unique_ptr<Transaction> txn2(db->BeginTransaction(sync_wo));
   ASSERT_OK(txn2->SetName("xid2"));
   ASSERT_OK(txn2->Put("k2", "v2"));
   const uint64_t synced_before =
@@ -10729,7 +10774,7 @@ TEST(TransactionPartitionedWalTest, SyncPrepareAfterSyncCommitSurvivesCrash) {
   // The sync=true Prepare must sync the WAL before it is acknowledged.
   EXPECT_GT(synced_after, synced_before)
       << "sync=true Prepare acknowledged without a WAL sync";
-  delete txn2;
+  txn2.reset();
 
   // Control: never synced, so the power loss below must drop it.
   ASSERT_OK(db->Put(WriteOptions(), "control", "v"));
@@ -10744,14 +10789,15 @@ TEST(TransactionPartitionedWalTest, SyncPrepareAfterSyncCommitSurvivesCrash) {
   ASSERT_OK(db->Get(ReadOptions(), "k1", &value));
   ASSERT_EQ("v1", value);
   ASSERT_TRUE(db->Get(ReadOptions(), "control", &value).IsNotFound());
-  Transaction* recovered = db->GetTransactionByName("xid2");
-  EXPECT_NE(nullptr, recovered)
+  std::unique_ptr<Transaction> recovered(db->GetTransactionByName("xid2"));
+  EXPECT_NE(nullptr, recovered.get())
       << "acknowledged sync=true Prepare of xid2 lost after power loss";
   if (recovered != nullptr) {
     ASSERT_OK(recovered->Rollback());
-    delete recovered;
+    recovered.reset();
   }
   delete db;
+  db = nullptr;
   SyncPoint::GetInstance()->DisableProcessing();
   SyncPoint::GetInstance()->ClearAllCallBacks();
   options.env = Env::Default();
@@ -10782,6 +10828,13 @@ TEST(TransactionPartitionedWalTest, FailedSyncPrepareLeavesNoStaleFence) {
   txn_db_options.write_policy = WRITE_COMMITTED;
   TransactionDB* db = nullptr;
   ASSERT_OK(TransactionDB::Open(options, txn_db_options, dbname, &db));
+  // Q6: release on every exit; the explicit cleanup below still runs first.
+  Defer close_db_on_exit([&] {
+    delete db;
+    db = nullptr;
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
   DBImpl* db_impl = static_cast_with_check<DBImpl>(db->GetRootDB());
   ASSERT_EQ(kPartitions, db_impl->TEST_NumWalPartitions());
   ASSERT_OK(db->Put(WriteOptions(), "before", "v"));
@@ -10798,7 +10851,7 @@ TEST(TransactionPartitionedWalTest, FailedSyncPrepareLeavesNoStaleFence) {
   SyncPoint::GetInstance()->EnableProcessing();
   WriteOptions sync_wo;
   sync_wo.sync = true;
-  Transaction* txn = db->BeginTransaction(sync_wo);
+  std::unique_ptr<Transaction> txn(db->BeginTransaction(sync_wo));
   ASSERT_OK(txn->SetName("xid"));
   ASSERT_OK(txn->Put("k", "v"));
   const SequenceNumber last = db->GetLatestSequenceNumber();
@@ -10826,8 +10879,9 @@ TEST(TransactionPartitionedWalTest, FailedSyncPrepareLeavesNoStaleFence) {
   ASSERT_OK(db->Get(ReadOptions(), "after", &value));
   ASSERT_EQ("v", value);
   txn->Rollback().PermitUncheckedError();
-  delete txn;
+  txn.reset();
   delete db;
+  db = nullptr;
   ASSERT_OK(DestroyDB(dbname, options));
 }
 
@@ -10945,6 +10999,28 @@ struct FU14SnapshotRace {
         "DBImpl::RunCompletionGate:BeforeWait");
   }
 
+  // Q6: an early exit (an ASSERT failure returns before Close()) still
+  // releases the open DB and the SyncPoint state. Close() still runs on
+  // the happy path and nulls db, so this no-ops then.
+  ~FU14SnapshotRace() {
+    if (db == nullptr) {
+      return;
+    }
+    if (reader_snapshot != nullptr) {
+      db->ReleaseSnapshot(reader_snapshot);
+      reader_snapshot = nullptr;
+    }
+    t1_snapshot.reset();
+    for (ColumnFamilyHandle* handle : handles) {
+      db->DestroyColumnFamilyHandle(handle).PermitUncheckedError();
+    }
+    handles.clear();
+    delete db;
+    db = nullptr;
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  }
+
   void Close() {
     if (reader_snapshot != nullptr) {
       db->ReleaseSnapshot(reader_snapshot);
@@ -10954,6 +11030,7 @@ struct FU14SnapshotRace {
       ASSERT_OK(db->DestroyColumnFamilyHandle(handle));
     }
     delete db;
+    db = nullptr;
     SyncPoint::GetInstance()->DisableProcessing();
     SyncPoint::GetInstance()->ClearAllCallBacks();
     ASSERT_OK(DestroyDB(dbname, options));
@@ -11281,10 +11358,21 @@ TEST(TransactionPartitionedWalTest,
     options.track_and_verify_wals_in_manifest = true;
     options.max_write_buffer_number = 8;
     ASSERT_OK(DestroyDB(dbname, options));
+    std::vector<ColumnFamilyHandle*> handles;
     TransactionDB* db = nullptr;
     ASSERT_OK(
         TransactionDB::Open(options, TransactionDBOptions(), dbname, &db));
-    std::vector<ColumnFamilyHandle*> handles;
+    // Q6: release on every exit; the explicit cleanup below still runs first.
+    Defer close_db_on_exit([&] {
+      if (db == nullptr) {
+        return;
+      }
+      for (ColumnFamilyHandle* handle : handles) {
+        db->DestroyColumnFamilyHandle(handle).PermitUncheckedError();
+      }
+      delete db;
+      db = nullptr;
+    });
     std::vector<ColumnFamilyHandle*> cf_for_partition(num_partitions, nullptr);
     size_t covered = 0;
     while (covered < num_partitions) {
@@ -11405,6 +11493,7 @@ TEST(TransactionPartitionedWalTest,
       ASSERT_OK(db->DestroyColumnFamilyHandle(handle));
     }
     delete db;
+    db = nullptr;
     ASSERT_OK(DestroyDB(dbname, options));
   }
 }

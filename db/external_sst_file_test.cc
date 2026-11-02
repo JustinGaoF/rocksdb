@@ -417,6 +417,38 @@ TEST_P(ExternalSSTFileTestN, IngestionConcurrentWritesAtWalPartitions) {
   }
 }
 
+// T1: ingestion with writes on every partition. Writes go to column families
+// covering every partition, and at N > 1 at least two partitions hold
+// records; then a file is ingested and every key is checked.
+TEST_P(ExternalSSTFileTestN, IngestionWithWritesOnEveryPartition) {
+  Options options = CurrentOptions();
+  const uint32_t partitions = options.wal_partitions;
+  const std::vector<uint32_t> cf_ids =
+      ColumnFamilyIdsCoveringWalPartitions(partitions);
+  const std::vector<std::string> cf_names = ColumnFamilyNamesThrough(cf_ids);
+  CreateAndReopenWithCF({cf_names.begin() + 1, cf_names.end()}, options);
+  for (uint32_t cf_id : cf_ids) {
+    ASSERT_OK(Put(static_cast<int>(cf_id), "before", "value"));
+  }
+  ASSERT_OK(db_->SyncWAL());
+  const size_t with_records =
+      CountWalPartitionsWithRecords(dbfull(), env_, dbname_);
+  if (partitions > 1) {
+    EXPECT_GE(with_records, 2u);
+  } else {
+    EXPECT_EQ(1u, with_records);
+  }
+
+  ASSERT_OK(GenerateAndAddExternalFile(
+      options, {{"ingested", "value"}}, /*file_id=*/-1,
+      /*allow_global_seqno=*/true, /*verify_checksums_before_ingest=*/true,
+      /*ingest_behind=*/false, /*sort_data=*/true));
+  EXPECT_EQ("value", Get("ingested"));
+  for (uint32_t cf_id : cf_ids) {
+    EXPECT_EQ("value", Get(static_cast<int>(cf_id), "before"));
+  }
+}
+
 TEST_P(ExternalSSTFileTestN, IngestionTimingHistogram) {
   Options options = CurrentOptions();
   options.statistics = CreateDBStatistics();

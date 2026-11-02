@@ -1012,9 +1012,9 @@ static enum ROCKSDB_NAMESPACE::CompressionType FLAGS_wal_compression_e =
 
 DEFINE_string(partition_wal_usage, "none",
               "WAL record ordering. 'none' to disable (vanilla WAL format); "
-              "'partition_by_column_family' to tag each WAL record with an "
-              "ordering number (WALs are not yet partitioned by column "
-              "family).");
+              "'partition_by_column_family' to turn on WAL indexing, tagging "
+              "each WAL record with an ordering number. --wal_partitions "
+              "sets how many WAL files writes spread across.");
 // Assigned once from the flag after ParseCommandLineFlags, like every other
 // FLAGS_*_e in this file, so it cannot be const.
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)

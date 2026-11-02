@@ -1431,6 +1431,9 @@ TEST_P(CheckpointTest, CheckpointIncludesEveryPartitionCurrentWal) {
         ASSERT_OK(Put(static_cast<int>(cf_id), "key1", "value1"));
       }
     }
+    ASSERT_OK(db_->SyncWAL());
+    EXPECT_EQ(GetParam(),
+              CountWalPartitionsWithRecords(dbfull(), env_, dbname_));
     LiveFilesStorageInfoOptions info_options;
     info_options.wal_size_for_flush = std::numeric_limits<uint64_t>::max();
     std::vector<LiveFileStorageInfo> live_files;

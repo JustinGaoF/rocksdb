@@ -1517,6 +1517,14 @@ std::vector<uint32_t> ColumnFamilyIdsCoveringWalPartitions(
 std::vector<std::string> ColumnFamilyNamesThrough(
     const std::vector<uint32_t>& cf_ids);
 
+// Counts the WAL partitions whose current WAL holds at least one data
+// record (WAL index metadata records do not count). The caller flushes WAL
+// buffers first (SyncWAL), so the files under `wal_dir` hold what was
+// appended. A test that writes to the default column family only counts 1:
+// routing sends a batch to one partition from its lowest column family id.
+size_t CountWalPartitionsWithRecords(DBImpl* db_impl, Env* env,
+                                     const std::string& wal_dir);
+
 // Opens the DB at `dbname` read-only once in each WALRecoveryMode. In every
 // open, column family cf_ids[p] holds "key0", "key1", ... with value "value<i>"
 // as a prefix: keys up to some point and none after, and at least the first

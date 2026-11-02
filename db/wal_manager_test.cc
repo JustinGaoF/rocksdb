@@ -331,6 +331,7 @@ TEST_P(WalManagerTest, WALArchivalTtlClockGoesBackwards) {
 }
 
 INSTANTIATE_TEST_CASE_P(WalPartitions1, WalManagerTest, testing::Values(1U));
+// The N=8 leg drives WalManager over synthetic files; nothing appends.
 INSTANTIATE_TEST_CASE_P(WalPartitions8, WalManagerTest,
                         testing::Values(test::kTestWalPartitions));
 

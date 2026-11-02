@@ -12528,6 +12528,9 @@ TEST_P(DBWritePartitionTest, ChangeStreamStopsBelowHeldLowerWrite) {
   ReopenWithPartitions(kPartitions, options);
   EXPECT_EQ("v", Get(cf_for_partition_[0], "k0"));
   EXPECT_EQ("v", Get(cf_for_partition_[1], "k1"));
+  // T7: neither the lost write nor the one above it comes back.
+  EXPECT_EQ("NOT_FOUND", Get(cf_for_partition_[0], "key_a"));
+  EXPECT_EQ("NOT_FOUND", Get(cf_for_partition_[1], "key_b"));
 }
 
 // G-36: a secondary instance replays WALs one file at a time, which is not
@@ -13765,6 +13768,18 @@ TEST_P(DBWalAppendFailureTest, FenceHidesFailedWriteFromWalIterator) {
   std::unique_ptr<TransactionLogIterator> iter;
   const Status s = db_->GetUpdatesSince(first, &iter);
   EXPECT_TRUE(s.IsNotSupported()) << s.ToString();
+
+  // T7: the failed write reads back NotFound while the DB is stopped ...
+  EXPECT_EQ("NOT_FOUND", Get(cf_b, "failed"));
+  // ... and still after Resume(), which is refused here: WAL-write-error
+  // recovery is refused with WAL tracking, which N > 1 requires, so the DB
+  // stays stopped.
+  EXPECT_TRUE(dbfull()->Resume().IsNotSupported());
+  EXPECT_EQ("NOT_FOUND", Get(cf_b, "failed"));
+  // ... but a reopen recovers it: the record landed whole, and D-1 allows a
+  // whole landed record to come back (GC26 Q1 recovers it).
+  ReopenWithPartitions(2, options);
+  EXPECT_EQ("value", Get(cf_b, "failed"));
 }
 
 // Q6 (G-14, F003): after live recovery succeeds, writes on every partition
@@ -15608,11 +15623,12 @@ TEST_P(DBWalAppendFailureTest, RetryFlushResumeExplainsBurnedIndex) {
   }
 }
 
-// GC24 Q4: the timestamp-stripping flush path never meets a read mask. Masks
-// exist only above one partition, which requires concurrent memtable writes;
-// not persisting user-defined timestamps, the only setting that strips them
-// in a flush, rejects those. This pins the refusal, so the path needs no
-// masking of its own while it holds.
+// GC24 Q4: timestamp stripping (persist_user_defined_timestamps = false
+// with user-defined timestamps) is refused above one partition: stripping
+// rejects concurrent memtable writes, which N > 1 requires. This pins the
+// refusal on both legs, with and without concurrent writes, so the
+// stripping flush path needs no multi-partition handling of its own while
+// the refusal holds.
 TEST_P(DBWalAppendFailureTest, StrippingFlushNeverMeetsAMask) {
   Options options = FailureOptions();
   options.comparator = test::BytewiseComparatorWithU64TsWrapper();
@@ -15625,8 +15641,10 @@ TEST_P(DBWalAppendFailureTest, StrippingFlushNeverMeetsAMask) {
     const Status s = DB::Open(options, dbname_ + "_strip", &db_);
     EXPECT_TRUE(s.IsNotSupported()) << s.ToString();
     EXPECT_NE(std::string::npos,
-              s.ToString().find(concurrent ? "user-defined timestamps"
-                                           : "allow_concurrent_memtable_write"))
+              s.ToString().find(
+                  concurrent ? "wal_partitions > 1 is not supported with "
+                               "persist_user_defined_timestamps"
+                             : "allow_concurrent_memtable_write"))
         << s.ToString();
     if (s.ok()) {
       Close();
@@ -20704,7 +20722,9 @@ TEST_P(DBWritePartitionTest, GC26ColumnFamilyRefusalsHoldAfterOpen) {
          o->comparator = test::BytewiseComparatorWithU64TsWrapper();
          o->persist_user_defined_timestamps = false;
        },
-       Status::kNotSupported, "concurrent memtable write"},
+       Status::kNotSupported,
+       "wal_partitions > 1 is not supported with "
+       "persist_user_defined_timestamps = false"},
   };
   for (const Case& c : cases) {
     SCOPED_TRACE(c.name);

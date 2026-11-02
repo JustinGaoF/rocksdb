@@ -936,10 +936,11 @@ void ErrorHandler::CheckAndSetRecoveryAndBGError(
   // rechecks). Never setting the flag while bg_error_ is OK keeps a gate
   // from spinning on a flag that GetBGError cannot back.
   if (!bg_error_.ok() && bg_err.severity() >= bg_error_.severity()) {
-    // Whatever the source (WAL, flush, compaction, MANIFEST): parked
-    // completion gates must fail on it instead of waiting out a frontier
-    // that can never cover them. mutex_ is held; the wake takes
-    // sequence_wal_index_mutex_ below it (see the LOCK ORDER note).
+    // Whatever the source (WAL, flush, compaction, MANIFEST): wake parked
+    // completion gates to recheck. A gate fails only on a fence or at
+    // shutdown; any other error just wakes it (see
+    // SignalWalDurabilityWaitersOnBGError). mutex_ is held; the wake takes
+    // wal_durability_wait_mutex_ below it (see the LOCK ORDER note).
     db_->SignalWalDurabilityWaitersOnBGError();
   }
   if (bg_error_.severity() >= Status::Severity::kHardError) {

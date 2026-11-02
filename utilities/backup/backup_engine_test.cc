@@ -1578,6 +1578,9 @@ TEST_P(BackupEngineTest, BackupIncludesEveryPartitionCurrentWal) {
         ASSERT_OK(db_->Put(WriteOptions(), handles[cf_id], "key1", "value1"));
       }
     }
+    ASSERT_OK(db_->SyncWAL());
+    EXPECT_EQ(GetParam(), CountWalPartitionsWithRecords(dbfull(), options_.env,
+                                                        options_.wal_dir));
     OpenBackupEngine(/*destroy_old_data=*/true);
     ASSERT_OK(backup_engine_->CreateNewBackup(db_.get(),
                                               /*flush_before_backup=*/false));

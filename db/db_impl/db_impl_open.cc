@@ -1725,13 +1725,17 @@ Status DBImpl::SetNextWALIndexAfterRecovery(uint64_t wal_index) {
 IOStatus DBImpl::WriteWALIndexSupersessions(
     const WriteOptions& write_options, log::Writer* new_log,
     const std::vector<WALIndexSupersession>& supersessions) {
-  // Recovery deliberately does not force a flush to retire the superseded
-  // files. The record here is the declaration, so it does not need those
-  // files gone, and avoid_flush_during_recovery stays honored. The cost is
-  // that a superseded WAL stays in the recovery set until an ordinary flush
-  // retires it, and every open until then re-reads it and redeclares the same
-  // cut. That repeat is idempotent: the declaration names one file and one
-  // lower bound, and a reader folds the minimum per file.
+  // The declaration here needs no flush to retire the superseded files: it
+  // does not need those files gone, and it leaves
+  // avoid_flush_during_recovery to the cases that force one anyway. A
+  // superseded WAL otherwise stays in the recovery set until an ordinary
+  // flush retires it, and every open until then re-reads it and redeclares
+  // the same cut. That repeat is idempotent: the declaration names one file
+  // and one lower bound, and a reader folds the minimum per file.
+  // Recovery flushes anyway when the merge skipped an unexplained discard
+  // (SkippedUnexplainedDiscard, so the WALs holding the superseded copies
+  // retire first) and when a kNone opener recovers an indexed set (it
+  // writes unindexed WALs, which the merge cannot order after those).
   assert(new_log != nullptr);
   // Recovery finds supersessions by reading WAL heads only, so they must
   // precede this file's first data record.
@@ -2197,8 +2201,9 @@ Status DBImpl::ProcessLogFilesMerged(
       // gap with every member finished ends the stream instead of surfacing
       // here. The hole is therefore not a tail and recovery must fail,
       // even when nothing reported (a silent torn stop). This is the
-      // behavior change R3.2 calls out: opens that previously succeeded by
-      // replaying across the gap now fail. WALRecoveryMode documents it.
+      // behavior change WALRecoveryMode documents (see also
+      // partition_wal_recovery_modes.md): opens that previously succeeded by
+      // replaying across the gap now fail.
       return Status::Corruption(
           "WAL index merge: tail gap at wal_index " +
           std::to_string(gap.index) +

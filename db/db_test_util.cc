@@ -13,10 +13,12 @@
 
 #include "cache/cache_reservation_manager.h"
 #include "db/forward_iterator.h"
+#include "db/log_reader.h"
 #include "db/write_batch_internal.h"
 #include "env/fs_readonly.h"
 #include "env/mock_env.h"
 #include "file/file_util.h"
+#include "file/sequence_file_reader.h"
 #include "port/lang.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/convenience.h"
@@ -1976,6 +1978,36 @@ std::vector<std::string> ColumnFamilyNamesThrough(
     names.push_back("cf" + std::to_string(cf_id));
   }
   return names;
+}
+
+size_t CountWalPartitionsWithRecords(DBImpl* db_impl, Env* env,
+                                     const std::string& wal_dir) {
+  const size_t partitions = db_impl->TEST_NumWalPartitions();
+  size_t with_records = 0;
+  for (size_t p = 0; p < partitions; ++p) {
+    const std::string path =
+        LogFileName(wal_dir, db_impl->TEST_CurrentWalNumber(p));
+    std::unique_ptr<SequentialFileReader> file_reader;
+    Status s = SequentialFileReader::Create(
+        env->GetFileSystem(), path, FileOptions(), &file_reader,
+        /*dbg=*/nullptr, /*rate_limiter=*/nullptr);
+    EXPECT_OK(s);
+    if (!s.ok()) {
+      continue;
+    }
+    log::Reader reader(/*info_log=*/nullptr, std::move(file_reader),
+                       /*reporter=*/nullptr, /*checksum=*/true,
+                       /*log_num=*/0);
+    Slice record;
+    std::string scratch;
+    // Metadata records (markers, voids) are not returned as records, so any
+    // record read here is a data record, indexed or not.
+    if (reader.ReadRecord(&record, &scratch,
+                          WALRecoveryMode::kPointInTimeRecovery)) {
+      ++with_records;
+    }
+  }
+  return with_records;
 }
 
 void AssertKeyPrefixesInEveryRecoveryMode(const Options& options,

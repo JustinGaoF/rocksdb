@@ -85,7 +85,11 @@ int RandomSeed();
 bool HasBigMem();
 
 // The WAL partition count that the WAL consumer and transaction suites also
-// run at, besides 1.
+// run at, besides 1. Routing sends a batch to one partition from its lowest
+// column family id, so an N=8 leg that writes to the default column family
+// only still drives one partition; legs that need more spread across column
+// families (ColumnFamilyIdsCoveringWalPartitions) and count what appended
+// (CountWalPartitionsWithRecords).
 constexpr uint32_t kTestWalPartitions = 8;
 
 // The WAL partition count for the running test: kTestWalPartitions when it is

@@ -68,6 +68,7 @@ class RepairWalPartitionsTest : public RepairTest,
 
 INSTANTIATE_TEST_CASE_P(WalPartitions1, RepairWalPartitionsTest,
                         testing::Values(1U));
+// The N=8 leg meets RepairDB's partitioned-WAL refusal; nothing appends.
 INSTANTIATE_TEST_CASE_P(WalPartitions8, RepairWalPartitionsTest,
                         testing::Values(test::kTestWalPartitions));
 

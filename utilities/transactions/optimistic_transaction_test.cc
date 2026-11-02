@@ -106,6 +106,65 @@ TEST_P(OptimisticTransactionTest, SuccessTest) {
   delete txn;
 }
 
+// T1: an optimistic commit with writes on every partition. Writes go to
+// column families covering every partition, and at N > 1 at least two
+// partitions hold records; then a transaction commits and every key is
+// checked.
+TEST_P(OptimisticTransactionTest, CommitWithWritesOnEveryPartition) {
+  WriteOptions write_options;
+  ReadOptions read_options;
+  const uint32_t partitions = options.wal_partitions;
+  const std::vector<uint32_t> cf_ids =
+      ColumnFamilyIdsCoveringWalPartitions(partitions);
+  const std::vector<std::string> cf_names = ColumnFamilyNamesThrough(cf_ids);
+  // Open with one column family per partition (ColumnFamiliesTest pattern).
+  for (size_t i = 1; i < cf_names.size(); ++i) {
+    ColumnFamilyHandle* handle = nullptr;
+    ASSERT_OK(txn_db->CreateColumnFamily(ColumnFamilyOptions(), cf_names[i],
+                                         &handle));
+    delete handle;
+  }
+  txn_db.reset();
+  std::vector<ColumnFamilyDescriptor> column_families;
+  for (const std::string& name : cf_names) {
+    column_families.emplace_back(name, ColumnFamilyOptions());
+  }
+  std::vector<ColumnFamilyHandle*> handles;
+  OptimisticTransactionDB* raw_txn_db = nullptr;
+  ASSERT_OK(OptimisticTransactionDB::Open(
+      options, occ_opts, dbname, column_families, &handles, &raw_txn_db));
+  ASSERT_NE(raw_txn_db, nullptr);
+  txn_db.reset(raw_txn_db);
+  for (uint32_t cf_id : cf_ids) {
+    ASSERT_OK(txn_db->Put(write_options, handles[cf_id], "before", "value"));
+  }
+  ASSERT_OK(txn_db->SyncWAL());
+  DBImpl* db_impl = static_cast_with_check<DBImpl>(txn_db->GetRootDB());
+  const size_t with_records =
+      CountWalPartitionsWithRecords(db_impl, options.env, dbname);
+  if (partitions > 1) {
+    EXPECT_GE(with_records, 2u);
+  } else {
+    EXPECT_EQ(1u, with_records);
+  }
+
+  Transaction* txn = txn_db->BeginTransaction(write_options);
+  ASSERT_NE(txn, nullptr);
+  ASSERT_OK(txn->Put(Slice("txn_key"), Slice("txn_value")));
+  ASSERT_OK(txn->Commit());
+  delete txn;
+  std::string value;
+  ASSERT_OK(txn_db->Get(read_options, "txn_key", &value));
+  EXPECT_EQ("txn_value", value);
+  for (uint32_t cf_id : cf_ids) {
+    ASSERT_OK(txn_db->Get(read_options, handles[cf_id], "before", &value));
+    EXPECT_EQ("value", value);
+  }
+  for (auto handle : handles) {
+    delete handle;
+  }
+}
+
 TEST_P(OptimisticTransactionTest, WriteConflictTest) {
   WriteOptions write_options;
   ReadOptions read_options;

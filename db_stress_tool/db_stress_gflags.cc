@@ -1526,9 +1526,9 @@ DEFINE_string(wal_compression, "none",
 
 DEFINE_string(partition_wal_usage, "none",
               "WAL record ordering. 'none' to disable (vanilla WAL format); "
-              "'partition_by_column_family' to tag each WAL record with an "
-              "ordering number (WALs are not yet partitioned by column "
-              "family).");
+              "'partition_by_column_family' to turn on WAL indexing, tagging "
+              "each WAL record with an ordering number. --wal_partitions "
+              "sets how many WAL files writes spread across.");
 
 DEFINE_uint32(wal_partitions, ROCKSDB_NAMESPACE::Options().wal_partitions,
               "DBOptions::wal_partitions. Values above 1 need "
