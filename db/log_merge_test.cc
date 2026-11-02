@@ -550,7 +550,12 @@ TEST_P(LogMergeTest, VoidCoverPlusDataFails) {
   ASSERT_EQ(std::vector<uint64_t>({1}), DrivenIndices(driven));
 }
 
-TEST_P(LogMergeTest, VoidCoverPlusSupersededDataFails) {
+// GC31 Q12 (D-2, owner ruling 2026-11-02): a declaration supersedes a void
+// by its first_obsolete alone, so 121's declaration, which attests no start,
+// obsoletes 120's void over 4..6 with its records there: nothing contradicts,
+// the void explains the indices, and the merge ends clean after 1..3. (Before
+// the ruling it reached records only, and the void failed the merge.)
+TEST_P(LogMergeTest, VoidCoverPlusSupersededDataMerges) {
   MemberFile a(120, recyclable());
   MemberFile b(121, recyclable());
   ASSERT_OK(a.Marker());
@@ -569,10 +574,10 @@ TEST_P(LogMergeTest, VoidCoverPlusSupersededDataFails) {
   members.push_back(MakeMember(b, b.Bytes()));
   auto merger = MakeMerger(std::move(members), {120, 121});
   DriveResult driven = Drive(merger.get());
-  ASSERT_EQ(WALIndexMerger::Result::kError, driven.outcome);
-  ASSERT_NE(std::string::npos,
-            merger->GetError().ToString().find("void cover"));
+  ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome)
+      << merger->GetError().ToString();
   ASSERT_EQ(std::vector<uint64_t>({1, 2, 3}), DrivenIndices(driven));
+  EXPECT_EQ(7U, merger->GetFrontier());
 }
 
 // A merge over a set including one idle member advances past that member's
@@ -2056,12 +2061,14 @@ TEST_P(LogMergeTest, GC27SupersededVoidPlusReissuedRecordMerges) {
   }
 }
 
-// A void stays live below its declarer's start: an open seeds past every void
-// below its start, so such a void explains its index and still contradicts
-// a record there. 121 starts at 7 (span last 6) and declares 120 obsolete
-// from 4, which reaches 120's records 4 and 5 but not its void over 6, so
-// 121's record at 6 contradicts it. The message names both WALs (Q5 (c)).
-TEST_P(LogMergeTest, GC27UnsupersededVoidPlusRecordStillFails) {
+// GC31 Q12 (D-2, owner ruling 2026-11-02): below its declarer's start a void
+// is superseded by first_obsolete alone. 121 starts at 7 (span last 6) and
+// declares 120 obsolete from 4, which now reaches 120's void over 6 as well
+// as its records 4 and 5: 121's record at 6 no longer contradicts the void.
+// 4 and 5 are superseded-only, so the live record at 6 above them stops the
+// merge there, as for any superseded-only index. (Before the ruling the void
+// stayed live and the merge failed naming both WALs.)
+TEST_P(LogMergeTest, GC27VoidBelowDeclarerStartYieldsToRecord) {
   MemberFile old(120, recyclable());
   MemberFile young(121, recyclable());
   ASSERT_OK(old.Marker());
@@ -2079,19 +2086,18 @@ TEST_P(LogMergeTest, GC27UnsupersededVoidPlusRecordStillFails) {
   members.push_back(MakeMember(young, young.Bytes()));
   auto merger = MakeMerger(std::move(members), {120, 121});
   DriveResult driven = Drive(merger.get());
-  ASSERT_EQ(WALIndexMerger::Result::kError, driven.outcome);
-  EXPECT_NE(std::string::npos,
-            merger->GetError().ToString().find(
-                "index 6 bears records (WAL 121) and a void cover (WAL 120)"))
+  ASSERT_EQ(WALIndexMerger::Result::kFrontier, driven.outcome)
       << merger->GetError().ToString();
+  EXPECT_EQ(4U, merger->GetFrontier());
+  EXPECT_TRUE(merger->FrontierIsPendingDiscard());
+  ASSERT_EQ(std::vector<uint64_t>({1, 2, 3}), DrivenIndices(driven));
 }
 
-// The inverted sibling of VoidCoverPlusSupersededDataFails: the same layout,
-// with the declarer attesting its start at 4 (span last 3). The void over 4..6
-// that shares a file with the data is then obsolete with it, and the merge
-// ends clean after 1..3, the superseded indices never reissued. The original
-// keeps failing: its declarer attests no start, so its supersession reaches
-// records only.
+// The sibling of VoidCoverPlusSupersededDataMerges: the same layout, with
+// the declarer attesting its start at 4 (span last 3), or none. The void over
+// 4..6 that shares a file with the data is obsolete with it either way (GC31
+// Q12: first_obsolete alone decides), and the merge ends clean after 1..3,
+// the superseded indices never reissued.
 TEST_P(LogMergeTest, GC27VoidCoverPlusSupersededDataFromStartMerges) {
   for (const bool attests_start : {false, true}) {
     SCOPED_TRACE(attests_start ? "declarer attests its start" : "no start");
@@ -2117,44 +2123,100 @@ TEST_P(LogMergeTest, GC27VoidCoverPlusSupersededDataFromStartMerges) {
     auto merger = MakeMerger(std::move(members), {120, 121});
     DriveResult driven = Drive(merger.get());
     ASSERT_EQ(std::vector<uint64_t>({1, 2, 3}), DrivenIndices(driven));
-    if (attests_start) {
-      ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome)
-          << merger->GetError().ToString();
-      EXPECT_EQ(7U, merger->GetFrontier());
-    } else {
-      ASSERT_EQ(WALIndexMerger::Result::kError, driven.outcome);
-      EXPECT_NE(std::string::npos,
-                merger->GetError().ToString().find("void cover"));
-    }
+    ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome)
+        << merger->GetError().ToString();
+    EXPECT_EQ(7U, merger->GetFrontier());
   }
 }
 
-// A superseded void explains nothing: its index is superseded-only, so a live
-// record above it, with the reissue of the void's index missing, stops the
-// merge there rather than skipping it as a void would. GC19's exception (a
-// void below the declarer clears a pending index) counts live voids only.
-// Neuter: let a superseded void explain its index; 4 is emitted.
-TEST_P(LogMergeTest, GC27SupersededVoidDoesNotExplainItsIndex) {
+// GC31 Q12 (D-2, owner ruling 2026-11-02): a superseded void still explains
+// its index when no live record bears it. 121 starts at 3 and declares 120
+// obsolete from 3, superseding 120's void over 3; no reissued record bears 3,
+// so the void explains it, and 121's record at 4 above it is emitted: no
+// hole, with or without continuing past discarded holes (skip mode).
+// Neuter: drop "a superseded void still explains its index"; the merge stops
+// at 3 as a superseded-only index.
+TEST_P(LogMergeTest, SupersededVoidStillExplainsUnbornIndex) {
+  for (const bool continue_past_discarded : {false, true}) {
+    SCOPED_TRACE(continue_past_discarded ? "skip" : "every other mode");
+    MemberFile old(120, recyclable());
+    MemberFile young(121, recyclable());
+    ASSERT_OK(old.Marker());
+    ASSERT_OK(old.Data("o1", 1, 1));
+    ASSERT_OK(old.Data("o2", 2, 2));
+    ASSERT_OK(old.Void(3, 3));
+    ASSERT_OK(young.Marker());
+    ASSERT_OK(young.Span(120, 1, 2));
+    ASSERT_OK(young.Sup(120, 3));
+    ASSERT_OK(young.Data("n4", 4, 4));
+
+    std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+    members.push_back(MakeMember(old, old.Bytes()));
+    members.push_back(MakeMember(young, young.Bytes()));
+    auto merger =
+        MakeMerger(std::move(members), {120, 121}, continue_past_discarded);
+    DriveResult driven = Drive(merger.get());
+    ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome)
+        << merger->GetError().ToString();
+    ASSERT_EQ(std::vector<uint64_t>({1, 2, 4}), DrivenIndices(driven));
+    EXPECT_TRUE(driven.gaps.empty());
+  }
+}
+
+// GC31 Q12: a declaration supersedes a void by its first_obsolete alone, even
+// below the declaring WAL's attested start. 121 starts at 5 (span last 4) and
+// declares 120 obsolete from 3; 120's void over 3..4 lies between. The
+// superseded void yields to 121's reissued record at 3 and still explains 4,
+// which no live record bears. Fails at the base, where the void below 5 is
+// not superseded and contradicts the record at 3.
+TEST_P(LogMergeTest, VoidBelowDeclarerStartSupersededByFirstObsolete) {
   MemberFile old(120, recyclable());
   MemberFile young(121, recyclable());
   ASSERT_OK(old.Marker());
   ASSERT_OK(old.Data("o1", 1, 1));
   ASSERT_OK(old.Data("o2", 2, 2));
-  ASSERT_OK(old.Void(3, 3));
+  ASSERT_OK(old.Void(3, 4));
   ASSERT_OK(young.Marker());
-  ASSERT_OK(young.Span(120, 1, 2));
+  ASSERT_OK(young.Span(120, 1, 4));
   ASSERT_OK(young.Sup(120, 3));
-  ASSERT_OK(young.Data("n4", 4, 4));
+  ASSERT_OK(young.Data("n3", 3, 3));
+  ASSERT_OK(young.Data("n5", 5, 5));
 
   std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
   members.push_back(MakeMember(old, old.Bytes()));
   members.push_back(MakeMember(young, young.Bytes()));
   auto merger = MakeMerger(std::move(members), {120, 121});
   DriveResult driven = Drive(merger.get());
-  ASSERT_EQ(WALIndexMerger::Result::kFrontier, driven.outcome);
-  EXPECT_EQ(3U, merger->GetFrontier());
-  EXPECT_TRUE(merger->FrontierIsPendingDiscard());
-  ASSERT_EQ(std::vector<uint64_t>({1, 2}), DrivenIndices(driven));
+  ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome)
+      << merger->GetError().ToString();
+  ASSERT_EQ(std::vector<uint64_t>({1, 2, 3, 5}), DrivenIndices(driven));
+  EXPECT_EQ("n3", driven.records[2].payload.substr(kWALIndexSize));
+}
+
+// GC31 Q12: the same with a declarer that attests no span or floor (an older
+// binary's declaration): it supersedes the void as well. Fails at the base,
+// where a declarer attesting no start supersedes no void.
+TEST_P(LogMergeTest, VoidSupersededByDeclarerWithoutStart) {
+  MemberFile old(120, recyclable());
+  MemberFile young(121, recyclable());
+  ASSERT_OK(old.Marker());
+  ASSERT_OK(old.Data("o1", 1, 1));
+  ASSERT_OK(old.Data("o2", 2, 2));
+  ASSERT_OK(old.Void(3, 4));
+  ASSERT_OK(young.Marker());
+  ASSERT_OK(young.Sup(120, 3));
+  ASSERT_OK(young.Data("n3", 3, 3));
+  ASSERT_OK(young.Data("n5", 5, 5));
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(old, old.Bytes()));
+  members.push_back(MakeMember(young, young.Bytes()));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome)
+      << merger->GetError().ToString();
+  ASSERT_EQ(std::vector<uint64_t>({1, 2, 3, 5}), DrivenIndices(driven));
+  EXPECT_EQ("n3", driven.records[2].payload.substr(kWALIndexSize));
 }
 
 // Detection kept (Q1): rotation excludes every writer, so a held predecessor

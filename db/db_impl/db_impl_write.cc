@@ -1583,20 +1583,28 @@ Status DBImpl::WriteImpl(
     // that nobody else can be writing to these particular stats.
     // We're optimistic, updating the stats before we successfully
     // commit.  That lets us release our leader status early.
+    // Above one partition (no two_write_queues) each partition's leader adds
+    // to its own shard, which no other leader writes.
     auto stats = default_cf_internal_stats_;
-    stats->AddDBStats(InternalStats::kIntStatsNumKeysWritten, total_count,
-                      concurrent_update);
+    auto add_db_stat = [&](InternalStats::InternalDBStatsType type,
+                           uint64_t value) {
+      if (NumWalPartitions() > 1 && !two_write_queues_) {
+        stats->AddDBStatsToShard(type, value, wal_context.wal_partition,
+                                 /*concurrent=*/false);
+      } else {
+        stats->AddDBStats(type, value, concurrent_update);
+      }
+    };
+    add_db_stat(InternalStats::kIntStatsNumKeysWritten, total_count);
     RecordTick(stats_, NUMBER_KEYS_WRITTEN, total_count);
-    stats->AddDBStats(InternalStats::kIntStatsBytesWritten, total_byte_size,
-                      concurrent_update);
+    add_db_stat(InternalStats::kIntStatsBytesWritten, total_byte_size);
     RecordTick(stats_, BYTES_WRITTEN, total_byte_size);
-    stats->AddDBStats(InternalStats::kIntStatsWriteDoneBySelf, 1,
-                      concurrent_update);
+    add_db_stat(InternalStats::kIntStatsWriteDoneBySelf, 1);
     RecordTick(stats_, WRITE_DONE_BY_SELF);
     auto write_done_by_other = write_group.size - 1;
     if (write_done_by_other > 0) {
-      stats->AddDBStats(InternalStats::kIntStatsWriteDoneByOther,
-                        write_done_by_other, concurrent_update);
+      add_db_stat(InternalStats::kIntStatsWriteDoneByOther,
+                  write_done_by_other);
       RecordTick(stats_, WRITE_DONE_BY_OTHER, write_done_by_other);
     }
     RecordInHistogram(stats_, BYTES_PER_WRITE, total_byte_size);
@@ -1793,13 +1801,9 @@ Status DBImpl::WriteImpl(
         !sync_group) {
       // An async write never syncs; its gate waits only for every record at
       // or below it to be written, and for its range to be published.
-      const SequenceNumber gate_low = current_sequence;
       const SequenceNumber gate_target = last_sequence;
-      write_group.completion_gate = [this, gate_low, gate_target]() {
-        return RunCompletionGate(gate_low, gate_target, /*sync=*/false,
-                                 /*published=*/true,
-                                 /*pre_sync_safe_point=*/0,
-                                 /*sync_micros=*/0);
+      write_group.completion_gate = [this, gate_target]() {
+        return RunCompletionGate(gate_target, /*published=*/true);
       };
     } else if (sync_group && io_s.ok()) {
       // D-9: the sync writers' range, [sync_low, gate_target], is inserted
@@ -1873,6 +1877,8 @@ Status DBImpl::WriteImpl(
           .PermitUncheckedError();  // Ignore error
       SnapshotImpl* reserved = new SnapshotImpl;
       {
+        // Accepted cost (audit A13): only groups with a post-memtable
+        // callback take mutex_ here, to keep snapshot order.
         InstrumentedMutexLock l(&mutex_);
         snapshots_.New(reserved, last_sequence, unix_time,
                        /*is_write_conflict_boundary=*/true);
@@ -1926,6 +1932,7 @@ Status DBImpl::WriteImpl(
           // fsync (WriteGroup::async_writers_gate), every writer's batch
           // inserted by then (D-GC30e (i)).
           write_group.leader_exits = sync_group;
+          write_group.multi_partition = true;
         }
         write_thread.LaunchParallelMemTableWriters(&write_group);
         in_parallel_group = true;
@@ -2603,9 +2610,6 @@ Status DBImpl::WriteImplWALOnly(
     seq_inc = total_batch_cnt;
   }
   Status status;
-  // Snapshot for the completion gate's conditional post-wait sync, read
-  // before the leadership-time sync below (sync writes, partitioned only).
-  SequenceNumber pre_sync_safe_point = 0;
   if (!write_options.disableWAL) {
     IOStatus io_s = ConcurrentWriteGroupToWAL(write_group, wal_used,
                                               &last_sequence, seq_inc);
@@ -2660,11 +2664,6 @@ Status DBImpl::WriteImplWALOnly(
   }
   if (status.ok() && write_options.sync) {
     assert(!write_options.disableWAL);
-    if (NumWalPartitions() > 1) {
-      // Read after our append completed and before this sync starts, so the
-      // gate can skip its own sync when this one already covers it.
-      pre_sync_safe_point = wal_durability_tracker_->SafePoint();
-    }
     // Requesting sync with two_write_queues_ is expected to be very rare. We
     // hance provide a simple implementation that is not necessarily efficient.
     if (manual_wal_flush_) {
@@ -2706,21 +2705,6 @@ Status DBImpl::WriteImplWALOnly(
     // This group's memtable writes follow it out of the group, but they are
     // already counted in pending_memtable_writes_, which a switch waits on.
     ExitMemTableSwitchGate(wal_partition);
-  }
-  // Completion gate, as in WriteImpl. Reaching here without disableWAL means
-  // the append succeeded (the error path above returned early), so the range
-  // is registered and completed; the target is sequence + count - 1.
-  if (NumWalPartitions() > 1 && !write_options.disableWAL) {
-    TEST_SYNC_POINT_CALLBACK("DBImpl::InstallCompletionGate", &last_sequence);
-    const SequenceNumber gate_low = last_sequence + 1;
-    const SequenceNumber gate_target = last_sequence + seq_inc;
-    const bool gate_sync = write_options.sync;
-    write_group.completion_gate = [this, gate_low, gate_target, gate_sync,
-                                   pre_sync_safe_point]() {
-      return RunCompletionGate(gate_low, gate_target, gate_sync,
-                               /*published=*/true, pre_sync_safe_point,
-                               /*sync_micros=*/0);
-    };
   }
   write_thread->ExitAsBatchGroupLeader(write_group, status);
   if (status.ok()) {
@@ -2872,8 +2856,7 @@ Status DBImpl::PreprocessWrite(const WriteOptions& write_options,
 
   PERF_TIMER_GUARD(write_scheduling_flushes_compactions_time);
 
-  if (UNLIKELY(status.ok() &&
-               wals_total_size_.LoadRelaxed() > GetMaxTotalWalSize())) {
+  if (UNLIKELY(status.ok() && WalsTotalSize() > GetMaxTotalWalSize())) {
     assert(versions_);
     InstrumentedMutexLock l(&mutex_);
     const ColumnFamilySet* const column_families =
@@ -2881,10 +2864,18 @@ Status DBImpl::PreprocessWrite(const WriteOptions& write_options,
     assert(column_families);
     size_t num_cfs = column_families->NumberOfColumnFamilies();
     assert(num_cfs >= 1);
-    if (num_cfs > 1) {
+    // Above one partition the switch stops every partition, so it runs only
+    // if SwitchWAL() will act: while the oldest WAL waits for its flush, or
+    // for a prepare to commit, it would return at once. Closing the gate
+    // releases mutex_, so decide again once it is closed.
+    const bool partitioned = NumWalPartitions() > 1;
+    if (num_cfs > 1 && (!partitioned || SwitchWALWouldAct())) {
+      TEST_SYNC_POINT("DBImpl::PreprocessWrite:SwitchWalWouldAct");
       CloseMemTableSwitchGate();
-      WaitForPendingWrites();
-      status = SwitchWAL(write_context);
+      if (!partitioned || SwitchWALWouldAct()) {
+        WaitForPendingWrites();
+        status = SwitchWAL(write_context);
+      }
       OpenMemTableSwitchGate();
     }
   }
@@ -2905,11 +2896,19 @@ Status DBImpl::PreprocessWrite(const WriteOptions& write_options,
   }
 
   if (UNLIKELY(status.ok() && !flush_scheduler_.Empty())) {
+    TEST_SYNC_POINT("DBImpl::PreprocessWrite:FlushScheduled");
     InstrumentedMutexLock l(&mutex_);
-    CloseMemTableSwitchGate();
-    WaitForPendingWrites();
-    status = ScheduleFlushes(write_context);
-    OpenMemTableSwitchGate();
+    // Above one partition, leaders that raced the check above find the
+    // scheduler drained by the first of them, and stop no partition.
+    const bool partitioned = NumWalPartitions() > 1;
+    if (!partitioned || !flush_scheduler_.Empty()) {
+      CloseMemTableSwitchGate();
+      if (!partitioned || !flush_scheduler_.Empty()) {
+        WaitForPendingWrites();
+        status = ScheduleFlushes(write_context);
+      }
+      OpenMemTableSwitchGate();
+    }
   }
 
   PERF_TIMER_STOP(write_scheduling_flushes_compactions_time);
@@ -3334,7 +3333,8 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
   if (wal_used != nullptr) {
     *wal_used = wal_file_number_size.number;
   }
-  wals_total_size_.FetchAddRelaxed(log_entry.size());
+  WalsTotalSizeCounter(wal_context.wal_partition)
+      .FetchAddRelaxed(log_entry.size());
   wal_file_number_size.AddSize(*log_size);
   WalEmpty(wal_context.wal_partition) = false;
 
@@ -3826,39 +3826,9 @@ SequenceNumber DBImpl::UnreleasedWalGateFenceLow() {
   return low;
 }
 
-Status DBImpl::RunCompletionGate(SequenceNumber low, SequenceNumber target,
-                                 bool sync, bool published,
-                                 SequenceNumber pre_sync_safe_point,
-                                 uint64_t sync_micros) {
+Status DBImpl::RunCompletionGate(SequenceNumber target, bool published) {
   TEST_SYNC_POINT("DBImpl::RunCompletionGate:BeforeWait");
-  Status s = WaitForWalDurability(target, /*wal_record=*/true, published);
-  if (!s.ok()) {
-    return s;
-  }
-  if (sync && pre_sync_safe_point < target) {
-    // The second threshold. The first fsync covered only what was written
-    // before it (everything pre_sync_safe_point covers, by the snapshot's
-    // position after our append and before the fsync). Predecessors
-    // that landed after it are covered by the wait above but not by that
-    // fsync, so sync again now that the whole prefix is written: this fsync
-    // covers every record at or below target, restoring what a single WAL
-    // gives for free (a sync write flushing all preceding async writes).
-    // Waiting on a tracked "synced" frontier instead would hang: async
-    // predecessors never publish one, so nothing would advance it past them.
-    // Manual flush buffers in user space, so flush there like the write path.
-    const uint64_t sync_start = WalPartitionTimerStart();
-    s = RunCoalescedGateSync(low, target, [this](SequenceNumber) {
-      return manual_wal_flush_ ? FlushWAL(true) : SyncWAL();
-    });
-    sync_micros += WalPartitionTimerElapsed(sync_start);
-    // No WALIOStatusCheck here: SyncWAL/FlushWAL already route an I/O
-    // failure to it (which wakes other parked gates), and this path
-    // propagates the outcome to the group.
-  }
-  if (sync && WalPartitionTimersEnabled()) {
-    RecordTimeToHistogram(stats_, WAL_SYNC_BARRIER_MICROS, sync_micros);
-  }
-  return s;
+  return WaitForWalDurability(target, /*wal_record=*/true, published);
 }
 
 IOStatus DBImpl::WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
@@ -3920,15 +3890,21 @@ IOStatus DBImpl::WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
   }
   if (to_be_cached_state) {
     TEST_SYNC_POINT("DBImpl::WriteGroupToWAL:BeforeCacheRecoverableState");
-    // Leaders of different partitions get here concurrently and in no
-    // particular sequence order, so keep the highest-sequence state.
-    InstrumentedMutexLock state_lock(&cached_recoverable_state_mutex_);
-    if (cached_recoverable_state_empty_ ||
-        sequence > cached_recoverable_state_seq_) {
+    if (NumWalPartitions() > 1) {
+      // Leaders of different partitions get here concurrently and in no
+      // particular sequence order: each caches into its own partition's slot,
+      // and WriteRecoverableState() takes the highest-sequence one.
+      RecoverableStateSlot& slot =
+          recoverable_state_slots_[wal_context.wal_partition];
+      if (slot.empty || sequence > slot.sequence) {
+        slot.state = *to_be_cached_state;
+        slot.sequence = sequence;
+        slot.empty = false;
+      }
+    } else {
       cached_recoverable_state_ = *to_be_cached_state;
-      cached_recoverable_state_seq_ = sequence;
-      cached_recoverable_state_empty_ = false;
     }
+    cached_recoverable_state_empty_ = false;
   }
 
   if (io_s.ok() && need_wal_sync) {
@@ -3969,18 +3945,28 @@ IOStatus DBImpl::WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
     merge_buffer.Clear();
   }
   if (io_s.ok()) {
-    // Leaders of other partitions update the same stats concurrently.
-    const bool concurrent = NumWalPartitions() > 1;
     auto stats = default_cf_internal_stats_;
     if (need_wal_sync) {
-      stats->AddDBStats(InternalStats::kIntStatsWalFileSynced, 1, concurrent);
+      stats->AddDBStats(InternalStats::kIntStatsWalFileSynced, 1,
+                        /*concurrent=*/false);
       RecordTick(stats_, WAL_FILE_SYNCED);
     }
-    stats->AddDBStats(InternalStats::kIntStatsWalFileBytes, log_size,
-                      concurrent);
+    if (NumWalPartitions() > 1) {
+      // Leaders of other partitions update the same stats concurrently, each
+      // in its own shard; this one is this partition's leader's alone.
+      stats->AddDBStatsToShard(InternalStats::kIntStatsWalFileBytes, log_size,
+                               wal_context.wal_partition,
+                               /*concurrent=*/false);
+      stats->AddDBStatsToShard(InternalStats::kIntStatsWriteWithWal,
+                               write_with_wal, wal_context.wal_partition,
+                               /*concurrent=*/false);
+    } else {
+      stats->AddDBStats(InternalStats::kIntStatsWalFileBytes, log_size,
+                        /*concurrent=*/false);
+      stats->AddDBStats(InternalStats::kIntStatsWriteWithWal, write_with_wal,
+                        /*concurrent=*/false);
+    }
     RecordTick(stats_, WAL_FILE_BYTES, log_size);
-    stats->AddDBStats(InternalStats::kIntStatsWriteWithWal, write_with_wal,
-                      concurrent);
     RecordTick(stats_, WRITE_WITH_WAL, write_with_wal);
     for (auto* writer : write_group) {
       if (!writer->CallbackFailed()) {
@@ -4121,13 +4107,12 @@ Status DBImpl::RunSyncGate(size_t wal_partition, SequenceNumber low,
   // D-GC28b (i): wait until every record at or below `target` is written,
   // then run one coalesced gate sync, which claims only the WALs holding
   // what the group needs (F2).
-  Status s = RunCompletionGate(low, target, /*sync=*/false,
-                               /*published=*/false,
-                               /*pre_sync_safe_point=*/0, /*sync_micros=*/0);
+  Status s = RunCompletionGate(target, /*published=*/false);
   if (s.ok()) {
     s = RunCoalescedGateSync(low, target, [&](SequenceNumber claim_bound) {
       return SyncWalsFromCompletionGate(
-          write_group.leader->rate_limiter_priority, claim_bound);
+          write_group.leader->rate_limiter_priority, claim_bound,
+          wal_partition);
     });
   }
   if (WalPartitionTimersEnabled()) {
@@ -4217,7 +4202,11 @@ Status DBImpl::WaitUntilRangesBelowPublished(SequenceNumber low,
 }
 
 void DBImpl::EndUnpublishedSyncGroup() {
-  if (unpublished_sync_groups_.fetch_sub(1) == 1) {
+  // Only an announced waiter needs the signal (WaitForUnpublishedSyncGroups):
+  // with none, ending a sync group takes no DB-wide mutex.
+  if (unpublished_sync_groups_.fetch_sub(1) == 1 &&
+      unpublished_sync_group_waiters_.load() != 0) {
+    TEST_SYNC_POINT("DBImpl::EndUnpublishedSyncGroup:Signal");
     // Taking mutex_ orders this signal after the waiter's last check, which
     // it makes holding mutex_ (WaitForPendingWrites).
     InstrumentedMutexLock l(&mutex_);
@@ -4226,36 +4215,55 @@ void DBImpl::EndUnpublishedSyncGroup() {
 }
 
 Status DBImpl::SyncWalsFromCompletionGate(Env::IOPriority rate_limiter_priority,
-                                          SequenceNumber claim_bound) {
+                                          SequenceNumber claim_bound,
+                                          size_t wal_partition) {
   assert(NumWalPartitions() > 1);
   bool need_wal_dir_sync = false;
   uint64_t up_to = 0;
   // Claim what the group needs, each partition under only its own mutex: a
   // Wait() must never hold a second partition mutex (see the LOCK ORDER
-  // note). Marking is serialized across all syncs (see
-  // wal_sync_mark_mutex_): the waits below are only for markers that
-  // already released it, which finish without it. The marks keep every
-  // claimed WAL from retiring until MarkLogsSynced below; a WAL a rotation
-  // installs meanwhile is numbered above up_to and is not claimed.
+  // note). Claims run in ascending partition order, and a marker never
+  // waits holding a mark (D-GC31e (i)): finding a partition marked by
+  // another marker, this one releases its marks, waits for that partition
+  // alone, and claims again. The marks keep every claimed WAL from retiring
+  // until it is finished below; a WAL a rotation installs meanwhile is
+  // numbered above up_to and is not claimed.
   autovector<uint8_t, 1> claimed;
   std::vector<GateSyncPartition> claim;
   uint32_t unsynced_partitions = 0;
   bool previously_failed = false;
-  {
-    TEST_SYNC_POINT("DBImpl::SyncWalsFromCompletionGate:TakesSyncMarkMutex");
-    InstrumentedMutexLock mark_lock(&wal_sync_mark_mutex_);
-    claimed.resize(NumWalPartitions());
-    for (size_t p = 0; p < NumWalPartitions(); ++p) {
+  TEST_SYNC_POINT("DBImpl::SyncWalsFromCompletionGate:TakesSyncMarkMutex");
+  claimed.resize(NumWalPartitions());
+  while (true) {
+    bool busy = false;
+    size_t p = 0;
+    for (; p < NumWalPartitions(); ++p) {
       WalWriteMutexLock l(&WalWriteMutex(p));
       if (p == 0) {
-        // Above one partition, a rotation writes these holding all N (and
-        // MarkLogsSynced does too), so one partition's mutex reads them.
+        // Written under partition 0's mutex or all N (rotation,
+        // MarkLogsSynced, and the marking below), so partition 0's mutex
+        // reads them.
         need_wal_dir_sync = !wal_dir_synced_;
         up_to = cur_wal_number_;
       }
-      claimed[p] = ClaimWalPartitionForGateSync(
-          p, claim_bound, &unsynced_partitions, &claim, &previously_failed);
+      claimed[p] =
+          ClaimWalPartitionForGateSync(p, claim_bound, &unsynced_partitions,
+                                       &claim, &previously_failed, &busy);
+      if (busy) {
+        break;
+      }
     }
+    if (!busy) {
+      break;
+    }
+    ReleaseWalPartitionClaims(up_to, claimed);
+    for (uint8_t& c : claimed) {
+      c = 0;
+    }
+    claim.clear();
+    unsynced_partitions = 0;
+    previously_failed = false;
+    WaitForWalPartitionFrontUnmarked(p);
   }
   WriteOptions write_options;
   write_options.rate_limiter_priority = rate_limiter_priority;
@@ -4303,13 +4311,31 @@ Status DBImpl::SyncWalsFromCompletionGate(Env::IOPriority rate_limiter_priority,
   RecordInHistogram(stats_, WAL_SYNC_FSYNCED_PARTITIONS, fsynced_partitions);
   RecordInHistogram(stats_, WAL_SYNC_UNSYNCED_PARTITIONS, unsynced_partitions);
 
+  // Finish (or cancel) each claimed partition under its own mutex, in
+  // ascending order, one at a time: a finish touches only its partition's
+  // deque, free list and condition variable, so appends to every other
+  // partition go on meanwhile. The directory flag is set under partition
+  // 0's mutex, which the read above and every other reader and writer of it
+  // share (rotation and MarkLogsSynced hold all N).
   VersionEdit synced_wals;
-  {
-    AllWalWriteMutexesLock all_locks(this);
-    if (io_s.ok()) {
-      MarkLogsSynced(up_to, need_wal_dir_sync, &synced_wals, claimed);
-    } else {
-      MarkLogsNotSynced(up_to, claimed);
+  for (size_t p = 0; p < NumWalPartitions(); ++p) {
+    const bool set_dir_synced = p == 0 && io_s.ok() && need_wal_dir_sync;
+    if (!claimed[p] && !set_dir_synced) {
+      continue;
+    }
+    WalWriteMutexLock l(&WalWriteMutex(p));
+    TEST_SYNC_POINT_CALLBACK(
+        "DBImpl::SyncWalsFromCompletionGate:FinishPartition", &p);
+    if (set_dir_synced && cur_wal_number_ == up_to) {
+      wal_dir_synced_ = true;
+    }
+    if (claimed[p]) {
+      if (io_s.ok()) {
+        FinishWalPartitionSync(p, up_to, &synced_wals);
+      } else {
+        CancelWalPartitionSync(p, up_to);
+      }
+      WalSyncCV(p).SignalAll();
     }
   }
   Status s = io_s;
@@ -4321,8 +4347,12 @@ Status DBImpl::SyncWalsFromCompletionGate(Env::IOPriority rate_limiter_priority,
     return s;
   }
   if (io_s.ok()) {
-    default_cf_internal_stats_->AddDBStats(
-        InternalStats::kIntStatsWalFileSynced, 1, /*concurrent=*/true);
+    // Gate syncs of one partition may run their completions concurrently
+    // (an exit runs after the next leader is promoted), and only they add
+    // this stat above one partition: an atomic add on this partition's shard.
+    default_cf_internal_stats_->AddDBStatsToShard(
+        InternalStats::kIntStatsWalFileSynced, 1, wal_partition,
+        /*concurrent=*/true);
     RecordTick(stats_, WAL_FILE_SYNCED);
     if (synced_wals.IsWalAddition()) {
       InstrumentedMutexLock l(&mutex_);
@@ -4503,6 +4533,8 @@ IOStatus DBImpl::ConcurrentWriteGroupToWAL(
   IOStatus io_s;
 
   assert(two_write_queues_ || immutable_db_options_.unordered_write);
+  // Open() refuses both above one partition.
+  assert(NumWalPartitions() == 1);
   assert(!write_group.leader->disable_wal);
   // Same holds for all in the batch group
   WriteBatch tmp_batch;
@@ -4535,26 +4567,16 @@ IOStatus DBImpl::ConcurrentWriteGroupToWAL(
     }
   }
   uint64_t wal_index = 0;
-  // At N==1 nothing consumes the tracker, so neither path below enters
-  // it; the mutex acquisitions go away with the registration.
-  const bool track_durability = NumWalPartitions() > 1;
+  // At N==1 nothing consumes the tracker, so the allocation registers
+  // nothing.
   if (log::WALIndexEnabled(immutable_db_options_.partition_wal_usage)) {
-    io_s = AllocateSequenceAndWALIndex(
-        seq_inc, /*write_wal=*/true, last_sequence, &wal_index, wal_partition,
-        /*register_durability=*/track_durability);
+    io_s = AllocateSequenceAndWALIndex(seq_inc, /*write_wal=*/true,
+                                       last_sequence, &wal_index, wal_partition,
+                                       /*register_durability=*/false);
     if (!io_s.ok()) {
       wal_mutex.Unlock();
       return io_s;
     }
-  } else if (track_durability) {
-    // No-index path: bracket the allocation with durability registration so
-    // no later scan can miss the outstanding range. sequence_wal_index_mutex_
-    // is a leaf below the WAL write mutex already held here.
-    SequenceWalIndexLock seq_lock(this);
-    *last_sequence = versions_->FetchAddLastAllocatedSequence(seq_inc);
-    const SequenceNumber low = *last_sequence + 1;
-    const SequenceNumber high = *last_sequence + seq_inc;
-    wal_durability_tracker_->Register(wal_partition, low, high);
   } else {
     *last_sequence = versions_->FetchAddLastAllocatedSequence(seq_inc);
   }
@@ -4581,13 +4603,6 @@ IOStatus DBImpl::ConcurrentWriteGroupToWAL(
         CoverBurnedWALIndex(write_options, wal_context.writer, wal_index,
                             wal_partition, /*wal_mutex_held=*/true);
     cover_io_s.PermitUncheckedError();
-  } else if (track_durability) {
-    // write() completed (not fsync). Still under the partition's WAL write
-    // mutex. Paired with the registration above: only complete what was
-    // registered, so at N==1 this completion goes away with it.
-    const SequenceNumber high = sequence + seq_inc - 1;
-    wal_durability_tracker_->Complete(wal_partition, sequence, high);
-    SignalWalDurabilityWaiters();
   }
   if (to_be_cached_state) {
     cached_recoverable_state_ = *to_be_cached_state;
@@ -4615,6 +4630,24 @@ IOStatus DBImpl::ConcurrentWriteGroupToWAL(
 
 Status DBImpl::WriteRecoverableState() {
   mutex_.AssertHeld();
+  if (!cached_recoverable_state_empty_ && NumWalPartitions() > 1) {
+    // Every leader is excluded: the highest-sequence slot supersedes every
+    // other, as a single highest-sequence state would.
+    RecoverableStateSlot* highest = nullptr;
+    for (RecoverableStateSlot& slot : recoverable_state_slots_) {
+      if (!slot.empty &&
+          (highest == nullptr || slot.sequence > highest->sequence)) {
+        highest = &slot;
+      }
+    }
+    if (highest != nullptr) {
+      std::swap(cached_recoverable_state_, highest->state);
+    }
+    for (RecoverableStateSlot& slot : recoverable_state_slots_) {
+      slot.state.Clear();
+      slot.empty = true;
+    }
+  }
   if (!cached_recoverable_state_empty_) {
     // Only for write-prepared and write-unprepared.
     assert(seq_per_batch_);
@@ -4730,6 +4763,30 @@ void DBImpl::AssignAtomicFlushSeq(const autovector<ColumnFamilyData*>& cfds) {
   }
 }
 
+bool DBImpl::SwitchWALWouldAct() {
+  mutex_.AssertHeld();
+  // As SwitchWAL() finds the oldest live WAL across partitions.
+  WalFileNumberSize oldest_alive_wal = OldestAliveWal(0);
+  for (size_t p = 1; p < NumWalPartitions(); ++p) {
+    const WalFileNumberSize candidate = OldestAliveWal(p);
+    if (candidate.number < oldest_alive_wal.number) {
+      oldest_alive_wal = candidate;
+    }
+  }
+  if (oldest_alive_wal.getting_flushed) {
+    return false;
+  }
+  if (allow_2pc() && unable_to_release_oldest_log_) {
+    const uint64_t oldest_log_with_uncommitted_prep =
+        logs_with_prep_tracker_.FindMinLogContainingOutstandingPrep();
+    if (oldest_log_with_uncommitted_prep > 0 &&
+        oldest_log_with_uncommitted_prep == oldest_alive_wal.number) {
+      return false;
+    }
+  }
+  return true;
+}
+
 Status DBImpl::SwitchWAL(WriteContext* write_context) {
   mutex_.AssertHeld();
   assert(write_context != nullptr);
@@ -4785,11 +4842,11 @@ Status DBImpl::SwitchWAL(WriteContext* write_context) {
     MarkOldestAliveWalGettingFlushed(oldest_partition);
   }
 
-  ROCKS_LOG_INFO(
-      immutable_db_options_.info_log,
-      "Flushing all column families with data in WAL number %" PRIu64
-      ". Total log size is %" PRIu64 " while max_total_wal_size is %" PRIu64,
-      oldest_alive_log, wals_total_size_.LoadRelaxed(), GetMaxTotalWalSize());
+  ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                 "Flushing all column families with data in WAL number %" PRIu64
+                 ". Total log size is %" PRIu64
+                 " while max_total_wal_size is %" PRIu64,
+                 oldest_alive_log, WalsTotalSize(), GetMaxTotalWalSize());
   // no need to refcount because drop is happening in write thread, so can't
   // happen while we're in the write thread
   autovector<ColumnFamilyData*> cfds;
@@ -5567,6 +5624,9 @@ Status DBImpl::SwitchMemtableImpl(ColumnFamilyData* cfd, WriteContext* context,
     if (s.ok()) {
       s = io_s;
     }
+    // Accepted cost (audit A9): the N-1 extra WALs are created here, with
+    // the switch gate closed, so file numbers keep partition 0's lowest and
+    // each WAL's predecessor span is known; a memtable switch is rare.
     for (size_t i = 0; s.ok() && i < extra_wal_numbers.size(); ++i) {
       log::Writer* extra_wal = nullptr;
       io_s = CreateWAL(db_options_snapshot, write_options, extra_wal_numbers[i],
@@ -5636,7 +5696,11 @@ Status DBImpl::SwitchMemtableImpl(ColumnFamilyData* cfd, WriteContext* context,
   if (s.ok() && creating_new_log) {
     // Rotation holds every partition's mutex (plus mutex_, already held):
     // readers of the globals touched below hold mutex_ or all N, so they
-    // always share one of those.
+    // always share one of those. Above one partition it also writes each
+    // retiring WAL's progress record and buffer under all N, the one hold of
+    // all N across I/O (accepted with A9): every retiring WAL asserts the
+    // same generation boundary while no append can land in between, and a
+    // memtable switch is rare.
     AllWalWriteMutexesLock l(this);
     assert(new_log != nullptr);
     for (size_t p = 0; s.ok() && p < NumWalPartitions(); ++p) {

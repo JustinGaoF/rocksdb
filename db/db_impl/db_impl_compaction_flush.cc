@@ -643,7 +643,7 @@ Status DBImpl::AtomicFlushMemTablesToOutputFiles(
 
     if (!log_io_s.ok() && !log_io_s.IsShutdownInProgress() &&
         !log_io_s.IsColumnFamilyDropped()) {
-      if (wals_total_size_.LoadRelaxed() > 0) {
+      if (WalsTotalSize() > 0) {
         error_handler_.SetBGError(log_io_s, BackgroundErrorReason::kFlush);
       } else {
         // If the WAL is empty, we use different error reason

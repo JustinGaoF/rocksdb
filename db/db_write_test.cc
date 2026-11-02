@@ -3933,8 +3933,8 @@ TEST_P(DBWritePartitionTest, SyncFanoutAndMutexHistograms) {
   EXPECT_EQ(0U, count(WAL_SYNC_FSYNCED_PARTITIONS));
 
   // Partitions 0 and 1 hold unsynced bytes, 2 and 3 are idle; the sync
-  // write fsyncs only the two it depends on (GC28 Q1), and takes all N WAL
-  // mutexes to mark them.
+  // write fsyncs only the two it depends on (GC28 Q1), and marks each under
+  // its own WAL mutex, never all N (GC31 Q4).
   ASSERT_OK(Put(cf_for_partition_[0], "k2", "v"));
   ASSERT_OK(Put(cf_for_partition_[0], "k3", "v", sync_wo));
   EXPECT_EQ(1U, count(WAL_SYNC_FSYNCED_PARTITIONS));
@@ -3942,7 +3942,7 @@ TEST_P(DBWritePartitionTest, SyncFanoutAndMutexHistograms) {
   EXPECT_EQ(1U, count(WAL_SYNC_UNSYNCED_PARTITIONS));
   EXPECT_EQ(2U, sum(WAL_SYNC_UNSYNCED_PARTITIONS));
   EXPECT_EQ(1U, count(WAL_SYNC_BARRIER_MICROS));
-  EXPECT_GE(count(WAL_WRITE_MUTEX_ALL_WAIT_MICROS), 1U);
+  EXPECT_EQ(0U, count(WAL_WRITE_MUTEX_ALL_WAIT_MICROS));
 }
 
 TEST_P(DBWritePartitionTest, IngestionStallHistogram) {
@@ -11041,6 +11041,1102 @@ TEST_P(DBWritePartitionTest, LoneWriterGroupStillPublishesInOrder) {
     }
     db_->ReleaseSnapshot(snapshot);
   }
+}
+
+// GC31 tests: the write-path locks and shared writes at N > 1 outside the
+// two allowed cross-partition sync points.
+namespace {
+// Holds every thread that reaches its sync point while armed, until
+// Release(), and counts the arrivals.
+class GC31Gate {
+ public:
+  GC31Gate() = default;
+  GC31Gate(const GC31Gate&) = delete;
+  GC31Gate& operator=(const GC31Gate&) = delete;
+  ~GC31Gate() {
+    Release();
+    if (!point_.empty()) {
+      SyncPoint::GetInstance()->ClearCallBack(point_);
+    }
+  }
+  void Arm(const std::string& point) {
+    point_ = point;
+    SyncPoint::GetInstance()->SetCallBack(point, [this](void*) {
+      std::unique_lock<std::mutex> lock(mu_);
+      ++arrivals_;
+      cv_.notify_all();
+      cv_.wait(lock, [this] { return released_; });
+    });
+  }
+  bool WaitArrivals(int n) {
+    std::unique_lock<std::mutex> lock(mu_);
+    return cv_.wait_for(lock, std::chrono::seconds(30),
+                        [this, n] { return arrivals_ >= n; });
+  }
+  void Release() {
+    std::lock_guard<std::mutex> lock(mu_);
+    released_ = true;
+    cv_.notify_all();
+  }
+
+ private:
+  std::string point_;
+  std::mutex mu_;
+  std::condition_variable cv_;
+  int arrivals_ = 0;
+  bool released_ = false;
+};
+
+// Blocks the HIGH and LOW background pools until Release() (or
+// destruction), so a flush a switch schedules stays queued.
+class GC31BlockedPools {
+ public:
+  explicit GC31BlockedPools(Env* env) {
+    env->SetBackgroundThreads(1, Env::Priority::HIGH);
+    env->SetBackgroundThreads(1, Env::Priority::LOW);
+    env->Schedule(&test::SleepingBackgroundTask::DoSleepTask, &high_,
+                  Env::Priority::HIGH);
+    env->Schedule(&test::SleepingBackgroundTask::DoSleepTask, &low_,
+                  Env::Priority::LOW);
+    high_.WaitUntilSleeping();
+    low_.WaitUntilSleeping();
+  }
+  ~GC31BlockedPools() { Release(); }
+  void Release() {
+    if (released_) {
+      return;
+    }
+    released_ = true;
+    high_.WakeUp();
+    low_.WakeUp();
+    high_.WaitUntilDone();
+    low_.WaitUntilDone();
+  }
+
+ private:
+  test::SleepingBackgroundTask high_;
+  test::SleepingBackgroundTask low_;
+  bool released_ = false;
+};
+
+// A FileSystem whose writable file for one WAL number blocks in Close()
+// until Unblock().
+class GC31BlockingCloseFS : public FileSystemWrapper {
+ public:
+  explicit GC31BlockingCloseFS(const std::shared_ptr<FileSystem>& target)
+      : FileSystemWrapper(target) {}
+  static const char* kClassName() { return "GC31BlockingCloseFS"; }
+  const char* Name() const override { return kClassName(); }
+  IOStatus NewWritableFile(const std::string& fname,
+                           const FileOptions& file_opts,
+                           std::unique_ptr<FSWritableFile>* result,
+                           IODebugContext* dbg) override {
+    IOStatus s = target()->NewWritableFile(fname, file_opts, result, dbg);
+    uint64_t number = 0;
+    FileType type;
+    if (s.ok() &&
+        ParseFileName(fname.substr(fname.rfind('/') + 1), &number, &type) &&
+        type == kWalFile) {
+      result->reset(new File(std::move(*result), this, number));
+    }
+    return s;
+  }
+  void BlockClose(uint64_t number) {
+    std::lock_guard<std::mutex> lock(mu_);
+    blocked_number_ = number;
+  }
+  bool WaitBlocked() {
+    std::unique_lock<std::mutex> lock(mu_);
+    return cv_.wait_for(lock, std::chrono::seconds(30),
+                        [this] { return blocked_; });
+  }
+  void Unblock() {
+    std::lock_guard<std::mutex> lock(mu_);
+    released_ = true;
+    cv_.notify_all();
+  }
+
+ private:
+  class File : public FSWritableFileOwnerWrapper {
+   public:
+    File(std::unique_ptr<FSWritableFile>&& t, GC31BlockingCloseFS* fs,
+         uint64_t number)
+        : FSWritableFileOwnerWrapper(std::move(t)), fs_(fs), number_(number) {}
+    IOStatus Close(const IOOptions& options, IODebugContext* dbg) override {
+      fs_->MaybeBlock(number_);
+      return FSWritableFileOwnerWrapper::Close(options, dbg);
+    }
+
+   private:
+    GC31BlockingCloseFS* const fs_;
+    const uint64_t number_;
+  };
+  void MaybeBlock(uint64_t number) {
+    std::unique_lock<std::mutex> lock(mu_);
+    if (number != blocked_number_) {
+      return;
+    }
+    blocked_ = true;
+    cv_.notify_all();
+    cv_.wait(lock, [this] { return released_; });
+  }
+  std::mutex mu_;
+  std::condition_variable cv_;
+  uint64_t blocked_number_ = 0;
+  bool blocked_ = false;
+  bool released_ = false;
+};
+
+// Counts the hits of a sync point until destroyed.
+class GC31Counter {
+ public:
+  explicit GC31Counter(const std::string& point) : point_(point) {
+    SyncPoint::GetInstance()->SetCallBack(
+        point_, [this](void*) { hits_.fetch_add(1); });
+  }
+  ~GC31Counter() { SyncPoint::GetInstance()->ClearCallBack(point_); }
+  int Get() const { return hits_.load(); }
+  void Reset() { hits_.store(0); }
+
+ private:
+  const std::string point_;
+  std::atomic<int> hits_{0};
+};
+}  // namespace
+
+TEST_P(DBWritePartitionTest, SwitchWalQuiesceSkippedWhileOldestWalFlushing) {
+  // GC31 Q1 (A1): past max_total_wal_size with more than one column family,
+  // a write stops every partition only when SwitchWAL will act. The first
+  // switch marks the oldest WAL getting_flushed and schedules the flush,
+  // which the blocked pools hold. Meanwhile every SwitchWAL would return at
+  // once, so 200 writes from 8 threads quiesce no partition. Once the flush
+  // runs the WAL retires, and the next write's switch acts, once.
+  // Neuter: drop the pre-check; every write group quiesces.
+  if (GetParam()) {
+    return;
+  }
+  constexpr size_t kPartitions = 8;
+  constexpr int kThreads = 8;
+  constexpr int kWritesPerThread = 25;
+  Options options = CurrentOptions();
+  options.write_buffer_size = 64 << 20;
+  options.max_total_wal_size = 64 << 10;
+  options.avoid_flush_during_shutdown = true;
+  OpenWithPartitions(kPartitions, options);
+  GC31BlockedPools pools(env_);
+  GC31Counter quiesces("DBImpl::WaitForPendingWrites:BeforeBlock");
+  GC31Counter switches("DBImpl::SwitchMemtable:AfterCreateWAL");
+  const std::string value(1 << 10, 'v');
+  for (int i = 0; switches.Get() == 0; ++i) {
+    ASSERT_LT(i, 10000);
+    ASSERT_OK(Put(cf_for_partition_[i % kPartitions],
+                  "fill" + std::to_string(i), value));
+  }
+  ASSERT_EQ(1, quiesces.Get());
+  quiesces.Reset();
+  std::vector<port::Thread> threads;
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&, t] {
+      for (int i = 0; i < kWritesPerThread; ++i) {
+        ASSERT_OK(Put(cf_for_partition_[t % kPartitions],
+                      "t" + std::to_string(t) + "_" + std::to_string(i),
+                      value));
+      }
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  EXPECT_EQ(0, quiesces.Get());
+  EXPECT_EQ(1, switches.Get());
+  const uint64_t held_total = dbfull()->TEST_wals_total_size();
+  ASSERT_GT(held_total, options.max_total_wal_size);
+
+  pools.Release();
+  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+  EXPECT_LT(dbfull()->TEST_wals_total_size(), held_total);
+  ASSERT_GT(dbfull()->TEST_wals_total_size(), options.max_total_wal_size);
+  quiesces.Reset();
+  ASSERT_OK(Put(cf_for_partition_[0], "next", value));
+  EXPECT_EQ(1, quiesces.Get());
+  EXPECT_EQ(2, switches.Get());
+}
+
+TEST_P(DBWritePartitionTest, SwitchWalDecidedAgainAfterGateCloses) {
+  // GC31 Q1 (A1), the decision after closing: D and A both find that the
+  // switch acts. D closes the switch gate first and waits for C, held in
+  // its append past the gate; A then waits for the gate. Once C is let go
+  // D switches, marking the oldest WAL getting_flushed (the blocked pools
+  // keep it so), and opens the gate. A closes it, finds the switch would no
+  // longer act, and opens it again without draining any partition: one
+  // quiesce in all, D's.
+  // Neuter: decide only before closing; A drains too (two quiesces).
+  if (GetParam()) {
+    return;
+  }
+  constexpr size_t kPartitions = 4;
+  Options options = CurrentOptions();
+  options.write_buffer_size = 64 << 20;
+  options.max_total_wal_size = 256 << 10;
+  options.avoid_flush_during_shutdown = true;
+  OpenWithPartitions(kPartitions, options);
+  GC31BlockedPools pools(env_);
+  const std::string value(1 << 10, 'v');
+  for (int i = 0; i < 64; ++i) {
+    ASSERT_OK(Put(cf_for_partition_[i % kPartitions],
+                  "fill" + std::to_string(i), value));
+  }
+  ASSERT_LT(dbfull()->TEST_wals_total_size(), options.max_total_wal_size);
+  GC31Counter quiesces("DBImpl::WaitForPendingWrites:BeforeBlock");
+  GC31Counter switches("DBImpl::SwitchMemtable:AfterCreateWAL");
+
+  GC30Write c;
+  GC30Write b;
+  GC30Write d;
+  GC30Write a;
+  GC28Hold c_append;
+  c_append.Arm("DBImpl::WriteToWAL:log_entry", [](void* arg) {
+    return static_cast<Slice*>(arg)->ends_with("held");
+  });
+  c.Start([&] { return Put(cf_for_partition_[2], "c", "held"); });
+  ASSERT_TRUE(c_append.WaitHeld());
+  // B's own append takes the total past the limit; B then waits for C.
+  std::atomic<std::thread::id> b_id;
+  GC28Hold b_appended;
+  b_appended.Arm("DBImpl::WriteToWAL:AfterAddRecord", GC28OnThread(&b_id),
+                 /*hold=*/false);
+  b.Start([&] {
+    b_id.store(std::this_thread::get_id());
+    return Put(cf_for_partition_[0], "b", std::string(256 << 10, 'x'));
+  });
+  ASSERT_TRUE(b_appended.WaitHits(1));
+  ASSERT_GT(dbfull()->TEST_wals_total_size(), options.max_total_wal_size);
+  GC28Hold d_waits;
+  d_waits.Arm("DBImpl::CloseMemTableSwitchGate:WaitForLeaders", nullptr,
+              /*hold=*/false);
+  d.Start([&] { return Put(cf_for_partition_[1], "d", "v"); });
+  ASSERT_TRUE(d_waits.WaitHits(1));
+  std::atomic<std::thread::id> a_id;
+  GC28Hold a_decided;
+  a_decided.Arm("DBImpl::PreprocessWrite:SwitchWalWouldAct",
+                GC28OnThread(&a_id), /*hold=*/false);
+  a.Start([&] {
+    a_id.store(std::this_thread::get_id());
+    return Put(cf_for_partition_[3], "a", "v");
+  });
+  ASSERT_TRUE(a_decided.WaitHits(1));
+  // A now waits for the gate D closed.
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  EXPECT_FALSE(a.Done());
+  c_append.Release();
+  ASSERT_OK(c.Join());
+  ASSERT_OK(b.Join());
+  ASSERT_OK(d.Join());
+  ASSERT_OK(a.Join());
+  EXPECT_EQ(1, switches.Get());
+  EXPECT_EQ(1, quiesces.Get());
+  EXPECT_EQ("v", Get(cf_for_partition_[3], "a"));
+}
+
+TEST_P(DBWritePartitionTest, FlushQuiesceSkippedWhenSchedulerDrained) {
+  // GC31 Q1 (A1), the flush path: two leaders on different partitions both
+  // find a flush scheduled before taking mutex_; the first to take it
+  // schedules the flush, and the second finds the scheduler drained and
+  // closes no gate. Exactly one quiesce.
+  // Neuter: no recheck under mutex_; both close the gate (two quiesces).
+  if (GetParam()) {
+    return;
+  }
+  constexpr size_t kPartitions = 4;
+  Options options = CurrentOptions();
+  options.write_buffer_size = 64 << 10;
+  options.avoid_flush_during_shutdown = true;
+  OpenWithPartitions(kPartitions, options);
+  ColumnFamilyData* cfd = static_cast_with_check<ColumnFamilyHandleImpl>(
+                              handles_[cf_for_partition_[0]])
+                              ->cfd();
+  for (int i = 0; !cfd->mem()->HasFlushScheduled(); ++i) {
+    ASSERT_LT(i, 1000);
+    ASSERT_OK(Put(cf_for_partition_[0], "fill" + std::to_string(i),
+                  std::string(4 << 10, 'v')));
+  }
+  GC31Counter quiesces("DBImpl::WaitForPendingWrites:BeforeBlock");
+  GC31Gate scheduled;
+  scheduled.Arm("DBImpl::PreprocessWrite:FlushScheduled");
+  GC30Write w1;
+  GC30Write w2;
+  w1.Start([&] { return Put(cf_for_partition_[1], "w1", "v"); });
+  w2.Start([&] { return Put(cf_for_partition_[2], "w2", "v"); });
+  ASSERT_TRUE(scheduled.WaitArrivals(2));
+  scheduled.Release();
+  ASSERT_OK(w1.Join());
+  ASSERT_OK(w2.Join());
+  EXPECT_EQ(1, quiesces.Get());
+  EXPECT_EQ("v", Get(cf_for_partition_[1], "w1"));
+  EXPECT_EQ("v", Get(cf_for_partition_[2], "w2"));
+}
+
+TEST_P(DBWritePartitionTest, DBStatsExactUnderConcurrentLeaders) {
+  // GC31 Q2 (A2): leaders of eight partitions add the hot DB stats
+  // concurrently, each to its own partition's shard. Every DB stat still
+  // reports the exact total: keys, bytes, writes by self and by other, writes
+  // with WAL, and the WAL bytes and syncs, which also equal their tickers.
+  // Neuter: GetDBStats reads only shard 0; the totals fall short.
+  if (GetParam()) {
+    return;
+  }
+  constexpr size_t kPartitions = 8;
+  constexpr int kThreads = 16;
+  constexpr int kWritesPerThread = 100;
+  Options options = CurrentOptions();
+  options.statistics = CreateDBStatistics();
+  options.write_buffer_size = 64 << 20;
+  options.avoid_flush_during_shutdown = true;
+  OpenWithPartitions(kPartitions, options);
+  ASSERT_OK(dbfull()->ResetStats());
+  ASSERT_OK(options.statistics->Reset());
+  std::atomic<uint64_t> expected_bytes{0};
+  std::vector<port::Thread> threads;
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&, t] {
+      const int cf = cf_for_partition_[t % kPartitions];
+      WriteOptions sync_wo;
+      sync_wo.sync = true;
+      for (int i = 0; i < kWritesPerThread; ++i) {
+        const std::string key =
+            "t" + std::to_string(t) + "_" + std::to_string(i);
+        const std::string value(1 + (t * 7 + i) % 300, 'v');
+        WriteBatch batch;
+        ASSERT_OK(batch.Put(handles_[cf], key, value));
+        expected_bytes.fetch_add(batch.GetDataSize());
+        ASSERT_OK(db_->Write(i % 10 == 0 ? sync_wo : WriteOptions(), &batch));
+      }
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  constexpr uint64_t kWrites = kThreads * kWritesPerThread;
+  std::map<std::string, std::string> stats;
+  ASSERT_TRUE(db_->GetMapProperty(DB::Properties::kDBStats, &stats));
+  auto stat = [&](const std::string& name) {
+    return std::stoull(stats.at(name));
+  };
+  auto ticker = [&](Tickers t) {
+    return options.statistics->getTickerCount(t);
+  };
+  EXPECT_EQ(kWrites, stat("db.user_keys_written"));
+  // A group's merged size counts one batch header (WriteBatchInternal::
+  // AppendedByteSize).
+  EXPECT_EQ(expected_bytes.load() -
+                WriteBatchInternal::kHeader * stat("db.user_writes_by_other"),
+            stat("db.user_bytes_written"));
+  EXPECT_EQ(kWrites,
+            stat("db.user_writes_by_self") + stat("db.user_writes_by_other"));
+  EXPECT_EQ(kWrites, stat("db.user_writes_with_wal"));
+  EXPECT_EQ(ticker(WRITE_DONE_BY_SELF), stat("db.user_writes_by_self"));
+  EXPECT_EQ(ticker(WRITE_DONE_BY_OTHER), stat("db.user_writes_by_other"));
+  EXPECT_EQ(ticker(WAL_FILE_BYTES), stat("db.wal_bytes_written"));
+  EXPECT_EQ(ticker(WAL_FILE_SYNCED), stat("db.wal_syncs"));
+  EXPECT_GT(stat("db.wal_syncs"), 0U);
+  uint64_t live_wal_bytes = 0;
+  for (size_t p = 0; p < kPartitions; ++p) {
+    for (const auto& file : dbfull()->TEST_AliveWalFiles(p)) {
+      live_wal_bytes += file.second;
+    }
+  }
+  EXPECT_EQ(live_wal_bytes, dbfull()->TEST_wals_total_size());
+  // The text dump sums the same shards.
+  std::string text;
+  ASSERT_TRUE(db_->GetProperty(DB::Properties::kDBStats, &text));
+  EXPECT_NE(std::string::npos, text.find(std::to_string(kWrites) + " writes, " +
+                                         std::to_string(kWrites) + " keys"))
+      << text;
+  // Reset clears every shard.
+  ASSERT_OK(dbfull()->ResetStats());
+  stats.clear();
+  ASSERT_TRUE(db_->GetMapProperty(DB::Properties::kDBStats, &stats));
+  EXPECT_EQ(0U, stat("db.user_keys_written"));
+  EXPECT_EQ(0U, stat("db.wal_bytes_written"));
+  EXPECT_EQ(0U, stat("db.wal_syncs"));
+}
+
+TEST_P(DBWritePartitionTest, WalsTotalSizeSumsPartitions) {
+  // GC31 Q2 (A8): each partition accounts its appends on its own counter.
+  // The total is the sum of the live WALs' sizes on every partition, drops
+  // by the retired WALs' sizes once a flush retires them, and the
+  // max_total_wal_size trigger fires on the sum, which no single partition
+  // reaches.
+  // Neuter: read one partition's counter; the totals fall short and the
+  // trigger never fires.
+  if (GetParam()) {
+    return;
+  }
+  constexpr size_t kPartitions = 4;
+  Options options = CurrentOptions();
+  options.write_buffer_size = 64 << 20;
+  options.avoid_flush_during_shutdown = true;
+  OpenWithPartitions(kPartitions, options);
+  auto live_wal_bytes = [&] {
+    uint64_t total = 0;
+    for (size_t p = 0; p < kPartitions; ++p) {
+      for (const auto& file : dbfull()->TEST_AliveWalFiles(p)) {
+        total += file.second;
+      }
+    }
+    return total;
+  };
+  const std::string value(4 << 10, 'v');
+  for (int i = 0; i < 40; ++i) {
+    ASSERT_OK(Put(cf_for_partition_[i % kPartitions], "k" + std::to_string(i),
+                  value));
+  }
+  const uint64_t before = dbfull()->TEST_wals_total_size();
+  EXPECT_EQ(live_wal_bytes(), before);
+  EXPECT_GT(before, 4 * 10 * value.size());
+  // Flush every family: the old WALs retire.
+  for (int cf = 0; cf < static_cast<int>(handles_.size()); ++cf) {
+    ASSERT_OK(Flush(cf));
+  }
+  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+  EXPECT_EQ(live_wal_bytes(), dbfull()->TEST_wals_total_size());
+  EXPECT_LT(dbfull()->TEST_wals_total_size(), before / 4);
+
+  // A limit no partition reaches alone, that every partition reaches
+  // together: the write that takes the sum past it switches.
+  GC31Counter switches("DBImpl::SwitchMemtable:AfterCreateWAL");
+  const uint64_t limit =
+      dbfull()->TEST_wals_total_size() + 3 * value.size() + value.size() / 2;
+  ASSERT_OK(db_->SetDBOptions({{"max_total_wal_size", std::to_string(limit)}}));
+  for (size_t p = 0; p < kPartitions; ++p) {
+    ASSERT_OK(Put(cf_for_partition_[p], "over" + std::to_string(p), value));
+  }
+  EXPECT_EQ(0, switches.Get());
+  ASSERT_GT(dbfull()->TEST_wals_total_size(), limit);
+  ASSERT_OK(Put(cf_for_partition_[0], "trigger", "v"));
+  EXPECT_EQ(1, switches.Get());
+}
+
+TEST_P(DBWritePartitionTest, UnpublishedSyncGroupWaiterNeverMissesWake) {
+  // GC31 Q3 (A3): the end of a sync group takes mutex_ and signals only if a
+  // waiter announced itself. A memtable switch (Flush), and then LockWAL(),
+  // waits for a sync group whose fsync is held; between the waiter's check
+  // and its wait (WaitForUnpublishedSyncGroups:Wait) the fsync is released
+  // and the group ends. The waiter announced itself before its check, so the
+  // ender signals it, and it returns.
+  // Neuter: the ender never signals (skip the announcement check); the
+  // waiter hangs and RunWithin fails.
+  if (GetParam()) {
+    return;
+  }
+  constexpr size_t kPartitions = 4;
+  Options options = CurrentOptions();
+  options.avoid_flush_during_shutdown = true;
+  OpenWithPartitions(kPartitions, options);
+  WriteOptions sync_wo;
+  sync_wo.sync = true;
+  for (const bool lock_wal : {false, true}) {
+    SCOPED_TRACE(lock_wal ? "LockWAL" : "Flush");
+    GC30Write s;
+    GC28Hold hold_fsync;
+    hold_fsync.Arm("DBImpl::SyncWalPartitionFiles:BeforeSyncPartition",
+                   GC28Partition(0));
+    s.Start([&] {
+      return Put(cf_for_partition_[0], lock_wal ? "s2" : "s1", "v", sync_wo);
+    });
+    ASSERT_TRUE(hold_fsync.WaitHeld());
+    ASSERT_EQ(1U, dbfull()->TEST_UnpublishedSyncGroups());
+    std::atomic<bool> in_window{false};
+    std::atomic<bool> ended_in_window{false};
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::WaitForUnpublishedSyncGroups:Wait", [&](void*) {
+          if (in_window.exchange(true)) {
+            return;
+          }
+          hold_fsync.Release();
+          const auto deadline =
+              std::chrono::steady_clock::now() + std::chrono::seconds(10);
+          while (dbfull()->TEST_UnpublishedSyncGroups() != 0 &&
+                 std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          }
+          ended_in_window = dbfull()->TEST_UnpublishedSyncGroups() == 0;
+        });
+    ASSERT_OK(RunWithin(std::chrono::seconds(30), [&] {
+      if (!lock_wal) {
+        return Flush(cf_for_partition_[1]);
+      }
+      Status st = db_->LockWAL();
+      if (st.ok()) {
+        st = db_->UnlockWAL();
+      }
+      return st;
+    }));
+    SyncPoint::GetInstance()->ClearCallBack(
+        "DBImpl::WaitForUnpublishedSyncGroups:Wait");
+    EXPECT_TRUE(in_window.load());
+    EXPECT_TRUE(ended_in_window.load());
+    ASSERT_OK(s.Join());
+  }
+  EXPECT_EQ("v", Get(cf_for_partition_[0], "s1"));
+  EXPECT_EQ("v", Get(cf_for_partition_[0], "s2"));
+}
+
+TEST_P(DBWritePartitionTest, EndSyncGroupWithoutWaiterTakesNoDbMutex) {
+  // GC31 Q3 (A3): with no memtable switch or other waiter, ending a sync
+  // group takes no DB mutex: 20 sequential sync writes never reach the
+  // signalling branch of EndUnpublishedSyncGroup.
+  // Neuter: always signal; the count is 20.
+  if (GetParam()) {
+    return;
+  }
+  constexpr size_t kPartitions = 4;
+  Options options = CurrentOptions();
+  options.avoid_flush_during_shutdown = true;
+  OpenWithPartitions(kPartitions, options);
+  GC31Counter signals("DBImpl::EndUnpublishedSyncGroup:Signal");
+  WriteOptions sync_wo;
+  sync_wo.sync = true;
+  for (int i = 0; i < 20; ++i) {
+    ASSERT_OK(Put(cf_for_partition_[i % kPartitions], "s" + std::to_string(i),
+                  "v", sync_wo));
+  }
+  EXPECT_EQ(0, signals.Get());
+  EXPECT_EQ(0U, dbfull()->TEST_UnpublishedSyncGroups());
+}
+
+TEST_P(DBWritePartitionTest, GateSyncTakesNoAllPartitionLock) {
+  // GC31 Q4 (A4, A5): a gate sync reads the horizon under one partition's
+  // mutex and finishes each claimed partition under its own: after a clean
+  // sync write, ten sync writes take all N WAL mutexes zero times.
+  // Neuter: take all N around the marking.
+  if (GetParam()) {
+    return;
+  }
+  constexpr size_t kPartitions = 4;
+  Options options = CurrentOptions();
+  options.statistics = CreateDBStatistics();
+  options.write_buffer_size = 64 << 20;
+  options.avoid_flush_during_shutdown = true;
+  OpenWithPartitions(kPartitions, options);
+  WriteOptions sync_wo;
+  sync_wo.sync = true;
+  ASSERT_OK(Put(cf_for_partition_[0], "clean", "v", sync_wo));
+  ASSERT_OK(options.statistics->Reset());
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_OK(
+        Put(cf_for_partition_[i % kPartitions], "a" + std::to_string(i), "v"));
+    ASSERT_OK(Put(cf_for_partition_[(i + 1) % kPartitions],
+                  "s" + std::to_string(i), "v", sync_wo));
+  }
+  HistogramData all_wait;
+  options.statistics->histogramData(WAL_WRITE_MUTEX_ALL_WAIT_MICROS, &all_wait);
+  EXPECT_EQ(0U, all_wait.count);
+  HistogramData fsynced;
+  options.statistics->histogramData(WAL_SYNC_FSYNCED_PARTITIONS, &fsynced);
+  EXPECT_EQ(10U, fsynced.count);
+}
+
+TEST_P(DBWritePartitionTest, AppendProceedsWhileGateSyncMarksOtherPartition) {
+  // GC31 Q4 (A5): a gate sync finishes each claimed partition under that
+  // partition's mutex alone. Held inside partition 0's finish, it leaves
+  // partition 2 free: an async write there binds its WAL and appends.
+  // Neuter: take all N around the marking; the append waits for the finish.
+  if (GetParam()) {
+    return;
+  }
+  constexpr size_t kPartitions = 4;
+  Options options = CurrentOptions();
+  options.avoid_flush_during_shutdown = true;
+  OpenWithPartitions(kPartitions, options);
+  WriteOptions sync_wo;
+  sync_wo.sync = true;
+  GC30Write s;
+  GC30Write w;
+  GC28Hold finishing;
+  finishing.Arm("DBImpl::SyncWalsFromCompletionGate:FinishPartition",
+                GC28Partition(0));
+  s.Start([&] { return Put(cf_for_partition_[0], "s", "v", sync_wo); });
+  ASSERT_TRUE(finishing.WaitHeld());
+  std::atomic<std::thread::id> w_id;
+  GC28Hold w_appended;
+  w_appended.Arm("DBImpl::WriteToWAL:AfterAddRecord", GC28OnThread(&w_id),
+                 /*hold=*/false);
+  w.Start([&] {
+    w_id.store(std::this_thread::get_id());
+    return Put(cf_for_partition_[2], "w", "v");
+  });
+  EXPECT_TRUE(w_appended.WaitHits(1, std::chrono::seconds(10)));
+  finishing.Release();
+  ASSERT_OK(s.Join());
+  ASSERT_OK(w.Join());
+  EXPECT_EQ("v", Get(cf_for_partition_[0], "s"));
+  EXPECT_EQ("v", Get(cf_for_partition_[2], "w"));
+}
+
+TEST_P(DBWritePartitionTest, GateSyncMarkingRacesKeepAckedWrites) {
+  // GC31 Q4 (A5) races: a gate sync claiming partitions 0 and 2 is held at
+  // its entry, then between its two finishes (inside partition 2's), while
+  // a forced rotation (a flush, whose background job runs SyncClosedWals and
+  // FindObsoleteFiles) and a SyncWAL() start. Once released, everything
+  // completes; after a power loss that drops every unsynced byte, a reopen
+  // in kAbsoluteConsistency reads every acknowledged write the syncs
+  // covered, and the MANIFEST records no WAL as synced beyond what was
+  // fsynced (the reopen verifies the tracked WAL sizes).
+  if (GetParam()) {
+    return;
+  }
+  constexpr size_t kPartitions = 4;
+  std::unique_ptr<FaultInjectionTestEnv> fault_env(
+      new FaultInjectionTestEnv(env_));
+  Defer close_before_env([this] { Close(); });
+  for (const char* point :
+       {"DBImpl::SyncWalsFromCompletionGate:TakesSyncMarkMutex",
+        "DBImpl::SyncWalsFromCompletionGate:FinishPartition"}) {
+    SCOPED_TRACE(point);
+    Options options = IndexedWalOptions(CurrentOptions());
+    options.env = fault_env.get();
+    options.wal_recovery_mode = WALRecoveryMode::kAbsoluteConsistency;
+    Close();
+    ASSERT_OK(DestroyDB(dbname_, options));
+    Reopen(options);
+    OpenWithPartitions(kPartitions, options);
+    WriteOptions sync_wo;
+    sync_wo.sync = true;
+    std::vector<std::pair<int, std::string>> acked;
+    {
+      GC30Write s;
+      GC30Write flush;
+      GC30Write sync_wal;
+      GC28Hold held;
+      const bool between = std::strstr(point, "FinishPartition") != nullptr;
+      held.Arm(point, between ? GC28Partition(2) : nullptr);
+      ASSERT_OK(Put(cf_for_partition_[0], "a0", "v"));
+      ASSERT_OK(Put(cf_for_partition_[2], "a2", "v"));
+      s.Start([&] { return Put(cf_for_partition_[2], "s", "v", sync_wo); });
+      ASSERT_TRUE(held.WaitHeld());
+      flush.Start([&] {
+        FlushOptions fo;
+        fo.wait = false;
+        return db_->Flush(fo, handles_[cf_for_partition_[1]]);
+      });
+      sync_wal.Start([&] { return db_->SyncWAL(); });
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      held.Release();
+      ASSERT_OK(s.Join());
+      ASSERT_OK(flush.Join());
+      ASSERT_OK(sync_wal.Join());
+    }
+    acked.emplace_back(cf_for_partition_[0], "a0");
+    acked.emplace_back(cf_for_partition_[2], "a2");
+    acked.emplace_back(cf_for_partition_[2], "s");
+    ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+    ASSERT_OK(Put(cf_for_partition_[3], "b3", "v", sync_wo));
+    acked.emplace_back(cf_for_partition_[3], "b3");
+    for (size_t p = 0; p < kPartitions; ++p) {
+      for (const auto& marks : dbfull()->TEST_WalSyncMarks(p)) {
+        EXPECT_FALSE(marks.second) << "partition " << p;
+      }
+    }
+    Close();
+    ASSERT_OK(fault_env->DropUnsyncedFileData());
+    ReopenWithPartitions(kPartitions, options);
+    for (const auto& [cf, key] : acked) {
+      EXPECT_EQ("v", Get(cf, key)) << key;
+    }
+    Close();
+  }
+}
+
+TEST_P(DBWritePartitionTest, GateSyncDoesNotWaitBehindParkedMarker) {
+  // GC31 Q6 (A7, D-GC31e (i)): no marker waits for another marker's sync
+  // while holding a lock or a mark other syncs need. A one-family DB at N=4
+  // writes only on partition r. A flush's obsolete-file cleanup closes every
+  // partition's obsolete WAL in ascending order, marking each while it
+  // closes it, and the close of partition q's (q above r) is held. A user
+  // SyncWAL() marks the partitions below q, r included, finds q marked,
+  // releases its marks and parks on q. A sync write on partition r runs its
+  // gate sync and returns meanwhile.
+  // (A flush's SyncClosedWals cannot be the held marker here: with coupled
+  // rotation every partition has a closed WAL, and SyncClosedWals marks
+  // every one, r's included.)
+  // Neuter: wait while holding the marks below the parked partition (D-GC31e
+  // (ii)), or restore the global mark mutex; the sync write waits for the
+  // held close.
+  if (GetParam()) {
+    return;
+  }
+  constexpr size_t kPartitions = 4;
+  WriteBatch probe;
+  ASSERT_OK(WriteBatchInternal::Put(&probe, 0, "key", "value"));
+  size_t r = kPartitions;
+  ASSERT_OK(DBImpl::TEST_WalPartitionForWrite(probe, kPartitions, &r));
+  ASSERT_LT(r + 1, kPartitions);
+  const size_t q = r + 1;
+  auto fs = std::make_shared<GC31BlockingCloseFS>(env_->GetFileSystem());
+  std::unique_ptr<Env> env(NewCompositeEnv(fs));
+  Defer close_before_env([this] { Close(); });
+  Options options = CurrentOptions();
+  options.env = env.get();
+  options.wal_partitions = kPartitions;
+  options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  options.track_and_verify_wals_in_manifest = true;
+  options.avoid_flush_during_shutdown = true;
+  DestroyAndReopen(options);
+  ASSERT_EQ(kPartitions, dbfull()->TEST_NumWalPartitions());
+  SyncPoint::GetInstance()->EnableProcessing();
+  WriteOptions sync_wo;
+  sync_wo.sync = true;
+  ASSERT_OK(Put("a", "v"));
+  fs->BlockClose(dbfull()->TEST_CurrentWalNumber(q));
+  Defer unblock([&] { fs->Unblock(); });
+  {
+    // The flush rotates now and cleans up once the pools run. A sync write
+    // in between syncs every closed WAL (each stays open), so later gate
+    // syncs need none of them.
+    GC31BlockedPools pools(env_);
+    FlushOptions no_wait;
+    no_wait.wait = false;
+    ASSERT_OK(db_->Flush(no_wait));
+    ASSERT_OK(Put("r0", "v", sync_wo));
+  }
+  ASSERT_TRUE(fs->WaitBlocked());
+  ASSERT_EQ(1U, dbfull()->TEST_WalSyncMarks(r).size());
+  ASSERT_TRUE(dbfull()->TEST_WalSyncMarks(q).front().second);
+  GC30Write sync_wal;
+  GC30Write r_write;
+  GC28Hold parked;
+  parked.Arm("DBImpl::ClaimWalPartitionForSyncWalImpl:Wait", nullptr,
+             /*hold=*/false);
+  sync_wal.Start([&] { return db_->SyncWAL(); });
+  ASSERT_TRUE(parked.WaitHits(1));
+  r_write.Start([&] { return Put("r", "v", sync_wo); });
+  EXPECT_TRUE(r_write.WaitDone(std::chrono::seconds(10)));
+  EXPECT_FALSE(sync_wal.Done());
+  fs->Unblock();
+  ASSERT_OK(r_write.Join());
+  ASSERT_OK(sync_wal.Join());
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+  for (size_t p = 0; p < kPartitions; ++p) {
+    for (const auto& marks : dbfull()->TEST_WalSyncMarks(p)) {
+      EXPECT_FALSE(marks.second) << "partition " << p;
+    }
+  }
+  EXPECT_EQ("v", Get("r"));
+}
+
+TEST_P(DBWritePartitionTest, MarkersRetryWithoutDeadlock) {
+  // GC31 Q6 (A7, D-GC31e (i)): markers with overlapping claims, in each
+  // order, both finish. (a) SyncWAL() marks every partition and is held in
+  // its fsync; a sync write needing partition 2 finds it marked and waits
+  // holding nothing. (b) A sync write claiming partitions 0 and 2 is held in
+  // partition 0's fsync; SyncWAL() finds partition 0 marked and waits
+  // holding nothing. Then SyncWAL(), FlushWAL(true) and sync writes on every
+  // partition race; every one finishes.
+  if (GetParam()) {
+    return;
+  }
+  constexpr size_t kPartitions = 4;
+  Options options = CurrentOptions();
+  options.avoid_flush_during_shutdown = true;
+  OpenWithPartitions(kPartitions, options);
+  WriteOptions sync_wo;
+  sync_wo.sync = true;
+  {
+    GC30Write sync_wal;
+    GC30Write s;
+    GC28Hold held;
+    ASSERT_OK(Put(cf_for_partition_[2], "a", "v"));
+    held.Arm("DBImpl::SyncWalImpl:BeforeSyncWAL");
+    sync_wal.Start([&] { return db_->SyncWAL(); });
+    ASSERT_TRUE(held.WaitHeld());
+    s.Start([&] { return Put(cf_for_partition_[2], "s", "v", sync_wo); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_FALSE(s.Done());
+    held.Release();
+    ASSERT_OK(RunWithin(std::chrono::seconds(30), [&] {
+      Status st = sync_wal.Join();
+      return st.ok() ? s.Join() : st;
+    }));
+  }
+  {
+    GC30Write s;
+    GC30Write sync_wal;
+    GC28Hold held;
+    ASSERT_OK(Put(cf_for_partition_[0], "b", "v"));
+    held.Arm("DBImpl::SyncWalPartitionFiles:BeforeSyncPartition",
+             GC28Partition(0));
+    s.Start([&] { return Put(cf_for_partition_[2], "t", "v", sync_wo); });
+    ASSERT_TRUE(held.WaitHeld());
+    GC28Hold parked;
+    parked.Arm("DBImpl::ClaimWalPartitionForSyncWalImpl:Wait", nullptr,
+               /*hold=*/false);
+    sync_wal.Start([&] { return db_->SyncWAL(); });
+    ASSERT_TRUE(parked.WaitHits(1));
+    held.Release();
+    ASSERT_OK(RunWithin(std::chrono::seconds(30), [&] {
+      Status st = s.Join();
+      return st.ok() ? sync_wal.Join() : st;
+    }));
+  }
+  ASSERT_OK(RunWithin(std::chrono::seconds(60), [&] {
+    std::vector<port::Thread> threads;
+    std::atomic<bool> failed{false};
+    for (size_t p = 0; p < kPartitions; ++p) {
+      threads.emplace_back([&, p] {
+        for (int i = 0; i < 50; ++i) {
+          if (!Put(cf_for_partition_[p], "x" + std::to_string(i), "v",
+                   i % 2 == 0 ? sync_wo : WriteOptions())
+                   .ok()) {
+            failed = true;
+          }
+        }
+      });
+    }
+    threads.emplace_back([&] {
+      for (int i = 0; i < 50; ++i) {
+        if (!db_->SyncWAL().ok() || !db_->FlushWAL(/*sync=*/true).ok()) {
+          failed = true;
+        }
+      }
+    });
+    for (auto& thread : threads) {
+      thread.join();
+    }
+    return failed.load() ? Status::Corruption("a marker failed") : Status::OK();
+  }));
+  for (size_t p = 0; p < kPartitions; ++p) {
+    for (const auto& marks : dbfull()->TEST_WalSyncMarks(p)) {
+      EXPECT_FALSE(marks.second) << "partition " << p;
+    }
+  }
+}
+
+namespace {
+// A FileSystem whose WAL appends block, while armed, on data containing
+// "blockme", until Unblock(). Works without sync points (release builds).
+class GC31BlockingAppendFS : public FileSystemWrapper {
+ public:
+  explicit GC31BlockingAppendFS(const std::shared_ptr<FileSystem>& target)
+      : FileSystemWrapper(target) {}
+  static const char* kClassName() { return "GC31BlockingAppendFS"; }
+  const char* Name() const override { return kClassName(); }
+  IOStatus NewWritableFile(const std::string& fname,
+                           const FileOptions& file_opts,
+                           std::unique_ptr<FSWritableFile>* result,
+                           IODebugContext* dbg) override {
+    IOStatus s = target()->NewWritableFile(fname, file_opts, result, dbg);
+    if (s.ok() && fname.size() > 4 &&
+        fname.compare(fname.size() - 4, 4, ".log") == 0) {
+      result->reset(new File(std::move(*result), this));
+    }
+    return s;
+  }
+  bool WaitBlocked() {
+    std::unique_lock<std::mutex> lock(mu_);
+    return cv_.wait_for(lock, std::chrono::seconds(30),
+                        [this] { return blocked_; });
+  }
+  void Unblock() {
+    std::lock_guard<std::mutex> lock(mu_);
+    released_ = true;
+    cv_.notify_all();
+  }
+
+ private:
+  class File : public FSWritableFileOwnerWrapper {
+   public:
+    File(std::unique_ptr<FSWritableFile>&& t, GC31BlockingAppendFS* fs)
+        : FSWritableFileOwnerWrapper(std::move(t)), fs_(fs) {}
+    IOStatus Append(const Slice& data, const IOOptions& options,
+                    IODebugContext* dbg) override {
+      fs_->MaybeBlock(data);
+      return FSWritableFileOwnerWrapper::Append(data, options, dbg);
+    }
+    IOStatus Append(const Slice& data, const IOOptions& options,
+                    const DataVerificationInfo& info,
+                    IODebugContext* dbg) override {
+      fs_->MaybeBlock(data);
+      return FSWritableFileOwnerWrapper::Append(data, options, info, dbg);
+    }
+
+   private:
+    GC31BlockingAppendFS* const fs_;
+  };
+  void MaybeBlock(const Slice& data) {
+    if (data.ToString().find("blockme") == std::string::npos) {
+      return;
+    }
+    std::unique_lock<std::mutex> lock(mu_);
+    blocked_ = true;
+    cv_.notify_all();
+    cv_.wait(lock, [this] { return released_; });
+  }
+  std::mutex mu_;
+  std::condition_variable cv_;
+  bool blocked_ = false;
+  bool released_ = false;
+};
+
+// Runs, at `num_partitions`, a write group {leader, follower} on the default
+// column family whose follower's batch (a few thousand puts, then one for a
+// dropped column family) fails its insert last, so the follower runs the
+// group's exit. The group forms behind a write whose WAL append blocks.
+// Returns the leader's and the follower's statuses.
+void GC31FollowerExitGroup(DBTestBase* test, size_t num_partitions,
+                           Status* leader_status, Status* follower_status) {
+  auto fs = std::make_shared<GC31BlockingAppendFS>(test->env_->GetFileSystem());
+  std::unique_ptr<Env> env(NewCompositeEnv(fs));
+  Defer close_before_env([test] { test->Close(); });
+  Options options = test->CurrentOptions();
+  options.env = env.get();
+  options.wal_partitions = static_cast<uint32_t>(num_partitions);
+  if (num_partitions > 1) {
+    options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+    options.track_and_verify_wals_in_manifest = true;
+  }
+  options.allow_concurrent_memtable_write = true;
+  test->DestroyAndReopen(options);
+  DB* db = test->db_.get();
+  ColumnFamilyHandle* dropped = nullptr;
+  ASSERT_OK(db->CreateColumnFamily(options, "dropped", &dropped));
+  const uint32_t dropped_id = dropped->GetID();
+  ASSERT_OK(db->DropColumnFamily(dropped));
+  ASSERT_OK(db->DestroyColumnFamilyHandle(dropped));
+
+  GC30Write blocker;
+  GC30Write leader;
+  GC30Write follower;
+  Defer unblock([&] { fs->Unblock(); });
+  blocker.Start([&] { return db->Put(WriteOptions(), "a", "blockme"); });
+  ASSERT_TRUE(fs->WaitBlocked());
+  leader.Start([&] { return db->Put(WriteOptions(), "leader", "v"); });
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  follower.Start([&] {
+    WriteBatch batch;
+    for (int i = 0; i < 4000; ++i) {
+      EXPECT_OK(batch.Put("f" + std::to_string(i), "v"));
+    }
+    EXPECT_OK(WriteBatchInternal::Put(&batch, dropped_id, "lost", "v"));
+    return db->Write(WriteOptions(), &batch);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  fs->Unblock();
+  ASSERT_OK(blocker.Join());
+  *leader_status = leader.Join();
+  *follower_status = follower.Join();
+  test->Close();
+}
+
+}  // namespace
+
+TEST_P(DBWritePartitionTest, N1FollowerExitMatchesUpstream) {
+  // GC31 Q11: at one WAL partition the follower exit is upstream's. A
+  // follower's insert fails (a dropped column family) and the follower runs
+  // the group's exit: upstream's assertion that the group succeeded fires in
+  // debug builds, and in release builds the leader returns OK while the
+  // follower returns the failure.
+  // Neuter: GC30's unconditional hand-off of a failed group status to the
+  // leader; no assertion fires (debug), the leader returns InvalidArgument
+  // (release).
+  if (GetParam()) {
+    return;
+  }
+#ifdef NDEBUG
+  Status leader_status;
+  Status follower_status;
+  GC31FollowerExitGroup(this, 1, &leader_status, &follower_status);
+  EXPECT_OK(leader_status);
+  EXPECT_TRUE(follower_status.IsInvalidArgument())
+      << follower_status.ToString();
+#else
+#ifdef GTEST_FLAG_SET
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+#else
+  ::testing::GTEST_FLAG(death_test_style) = "threadsafe";
+#endif
+  EXPECT_DEATH(
+      {
+        Status leader_status;
+        Status follower_status;
+        GC31FollowerExitGroup(this, 1, &leader_status, &follower_status);
+      },
+      "write_group->status\\.ok\\(\\)");
+#endif  // NDEBUG
+}
+
+TEST_P(DBWritePartitionTest, NGreaterThan1FollowerExitHandsFailureToLeader) {
+  // GC31 Q11: above one partition GC30's follower exit stays: the same group,
+  // whose follower's insert fails and whose exit the follower runs, fails as
+  // one, the leader included.
+  // Neuter: upstream's follower exit at every N; the leader returns OK (and
+  // debug builds assert).
+  if (GetParam()) {
+    return;
+  }
+  for (const size_t partitions : {size_t{2}, size_t{8}}) {
+    SCOPED_TRACE("partitions=" + std::to_string(partitions));
+    Status leader_status;
+    Status follower_status;
+    GC31FollowerExitGroup(this, partitions, &leader_status, &follower_status);
+    EXPECT_TRUE(leader_status.IsInvalidArgument()) << leader_status.ToString();
+    EXPECT_TRUE(follower_status.IsInvalidArgument())
+        << follower_status.ToString();
+  }
+}
+
+TEST_P(DBWritePartitionTest, FailedSyncDropKeepsBelowFenceRangeTombstone) {
+  // GC31 Q13 (e): ported from Muse's GC30 candidate (pwal/ab/gc30-muse-PR34
+  // @ ef4defc379c3), adapted to this base. A flush dropping a failed range
+  // above a fence keeps the range tombstones below it. S, acknowledged below
+  // the fence, deletes "f" via a range tombstone; F, a sync write above it
+  // with its own tombstone, fails its gate sync and is dropped. After Resume
+  // and a flush, "f" stays deleted (the below-fence tombstone persisted),
+  // "z" reads back, and F's key is absent everywhere, SSTs included.
+  // Neuter: drop the below-fence tombstone filter in the recovery flush.
+  if (GetParam()) {
+    return;
+  }
+  constexpr size_t kPartitions = 2;
+  Options options = CurrentOptions();
+  options.paranoid_checks = true;
+  options.max_bgerror_resume_count = 0;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  OpenWithPartitions(kPartitions, options);
+  const int cf = cf_for_partition_[0];
+  WriteOptions sync_wo;
+  sync_wo.sync = true;
+  ASSERT_OK(Put(cf, "f", "value_f"));
+  {
+    WriteBatch batch;
+    ASSERT_OK(batch.DeleteRange(handles_[cf], "a", "m"));
+    ASSERT_OK(batch.Put(handles_[cf], "z", "value_z"));
+    ASSERT_OK(db_->Write(sync_wo, &batch));
+  }
+  // F fails its gate sync once, above the tombstone.
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SyncWalsFromCompletionGate:AfterGateSync", [&](void* arg) {
+        IOStatus error = IOStatus::IOError("injected gate sync error");
+        error.SetRetryable(true);
+        *static_cast<IOStatus*>(arg) = error;
+      });
+  {
+    WriteBatch batch;
+    ASSERT_OK(batch.DeleteRange(handles_[cf], "p", "t"));
+    ASSERT_OK(batch.Put(handles_[cf], "g", "value_g"));
+    const Status s = db_->Write(sync_wo, &batch);
+    ASSERT_TRUE(s.IsIOError()) << s.ToString();
+  }
+  SyncPoint::GetInstance()->ClearCallBack(
+      "DBImpl::SyncWalsFromCompletionGate:AfterGateSync");
+  ASSERT_OK(dbfull()->Resume());
+  ASSERT_OK(Flush(cf));
+  EXPECT_EQ("NOT_FOUND", Get(cf, "f"));
+  EXPECT_EQ("value_z", Get(cf, "z"));
+  EXPECT_EQ("NOT_FOUND", Get(cf, "g"));
+  EXPECT_FALSE(GC30LiveSstHasKey(db_.get(), handles_[cf], "g"));
+  Close();
 }
 
 TEST_P(DBWritePartitionTest, ManualWalFlushSyncWriteSurvivesCrash) {

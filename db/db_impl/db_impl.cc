@@ -267,6 +267,10 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
         decltype(last_batch_group_size_)(num_wal_partitions);
     leaders_past_switch_gate_ =
         decltype(leaders_past_switch_gate_)(num_wal_partitions);
+    wal_partition_sizes_ =
+        decltype(wal_partition_sizes_)(num_wal_partitions - 1);
+    recoverable_state_slots_ =
+        decltype(recoverable_state_slots_)(num_wal_partitions);
   }
   for (size_t p = 0; p < num_wal_partitions; ++p) {
     write_threads_.emplace_back(
@@ -2337,7 +2341,7 @@ Status DBImpl::SetDBOptions(
         // into the one it switches out.
         WaitForUnpublishedSyncGroups();
         if (wal_other_option_changed ||
-            wals_total_size_.LoadRelaxed() > GetMaxTotalWalSize()) {
+            WalsTotalSize() > GetMaxTotalWalSize()) {
           Status purge_wal_status = SwitchWAL(&write_context);
           if (!purge_wal_status.ok()) {
             ROCKS_LOG_WARN(immutable_db_options_.info_log,
@@ -2558,7 +2562,8 @@ IOStatus DBImpl::SyncWalImpl(bool include_current_wal,
     // Nothing else inspected here is carried past the release: the claim
     // loop re-checks emptiness under WalWriteMutex(p), and because this block
     // marks nothing and the claim loop has no early exit, the return below
-    // cannot leave a partition marked getting_synced.
+    // cannot leave a partition marked getting_synced. Accepted cost (audit
+    // A11): all N once per SyncWAL or background sync, off the write path.
     AllWalWriteMutexesLock l(this);
 
     // maybe_active_number and need_wal_dir_sync are consumed after the claim
@@ -2600,24 +2605,32 @@ IOStatus DBImpl::SyncWalImpl(bool include_current_wal,
   // Claim each partition sequentially: the wait on WalSyncCV(p) holds only
   // WalWriteMutex(p) (see the LOCK ORDER note). Every live log is claimed no
   // matter its number: with cur_wal_number_ the lowest live number, a number
-  // bound would skip every other partition's WAL. Marking is serialized
-  // across all syncs under wal_sync_mark_mutex_: this claim runs ascending
-  // while leadership marking runs others-then-own, so head waits alone
-  // cannot exclude an interleaved marker.
-  {
-    // The mark mutex serializes markers across partitions; with one
-    // partition there is nothing to interleave, so the N=1 path takes
-    // nothing here, exactly as before the mutex existed.
-    std::optional<InstrumentedMutexLock> mark_lock;
-    if (NumWalPartitions() > 1) {
-      TEST_SYNC_POINT("DBImpl::SyncWalImpl:TakesSyncMarkMutex");
-      mark_lock.emplace(&wal_sync_mark_mutex_);
-    }
-    for (size_t p = 0; p < NumWalPartitions(); ++p) {
+  // bound would skip every other partition's WAL. Above one partition every
+  // multi-partition marker claims in ascending order and never waits holding
+  // a mark (D-GC31e (i)): finding a partition marked by another marker, it
+  // releases every mark it took, waits for that partition alone, and starts
+  // over. With one partition there is nothing to interleave, and the claim
+  // waits in place, as before.
+  if (NumWalPartitions() > 1) {
+    TEST_SYNC_POINT("DBImpl::SyncWalImpl:TakesSyncMarkMutex");
+  }
+  while (true) {
+    bool busy = false;
+    for (size_t p = 0; p < NumWalPartitions() && !busy; ++p) {
       WalWriteMutexLock l(&WalWriteMutex(p));
-      claimed.push_back(ClaimWalPartitionForSyncWalImpl(p, include_current_wal,
-                                                        &wals_to_sync));
+      claimed.push_back(ClaimWalPartitionForSyncWalImpl(
+          p, include_current_wal, &wals_to_sync,
+          NumWalPartitions() > 1 ? &busy : nullptr));
     }
+    if (!busy) {
+      break;
+    }
+    const size_t busy_partition = claimed.size() - 1;
+    ReleaseWalPartitionClaims(up_to_number, claimed);
+    claimed.clear();
+    wals_to_sync.clear();
+    TEST_SYNC_POINT("DBImpl::ClaimWalPartitionForSyncWalImpl:Wait");
+    WaitForWalPartitionFrontUnmarked(busy_partition);
   }
 
   if (include_current_wal) {
@@ -2847,11 +2860,7 @@ Status DBImpl::UnlockWAL() {
 
 bool DBImpl::ClaimWalPartitionForLeadershipSync(size_t partition,
                                                 uint32_t* unsynced_partitions) {
-  // The mark mutex is only taken above one partition (single-partition
-  // markers cannot interleave).
-  if (NumWalPartitions() > 1) {
-    wal_sync_mark_mutex_.AssertHeld();
-  }
+  assert(NumWalPartitions() == 1);
   WalWriteMutex(partition).AssertHeld();
   if (logs_[partition].empty()) {
     return false;
@@ -2877,8 +2886,7 @@ bool DBImpl::ClaimWalPartitionForGateSync(size_t partition,
                                           SequenceNumber claim_bound,
                                           uint32_t* unsynced_partitions,
                                           std::vector<GateSyncPartition>* claim,
-                                          bool* previously_failed) {
-  wal_sync_mark_mutex_.AssertHeld();
+                                          bool* previously_failed, bool* busy) {
   WalWriteMutex(partition).AssertHeld();
   std::deque<LogWriterNumber>& logs = logs_[partition];
   // The number of WALs to mark: the prefix through the last one that needs
@@ -2894,15 +2902,13 @@ bool DBImpl::ClaimWalPartitionForGateSync(size_t partition,
     }
     return length;
   };
-  if (claim_length() == 0) {
-    return false;
-  }
-  while (logs.front().IsSyncing()) {
-    WalSyncCV(partition).Wait();
-  }
-  // The wait can sync or retire what needed this sync.
   const size_t length = claim_length();
   if (length == 0) {
+    return false;
+  }
+  if (logs.front().IsSyncing()) {
+    // Another marker's: never wait here holding this marker's other marks.
+    *busy = true;
     return false;
   }
   GateSyncPartition claimed;
@@ -2934,12 +2940,7 @@ bool DBImpl::ClaimWalPartitionForGateSync(size_t partition,
 
 bool DBImpl::ClaimWalPartitionForSyncWalImpl(
     size_t partition, bool include_current_wal,
-    autovector<std::pair<log::Writer*, bool>, 1>* wals_to_sync) {
-  // The mark mutex is only taken above one partition (single-partition
-  // markers cannot interleave).
-  if (NumWalPartitions() > 1) {
-    wal_sync_mark_mutex_.AssertHeld();
-  }
+    autovector<std::pair<log::Writer*, bool>, 1>* wals_to_sync, bool* busy) {
   WalWriteMutex(partition).AssertHeld();
   if (logs_[partition].empty()) {
     return false;
@@ -2950,6 +2951,10 @@ bool DBImpl::ClaimWalPartitionForSyncWalImpl(
   const bool claim_front =
       include_current_wal ||
       logs_[partition].front().number != logs_[partition].back().number;
+  if (busy != nullptr && claim_front && logs_[partition].front().IsSyncing()) {
+    *busy = true;
+    return false;
+  }
   while (claim_front && logs_[partition].front().IsSyncing()) {
     TEST_SYNC_POINT("DBImpl::ClaimWalPartitionForSyncWalImpl:Wait");
     WalSyncCV(partition).Wait();
@@ -2986,6 +2991,24 @@ bool DBImpl::ClaimWalPartitionForSyncWalImpl(
     }
   }
   return marked;
+}
+
+void DBImpl::ReleaseWalPartitionClaims(uint64_t up_to,
+                                       const autovector<uint8_t, 1>& claimed) {
+  for (size_t p = 0; p < claimed.size(); ++p) {
+    if (claimed[p]) {
+      WalWriteMutexLock l(&WalWriteMutex(p));
+      CancelWalPartitionSync(p, up_to);
+      WalSyncCV(p).SignalAll();
+    }
+  }
+}
+
+void DBImpl::WaitForWalPartitionFrontUnmarked(size_t partition) {
+  WalWriteMutexLock l(&WalWriteMutex(partition));
+  while (!logs_[partition].empty() && logs_[partition].front().IsSyncing()) {
+    WalSyncCV(partition).Wait();
+  }
 }
 
 IOStatus DBImpl::SyncWalPartitionFiles(size_t partition,

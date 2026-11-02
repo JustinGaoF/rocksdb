@@ -551,6 +551,11 @@ class InternalStats {
     for (int i = 0; i < kIntStatsNumMax; i++) {
       db_stats_[i].store(0);
     }
+    for (size_t s = 0; s < num_db_stats_shards_; ++s) {
+      for (auto& v : db_stats_shards_[s].v) {
+        v.store(0);
+      }
+    }
     for (int i = 0; i < INTERNAL_CF_STATS_ENUM_MAX; i++) {
       cf_stats_count_[i] = 0;
       cf_stats_value_[i] = 0;
@@ -619,8 +624,45 @@ class InternalStats {
     }
   }
 
+  // Adds to the hot DB stat `type` (one of the first kNumShardedDBStats) in
+  // `shard` of the SetNumDBStatsShards() shards, each on its own cache line.
+  // A writer that is the shard's only writer of `type` passes concurrent ==
+  // false (a plain load and store), as AddDBStats() does.
+  void AddDBStatsToShard(InternalDBStatsType type, uint64_t value, size_t shard,
+                         bool concurrent) {
+    assert(type < kNumShardedDBStats);
+    assert(shard < num_db_stats_shards_);
+    auto& v = db_stats_shards_[shard].v[type];
+    if (concurrent) {
+      v.fetch_add(value, std::memory_order_relaxed);
+    } else {
+      v.store(v.load(std::memory_order_relaxed) + value,
+              std::memory_order_relaxed);
+    }
+  }
+
+  // Gives the hot DB stats `num_shards` shards, for writers that each own
+  // one (the leaders of `num_shards` WAL partitions). REQUIRES: called once,
+  // before any add or read of the DB stats.
+  void SetNumDBStatsShards(size_t num_shards) {
+    assert(num_db_stats_shards_ == 0);
+    db_stats_shards_.reset(new DBStatsShard[num_shards]);
+    for (size_t s = 0; s < num_shards; ++s) {
+      for (auto& v : db_stats_shards_[s].v) {
+        v.store(0, std::memory_order_relaxed);
+      }
+    }
+    num_db_stats_shards_ = num_shards;
+  }
+
   uint64_t GetDBStats(InternalDBStatsType type) {
-    return db_stats_[type].load(std::memory_order_relaxed);
+    uint64_t value = db_stats_[type].load(std::memory_order_relaxed);
+    if (type < kNumShardedDBStats) {
+      for (size_t s = 0; s < num_db_stats_shards_; ++s) {
+        value += db_stats_shards_[s].v[type].load(std::memory_order_relaxed);
+      }
+    }
+    return value;
   }
 
   HistogramImpl* GetFileReadHist(int level) {
@@ -702,6 +744,14 @@ class InternalStats {
 
   // Per-DB stats
   std::atomic<uint64_t> db_stats_[kIntStatsNumMax];
+  // The shards of the hot DB stats (AddDBStatsToShard), added to db_stats_
+  // by every reader.
+  static constexpr int kNumShardedDBStats = kIntStatsWriteWithWal + 1;
+  struct ALIGN_AS(CACHE_LINE_SIZE) DBStatsShard {
+    std::atomic<uint64_t> v[kNumShardedDBStats];
+  };
+  std::unique_ptr<DBStatsShard[]> db_stats_shards_;
+  size_t num_db_stats_shards_ = 0;
   // Per-ColumnFamily stats
   uint64_t cf_stats_value_[INTERNAL_CF_STATS_ENUM_MAX];
   uint64_t cf_stats_count_[INTERNAL_CF_STATS_ENUM_MAX];

@@ -141,6 +141,10 @@ class WriteThread {
     // the exit to the leader (STATE_PARALLEL_GROUP_EXIT) instead of running
     // it.
     bool leader_exits = false;
+    // Set by DBImpl on every group above one WAL partition. A follower that
+    // exits such a group hands the leader any failed group status; at one
+    // partition the follower exit is upstream's.
+    bool multi_partition = false;
 
     struct Iterator {
       Writer* writer;

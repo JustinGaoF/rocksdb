@@ -277,10 +277,13 @@ class WalDurabilityTracker {
   static_assert(sizeof(Partition) % CACHE_LINE_SIZE == 0);
 
   std::vector<Partition> partitions_;
-  std::atomic<uint64_t> safe_point_{0};
+  // Each on its own cache line: the safe point advances on publication and
+  // is read by every gate, registered_high_ advances on every allocation,
+  // and the read-only hook is read on publication.
+  ALIGN_AS(CACHE_LINE_SIZE) std::atomic<uint64_t> safe_point_ { 0 };
   // The highest sequence registered so far, which bounds every scan.
-  std::atomic<uint64_t> registered_high_{0};
-  const bool safe_point_test_hook_;
+  ALIGN_AS(CACHE_LINE_SIZE) std::atomic<uint64_t> registered_high_ { 0 };
+  ALIGN_AS(CACHE_LINE_SIZE) const bool safe_point_test_hook_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

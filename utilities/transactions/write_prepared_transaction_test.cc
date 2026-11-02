@@ -5220,6 +5220,96 @@ TEST_F(WritePreparedPartitionedWalTest, HigherSequenceRecoverableStateWins) {
   ASSERT_EQ("NOT_FOUND", GetState(CfOnPartition(0)));
 }
 
+TEST_F(WritePreparedPartitionedWalTest, RecoverableStateSlotsTakeHighest) {
+  // GC31 Q7 (A12): each partition caches its leader's recoverable state in
+  // its own slot, taking no shared mutex. The lower-sequence state (A, on
+  // partition 0) and the higher (B, on partition 1) are cached in either
+  // order; the flush writes B's and leaves every slot empty.
+  // Neuter: take the last-written slot; with A cached last its state wins.
+  for (const bool low_cached_last : {true, false}) {
+    SCOPED_TRACE(low_cached_last ? "low cached last" : "high cached last");
+    Close();
+    cf_names_.clear();
+    ASSERT_OK(DestroyDB(dbname_, options_));
+    Open(2);
+    DBImpl* db_impl = static_cast_with_check<DBImpl>(db_->GetRootDB());
+    static thread_local bool held_thread = false;
+    std::mutex mu;
+    std::condition_variable cv;
+    bool held = false;
+    bool released = false;
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::WriteGroupToWAL:BeforeCacheRecoverableState", [&](void*) {
+          if (!held_thread) {
+            return;
+          }
+          std::unique_lock<std::mutex> lock(mu);
+          held = true;
+          cv.notify_all();
+          cv.wait_for(lock, std::chrono::seconds(30), [&] { return released; });
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+    auto release = [&] {
+      std::lock_guard<std::mutex> lock(mu);
+      released = true;
+      cv.notify_all();
+    };
+    auto wait_held = [&] {
+      std::unique_lock<std::mutex> lock(mu);
+      return cv.wait_for(lock, std::chrono::seconds(30), [&] { return held; });
+    };
+    if (low_cached_last) {
+      // Both prepare first. A's commit takes the lower sequence and is held
+      // before caching; B's commit caches, then parks in its gate until A
+      // publishes; A caches last.
+      auto prepare = [&](ColumnFamilyHandle* cf, const std::string& name,
+                         const std::string& value) {
+        TransactionOptions txn_options;
+        txn_options.use_only_the_last_commit_time_batch_for_recovery = true;
+        std::unique_ptr<Transaction> txn(
+            db_->BeginTransaction(WriteOptions(), txn_options));
+        EXPECT_OK(txn->SetName(name));
+        EXPECT_OK(txn->Put(cf, name, value));
+        EXPECT_OK(txn->Prepare());
+        EXPECT_OK(txn->GetCommitTimeWriteBatch()->Put(cf, "state", value));
+        return txn;
+      };
+      std::unique_ptr<Transaction> txn_a =
+          prepare(CfOnPartition(0), "a", "low");
+      std::unique_ptr<Transaction> txn_b =
+          prepare(CfOnPartition(1), "b", "high");
+      port::Thread a([&] {
+        held_thread = true;
+        ASSERT_OK(txn_a->Commit());
+      });
+      ASSERT_TRUE(wait_held());
+      port::Thread b([&] { ASSERT_OK(txn_b->Commit()); });
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(30);
+      while (db_impl->TEST_WalDurabilityWaiters() == 0 &&
+             std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      ASSERT_EQ(1U, db_impl->TEST_WalDurabilityWaiters());
+      release();
+      a.join();
+      b.join();
+    } else {
+      // A, on the lower sequence, caches and returns; then B.
+      ASSERT_OK(CommitWithState(CfOnPartition(0), "a", "low"));
+      ASSERT_OK(CommitWithState(CfOnPartition(1), "b", "high"));
+    }
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearCallBack(
+        "DBImpl::WriteGroupToWAL:BeforeCacheRecoverableState");
+    FlushAll();
+    EXPECT_TRUE(db_impl->TEST_CachedRecoverableStateEmpty());
+    Reopen();
+    EXPECT_EQ("high", GetState(CfOnPartition(1)));
+    EXPECT_EQ("NOT_FOUND", GetState(CfOnPartition(0)));
+  }
+}
+
 // G-56: prepares routed to different partitions reach PreparedHeap::push out
 // of sequence order. push inserts each in place, so every entry is popped at
 // its commit and closing the DB passes `assert(heap_.empty())` in
