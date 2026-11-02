@@ -1997,7 +1997,10 @@ Status DBImpl::WriteImpl(
                          : wal_write_number,
                      last_sequence, last_sequence + 1 - seq_inc,
                      registered_applied_range ? wal_context.wal_partition
-                                              : kNoPinnedWalRange);
+                                              : kNoPinnedWalRange,
+                     sync_group && async_seq_count > 0
+                         ? write_group.sync_first_sequence
+                         : 0);
   }
   if (!w.CallbackFailed()) {
     if (!io_s.ok()) {
@@ -2761,7 +2764,8 @@ void DBImpl::WALIOStatusCheck(const IOStatus& io_status,
                               uint64_t failed_wal_number,
                               SequenceNumber failed_wal_sequence,
                               SequenceNumber failed_wal_sequence_start,
-                              size_t pinned_wal_partition) {
+                              size_t pinned_wal_partition,
+                              SequenceNumber pinned_sync_first_sequence) {
   // Is setting bg_error_ enough here?  This will at least stop
   // compaction and fail any further writes.
   // Above one partition every failure stops the DB (D-1), Busy and Incomplete
@@ -2776,9 +2780,9 @@ void DBImpl::WALIOStatusCheck(const IOStatus& io_status,
       // Under the same mutex_ hold as the error below, so recovery from an
       // earlier error cannot release this range before the error is set.
       assert(NumWalPartitions() > 1);
-      failed_wal_ranges_.push_back({pinned_wal_partition,
-                                    failed_wal_sequence_start,
-                                    failed_wal_sequence});
+      failed_wal_ranges_.push_back(
+          {pinned_wal_partition, failed_wal_sequence_start, failed_wal_sequence,
+           pinned_sync_first_sequence});
     }
     // Maybe change the return status to void?
     if (io_status.IsIOError() && !io_status.IsIOFenced()) {
@@ -2789,8 +2793,11 @@ void DBImpl::WALIOStatusCheck(const IOStatus& io_status,
           failed_wal_number != 0 ? failed_wal_number : cur_wal_number_;
       if (io_status.GetScope() == IOStatus::IOErrorScope::kIOErrorScopeFile) {
         context.failed_wal_number = resolved_failed_wal_number;
+        // Above one partition the release records the gap that covers this
+        // range (ClearWalDurabilityBGError), and GetUpdatesSince is refused.
         if (failed_wal_sequence_start != 0 &&
-            failed_wal_sequence_start <= failed_wal_sequence) {
+            failed_wal_sequence_start <= failed_wal_sequence &&
+            NumWalPartitions() == 1) {
           // Successful live resumption deliberately omits this write from the
           // database even if the physical WAL record is complete. Keep a
           // DB-lifetime fence so TransactionLogIterator does not expose it.
@@ -3541,7 +3548,15 @@ void DBImpl::ClearWalDurabilityBGError() {
       InstrumentedMutexLock l(&wal_durability_wait_mutex_);
       wal_durability_tracker_->Release(range.partition, range.low, range.high);
     }
-    PublishAppliedPrefix(range.partition, range.low, range.high,
+    SequenceNumber applied_low = range.low;
+    if (range.sync_first_sequence != 0) {
+      // Completed as registered: the async writers' range, then the sync
+      // writers'.
+      PublishAppliedPrefix(range.partition, range.low,
+                           range.sync_first_sequence - 1, /*wal_record=*/true);
+      applied_low = range.sync_first_sequence;
+    }
+    PublishAppliedPrefix(range.partition, applied_low, range.high,
                          /*wal_record=*/true);
   }
   failed_wal_ranges_.clear();
@@ -3616,7 +3631,8 @@ Status DBImpl::BurnedWALIndexLanded(uint64_t wal_number, uint64_t wal_index,
   return s;
 }
 
-Status DBImpl::ExplainBurnedWALIndices(const WriteOptions& write_options) {
+Status DBImpl::ExplainBurnedWALIndices(const WriteOptions& write_options,
+                                       uint64_t retired_below) {
   mutex_.AssertHeld();
   assert(NumWalPartitions() > 1);
   std::vector<BurnedWalIndex> burned;
@@ -3624,7 +3640,20 @@ Status DBImpl::ExplainBurnedWALIndices(const WriteOptions& write_options) {
     InstrumentedMutexLock l(&wal_durability_wait_mutex_);
     burned = burned_wal_indices_;
   }
+  // Only what was copied is erased below: a failure since may have burned
+  // more.
+  const size_t copied = burned.size();
+  burned.erase(std::remove_if(burned.begin(), burned.end(),
+                              [retired_below](const BurnedWalIndex& b) {
+                                return b.wal_number < retired_below;
+                              }),
+               burned.end());
   if (burned.empty()) {
+    if (copied != 0) {
+      InstrumentedMutexLock l(&wal_durability_wait_mutex_);
+      burned_wal_indices_.erase(burned_wal_indices_.begin(),
+                                burned_wal_indices_.begin() + copied);
+    }
     return Status::OK();
   }
   // A file's void lower bounds must ascend.
@@ -3778,10 +3807,9 @@ Status DBImpl::ExplainBurnedWALIndices(const WriteOptions& write_options) {
     return io_s;
   }
   {
-    // Only what was copied above: a failure since may have burned more.
     InstrumentedMutexLock l(&wal_durability_wait_mutex_);
     burned_wal_indices_.erase(burned_wal_indices_.begin(),
-                              burned_wal_indices_.begin() + burned.size());
+                              burned_wal_indices_.begin() + copied);
   }
   return Status::OK();
 }
