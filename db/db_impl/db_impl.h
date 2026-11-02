@@ -3295,10 +3295,11 @@ class DBImpl : public DB
   }
 
   // N>1: a sync group leaves its write queue before its sync writers'
-  // batches are fsynced, inserted and published (RunSyncGate). Waits until
-  // each such group published or fenced them, so no memtable switch comes
-  // between their allocation and their insert, and no write in flight holds
-  // a sequence above LastSequence() (AssertLastSequenceCoversAllocated).
+  // batches are fsynced and published (RunSyncGate); they are already
+  // inserted (at leadership, overlapping the append). Waits until each
+  // such group published or fenced them: until then its fsync may still
+  // fail, and no write in flight holds a sequence above LastSequence()
+  // (AssertLastSequenceCoversAllocated).
   // REQUIRES: mutex_ held, and every write queue (or the closed memtable
   // switch gate), so no group can start counting meanwhile.
   void WaitForUnpublishedSyncGroups() {
@@ -3488,8 +3489,12 @@ class DBImpl : public DB
   // append succeeded. Called without holding any mutex; takes
   // wal_durability_wait_mutex_ only to check fences and park, never together
   // with mutex_.
+  // When help_gate_sync is false the waiter never takes a partition of a
+  // running gate sync: the async members of a sync-led group pass false, so
+  // helping can never delay their acknowledgment past their group's fsync
+  // (Q8). Every other waiter helps only a sync that can cover its target.
   Status WaitForWalDurability(SequenceNumber target, bool wal_record,
-                              bool published);
+                              bool published, bool help_gate_sync = true);
 
   // Whether the frontiers cover `target` for a waiter with these legs (see
   // WaitForWalDurability). Publication implies durability for a range with
@@ -3646,10 +3651,12 @@ class DBImpl : public DB
   // above it fail, and every flush drops their entries until recovery
   // releases it. Otherwise no background error is set (the MANIFEST record
   // of the sync failed, or shutdown began): publishes the range as a hole,
-  // as one partition's failed write inserts nothing. Takes mutex_.
+  // but only when `range_inserted` is false, i.e. nothing of the range
+  // reached a memtable (D-GC30d); an inserted range fences instead. Takes
+  // mutex_.
   void FailUnpublishedSyncRange(size_t wal_partition, SequenceNumber low,
                                 SequenceNumber high, const Status& status,
-                                bool callback_failed);
+                                bool callback_failed, bool range_inserted);
 
   // Leaves unpublished_sync_groups_, waking WaitForPendingWrites at zero.
   // Takes mutex_ then; call without it.
@@ -4539,16 +4546,20 @@ class DBImpl : public DB
   };
   GateSyncWork wal_gate_sync_work_;
   // Whether wal_gate_sync_work_ has a partition no one took yet. Writers
-  // parked in WaitForWalDurability, most of them waiting for this very sync
-  // to publish, take one too (HelpRunningGateSync).
+  // parked in WaitForWalDurability take one too (HelpRunningGateSync),
+  // except the async members of a sync-led group, whose acknowledgment
+  // precedes any fsync (Q8).
   std::atomic<bool> wal_gate_sync_help_wanted_{false};
   // Runs claimed partition `index` of wal_gate_sync_work_ with the mutex
   // released, and records its outcome.
   // REQUIRES: wal_gate_sync_mutex_ held, index taken from work.next.
   void RunGateSyncWorkLocked(size_t index);
-  // Fsyncs the running gate sync's untaken partitions, if any.
+  // Fsyncs the running gate sync's untaken partitions, if any. Any parked
+  // writer may help: the park loop already skipped targets the frontier
+  // covers, and async members of a sync-led group never reach here.
+  // Returns whether it took any partition.
   // REQUIRES: no mutex held.
-  void HelpRunningGateSync();
+  bool HelpRunningGateSync(SequenceNumber target);
   // Gate syncs are numbered as they start; wal_gate_synced_epoch_ is the
   // number of the latest one that succeeded, wal_gate_sync_failed_epoch_ of
   // the latest one that failed, with its status. A gate is covered by any

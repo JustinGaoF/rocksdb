@@ -123,6 +123,14 @@ class WBWIMemTable final : public ReadOnlyMemTable {
     return nullptr;
   }
 
+  FragmentedRangeTombstoneIterator* NewRangeTombstoneIteratorBelowFloor(
+      const ReadOptions&, SequenceNumber, uint64_t* num_excluded) override {
+    // TODO: support DeleteRange
+    assert(!wbwi_->GetWriteBatch()->HasDeleteRange());
+    *num_excluded = 0;
+    return nullptr;
+  }
+
   FragmentedRangeTombstoneIterator* NewTimestampStrippingRangeTombstoneIterator(
       const ReadOptions&, SequenceNumber, size_t) override {
     // TODO: support UDT

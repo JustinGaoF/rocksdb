@@ -299,6 +299,8 @@ struct TransactionDBOptions {
   friend class TransactionTestBase;
   friend class MySQLStyleTransactionTest;
   friend class StressTest;
+  // GC30 Q2 eviction pin: sets wp_commit_cache_bits directly.
+  friend class WritePreparedPartitionedWalTest;
 };
 
 struct TransactionOptions {

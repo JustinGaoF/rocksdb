@@ -4846,6 +4846,12 @@ class WritePreparedPartitionedWalTest : public testing::Test {
     EXPECT_OK(DestroyDB(dbname_, options_));
   }
 
+  // GC30 Q2 eviction pin: TransactionDBOptions friends this fixture (not
+  // each TEST_F subclass), so the private-field access lives here.
+  void SetCommitCacheBits(size_t bits) {
+    txn_db_options_.wp_commit_cache_bits = bits;
+  }
+
   // Opens with `num_partitions` WAL partitions and creates column families,
   // whose ids follow creation order, until one routes to every partition.
   void Open(size_t num_partitions) {
@@ -5681,6 +5687,544 @@ TEST_F(WritePreparedPartitionedWalTest,
       txn.reset();
       Reopen();
       EXPECT_EQ(expected, read("committed"));
+    }
+  }
+}
+
+// GC30 Q2/Q3 2PC tests. Releases every hold and joins every thread on scope
+// exit, so an ASSERT failure mid-hold fails the test instead of terminating
+// the binary on an unjoined port::Thread.
+namespace {
+class GC30WPJoinGuard {
+ public:
+  GC30WPJoinGuard(std::function<void()> release,
+                  std::vector<std::unique_ptr<port::Thread>>* threads)
+      : release_(std::move(release)), threads_(threads) {}
+  ~GC30WPJoinGuard() {
+    release_();
+    for (const auto& t : *threads_) {
+      t->join();
+    }
+  }
+
+ private:
+  std::function<void()> release_;
+  std::vector<std::unique_ptr<port::Thread>>* threads_;
+};
+
+// Rolls back prepared transactions at scope exit unless the test already
+// resolved them: an early ASSERT must not leave prepared-heap entries
+// behind to abort teardown. Declare before the join guard, so threads join
+// before any rollback runs.
+class GC30WPRollbackGuard {
+ public:
+  explicit GC30WPRollbackGuard(std::unique_ptr<Transaction>* txn) : txn_(txn) {}
+  ~GC30WPRollbackGuard() {
+    if (*txn_) {
+      (*txn_)->Rollback().PermitUncheckedError();
+      txn_->reset();
+    }
+  }
+
+ private:
+  std::unique_ptr<Transaction>* txn_;
+};
+
+class GC30WPTxnsRollbackGuard {
+ public:
+  explicit GC30WPTxnsRollbackGuard(
+      std::vector<std::unique_ptr<Transaction>>* txns)
+      : txns_(txns) {}
+  ~GC30WPTxnsRollbackGuard() {
+    for (auto& txn : *txns_) {
+      if (txn) {
+        txn->Rollback().PermitUncheckedError();
+      }
+    }
+    txns_->clear();
+  }
+
+ private:
+  std::vector<std::unique_ptr<Transaction>>* txns_;
+};
+
+}  // namespace
+
+TEST_F(WritePreparedPartitionedWalTest,
+       SyncCommitCallbacksWaitUntilGroupCannotFail) {
+  // GC30 Q2 (D-GC30c (i)): a sync 2PC commit's pre-release callbacks run
+  // only once the group can no longer fail: after its append and fsync
+  // succeeded and every range below its first sequence is published. A sync
+  // commit C in a group above a lower sync group S whose fsync is held:
+  // C's own fsync succeeds first (C runs the coalesced sync while S is
+  // held; S then shares it), then S fails (its pre-release callbacks fail
+  // via FailPreReleaseCallbacks: a shared fsync cannot fail S once C has
+  // covered it). C returns an error; it is never visible, not before or
+  // after Resume(), not after a reopen; Rollback() of its transaction
+  // works.
+  // Neuter: run the callbacks right after C's own fsync (D-GC30c (ii)).
+  // The commit becomes visible after Resume(), or Rollback() fails.
+  WriteOptions sync_wo;
+  sync_wo.sync = true;
+  for (const auto policy :
+       {TxnDBWritePolicy::WRITE_PREPARED, TxnDBWritePolicy::WRITE_UNPREPARED}) {
+    for (const size_t partitions : {size_t{2}, size_t{8}}) {
+      SCOPED_TRACE("policy=" + std::to_string(static_cast<int>(policy)) +
+                   " partitions=" + std::to_string(partitions));
+      Close();
+      cf_names_.clear();
+      ASSERT_OK(DestroyDB(dbname_, options_));
+      txn_db_options_.write_policy = policy;
+      options_.max_bgerror_resume_count = 0;
+      Open(partitions);
+      auto* db_impl = static_cast_with_check<DBImpl>(db_->GetRootDB());
+      ColumnFamilyHandle* cf_c = CfOnPartition(0);
+      ColumnFamilyHandle* cf_s = CfOnPartition(1);
+      ASSERT_OK(db_->Put(sync_wo, cf_s, "below", "v"));
+
+      std::unique_ptr<Transaction> committing(db_->BeginTransaction(sync_wo));
+      GC30WPRollbackGuard rollback_guard(&committing);
+      ASSERT_OK(committing->SetName("committing"));
+      ASSERT_OK(committing->Put(cf_c, "c", "v"));
+      ASSERT_OK(committing->Prepare());
+
+      std::mutex mu;
+      std::condition_variable cv;
+      bool s_held = false;
+      bool release_s = false;
+      bool fail_s_callbacks = false;
+      auto wait_for = [&](const std::function<bool()>& pred) {
+        std::unique_lock<std::mutex> lock(mu);
+        return cv.wait_for(lock, std::chrono::seconds(30), pred);
+      };
+      SyncPoint::GetInstance()->SetCallBack(
+          "DBImpl::CompletionGate:BeforeCoalescedSync", [&](void*) {
+            // First hit only: S is held, C (started after s_held) runs its
+            // own coalesced sync through.
+            std::unique_lock<std::mutex> lock(mu);
+            if (!s_held) {
+              s_held = true;
+              cv.notify_all();
+              cv.wait(lock, [&] { return release_s; });
+            }
+          });
+      SyncPoint::GetInstance()->SetCallBack(
+          "DBImpl::RunSyncGate:FailPreReleaseCallbacks", [&](void* arg) {
+            std::lock_guard<std::mutex> lock(mu);
+            if (fail_s_callbacks) {
+              *static_cast<bool*>(arg) = true;
+            }
+          });
+      SyncPoint::GetInstance()->EnableProcessing();
+      std::vector<std::unique_ptr<port::Thread>> threads;
+      GC30WPJoinGuard join_guard(
+          [&] {
+            std::lock_guard<std::mutex> lock(mu);
+            release_s = true;
+            cv.notify_all();
+          },
+          &threads);
+      Status s_status;
+      Status c_status;
+      bool done_s = false;
+      bool done_c = false;
+      threads.emplace_back(new port::Thread([&] {
+        WriteBatch batch;
+        EXPECT_OK(batch.Put(cf_s, "s", "v"));
+        s_status = db_->Write(sync_wo, &batch);
+        std::lock_guard<std::mutex> lock(mu);
+        done_s = true;
+        cv.notify_all();
+      }));
+      ASSERT_TRUE(wait_for([&] { return s_held; }));
+      threads.emplace_back(new port::Thread([&] {
+        c_status = committing->Commit();
+        std::lock_guard<std::mutex> lock(mu);
+        done_c = true;
+        cv.notify_all();
+      }));
+      // C ran its own fsync and parks waiting for S to publish: past its
+      // callback loop (base order), or parked before it (D-GC30c, never
+      // reached once the wait fails). Either way C never passes the hook
+      // below after this point, so arming it only fails S.
+      ASSERT_TRUE(
+          wait_for([&] { return db_impl->TEST_WalDurabilityWaiters() == 1; }));
+      {
+        std::lock_guard<std::mutex> lock(mu);
+        fail_s_callbacks = true;
+        release_s = true;
+        cv.notify_all();
+      }
+      ASSERT_TRUE(wait_for([&] { return done_s && done_c; }));
+      SyncPoint::GetInstance()->ClearAllCallBacks();
+      ASSERT_TRUE(s_status.IsIOError()) << s_status.ToString();
+      ASSERT_NOK(c_status);
+      auto read = [&](const std::string& key) {
+        std::string value;
+        Status s = db_->Get(ReadOptions(), cf_c, key, &value);
+        if (s.IsNotFound()) {
+          return std::string("NOT_FOUND");
+        }
+        EXPECT_OK(s);
+        return value;
+      };
+      EXPECT_EQ("NOT_FOUND", read("c"));
+      ASSERT_OK(db_->Resume());
+      EXPECT_EQ("NOT_FOUND", read("c"));
+      ASSERT_OK(committing->Rollback());
+      EXPECT_EQ("NOT_FOUND", read("c"));
+      committing.reset();
+      Reopen();
+      cf_c = CfOnPartition(0);
+      EXPECT_EQ("v", [&] {
+        std::string value;
+        EXPECT_OK(db_->Get(ReadOptions(), CfOnPartition(1), "below", &value));
+        return value;
+      }());
+      EXPECT_EQ("NOT_FOUND", read("c"));
+    }
+  }
+}
+
+TEST_F(WritePreparedPartitionedWalTest,
+       FailedCommitNeverVisibleAfterCommitCacheEviction) {
+  // GC30 Q2 eviction pin (GC27 carry-over e): with a two-entry commit
+  // cache, four async commits parked above a sync write whose fsync fails
+  // are none of them visible after Resume, Rollback or a reopen. It must
+  // keep passing under D-GC30c's callback placement.
+  for (const auto policy :
+       {TxnDBWritePolicy::WRITE_PREPARED, TxnDBWritePolicy::WRITE_UNPREPARED}) {
+    for (const size_t partitions : {size_t{2}, size_t{8}}) {
+      SCOPED_TRACE("policy=" + std::to_string(static_cast<int>(policy)) +
+                   " partitions=" + std::to_string(partitions));
+      Close();
+      cf_names_.clear();
+      ASSERT_OK(DestroyDB(dbname_, options_));
+      txn_db_options_.write_policy = policy;
+      SetCommitCacheBits(1);
+      options_.max_bgerror_resume_count = 0;
+      Open(partitions);
+      auto* db_impl = static_cast_with_check<DBImpl>(db_->GetRootDB());
+      ColumnFamilyHandle* cf = CfOnPartition(0);
+      ColumnFamilyHandle* cf_s = CfOnPartition(1);
+
+      constexpr size_t kCommits = 4;
+      std::vector<std::unique_ptr<Transaction>> txns;
+      GC30WPTxnsRollbackGuard rollback_guard(&txns);
+      std::vector<Status> commit_statuses(kCommits);
+      for (size_t i = 0; i < kCommits; ++i) {
+        txns.emplace_back(db_->BeginTransaction(WriteOptions()));
+        ASSERT_OK(txns.back()->SetName("c" + std::to_string(i)));
+        ASSERT_OK(txns.back()->Put(cf, "c" + std::to_string(i), "v"));
+        ASSERT_OK(txns.back()->Prepare());
+      }
+
+      std::mutex mu;
+      std::condition_variable cv;
+      bool s_held = false;
+      bool release_s = false;
+      bool fail_sync = false;
+      size_t began = 0;
+      auto wait_for = [&](const std::function<bool()>& pred) {
+        std::unique_lock<std::mutex> lock(mu);
+        return cv.wait_for(lock, std::chrono::seconds(30), pred);
+      };
+      SyncPoint::GetInstance()->SetCallBack(
+          "DBImpl::CompletionGate:BeforeCoalescedSync", [&](void*) {
+            std::unique_lock<std::mutex> lock(mu);
+            s_held = true;
+            cv.notify_all();
+            cv.wait(lock, [&] { return release_s; });
+          });
+      SyncPoint::GetInstance()->SetCallBack(
+          "DBImpl::SyncWalsFromCompletionGate:AfterGateSync", [&](void* arg) {
+            std::lock_guard<std::mutex> lock(mu);
+            if (fail_sync) {
+              fail_sync = false;
+              IOStatus error = IOStatus::IOError("injected gate sync error");
+              error.SetRetryable(true);
+              *static_cast<IOStatus*>(arg) = error;
+            }
+          });
+      // (No BeganWaiting count: the first commit may lead without queueing.
+      // Thread-start counting below covers all four instead.)
+      SyncPoint::GetInstance()->EnableProcessing();
+      std::vector<std::unique_ptr<port::Thread>> threads;
+      GC30WPJoinGuard join_guard(
+          [&] {
+            std::lock_guard<std::mutex> lock(mu);
+            release_s = true;
+            cv.notify_all();
+          },
+          &threads);
+      WriteOptions sync_wo;
+      sync_wo.sync = true;
+      Status s_status;
+      bool done_s = false;
+      std::vector<bool> done_c(kCommits, false);
+      threads.emplace_back(new port::Thread([&] {
+        s_status = db_->Put(sync_wo, cf_s, "s", "v");
+        std::lock_guard<std::mutex> lock(mu);
+        done_s = true;
+        cv.notify_all();
+      }));
+      ASSERT_TRUE(wait_for([&] { return s_held; }));
+      for (size_t i = 0; i < kCommits; ++i) {
+        threads.emplace_back(new port::Thread([&, i] {
+          {
+            std::lock_guard<std::mutex> lock(mu);
+            ++began;
+            cv.notify_all();
+          }
+          commit_statuses[i] = txns[i]->Commit();
+          std::lock_guard<std::mutex> lock(mu);
+          done_c[i] = true;
+          cv.notify_all();
+        }));
+      }
+      // All four commits are in flight above S (only group leaders park in
+      // a durability wait, so the waiter count is not the commit count).
+      ASSERT_TRUE(wait_for([&] { return began == kCommits; }));
+      ASSERT_TRUE(
+          wait_for([&] { return db_impl->TEST_WalDurabilityWaiters() >= 1; }));
+      {
+        std::lock_guard<std::mutex> lock(mu);
+        fail_sync = true;
+        release_s = true;
+        cv.notify_all();
+      }
+      ASSERT_TRUE(wait_for([&] {
+        return done_s && std::all_of(done_c.begin(), done_c.end(),
+                                     [](bool d) { return d; });
+      }));
+      SyncPoint::GetInstance()->ClearAllCallBacks();
+      ASSERT_TRUE(s_status.IsIOError()) << s_status.ToString();
+      // With a two-entry cache, evicted commit data makes some reads return
+      // TryAgain ("cannot determine") instead of NotFound. Either way the
+      // commit is not visible: no value comes back.
+      auto read = [&](const std::string& key) {
+        std::string value;
+        Status s = db_->Get(ReadOptions(), cf, key, &value);
+        if (s.IsNotFound()) {
+          return std::string("NOT_FOUND");
+        }
+        if (s.IsTryAgain()) {
+          return std::string("TRY_AGAIN");
+        }
+        EXPECT_OK(s);
+        return value;
+      };
+      auto expect_not_visible = [&](const std::string& key) {
+        const std::string v = read(key);
+        EXPECT_TRUE(v == "NOT_FOUND" || v == "TRY_AGAIN") << v;
+      };
+      for (size_t i = 0; i < kCommits; ++i) {
+        SCOPED_TRACE("commit " + std::to_string(i));
+        ASSERT_NOK(commit_statuses[i]);
+        expect_not_visible("c" + std::to_string(i));
+      }
+      ASSERT_OK(db_->Resume());
+      for (size_t i = 0; i < kCommits; ++i) {
+        expect_not_visible("c" + std::to_string(i));
+        ASSERT_OK(txns[i]->Rollback());
+        expect_not_visible("c" + std::to_string(i));
+      }
+      txns.clear();
+      Reopen();
+      cf = CfOnPartition(0);
+      for (size_t i = 0; i < kCommits; ++i) {
+        expect_not_visible("c" + std::to_string(i));
+      }
+    }
+  }
+}
+
+TEST_F(WritePreparedPartitionedWalTest,
+       AsyncTwoPCCallbacksWaitUntilGroupCannotFail) {
+  // GC30 Q3 (D-GC30c): an async 2PC commit grouped with a plain async write
+  // above a held lower sync group that then fails. The follower's insert
+  // runs while the lower sync is held (it fails at the base, where the
+  // failed group skips its inserts); the commit is never both failed and
+  // visible: invisible before and after Resume() and after a reopen, and
+  // Rollback() works.
+  // Neuter: callbacks at leadership (pre-GC27 async order). The commit's
+  // AddCommitted runs, and Rollback fails.
+  for (const auto policy :
+       {TxnDBWritePolicy::WRITE_PREPARED, TxnDBWritePolicy::WRITE_UNPREPARED}) {
+    for (const size_t partitions : {size_t{2}, size_t{8}}) {
+      SCOPED_TRACE("policy=" + std::to_string(static_cast<int>(policy)) +
+                   " partitions=" + std::to_string(partitions));
+      Close();
+      cf_names_.clear();
+      ASSERT_OK(DestroyDB(dbname_, options_));
+      txn_db_options_.write_policy = policy;
+      options_.max_bgerror_resume_count = 0;
+      Open(partitions);
+      // A 2PC commit batch carries no CF records (marker only), so the
+      // commit routes by its XID, not by its CF. Find that partition and
+      // put the plain write on it, so the two group together; the lower
+      // sync goes on the next partition over.
+      size_t commit_partition = partitions;
+      {
+        WriteBatch marker;
+        ASSERT_OK(WriteBatchInternal::MarkCommit(&marker, "committing"));
+        ASSERT_OK(DBImpl::TEST_WalPartitionForWrite(marker, partitions,
+                                                    &commit_partition));
+      }
+      auto* db_impl = static_cast_with_check<DBImpl>(db_->GetRootDB());
+      ColumnFamilyHandle* cf = CfOnPartition(commit_partition);
+      ColumnFamilyHandle* cf_s =
+          CfOnPartition((commit_partition + 1) % partitions);
+      ASSERT_OK(db_->Put(WriteOptions(), cf, "below", "v"));
+
+      std::unique_ptr<Transaction> committing(
+          db_->BeginTransaction(WriteOptions()));
+      GC30WPRollbackGuard rollback_guard(&committing);
+      ASSERT_OK(committing->SetName("committing"));
+      ASSERT_OK(committing->Put(cf, "c", "v"));
+      ASSERT_OK(committing->Prepare());
+
+      std::mutex mu;
+      std::condition_variable cv;
+      bool s_held = false;
+      bool release_s = false;
+      bool fail_sync = false;
+      bool leader_released = false;
+      bool leader_entered = false;
+      size_t waiting = 0;
+      size_t inserts = 0;
+      const size_t cf_partition = commit_partition;
+      auto wait_for = [&](const std::function<bool()>& pred) {
+        std::unique_lock<std::mutex> lock(mu);
+        return cv.wait_for(lock, std::chrono::seconds(30), pred);
+      };
+      SyncPoint::GetInstance()->SetCallBack(
+          "DBImpl::CompletionGate:BeforeCoalescedSync", [&](void*) {
+            std::unique_lock<std::mutex> lock(mu);
+            s_held = true;
+            cv.notify_all();
+            cv.wait(lock, [&] { return release_s; });
+          });
+      SyncPoint::GetInstance()->SetCallBack(
+          "DBImpl::SyncWalsFromCompletionGate:AfterGateSync", [&](void* arg) {
+            std::lock_guard<std::mutex> lock(mu);
+            if (fail_sync) {
+              fail_sync = false;
+              IOStatus error = IOStatus::IOError("injected gate sync error");
+              error.SetRetryable(true);
+              *static_cast<IOStatus*>(arg) = error;
+            }
+          });
+      SyncPoint::GetInstance()->SetCallBack(
+          "WriteThread::JoinBatchGroup:BeganWaiting", [&](void* arg) {
+            if (static_cast<WriteThread::Writer*>(arg)->wal_partition !=
+                cf_partition) {
+              return;
+            }
+            std::lock_guard<std::mutex> lock(mu);
+            ++waiting;
+            cv.notify_all();
+          });
+      SyncPoint::GetInstance()->SetCallBack(
+          "DBImpl::WriteImpl:AfterParallelMemTableInsert", [&](void*) {
+            std::lock_guard<std::mutex> lock(mu);
+            ++inserts;
+            cv.notify_all();
+          });
+      SyncPoint::GetInstance()->EnableProcessing();
+      std::vector<std::unique_ptr<port::Thread>> threads;
+      GC30WPJoinGuard join_guard(
+          [&] {
+            std::lock_guard<std::mutex> lock(mu);
+            release_s = true;
+            leader_released = true;
+            cv.notify_all();
+          },
+          &threads);
+      WriteOptions sync_wo;
+      sync_wo.sync = true;
+      Status s_status;
+      Status c_status;
+      Status p_status;
+      bool done_s = false;
+      bool done_c = false;
+      bool done_p = false;
+      threads.emplace_back(new port::Thread([&] {
+        s_status = db_->Put(sync_wo, cf_s, "s", "v");
+        std::lock_guard<std::mutex> lock(mu);
+        done_s = true;
+        cv.notify_all();
+      }));
+      ASSERT_TRUE(wait_for([&] { return s_held; }));
+      // Hold the next leader on partition 0 before it enters; whoever links
+      // first waits there while the other queues behind it, so the two
+      // form one group. Armed only now so S already passed this point.
+      SyncPoint::GetInstance()->SetCallBack(
+          "DBImpl::WriteImpl:BeforeLeaderEnters", [&](void*) {
+            std::unique_lock<std::mutex> lock(mu);
+            if (!leader_entered) {
+              leader_entered = true;
+              cv.notify_all();
+              cv.wait(lock, [&] { return leader_released; });
+            }
+          });
+      threads.emplace_back(new port::Thread([&] {
+        c_status = committing->Commit();
+        std::lock_guard<std::mutex> lock(mu);
+        done_c = true;
+        cv.notify_all();
+      }));
+      ASSERT_TRUE(wait_for([&] { return leader_entered; }));
+      threads.emplace_back(new port::Thread([&] {
+        p_status = db_->Put(WriteOptions(), cf, "p", "v");
+        std::lock_guard<std::mutex> lock(mu);
+        done_p = true;
+        cv.notify_all();
+      }));
+      ASSERT_TRUE(wait_for([&] { return waiting == 1; }));
+      {
+        std::lock_guard<std::mutex> lock(mu);
+        leader_released = true;
+        cv.notify_all();
+      }
+      // The group's leader parks waiting for the held sync; the follower
+      // inserted meanwhile.
+      ASSERT_TRUE(
+          wait_for([&] { return db_impl->TEST_WalDurabilityWaiters() == 1; }));
+      ASSERT_TRUE(wait_for([&] { return inserts == 1; }));
+      {
+        std::lock_guard<std::mutex> lock(mu);
+        fail_sync = true;
+        release_s = true;
+        cv.notify_all();
+      }
+      ASSERT_TRUE(wait_for([&] { return done_s && done_c && done_p; }));
+      SyncPoint::GetInstance()->ClearAllCallBacks();
+      ASSERT_TRUE(s_status.IsIOError()) << s_status.ToString();
+      ASSERT_NOK(c_status);
+      ASSERT_NOK(p_status);
+      auto read = [&](const std::string& key) {
+        std::string value;
+        Status s = db_->Get(ReadOptions(), cf, key, &value);
+        if (s.IsNotFound()) {
+          return std::string("NOT_FOUND");
+        }
+        EXPECT_OK(s);
+        return value;
+      };
+      EXPECT_EQ("NOT_FOUND", read("c"));
+      EXPECT_EQ("NOT_FOUND", read("p"));
+      ASSERT_OK(db_->Resume());
+      EXPECT_EQ("NOT_FOUND", read("c"));
+      EXPECT_EQ("NOT_FOUND", read("p"));
+      ASSERT_OK(committing->Rollback());
+      EXPECT_EQ("NOT_FOUND", read("c"));
+      committing.reset();
+      Reopen();
+      cf = CfOnPartition(commit_partition);
+      EXPECT_EQ("v", read("below"));
+      EXPECT_EQ("NOT_FOUND", read("c"));
+      EXPECT_EQ("NOT_FOUND", read("p"));
     }
   }
 }

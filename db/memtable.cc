@@ -919,6 +919,73 @@ MemTable::NewTimestampStrippingRangeTombstoneIterator(
       comparator_.comparator, read_seq, read_options.timestamp);
 }
 
+namespace {
+// Forward-only view that hides range tombstones at or above `floor` and owns
+// its input, so a flush dropping a failed range can fragment only the
+// tombstones it may output.
+class FloorFilteredRangeDelIterator : public InternalIterator {
+ public:
+  FloorFilteredRangeDelIterator(InternalIterator* input, SequenceNumber floor)
+      : input_(input), floor_(floor) {}
+
+  bool Valid() const override { return input_->Valid(); }
+  void SeekToFirst() override {
+    input_->SeekToFirst();
+    SkipHidden();
+  }
+  void SeekToLast() override { assert(false); }
+  void Seek(const Slice& target) override {
+    input_->Seek(target);
+    SkipHidden();
+  }
+  void SeekForPrev(const Slice& /*target*/) override { assert(false); }
+  void Next() override {
+    input_->Next();
+    SkipHidden();
+  }
+  void Prev() override { assert(false); }
+  Slice key() const override { return input_->key(); }
+  Slice value() const override { return input_->value(); }
+  Status status() const override { return input_->status(); }
+  bool IsKeyPinned() const override { return input_->IsKeyPinned(); }
+  bool IsValuePinned() const override { return input_->IsValuePinned(); }
+
+ private:
+  void SkipHidden() {
+    while (input_->Valid() && GetInternalKeySeqno(input_->key()) >= floor_) {
+      input_->Next();
+    }
+  }
+
+  const std::unique_ptr<InternalIterator> input_;
+  const SequenceNumber floor_;
+};
+}  // namespace
+
+FragmentedRangeTombstoneIterator* MemTable::NewRangeTombstoneIteratorBelowFloor(
+    const ReadOptions& read_options, SequenceNumber floor,
+    uint64_t* num_excluded) {
+  assert(num_excluded != nullptr);
+  *num_excluded = 0;
+  if (read_options.ignore_range_deletions ||
+      is_range_del_table_empty_.LoadRelaxed()) {
+    return nullptr;
+  }
+  auto* unfragmented_iter = new MemTableIterator(
+      MemTableIterator::kRangeDelEntries, *this, read_options);
+  auto filtered = std::make_shared<FragmentedRangeTombstoneList>(
+      std::unique_ptr<InternalIterator>(
+          new FloorFilteredRangeDelIterator(unfragmented_iter, floor)),
+      comparator_.comparator);
+  *num_excluded = NumRangeDeletion() - filtered->num_unfragmented_tombstones();
+  if (filtered->empty()) {
+    return nullptr;
+  }
+  return new FragmentedRangeTombstoneIterator(filtered, comparator_.comparator,
+                                              kMaxSequenceNumber,
+                                              read_options.timestamp);
+}
+
 FragmentedRangeTombstoneIterator* MemTable::NewRangeTombstoneIteratorInternal(
     const ReadOptions& read_options, SequenceNumber read_seq,
     bool immutable_memtable) {

@@ -742,6 +742,32 @@ bool WriteThread::CompleteParallelMemTableWriter(Writer* w) {
     write_group->status = w->status;
   }
 
+  if (write_group->leader_runs_exit && w != write_group->leader) {
+    // A sync group's follower (N>1, D-GC30e (i)): only the leader runs the
+    // exit, so this thread only inserts and waits. The last follower out
+    // wakes the leader, whose unit is the only one left.
+    if (write_group->running.fetch_sub(1) == 2) {
+      std::lock_guard<std::mutex> guard(write_group->leader->StateMutex());
+      write_group->leader->StateCV().notify_one();
+    }
+    AwaitState(w, STATE_COMPLETED, &cpmtw_ctx);
+    return false;
+  }
+  if (write_group->leader_runs_exit) {
+    // The sync group's leader: join every follower (their status is
+    // already in write_group->status, ordered by the state mutex), then
+    // run the exit. The predicate makes a wakeup before the wait harmless.
+    assert(w == write_group->leader);
+    {
+      std::unique_lock<std::mutex> lock(w->StateMutex());
+      w->StateCV().wait(lock, [&] { return write_group->running.load() == 1; });
+      write_group->running--;
+    }
+    w->status = write_group->status;
+    write_group->status.PermitUncheckedError();
+    return true;
+  }
+
   if (write_group->running-- > 1) {
     // we're not the last one
     AwaitState(w, STATE_COMPLETED, &cpmtw_ctx);
@@ -759,7 +785,11 @@ void WriteThread::ExitAsBatchGroupFollower(Writer* w) {
 
   assert(w->state == STATE_PARALLEL_MEMTABLE_WRITER);
   assert(w != write_group->leader);
-  assert(write_group->status.ok());
+  // No status assertion: at N > 1 a follower can exit a failed group (its
+  // inserts overlapped the append, so an append, callback or insert failure
+  // lands after the join). WriteImpl routes each failure to its handler
+  // before reaching here, and write_group->status carries the outcome the
+  // followers take.
   ExitAsBatchGroupLeader(*write_group, write_group->status);
   // The exit hands every non-leader member the group outcome, so the exiting
   // follower's status now equals the group status, including a completion-gate
@@ -914,9 +944,8 @@ void WriteThread::ExitAsBatchGroupLeader(WriteGroup& write_group,
       // already failed; followers are failing either way, and a failed append
       // stays pinned, so waiting on it could never succeed.
       if (write_group.async_writers_gate) {
-        // The leader, a sync writer, inserts every batch of such a group
-        // itself and so runs this exit: only sync writers wait for the
-        // completion gate below.
+        // The leader, a sync writer, runs this exit (its followers only
+        // inserted): only sync writers wait for the completion gate below.
         assert(leader->sync);
         Status async_status = write_group.async_writers_gate();
         CompleteAsyncWriters(write_group,

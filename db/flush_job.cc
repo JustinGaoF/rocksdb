@@ -481,17 +481,22 @@ Status FlushJob::MemPurge() {
   std::vector<std::unique_ptr<FragmentedRangeTombstoneIterator>>
       range_del_iters;
   // What a flush would drop, MemPurge drops too: entries at or above an
-  // unreleased fence.
-  const SequenceNumber range_del_read_seq =
-      drop_entries_at_or_above_ == kMaxSequenceNumber
-          ? kMaxSequenceNumber
-          : drop_entries_at_or_above_ - 1;
+  // unreleased fence. The tombstones below the fence fragment into an
+  // unbounded iterator: bounding the stripes instead would hand
+  // CompactionRangeDelAggregator an input it rejects.
+  const bool drop_range_dels = drop_entries_at_or_above_ != kMaxSequenceNumber;
   for (ReadOnlyMemTable* m : mems_) {
     memtables.push_back(m->NewIterator(ro, /*seqno_to_time_mapping=*/nullptr,
                                        &arena, /*prefix_extractor=*/nullptr,
                                        /*for_flush=*/true));
-    auto* range_del_iter = m->NewRangeTombstoneIterator(
-        ro, range_del_read_seq, true /* immutable_memtable */);
+    uint64_t num_excluded = 0;
+    auto* range_del_iter =
+        drop_range_dels
+            ? m->NewRangeTombstoneIteratorBelowFloor(
+                  ro, drop_entries_at_or_above_, &num_excluded)
+            : m->NewRangeTombstoneIterator(ro, kMaxSequenceNumber,
+                                           true /* immutable_memtable */);
+    (void)num_excluded;  // MemPurge verifies no entry count.
     if (range_del_iter != nullptr) {
       range_del_iters.emplace_back(range_del_iter);
     }
@@ -1018,20 +1023,31 @@ Status FlushJob::WriteLevel0Table() {
             m->NewIterator(ro, /*seqno_to_time_mapping=*/nullptr, &arena,
                            /*prefix_extractor=*/nullptr, /*for_flush=*/true));
       }
+      // When dropping, fragment only the tombstones below the fence into an
+      // unbounded iterator (bounding the stripes would hand
+      // CompactionRangeDelAggregator an input it rejects), and discount the
+      // excluded tombstones from the entry count below. Timestamp stripping
+      // cannot meet a fence: it is refused with the concurrent memtable
+      // writes N>1 requires.
       const SequenceNumber range_del_read_seq =
           drop_entries_at_or_above_ == kMaxSequenceNumber
               ? kMaxSequenceNumber
               : drop_entries_at_or_above_ - 1;
+      uint64_t num_excluded_range_dels = 0;
       auto* range_del_iter =
           logical_strip_timestamp
               ? m->NewTimestampStrippingRangeTombstoneIterator(
                     ro, range_del_read_seq, ts_sz)
-              : m->NewRangeTombstoneIterator(ro, range_del_read_seq,
+          : drop_entries_at_or_above_ != kMaxSequenceNumber
+              ? m->NewRangeTombstoneIteratorBelowFloor(
+                    ro, drop_entries_at_or_above_, &num_excluded_range_dels)
+              : m->NewRangeTombstoneIterator(ro, kMaxSequenceNumber,
                                              true /* immutable_memtable */);
       if (range_del_iter != nullptr) {
         range_del_iters.emplace_back(range_del_iter);
       }
       total_num_input_entries += m->NumEntries();
+      total_num_input_entries -= num_excluded_range_dels;
       total_num_deletes += m->NumDeletion();
       total_data_size += m->GetDataSize();
       total_memory_usage += m->ApproximateMemoryUsage();

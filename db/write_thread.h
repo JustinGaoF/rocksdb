@@ -123,6 +123,20 @@ class WriteThread {
     // the gate. Lets ExitAsBatchGroupFollower hand the gate outcome to the
     // leader, whose own status is otherwise untouched by the exit.
     Status gate_status;
+    // At N > 1 the leader publishes the group outcome here, under its state
+    // mutex, before it joins the parallel memtable writers (after its WAL
+    // append, whose inserts overlapped it). The thread that runs the exit,
+    // which may be a follower, reads them after the join, exactly as the
+    // leader would use its locals.
+    Status wal_write_status;
+    bool release_unapplied_range = false;
+    bool leader_status_ok = true;
+    // Set by DBImpl on an N>1 sync group whose parallel writers insert at
+    // leadership (ruling 4b, D-GC30e (i)): the exit, which runs the fsync,
+    // stays on the leader's thread (a sync writer's), so the followers
+    // only insert and wait, and the leader joins them before it exits. An
+    // async member of the group thus never waits for the group's fsync.
+    bool leader_runs_exit = false;
 
     struct Iterator {
       Writer* writer;

@@ -3144,6 +3144,29 @@ std::string PartitionedWalGapsRefusal(const std::string& wal_file,
          "across partitioned WALs, so gaps in file order are not real gaps";
 }
 
+// Whether WAL dumps treat `dir` as an indexed DB: OPTIONS says
+// wal_partitions > 1, or the MANIFEST WAL-index guard is set, so the CLI
+// default (wal_partitions 1, no OPTIONS loaded) refuses a damaged head too
+// (Q9). A directory without a readable MANIFEST reads as unindexed.
+bool WalDumpDirIsIndexed(const Options& options, const std::string& dir) {
+  if (options.wal_partitions > 1 || options.env == nullptr) {
+    return options.wal_partitions > 1;
+  }
+  uint64_t wal_index_guard = 0;
+  return VersionSet::ReadWALIndexGuard(dir, options.env->GetFileSystem().get(),
+                                       &wal_index_guard)
+             .ok() &&
+         wal_index_guard != 0;
+}
+
+std::string DamagedHeadRefusal(const std::string& wal_file, uint64_t log_number,
+                               const Status& head) {
+  return "NotSupported: dump_wal: WAL " + std::to_string(log_number) + " (" +
+         wal_file + "): " + head.ToString() +
+         "; the DB is indexed and the WAL's partition is unknown, so its "
+         "sequences cannot be ordered";
+}
+
 void DumpWalFiles(Options options, const std::string& dir_or_file,
                   bool print_header, bool print_values,
                   bool only_print_seqno_gaps, bool is_write_committed,
@@ -3175,6 +3198,38 @@ void DumpWalFiles(Options options, const std::string& dir_or_file,
       }
       return;
     }
+    if (!only_print_seqno_gaps && options.env != nullptr) {
+      // Refuse a damaged head in an indexed DB before printing anything
+      // (Q9); gaps mode checks each record's partition as it dumps.
+      const size_t single_slash = dir_or_file.rfind(kFilePathSeparator);
+      const std::string single_name =
+          single_slash == std::string::npos
+              ? dir_or_file
+              : dir_or_file.substr(single_slash + 1);
+      const std::string single_dir = single_slash == std::string::npos
+                                         ? "."
+                                         : dir_or_file.substr(0, single_slash);
+      uint64_t single_log = 0;
+      FileType single_type;
+      Status single_head;
+      if (ParseFileName(single_name, &single_log, &single_type)) {
+        uint32_t single_partition = 0;
+        single_head = log::ReadWALPartition(options.env->GetFileSystem().get(),
+                                            dir_or_file, FileOptions(options),
+                                            single_log, &single_partition);
+      }
+      if (!single_head.ok() && !single_head.IsNotFound() &&
+          WalDumpDirIsIndexed(options, single_dir)) {
+        const std::string refusal =
+            DamagedHeadRefusal(dir_or_file, single_log, single_head);
+        if (exec_state) {
+          *exec_state = LDBCommandExecuteResult::Failed(refusal);
+        } else {
+          std::cerr << refusal << std::endl;
+        }
+        return;
+      }
+    }
     DumpWalFile(options, dir_or_file, print_header, print_values,
                 only_print_seqno_gaps, is_write_committed, ucmps, exec_state,
                 &prev_batch_seqno, &prev_batch_count);
@@ -3186,6 +3241,37 @@ void DumpWalFiles(Options options, const std::string& dir_or_file,
             dir_or_file + ": No valid wal logs found");
       }
       return;
+    }
+    const bool dump_indexed =
+        options.env != nullptr && WalDumpDirIsIndexed(options, dir_or_file);
+    if (!only_print_seqno_gaps && options.env != nullptr) {
+      // Refuse a damaged head in an indexed DB before printing anything
+      // (Q9). Healthy partitioned WALs still dump below, as today.
+      WALFileIterator prescan_iter(dir_or_file, filenames);
+      while (prescan_iter.Valid()) {
+        const std::string scanned = prescan_iter.GetNextWAL();
+        uint64_t prescan_log = 0;
+        FileType prescan_type;
+        if (!ParseFileName(
+                scanned.substr(scanned.rfind(kFilePathSeparator) + 1),
+                &prescan_log, &prescan_type)) {
+          prescan_log = 0;
+        }
+        uint32_t prescan_partition = 0;
+        const Status prescan_head = log::ReadWALPartition(
+            options.env->GetFileSystem().get(), scanned, FileOptions(options),
+            prescan_log, &prescan_partition);
+        if (!prescan_head.ok() && !prescan_head.IsNotFound() && dump_indexed) {
+          const std::string refusal =
+              DamagedHeadRefusal(scanned, prescan_log, prescan_head);
+          if (exec_state) {
+            *exec_state = LDBCommandExecuteResult::Failed(refusal);
+          } else {
+            std::cerr << refusal << std::endl;
+          }
+          return;
+        }
+      }
     }
     // Refused before anything is printed: partition 0's WAL comes first and
     // would report the other partitions' sequences as gaps.
@@ -3202,7 +3288,7 @@ void DumpWalFiles(Options options, const std::string& dir_or_file,
       const Status head = log::ReadWALPartition(
           options.env->GetFileSystem().get(), scanned, FileOptions(options),
           log_number, &wal_partition);
-      if (!head.ok() && !head.IsNotFound() && options.wal_partitions > 1) {
+      if (!head.ok() && !head.IsNotFound() && dump_indexed) {
         // Which partition wrote it is unknown (D-GC27b).
         if (exec_state) {
           *exec_state = LDBCommandExecuteResult::Failed(

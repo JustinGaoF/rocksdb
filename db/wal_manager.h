@@ -51,6 +51,15 @@ class WalManager {
                          const WalIterator::ReadOptions& read_options,
                          VersionSet* version_set);
 
+  // Refuses the WAL set when reading it in file order would misreport: a WAL
+  // written by a nonzero partition, or a WAL whose head cannot be read while
+  // the DB is indexed (wal_partitions > 1, or the MANIFEST WAL-index guard).
+  // A head that vanished (NotFound) is transient, not a refusal. Ported from
+  // Muse's GC27 candidate (pwal/ab/gc27-muse-PR29), adapted to GC27's reader
+  // statuses (NotFound excluded); Q9.
+  Status CheckWalsReadableAndUnpartitioned(const VectorWalPtr& wal_files,
+                                           VersionSet* version_set);
+
   // Record the end of a write group's sequence range when its WAL append has
   // an indeterminate outcome. TransactionLogIterator uses this process-lifetime
   // fence to avoid returning a physically complete record that successful

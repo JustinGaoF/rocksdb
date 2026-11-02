@@ -116,6 +116,57 @@ Status WalManager::GetSortedWalFiles(VectorWalPtr& files, bool need_seqnos,
   return s;
 }
 
+Status WalManager::CheckWalsReadableAndUnpartitioned(
+    const VectorWalPtr& wal_files, VersionSet* version_set) {
+  // WALs an earlier instance wrote with wal_partitions > 1 interleave their
+  // sequences across files, so reading them in file order would report gaps
+  // that are not there. A WAL whose head cannot be read is refused the same
+  // way when the DB is indexed (OPTIONS says wal_partitions > 1, or the
+  // MANIFEST WAL-index guard is set, which covers an N=1 opener of a
+  // partitioned set); an unindexed DB keeps today's behaviour. A head that
+  // vanished between the listing and this check is transient, not a refusal
+  // (adapted from the port's source, which refuses it, to GC27's reader
+  // statuses). Ported from Muse's GC27 candidate (pwal/ab/gc27-muse-PR29).
+  uint64_t partitioned_log = 0;
+  uint32_t partitioned_log_partition = 0;
+  uint64_t unknown_log = 0;
+  for (const auto& wal : wal_files) {
+    const std::string fname =
+        wal->Type() == kAliveLogFile
+            ? LogFileName(wal_dir_, wal->LogNumber())
+            : ArchivedLogFileName(wal_dir_, wal->LogNumber());
+    uint32_t wal_partition = 0;
+    const Status partition_status = log::ReadWALPartition(
+        fs_.get(), fname, fs_->OptimizeForLogRead(file_options_),
+        wal->LogNumber(), &wal_partition);
+    if (partition_status.ok() && wal_partition != 0 && partitioned_log == 0) {
+      partitioned_log = wal->LogNumber();
+      partitioned_log_partition = wal_partition;
+    } else if (!partition_status.ok() && !partition_status.IsNotFound() &&
+               unknown_log == 0) {
+      unknown_log = wal->LogNumber();
+    }
+  }
+  const bool indexed =
+      db_options_.wal_partitions > 1 ||
+      (version_set != nullptr && version_set->wal_index_guard() != 0);
+  if (unknown_log != 0 && indexed) {
+    return Status::NotSupported(
+        "GetUpdatesSince: WAL " + std::to_string(unknown_log) +
+        " cannot be read and the DB is indexed; its sequences cannot be "
+        "ordered in file order");
+  }
+  if (partitioned_log != 0) {
+    return Status::NotSupported(
+        "GetUpdatesSince: WAL " + std::to_string(partitioned_log) +
+        " was written by partition " +
+        std::to_string(partitioned_log_partition) +
+        " of a DB with wal_partitions > 1, whose sequences interleave "
+        "across files");
+  }
+  return Status::OK();
+}
+
 Status WalManager::GetUpdatesSince(SequenceNumber seq,
                                    std::unique_ptr<WalIterator>* iter,
                                    const WalIterator::ReadOptions& read_options,
@@ -134,6 +185,17 @@ Status WalManager::GetUpdatesSince(SequenceNumber seq,
   std::unique_ptr<VectorWalPtr> wal_files(new VectorWalPtr);
   Status s = GetSortedWalFiles(*wal_files);
   if (!s.ok()) {
+    // A damaged head fails the seqno pass above; in an indexed DB that is a
+    // refusal naming the WAL, not a Corruption. Re-list without seqnos to
+    // find it. Any other listing failure returns as before.
+    std::unique_ptr<VectorWalPtr> unscanned(new VectorWalPtr);
+    if (GetSortedWalFiles(*unscanned, /*need_seqnos=*/false).ok()) {
+      const Status check =
+          CheckWalsReadableAndUnpartitioned(*unscanned, version_set);
+      if (!check.ok()) {
+        return check;
+      }
+    }
     return s;
   }
 
@@ -141,35 +203,9 @@ Status WalManager::GetUpdatesSince(SequenceNumber seq,
   if (!s.ok()) {
     return s;
   }
-  // WALs an earlier instance wrote with wal_partitions > 1 interleave their
-  // sequences across files, so reading them in file order would report gaps
-  // that are not there.
-  for (const auto& wal : *wal_files) {
-    const std::string fname =
-        wal->Type() == kAliveLogFile
-            ? LogFileName(wal_dir_, wal->LogNumber())
-            : ArchivedLogFileName(wal_dir_, wal->LogNumber());
-    uint32_t wal_partition = 0;
-    const Status head = log::ReadWALPartition(
-        fs_.get(), fname, fs_->OptimizeForLogRead(file_options_),
-        wal->LogNumber(), &wal_partition);
-    if (!head.ok() && !head.IsNotFound() &&
-        (db_options_.wal_partitions > 1 ||
-         (version_set != nullptr && version_set->wal_index_guard() != 0))) {
-      // An indexed DB: which partition wrote it is unknown (D-GC27b).
-      return Status::NotSupported(
-          "GetUpdatesSince: WAL " + std::to_string(wal->LogNumber()) + ": " +
-          head.ToString() +
-          "; it may be a partitioned WAL, whose sequences interleave across "
-          "files");
-    }
-    if (head.ok() && wal_partition != 0) {
-      return Status::NotSupported(
-          "GetUpdatesSince: WAL " + std::to_string(wal->LogNumber()) +
-          " was written by partition " + std::to_string(wal_partition) +
-          " of a DB with wal_partitions > 1, whose sequences interleave "
-          "across files");
-    }
+  s = CheckWalsReadableAndUnpartitioned(*wal_files, version_set);
+  if (!s.ok()) {
+    return s;
   }
   iter->reset(new WalIteratorImpl(
       wal_dir_, &db_options_, read_options, file_options_, seq,

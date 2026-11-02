@@ -3344,7 +3344,12 @@ Status WriteBatchInternal::InsertInto(
                             concurrent_memtable_writes, nullptr /* prot_info */,
                             nullptr /*has_valid_writes*/, seq_per_batch,
                             batch_per_txn, hint_per_batch);
-  SetSequence(writer->batch, sequence);
+  // At N > 1 the leader pre-stamps every batch before the parallel writers
+  // launch, so the WAL append and the inserts overlap without writing batch
+  // headers concurrently; skip the redundant stamp then.
+  if (Sequence(writer->batch) != sequence) {
+    SetSequence(writer->batch, sequence);
+  }
   inserter.set_log_number_ref(writer->log_ref);
   inserter.set_prot_info(writer->batch->prot_info_.get());
   Status s = writer->batch->Iterate(&inserter);

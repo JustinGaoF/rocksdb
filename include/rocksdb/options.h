@@ -1584,6 +1584,11 @@ struct DBOptions {
   // Status::NotSupported. With the default of 1 the WAL is byte-for-byte
   // identical to a build without this option.
   //
+  // Merge batches take the concurrent memtable path with more than one
+  // partition, like any other batch, including the write pipeline's overlap
+  // of the WAL append with the memtable insert; this is safe only because
+  // Open() requires max_successive_merges == 0 there.
+  //
   // Recovery reads the partitions as one stream in WAL index order, so a
   // record lost from one partition while another holds later records is a
   // hole in that stream, not a torn tail. kTolerateCorruptedTailRecords and

@@ -348,23 +348,35 @@ class Repairer {
 
   // Each WAL converts to a table on its own, which drops the cross-file order
   // of a set written with wal_partitions > 1 and can keep records above a
-  // hole. Checked before anything is changed.
+  // hole. Checked before anything is changed. The DB counts as indexed when
+  // OPTIONS says so or the MANIFEST WAL-index guard is set, so an N=1
+  // invocation over a partitioned set refuses too (Q9).
   Status CheckWalsNotPartitioned() {
     const auto& fs = env_->GetFileSystem();
     const auto& wal_dir = immutable_db_options_.GetWalDir();
+    const bool indexed_by_options = immutable_db_options_.wal_partitions > 1;
+    uint64_t wal_index_guard = 0;
+    const bool indexed_by_guard =
+        !indexed_by_options &&
+        VersionSet::ReadWALIndexGuard(dbname_, fs.get(), &wal_index_guard)
+            .ok() &&
+        wal_index_guard != 0;
     for (uint64_t log : logs_) {
       uint32_t wal_partition = 0;
       const Status head = log::ReadWALPartition(
           fs.get(), LogFileName(wal_dir, log),
           fs->OptimizeForLogRead(file_options_), log, &wal_partition);
       if (!head.ok() && !head.IsNotFound() &&
-          immutable_db_options_.wal_partitions > 1) {
+          (indexed_by_options || indexed_by_guard)) {
         // Which partition wrote it is unknown, so it may be a partitioned
         // WAL (D-GC27b).
         return Status::NotSupported(
             "RepairDB: WAL " + std::to_string(log) + ": " + head.ToString() +
-            "; with wal_partitions > 1 RepairDB does not convert a WAL "
-            "that may be partitioned");
+            (indexed_by_options
+                 ? "; with wal_partitions > 1 RepairDB does not convert a "
+                   "WAL that may be partitioned"
+                 : "; the MANIFEST WAL-index guard is set, so RepairDB does "
+                   "not convert a WAL that may be partitioned"));
       }
       if (head.ok() && wal_partition != 0) {
         return Status::NotSupported(

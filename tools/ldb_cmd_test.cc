@@ -285,6 +285,109 @@ TEST_F(LdbCmdTest, DumpWalOnPartitionedWals) {
   ASSERT_OK(DestroyDB(dbname, opts));
 }
 
+// GC30 Q9: `ldb dump_wal` without loading OPTIONS (wal_partitions defaults
+// to 1) still refuses a damaged head when the MANIFEST WAL-index guard marks
+// the DB indexed: the single-file dump and the directory dump both fail with
+// NotSupported naming the WAL. An unindexed DB with a damaged head keeps
+// today's behaviour (no refusal).
+// Neuter: decide from the options alone; both dumps read past the damage.
+TEST_F(LdbCmdTest, LdbDumpWalRefusesDamagedHeadWithoutOptions) {
+  Env* env = TryLoadCustomOrDefaultEnv();
+  Options opts;
+  opts.env = env;
+  opts.create_if_missing = true;
+  opts.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  opts.track_and_verify_wals_in_manifest = true;
+  opts.avoid_flush_during_shutdown = true;
+  const std::string dbname = test::PerThreadDBPath(env, "ldb_cmd_test");
+  ASSERT_OK(DestroyDB(dbname, opts));
+
+  constexpr size_t kPartitions = 2;
+  opts.wal_partitions = kPartitions;
+  std::vector<uint64_t> current_wals(kPartitions);
+  {
+    std::unique_ptr<DB> db;
+    ASSERT_OK(DB::Open(opts, dbname, &db));
+    std::vector<std::unique_ptr<ColumnFamilyHandle>> handles;
+    std::vector<bool> covered(kPartitions, false);
+    size_t num_covered = 0;
+    for (uint32_t cf_id = 1; num_covered < kPartitions; ++cf_id) {
+      ColumnFamilyHandle* handle = nullptr;
+      ASSERT_OK(
+          db->CreateColumnFamily(opts, "cf" + std::to_string(cf_id), &handle));
+      handles.emplace_back(handle);
+      WriteBatch batch;
+      ASSERT_OK(WriteBatchInternal::Put(&batch, cf_id, "key", "value"));
+      size_t partition = kPartitions;
+      ASSERT_OK(
+          DBImpl::TEST_WalPartitionForWrite(batch, kPartitions, &partition));
+      if (!covered[partition]) {
+        covered[partition] = true;
+        ++num_covered;
+        ASSERT_OK(db->Put(WriteOptions(), handle, "key", "value"));
+      }
+    }
+    for (size_t p = 0; p < kPartitions; ++p) {
+      current_wals[p] =
+          static_cast<DBImpl*>(db.get())->TEST_CurrentWalNumber(p);
+    }
+    for (auto& handle : handles) {
+      ASSERT_OK(db->DestroyColumnFamilyHandle(handle.release()));
+    }
+  }
+  const std::string p1_fname = LogFileName(dbname, current_wals[1]);
+  ASSERT_OK(test::CorruptFile(env, p1_fname, 0, /*bytes_to_corrupt=*/1,
+                              /*verify_checksum=*/false));
+  // Without loading OPTIONS: wal_partitions defaults to 1, so only the
+  // MANIFEST guard marks the set indexed.
+  Options cli_opts;
+  cli_opts.env = env;
+  auto dump = [&](const std::string& target, std::string* output) {
+    const std::string wal_arg = "--walfile=" + target;
+    const char* argv[] = {"./ldb", "dump_wal", wal_arg.c_str()};
+    testing::internal::CaptureStdout();
+    testing::internal::CaptureStderr();
+    const int code =
+        LDBCommandRunner::RunCommand(3, argv, cli_opts, LDBOptions(), nullptr);
+    *output = testing::internal::GetCapturedStderr();
+    *output += testing::internal::GetCapturedStdout();
+    return code;
+  };
+  std::string output;
+  ASSERT_NE(0, dump(p1_fname, &output));
+  EXPECT_NE(std::string::npos, output.find("NotSupported")) << output;
+  EXPECT_NE(std::string::npos,
+            output.find("WAL " + std::to_string(current_wals[1])))
+      << output;
+  ASSERT_NE(0, dump(dbname, &output));
+  EXPECT_NE(std::string::npos, output.find("NotSupported")) << output;
+  EXPECT_NE(std::string::npos,
+            output.find("WAL " + std::to_string(current_wals[1])))
+      << output;
+  ASSERT_OK(DestroyDB(dbname, opts));
+
+  // Unindexed control: a plain N=1 DB with a damaged head keeps today's
+  // behaviour (no refusal).
+  Options plain_opts;
+  plain_opts.env = env;
+  plain_opts.create_if_missing = true;
+  ASSERT_OK(DestroyDB(dbname, plain_opts));
+  std::string plain_wal;
+  {
+    std::unique_ptr<DB> db;
+    ASSERT_OK(DB::Open(plain_opts, dbname, &db));
+    ASSERT_OK(db->Put(WriteOptions(), "key", "value"));
+    std::unique_ptr<WalFile> wal;
+    ASSERT_OK(db->GetCurrentWalFile(&wal));
+    plain_wal = dbname + wal->PathName();
+  }
+  ASSERT_OK(test::CorruptFile(env, plain_wal, 0, /*bytes_to_corrupt=*/1,
+                              /*verify_checksum=*/false));
+  dump(plain_wal, &output);
+  EXPECT_EQ(std::string::npos, output.find("NotSupported")) << output;
+  ASSERT_OK(DestroyDB(dbname, plain_opts));
+}
+
 class LdbCmdWalPartitionsTest : public LdbCmdTest,
                                 public testing::WithParamInterface<uint32_t> {};
 

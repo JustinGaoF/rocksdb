@@ -186,6 +186,18 @@ class ReadOnlyMemTable {
       const ReadOptions& read_options, SequenceNumber read_seq,
       bool immutable_memtable) = 0;
 
+  // Returns an unbounded iterator over the memtable's range tombstones with
+  // sequence numbers below `floor`, and sets `*num_excluded` to the number of
+  // tombstones at or above it. Used only by flush when dropping entries at or
+  // above an unreleased fence: unlike NewRangeTombstoneIterator with a
+  // read_seq, which bounds the stripes (and CompactionRangeDelAggregator
+  // rejects bounded input), this fragments only the tombstones the flush may
+  // output. Returns nullptr when no tombstone sits below the floor. The
+  // caller owns the iterator.
+  virtual FragmentedRangeTombstoneIterator* NewRangeTombstoneIteratorBelowFloor(
+      const ReadOptions& read_options, SequenceNumber floor,
+      uint64_t* num_excluded) = 0;
+
   // Returns an iterator that yields the range tombstones of the memtable and
   // logically strips the user-defined timestamp of each key (including start
   // key, and end key). This API is only used by flush when user-defined
@@ -684,6 +696,10 @@ class MemTable final : public ReadOnlyMemTable {
   FragmentedRangeTombstoneIterator* NewRangeTombstoneIterator(
       const ReadOptions& read_options, SequenceNumber read_seq,
       bool immutable_memtable) override;
+
+  FragmentedRangeTombstoneIterator* NewRangeTombstoneIteratorBelowFloor(
+      const ReadOptions& read_options, SequenceNumber floor,
+      uint64_t* num_excluded) override;
 
   FragmentedRangeTombstoneIterator* NewTimestampStrippingRangeTombstoneIterator(
       const ReadOptions& read_options, SequenceNumber read_seq,
