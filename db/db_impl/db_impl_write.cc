@@ -1997,7 +1997,12 @@ Status DBImpl::WriteImpl(
                          : wal_write_number,
                      last_sequence, last_sequence + 1 - seq_inc,
                      registered_applied_range ? wal_context.wal_partition
-                                              : kNoPinnedWalRange);
+                                              : kNoPinnedWalRange,
+                     // A sync-led group registers its async writers' leading
+                     // applied range separately; the recorded failure must
+                     // release what was registered (GC32 Q10). Non-sync
+                     // groups carry kMaxSequenceNumber, which records no split.
+                     write_group.sync_first_sequence);
   }
   if (!w.CallbackFailed()) {
     if (!io_s.ok()) {
@@ -2761,7 +2766,8 @@ void DBImpl::WALIOStatusCheck(const IOStatus& io_status,
                               uint64_t failed_wal_number,
                               SequenceNumber failed_wal_sequence,
                               SequenceNumber failed_wal_sequence_start,
-                              size_t pinned_wal_partition) {
+                              size_t pinned_wal_partition,
+                              SequenceNumber applied_split) {
   // Is setting bg_error_ enough here?  This will at least stop
   // compaction and fail any further writes.
   // Above one partition every failure stops the DB (D-1), Busy and Incomplete
@@ -2776,9 +2782,17 @@ void DBImpl::WALIOStatusCheck(const IOStatus& io_status,
       // Under the same mutex_ hold as the error below, so recovery from an
       // earlier error cannot release this range before the error is set.
       assert(NumWalPartitions() > 1);
-      failed_wal_ranges_.push_back({pinned_wal_partition,
-                                    failed_wal_sequence_start,
-                                    failed_wal_sequence});
+      FailedWalRange failed_range{
+          pinned_wal_partition, failed_wal_sequence_start, failed_wal_sequence};
+      // Record the split only when it falls strictly inside the range: a
+      // sync group without leading async writers has sync_first_sequence ==
+      // low and registered one applied range.
+      if (applied_split != kMaxSequenceNumber &&
+          applied_split > failed_wal_sequence_start &&
+          applied_split <= failed_wal_sequence) {
+        failed_range.applied_split = applied_split;
+      }
+      failed_wal_ranges_.push_back(failed_range);
     }
     // Maybe change the return status to void?
     if (io_status.IsIOError() && !io_status.IsIOFenced()) {
@@ -2789,7 +2803,13 @@ void DBImpl::WALIOStatusCheck(const IOStatus& io_status,
           failed_wal_number != 0 ? failed_wal_number : cur_wal_number_;
       if (io_status.GetScope() == IOStatus::IOErrorScope::kIOErrorScopeFile) {
         context.failed_wal_number = resolved_failed_wal_number;
-        if (failed_wal_sequence_start != 0 &&
+        // At one partition only: above one partition recovery's release
+        // records the gap [closed_low, last_allocated], which covers this
+        // range, and the tracker keys gaps by end sequence, so recording
+        // both trips its duplicate-end assertion when nothing allocated
+        // above the failed range (GC32 Q4). Nothing reads the tracker above
+        // one partition (GetUpdatesSince is NotSupported there).
+        if (NumWalPartitions() == 1 && failed_wal_sequence_start != 0 &&
             failed_wal_sequence_start <= failed_wal_sequence) {
           // Successful live resumption deliberately omits this write from the
           // database even if the physical WAL record is complete. Keep a
@@ -3541,8 +3561,21 @@ void DBImpl::ClearWalDurabilityBGError() {
       InstrumentedMutexLock l(&wal_durability_wait_mutex_);
       wal_durability_tracker_->Release(range.partition, range.low, range.high);
     }
-    PublishAppliedPrefix(range.partition, range.low, range.high,
-                         /*wal_record=*/true);
+    // The durability tracker holds the union [low, high], released above; the
+    // applied tracker holds the two registered ranges when applied_split is
+    // set (GC32 Q10). Completing the union against the two registered ranges
+    // matches neither: a debug build asserts and a release build leaves both
+    // registered, so no later write ever publishes.
+    if (range.applied_split != kMaxSequenceNumber &&
+        range.applied_split > range.low && range.applied_split <= range.high) {
+      PublishAppliedPrefix(range.partition, range.low, range.applied_split - 1,
+                           /*wal_record=*/true);
+      PublishAppliedPrefix(range.partition, range.applied_split, range.high,
+                           /*wal_record=*/true);
+    } else {
+      PublishAppliedPrefix(range.partition, range.low, range.high,
+                           /*wal_record=*/true);
+    }
   }
   failed_wal_ranges_.clear();
 }
@@ -3616,7 +3649,8 @@ Status DBImpl::BurnedWALIndexLanded(uint64_t wal_number, uint64_t wal_index,
   return s;
 }
 
-Status DBImpl::ExplainBurnedWALIndices(const WriteOptions& write_options) {
+Status DBImpl::ExplainBurnedWALIndices(const WriteOptions& write_options,
+                                       uint64_t file_scoped_retire_through) {
   mutex_.AssertHeld();
   assert(NumWalPartitions() > 1);
   std::vector<BurnedWalIndex> burned;
@@ -3626,6 +3660,30 @@ Status DBImpl::ExplainBurnedWALIndices(const WriteOptions& write_options) {
   }
   if (burned.empty()) {
     return Status::OK();
+  }
+  const size_t copied_count = burned.size();
+  if (file_scoped_retire_through != 0) {
+    // GC32 Q6: a file-scoped resume retires every WAL through
+    // file_scoped_retire_through, so a burned index in one of them needs no
+    // read-back, zeroing, void or sync, and must not depend on I/O to the
+    // file the error was scoped to. The replacement WALs' predecessor spans
+    // attest those WALs below the retirement bound, and the merge skips
+    // indices in a retired span without a void; a record that landed whole
+    // in a retired WAL is not recovered, since no recovery reads it.
+    std::vector<BurnedWalIndex> retained;
+    retained.reserve(burned.size());
+    for (const BurnedWalIndex& b : burned) {
+      if (b.wal_number <= file_scoped_retire_through) {
+        ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                       "[WAL recovery] Burned WAL index %" PRIu64
+                       " in retired WAL #%" PRIu64
+                       "; explained by the replacement's predecessor span",
+                       b.wal_index, b.wal_number);
+      } else {
+        retained.push_back(b);
+      }
+    }
+    burned.swap(retained);
   }
   // A file's void lower bounds must ascend.
   std::sort(burned.begin(), burned.end(),
@@ -3717,48 +3775,54 @@ Status DBImpl::ExplainBurnedWALIndices(const WriteOptions& write_options) {
     // that burned an index, so any recovery that reads such a WAL reads this
     // one too, and writes stay stopped until ClearBGError, so it holds no
     // data above them. The WAL mutex, held across the sync, excludes a gate
-    // sync; waiting out a claim excludes SyncWAL.
-    WalWriteMutexLock wal_lock(&WalWriteMutex(0));
-    while (CurrentWalOrNull(0) != nullptr && CurrentWalOrNull(0)->IsSyncing()) {
-      WalSyncCV(0).Wait();
-    }
-    LogWriterNumber* target = CurrentWalOrNull(0);
-    if (target == nullptr || target->number <= newest_burning_wal ||
-        target->writer->file() == nullptr ||
-        target->writer->file()->seen_error() ||
-        target->writer->last_wal_index_recorded() >= burned.front().wal_index) {
-      io_s = IOStatus::Corruption(
-          "WAL recovery found no healthy WAL to explain burned WAL index " +
-          std::to_string(burned.front().wal_index));
-    } else {
-      // Lets a test fault the target's real I/O.
-      TEST_SYNC_POINT_CALLBACK("DBImpl::ExplainBurnedWALIndices:Target",
-                               &target->number);
-      uint64_t last_voided = 0;
-      for (const BurnedWalIndex& b : burned) {
-        if (b.wal_index == last_voided || landed.count(b.wal_index) != 0) {
-          continue;
+    // sync; waiting out a claim excludes SyncWAL. When a file-scoped resume
+    // retired every burning WAL there is nothing to void; the callback below
+    // still runs so a test can fault this step.
+    if (!burned.empty()) {
+      WalWriteMutexLock wal_lock(&WalWriteMutex(0));
+      while (CurrentWalOrNull(0) != nullptr &&
+             CurrentWalOrNull(0)->IsSyncing()) {
+        WalSyncCV(0).Wait();
+      }
+      LogWriterNumber* target = CurrentWalOrNull(0);
+      if (target == nullptr || target->number <= newest_burning_wal ||
+          target->writer->file() == nullptr ||
+          target->writer->file()->seen_error() ||
+          target->writer->last_wal_index_recorded() >=
+              burned.front().wal_index) {
+        io_s = IOStatus::Corruption(
+            "WAL recovery found no healthy WAL to explain burned WAL index " +
+            std::to_string(burned.front().wal_index));
+      } else {
+        // Lets a test fault the target's real I/O.
+        TEST_SYNC_POINT_CALLBACK("DBImpl::ExplainBurnedWALIndices:Target",
+                                 &target->number);
+        uint64_t last_voided = 0;
+        for (const BurnedWalIndex& b : burned) {
+          if (b.wal_index == last_voided || landed.count(b.wal_index) != 0) {
+            continue;
+          }
+          io_s = target->writer->AddWALIndexVoidRecord(
+              write_options, b.wal_index, b.wal_index);
+          if (!io_s.ok()) {
+            break;
+          }
+          last_voided = b.wal_index;
         }
-        io_s = target->writer->AddWALIndexVoidRecord(write_options, b.wal_index,
-                                                     b.wal_index);
-        if (!io_s.ok()) {
-          break;
+        // A later recovery rotates past this WAL rather than reusing it.
+        WalEmpty(0) = false;
+        if (io_s.ok()) {
+          io_s = target->writer->WriteBuffer(write_options);
         }
-        last_voided = b.wal_index;
-      }
-      // A later recovery rotates past this WAL rather than reusing it.
-      WalEmpty(0) = false;
-      if (io_s.ok()) {
-        io_s = target->writer->WriteBuffer(write_options);
-      }
-      IOOptions opts;
-      if (io_s.ok()) {
-        io_s = WritableFileWriter::PrepareIOOptions(write_options, opts);
-      }
-      if (io_s.ok()) {
-        bool seen_error = false;
-        io_s = target->writer->file()->Sync(
-            opts, immutable_db_options_.use_fsync, &seen_error);
+        IOOptions opts;
+        if (io_s.ok()) {
+          io_s = WritableFileWriter::PrepareIOOptions(write_options, opts);
+        }
+        if (io_s.ok()) {
+          bool seen_error = false;
+          io_s = target->writer->file()->Sync(
+              opts, immutable_db_options_.use_fsync, &seen_error);
+        }
       }
     }
     TEST_SYNC_POINT_CALLBACK("DBImpl::ExplainBurnedWALIndices:io_s", &io_s);
@@ -3778,10 +3842,12 @@ Status DBImpl::ExplainBurnedWALIndices(const WriteOptions& write_options) {
     return io_s;
   }
   {
-    // Only what was copied above: a failure since may have burned more.
+    // Only what was copied above: a failure since may have burned more. The
+    // count, not the remainder's size: entries a file-scoped resume dropped
+    // as retired leave the list too.
     InstrumentedMutexLock l(&wal_durability_wait_mutex_);
     burned_wal_indices_.erase(burned_wal_indices_.begin(),
-                              burned_wal_indices_.begin() + burned.size());
+                              burned_wal_indices_.begin() + copied_count);
   }
   return Status::OK();
 }

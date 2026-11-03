@@ -452,6 +452,7 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
 
   if (context.IsWALWriteErrorRecovery()) {
     ExtendWALRecoveryCutoff(context.failed_wal_number);
+    TEST_SYNC_POINT("DBImpl::ResumeImpl:AfterExtendCutoff");
   }
 
   // With two_write_queues=true, sequence numbers are allocated via
@@ -488,14 +489,19 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
   if (s.ok() && context.IsWALWriteErrorRecovery()) {
     const bool has_blob_direct_write =
         HasAnyBlobDirectWriteColumnFamilyWithLockHeld();
+    // GC32 Q2 (D-F1a (i)): MANIFEST WAL tracking no longer refuses a
+    // file-scoped resume above one partition; it still refuses at N=1, with
+    // the same message. Every other member still refuses everywhere.
+    const bool refuse_tracking =
+        immutable_db_options_.track_and_verify_wals_in_manifest &&
+        NumWalPartitions() == 1;
     if (immutable_db_options_.manual_wal_flush ||
         immutable_db_options_.allow_2pc || two_write_queues_ ||
         immutable_db_options_.enable_pipelined_write ||
         immutable_db_options_.unordered_write ||
         immutable_db_options_.recycle_log_file_num != 0 ||
         immutable_db_options_.WAL_ttl_seconds != 0 ||
-        immutable_db_options_.WAL_size_limit_MB != 0 ||
-        immutable_db_options_.track_and_verify_wals_in_manifest ||
+        immutable_db_options_.WAL_size_limit_MB != 0 || refuse_tracking ||
         immutable_db_options_.track_and_verify_wals || has_blob_direct_write) {
       ROCKS_LOG_WARN(
           immutable_db_options_.info_log,
@@ -563,8 +569,12 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
     }
   }
 
+  // At one partition the reservation below keeps upstream's shape and order
+  // (GC32 Q4 gates it to N=1; above one partition it never ran, because the
+  // guard above always refused tracking there). Above one partition the
+  // reservation runs after the atomic flush instead; see below.
   if (s.ok() && context.IsWALWriteErrorRecovery() &&
-      context.failed_wal_sequence > 0) {
+      context.failed_wal_sequence > 0 && NumWalPartitions() == 1) {
     // A WAL error can be reported after the whole record reached storage but
     // before its sequence range was published. Persist the reservation before
     // admitting later writes so they cannot reuse an ambiguous sequence. This
@@ -659,6 +669,59 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
                      "DB resume requested but failed due to Flush failure [%s]",
                      s.ToString().c_str());
     }
+    TEST_SYNC_POINT("DBImpl::ResumeImpl:AfterFlush");
+  }
+
+  // GC32 Q4: above one partition the persisted reservation covers the top of
+  // the fence, and it is persisted after the atomic flush, not before it.
+  // Persisting first would raise the published LastSequence while the failed
+  // and fenced entries still sit in the memtables, exposing them to
+  // concurrent reads: LogAndApply applies the edit's last sequence to the
+  // versions, and SetLastSequence never lowers it again. After the flush
+  // those entries are dropped, so the raise is safe. Nothing allocates
+  // between here and the release (writes are stopped), so the value read
+  // here is the last sequence allocated when the ranges release. This also
+  // covers a failed gate sync, whose context carries no sequence range.
+  if (s.ok() && context.IsWALWriteErrorRecovery() && NumWalPartitions() > 1) {
+    // No RecordIndeterminateWriteSequence for the failed range here: recovery's
+    // release records the gap [closed_low, last_allocated], which covers it,
+    // and the tracker keys gaps by end sequence.
+    const SequenceNumber reserve = std::max(context.failed_wal_sequence,
+                                            versions_->LastAllocatedSequence());
+    if (reserve > 0) {
+      if (reserve > versions_->LastAllocatedSequence()) {
+        versions_->SetLastAllocatedSequence(reserve);
+      }
+      if (reserve > versions_->LastPublishedSequence()) {
+        versions_->SetLastPublishedSequence(reserve);
+      }
+      if (reserve > versions_->LastSequence()) {
+        versions_->SetLastSequence(reserve);
+      }
+      VersionEdit edit;
+      edit.SetLastSequence(reserve);
+      auto cfh =
+          static_cast_with_check<ColumnFamilyHandleImpl>(default_cf_handle_);
+      assert(cfh);
+      s = versions_->LogAndApply(cfh->cfd(), read_options, write_options, &edit,
+                                 &mutex_, directories_.GetDbDir());
+      if (!s.ok() && versions_->io_status().IsIOError()) {
+        error_handler_.SetBGError(versions_->io_status(),
+                                  BackgroundErrorReason::kManifestWrite);
+      }
+      if (s.ok()) {
+        ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                       "[WAL recovery] Persisted sequence reservation through "
+                       "#%" PRIu64,
+                       reserve);
+      } else {
+        ROCKS_LOG_WARN(immutable_db_options_.info_log,
+                       "[WAL recovery] Failed to persist sequence reservation "
+                       "through #%" PRIu64 ": %s",
+                       reserve, s.ToString().c_str());
+      }
+    }
+    TEST_SYNC_POINT("DBImpl::ResumeImpl:AfterReservation");
   }
 
   if (s.ok() && context.IsWALWriteErrorRecovery()) {
@@ -681,24 +744,44 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
     mutex_.Unlock();
     {
       size_t retired_wal_count = 0;
-      bool replacement_installed;
-      {
-        // The replacement WAL is installed by rotation, which targets
-        // partition 0.
-        WalWriteMutexLock wal_lock(&WalWriteMutex(0));
-        const LogWriterNumber* current_wal = CurrentWalOrNull(0);
-        replacement_installed = current_wal != nullptr &&
-                                current_wal->number > context.failed_wal_number;
+      // GC32 Q3: the coupled rotation replaces every partition's WAL; the
+      // check covers every partition, not just partition 0. The numbers are
+      // collected one partition at a time (see the LOCK ORDER note), then
+      // verified together.
+      std::vector<uint64_t> current_wal_numbers;
+      current_wal_numbers.reserve(NumWalPartitions());
+      for (size_t p = 0; p < NumWalPartitions(); ++p) {
+        WalWriteMutexLock wal_lock(&WalWriteMutex(p));
+        const LogWriterNumber* current_wal = CurrentWalOrNull(p);
+        current_wal_numbers.push_back(
+            current_wal != nullptr ? current_wal->number : 0);
       }
-      if (!replacement_installed) {
-        s = Status::Corruption(
-            "WAL write error recovery did not install a replacement WAL "
-            "after WAL " +
-            std::to_string(context.failed_wal_number));
+      // A test-only hook may mark a partition unreplaced.
+      TEST_SYNC_POINT_CALLBACK("DBImpl::ResumeImpl:CheckReplacement",
+                               &current_wal_numbers);
+      size_t unreplaced_partition = current_wal_numbers.size();
+      for (size_t p = 0; p < current_wal_numbers.size(); ++p) {
+        if (current_wal_numbers[p] <= context.failed_wal_number) {
+          unreplaced_partition = p;
+          break;
+        }
+      }
+      if (unreplaced_partition != current_wal_numbers.size()) {
+        // The partition-0 text keeps its exact upstream wording, so the N=1
+        // failure reads as before.
+        std::string detail =
+            "WAL write error recovery did not install a replacement WAL ";
+        if (unreplaced_partition != 0) {
+          detail +=
+              "on partition " + std::to_string(unreplaced_partition) + " ";
+        }
+        detail += "after WAL " + std::to_string(context.failed_wal_number);
+        s = Status::Corruption(detail);
       } else {
         // One partition at a time: the wait on WalSyncCV(p) must hold only
         // WalWriteMutex(p) (see the LOCK ORDER note).
         for (size_t p = 0; p < NumWalPartitions(); ++p) {
+          TEST_SYNC_POINT("DBImpl::ResumeImpl:InRetireLoop");
           WalWriteMutexLock wal_lock(&WalWriteMutex(p));
           while (true) {
             LogWriterNumber* oldest = OldestWalOrNull(p);
@@ -746,8 +829,12 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
   }
 
   if (s.ok() && NumWalPartitions() > 1) {
-    // Before ClearBGError admits writes above a burned index.
-    s = ExplainBurnedWALIndices(write_options);
+    // Before ClearBGError admits writes above a burned index. A file-scoped
+    // resume retires the burning WALs, whose indices the replacement's
+    // predecessor spans explain; only a retryable resume reads them back.
+    s = ExplainBurnedWALIndices(write_options, context.IsWALWriteErrorRecovery()
+                                                   ? context.failed_wal_number
+                                                   : 0);
   }
 
   JobContext job_context(0);

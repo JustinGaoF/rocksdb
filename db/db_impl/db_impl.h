@@ -1614,6 +1614,27 @@ class DBImpl : public DB
     return wal_durability_tracker_->DurableUpto(partition);
   }
 
+  // Partition p's lowest applied-but-unpublished sequence, or
+  // WalDurabilityTracker::kIdle. Tests use it to prove recovery released
+  // every applied range a failed group registered.
+  uint64_t TEST_AppliedPendingLow(size_t partition) const {
+    return applied_tracker_->PendingLow(partition);
+  }
+
+  // Highest sequence allocated so far. Tests use it to prove a write after
+  // recovery, or after a reopen that follows it, never reuses a sequence a
+  // failed or fenced write allocated.
+  SequenceNumber TEST_LastAllocatedSequence() const {
+    return versions_->LastAllocatedSequence();
+  }
+
+  // Ranges pinned for recovery's release. Tests use it to prove a failed
+  // resume keeps them and a successful one releases them.
+  size_t TEST_FailedWalRangesCount() {
+    InstrumentedMutexLock l(&mutex_);
+    return failed_wal_ranges_.size();
+  }
+
   // The inclusive WAL-number cutoff a file-scoped WAL failure quarantines.
   uint64_t TEST_WalRecoveryCutoff() const {
     return wal_recovery_cutoff_.load(std::memory_order_acquire);
@@ -1644,6 +1665,13 @@ class DBImpl : public DB
   void TEST_SetNextWALIndex(uint64_t next_wal_index) {
     SequenceWalIndexLock lock(this);
     next_wal_index_ = next_wal_index;
+  }
+
+  // Next WAL index to allocate. Tests use it to prove post-resume indices
+  // continue above every pre-resume index.
+  uint64_t TEST_GetNextWALIndex() {
+    SequenceWalIndexLock lock(this);
+    return next_wal_index_;
   }
 #endif  // NDEBUG
 
@@ -3553,7 +3581,8 @@ class DBImpl : public DB
   // them as a lost tail. Called by ResumeImpl,
   // with mutex_ held, before ClearBGError; releases mutex_ around the I/O. On
   // failure the indices stay pending and the DB stays write-stopped.
-  Status ExplainBurnedWALIndices(const WriteOptions& write_options);
+  Status ExplainBurnedWALIndices(const WriteOptions& write_options,
+                                 uint64_t file_scoped_retire_through = 0);
 
   // Whether any burned WAL index still awaits explanation. The retry-flush
   // recovery path rotates no WALs, so with burns pending Resume takes the
@@ -3757,11 +3786,15 @@ class DBImpl : public DB
   // which the failed group registered [failed_wal_sequence_start,
   // failed_wal_sequence] for N>1 durability and publication; the range is
   // kept in failed_wal_ranges_ until recovery clears the error.
+  // `applied_split`, when inside the range, is the first sequence of the
+  // sync writers' range of a sync-led group, whose async writers registered
+  // the leading applied range separately; recovery completes both (GC32 Q10).
   static constexpr size_t kNoPinnedWalRange = SIZE_MAX;
   void WALIOStatusCheck(const IOStatus& status, uint64_t failed_wal_number = 0,
                         SequenceNumber failed_wal_sequence = 0,
                         SequenceNumber failed_wal_sequence_start = 0,
-                        size_t pinned_wal_partition = kNoPinnedWalRange);
+                        size_t pinned_wal_partition = kNoPinnedWalRange,
+                        SequenceNumber applied_split = kMaxSequenceNumber);
 
   // Extends the inclusive WAL-number cutoff that must not receive more I/O.
   // This is lock-free because a WAL error can race with public SyncWAL().
@@ -5374,6 +5407,12 @@ class DBImpl : public DB
     size_t partition;
     SequenceNumber low;
     SequenceNumber high;
+    // First sequence of the sync writers' range when [low, high] covers a
+    // sync-led group whose async writers registered the leading applied range
+    // [low, applied_split - 1] separately (GC32 Q10); kMaxSequenceNumber when
+    // the applied tracker holds [low, high] as one range. The durability
+    // tracker always holds the union [low, high].
+    SequenceNumber applied_split = kMaxSequenceNumber;
   };
   std::vector<FailedWalRange> failed_wal_ranges_;
   // N>1 WAL indices whose append reported failure, with the WAL that burned
