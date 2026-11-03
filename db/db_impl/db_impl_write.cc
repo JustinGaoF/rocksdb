@@ -1583,28 +1583,43 @@ Status DBImpl::WriteImpl(
     // that nobody else can be writing to these particular stats.
     // We're optimistic, updating the stats before we successfully
     // commit.  That lets us release our leader status early.
-    // Above one partition (no two_write_queues) each partition's leader adds
-    // to its own shard, which no other leader writes.
+    // Branches rather than a per-stat lambda: with the completion gate's
+    // capture below, they keep WriteImpl's stack frame as before GC31, and
+    // so the stack placement of the pipelined writers below it, which
+    // one-partition throughput depends on.
     auto stats = default_cf_internal_stats_;
-    auto add_db_stat = [&](InternalStats::InternalDBStatsType type,
-                           uint64_t value) {
-      if (NumWalPartitions() > 1 && !two_write_queues_) {
-        stats->AddDBStatsToShard(type, value, wal_context.wal_partition,
-                                 /*concurrent=*/false);
-      } else {
-        stats->AddDBStats(type, value, concurrent_update);
-      }
-    };
-    add_db_stat(InternalStats::kIntStatsNumKeysWritten, total_count);
-    RecordTick(stats_, NUMBER_KEYS_WRITTEN, total_count);
-    add_db_stat(InternalStats::kIntStatsBytesWritten, total_byte_size);
-    RecordTick(stats_, BYTES_WRITTEN, total_byte_size);
-    add_db_stat(InternalStats::kIntStatsWriteDoneBySelf, 1);
-    RecordTick(stats_, WRITE_DONE_BY_SELF);
     auto write_done_by_other = write_group.size - 1;
+    if (NumWalPartitions() > 1 && !two_write_queues_) {
+      // Above one partition (no two_write_queues) each partition's leader
+      // adds to its own shard, which no other leader writes.
+      const size_t shard = wal_context.wal_partition;
+      stats->AddDBStatsToShard(InternalStats::kIntStatsNumKeysWritten,
+                               total_count, shard, /*concurrent=*/false);
+      stats->AddDBStatsToShard(InternalStats::kIntStatsBytesWritten,
+                               total_byte_size, shard, /*concurrent=*/false);
+      stats->AddDBStatsToShard(InternalStats::kIntStatsWriteDoneBySelf, 1,
+                               shard, /*concurrent=*/false);
+      if (write_done_by_other > 0) {
+        stats->AddDBStatsToShard(InternalStats::kIntStatsWriteDoneByOther,
+                                 write_done_by_other, shard,
+                                 /*concurrent=*/false);
+      }
+    } else {
+      stats->AddDBStats(InternalStats::kIntStatsNumKeysWritten, total_count,
+                        concurrent_update);
+      stats->AddDBStats(InternalStats::kIntStatsBytesWritten, total_byte_size,
+                        concurrent_update);
+      stats->AddDBStats(InternalStats::kIntStatsWriteDoneBySelf, 1,
+                        concurrent_update);
+      if (write_done_by_other > 0) {
+        stats->AddDBStats(InternalStats::kIntStatsWriteDoneByOther,
+                          write_done_by_other, concurrent_update);
+      }
+    }
+    RecordTick(stats_, NUMBER_KEYS_WRITTEN, total_count);
+    RecordTick(stats_, BYTES_WRITTEN, total_byte_size);
+    RecordTick(stats_, WRITE_DONE_BY_SELF);
     if (write_done_by_other > 0) {
-      add_db_stat(InternalStats::kIntStatsWriteDoneByOther,
-                  write_done_by_other);
       RecordTick(stats_, WRITE_DONE_BY_OTHER, write_done_by_other);
     }
     RecordInHistogram(stats_, BYTES_PER_WRITE, total_byte_size);
@@ -1801,8 +1816,12 @@ Status DBImpl::WriteImpl(
         !sync_group) {
       // An async write never syncs; its gate waits only for every record at
       // or below it to be written, and for its range to be published.
+      // gate_low is captured, unused, for WriteImpl's stack frame (see the
+      // DB stats above).
+      const SequenceNumber gate_low = current_sequence;
       const SequenceNumber gate_target = last_sequence;
-      write_group.completion_gate = [this, gate_target]() {
+      write_group.completion_gate = [this, gate_low, gate_target]() {
+        (void)gate_low;
         return RunCompletionGate(gate_target, /*published=*/true);
       };
     } else if (sync_group && io_s.ok()) {
@@ -2890,10 +2909,7 @@ Status DBImpl::PreprocessWrite(const WriteOptions& write_options,
   if (UNLIKELY(status.ok() && write_buffer_manager_->ShouldFlush())) {
     if (write_buffer_manager_->TryAcquireLocalFlush()) {
       InstrumentedMutexLock l(&mutex_);
-      CloseMemTableSwitchGate();
-      WaitForPendingWrites();
-      status = HandleWriteBufferManagerFlush(write_context);
-      OpenMemTableSwitchGate();
+      status = QuiescedWriteBufferManagerFlush(write_context);
     }
   }
 
@@ -4658,7 +4674,7 @@ IOStatus DBImpl::ConcurrentWriteGroupToWAL(
 
 Status DBImpl::WriteRecoverableState() {
   mutex_.AssertHeld();
-  if (!cached_recoverable_state_empty_ && NumWalPartitions() > 1) {
+  if (NumWalPartitions() > 1 && !cached_recoverable_state_empty_) {
     // Every leader is excluded: the highest-sequence slot supersedes every
     // other, as a single highest-sequence state would.
     RecoverableStateSlot* highest = nullptr;
@@ -5036,6 +5052,49 @@ Status DBImpl::HandleWriteBufferManagerFlush(WriteContext* write_context) {
   return status;
 }
 
+Status DBImpl::QuiescedWriteBufferManagerFlush(WriteContext* write_context) {
+  mutex_.AssertHeld();
+  // As for SwitchWAL() in PreprocessWrite(): closing the gate releases
+  // mutex_, so decide again once it is closed. A column family that becomes
+  // selectable after a skip is picked up by the next write group, whose
+  // ShouldFlush() check still holds.
+  const bool partitioned = NumWalPartitions() > 1;
+  if (!partitioned || WriteBufferManagerFlushWouldAct()) {
+    TEST_SYNC_POINT("DBImpl::QuiescedWriteBufferManagerFlush:WouldAct");
+    CloseMemTableSwitchGate();
+    if (!partitioned || WriteBufferManagerFlushWouldAct()) {
+      WaitForPendingWrites();
+      const Status status = HandleWriteBufferManagerFlush(write_context);
+      OpenMemTableSwitchGate();
+      return status;
+    }
+    OpenMemTableSwitchGate();
+  }
+  // What HandleWriteBufferManagerFlush() does when it selects nothing.
+  if (write_buffer_manager_->ShouldTrackFlushInitiator()) {
+    RefreshFlushableMemAccounting();
+  }
+  MaybeScheduleFlushOrCompaction();
+  return Status::OK();
+}
+
+bool DBImpl::WriteBufferManagerFlushWouldAct() {
+  mutex_.AssertHeld();
+  // As HandleWriteBufferManagerFlush() selects; MaybeFlushStatsCF() adds to
+  // a non-empty selection only.
+  if (immutable_db_options_.atomic_flush) {
+    autovector<ColumnFamilyData*> cfds;
+    SelectColumnFamiliesForAtomicFlush(&cfds);
+    return !cfds.empty();
+  }
+  const WriteBufferFlushPolicy policy = write_buffer_manager_->flush_policy();
+  const bool include_waiting_immutable =
+      policy == WriteBufferFlushPolicy::kFlushLargestAcrossDBs;
+  // The largest and the oldest flushable column family are both set or
+  // both null.
+  return CollectFlushableCFs(include_waiting_immutable).largest != nullptr;
+}
+
 uint64_t DBImpl::GetMaxTotalWalSize() const {
   uint64_t max_total_wal_size =
       max_total_wal_size_.load(std::memory_order_acquire);
@@ -5209,10 +5268,7 @@ Status DBImpl::WriteBufferManagerStallWrites(size_t wal_partition,
     if (!retry_local_flush || !write_buffer_manager_->ShouldStall()) {
       return Status::OK();
     }
-    CloseMemTableSwitchGate();
-    WaitForPendingWrites();
-    Status status = HandleWriteBufferManagerFlush(write_context);
-    OpenMemTableSwitchGate();
+    Status status = QuiescedWriteBufferManagerFlush(write_context);
     if (!status.ok()) {
       return status;
     }

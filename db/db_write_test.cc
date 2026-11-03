@@ -17898,6 +17898,167 @@ TEST_P(DBWalAppendFailureTest, FailedSyncLedGroupReleasesEveryRegisteredRange) {
   }
 }
 
+namespace {
+// The number of immutable memtables of column family `cf` (a handle index).
+uint64_t GC33Immutable(DBTestBase* test, ColumnFamilyHandle* cf) {
+  uint64_t immutable = 0;
+  EXPECT_TRUE(test->dbfull()->GetIntProperty(
+      cf, DB::Properties::kNumImmutableMemTable, &immutable));
+  return immutable;
+}
+}  // namespace
+
+TEST_P(DBWritePartitionTest, WbmFlushQuiesceSkippedWhenNothingToSwitch) {
+  // GC33 Q3: above one partition a write-buffer-manager flush stops every
+  // partition only when it will switch a memtable or request a flush. The
+  // manager's memory is reserved past its limit, so ShouldFlush() stays
+  // true for every write group, and the blocked pools hold every flush. The
+  // first writes switch each partition's column family once; from then on
+  // each is flushing and nothing is selectable, so 200 writes from 8
+  // threads switch nothing and quiesce no partition. Fails at the base,
+  // where every write group that reaches the manager's branch quiesces.
+  // Neuter: drop the pre-check; every such group quiesces.
+  if (GetParam()) {
+    return;
+  }
+  constexpr size_t kPartitions = 8;
+  constexpr int kThreads = 8;
+  constexpr int kWritesPerThread = 25;
+  constexpr size_t kBufferSize = 1 << 20;
+  Options options = CurrentOptions();
+  options.write_buffer_size = 64 << 20;
+  options.avoid_flush_during_shutdown = true;
+  options.write_buffer_manager =
+      std::make_shared<WriteBufferManager>(kBufferSize);
+  OpenWithPartitions(kPartitions, options);
+  GC31BlockedPools pools(env_);
+  options.write_buffer_manager->ReserveMem(4 * kBufferSize);
+  ASSERT_TRUE(options.write_buffer_manager->ShouldFlush());
+  GC31Counter quiesces("DBImpl::WaitForPendingWrites:BeforeBlock");
+  auto switched = [&]() {
+    uint64_t total = 0;
+    for (const int cf : cf_for_partition_) {
+      total += std::min<uint64_t>(GC33Immutable(this, handles_[cf]), 1);
+    }
+    return total;
+  };
+  for (int i = 0; switched() < kPartitions; ++i) {
+    ASSERT_LT(i, 1000);
+    ASSERT_OK(Put(cf_for_partition_[i % kPartitions],
+                  "fill" + std::to_string(i), "v"));
+  }
+  std::vector<uint64_t> immutable_before;
+  for (ColumnFamilyHandle* handle : handles_) {
+    immutable_before.push_back(GC33Immutable(this, handle));
+  }
+  quiesces.Reset();
+  std::vector<port::Thread> threads;
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&, t] {
+      for (int i = 0; i < kWritesPerThread; ++i) {
+        ASSERT_OK(Put(cf_for_partition_[t % kPartitions],
+                      "t" + std::to_string(t) + "_" + std::to_string(i), "v"));
+      }
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  EXPECT_EQ(0, quiesces.Get());
+  for (size_t i = 0; i < handles_.size(); ++i) {
+    EXPECT_EQ(immutable_before[i], GC33Immutable(this, handles_[i])) << i;
+  }
+  EXPECT_EQ("v", Get(cf_for_partition_[kThreads - 1], "t7_24"));
+  options.write_buffer_manager->ScheduleFreeMem(4 * kBufferSize);
+  options.write_buffer_manager->FreeMem(4 * kBufferSize);
+}
+
+TEST_P(DBWritePartitionTest, WbmFlushDecidedAgainAfterGateCloses) {
+  // GC33 Q3, the decision after closing: the manager's memory is reserved
+  // past its limit, every partition's column family but partition 1's is
+  // flushing (the blocked pools hold the flushes), and partition 1's holds
+  // one record, so the next manager flush switches it. D and A both find
+  // that the flush acts. D closes the switch gate first and waits for C,
+  // held past the gate; A then waits for the gate. Once C is
+  // let go D switches partition 1's column family and opens the gate. A
+  // closes it, finds nothing selectable any more, and opens it again
+  // without draining any partition: one quiesce in all, D's.
+  // Neuter: decide only before closing; A drains too (two quiesces).
+  if (GetParam()) {
+    return;
+  }
+  constexpr size_t kPartitions = 4;
+  constexpr size_t kBufferSize = 1 << 20;
+  Options options = CurrentOptions();
+  options.write_buffer_size = 64 << 20;
+  options.avoid_flush_during_shutdown = true;
+  options.write_buffer_manager =
+      std::make_shared<WriteBufferManager>(kBufferSize);
+  OpenWithPartitions(kPartitions, options);
+  GC31BlockedPools pools(env_);
+  options.write_buffer_manager->ReserveMem(4 * kBufferSize);
+  ColumnFamilyHandle* const target = handles_[cf_for_partition_[1]];
+  auto others_switched = [&]() {
+    for (size_t p = 0; p < kPartitions; ++p) {
+      if (p != 1 && GC33Immutable(this, handles_[cf_for_partition_[p]]) == 0) {
+        return false;
+      }
+    }
+    return true;
+  };
+  for (int i = 0; !others_switched(); ++i) {
+    ASSERT_LT(i, 1000);
+    const size_t p = std::vector<size_t>{0, 2, 3}[i % 3];
+    ASSERT_OK(Put(cf_for_partition_[p], "fill" + std::to_string(i), "v"));
+  }
+  ASSERT_EQ(0, GC33Immutable(this, target));
+
+  GC30Write c;
+  GC30Write d;
+  GC30Write a;
+  // C is held past the gate, before it takes a sequence, so the next write
+  // does not wait for it.
+  std::atomic<std::thread::id> c_id;
+  GC28Hold c_held;
+  c_held.Arm("DBImpl::WriteImpl:BeforeLeaderEnters", GC28OnThread(&c_id));
+  c.Start([&] {
+    c_id.store(std::this_thread::get_id());
+    return Put(cf_for_partition_[2], "c", "v");
+  });
+  ASSERT_TRUE(c_held.WaitHeld());
+  // Nothing is selectable when this write checks, and it leaves partition
+  // 1's column family flushable.
+  ASSERT_OK(Put(cf_for_partition_[1], "y", "v"));
+  ASSERT_EQ(0, GC33Immutable(this, target));
+  GC31Counter quiesces("DBImpl::WaitForPendingWrites:BeforeBlock");
+  GC28Hold d_waits;
+  d_waits.Arm("DBImpl::CloseMemTableSwitchGate:WaitForLeaders", nullptr,
+              /*hold=*/false);
+  d.Start([&] { return Put(cf_for_partition_[0], "d", "v"); });
+  ASSERT_TRUE(d_waits.WaitHits(1));
+  std::atomic<std::thread::id> a_id;
+  GC28Hold a_decided;
+  a_decided.Arm("DBImpl::QuiescedWriteBufferManagerFlush:WouldAct",
+                GC28OnThread(&a_id), /*hold=*/false);
+  a.Start([&] {
+    a_id.store(std::this_thread::get_id());
+    return Put(cf_for_partition_[3], "a", "v");
+  });
+  ASSERT_TRUE(a_decided.WaitHits(1));
+  // A now waits for the gate D closed.
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  EXPECT_FALSE(a.Done());
+  c_held.Release();
+  ASSERT_OK(c.Join());
+  ASSERT_OK(d.Join());
+  ASSERT_OK(a.Join());
+  EXPECT_EQ(1, GC33Immutable(this, target));
+  EXPECT_EQ(1, quiesces.Get());
+  EXPECT_EQ("v", Get(cf_for_partition_[3], "a"));
+  options.write_buffer_manager->ScheduleFreeMem(4 * kBufferSize);
+  options.write_buffer_manager->FreeMem(4 * kBufferSize);
+}
+
 TEST_P(DBWalAppendFailureTest,
        IngestionBehindParkedWriteAssignsUnheldSequence) {
   // Q9: a higher write parks in its completion gate behind a lower write held
@@ -23064,6 +23225,303 @@ TEST_P(DBWalPartitionCoverageTest, GC27PointInTimeStopKeepsLowestWal) {
       image, 2, options,
       {{kPointInTime, Status::kCorruption, 0, "Column family inconsistency"}},
       {});
+}
+
+namespace {
+// GC33 Q2's DB-level tests: a DB opened by OpenCopy and its handles.
+struct GC33Db {
+  std::vector<ColumnFamilyHandle*> handles;
+  std::unique_ptr<DB> db;
+
+  void Close() {
+    for (ColumnFamilyHandle* handle : handles) {
+      ASSERT_OK(db->DestroyColumnFamilyHandle(handle));
+    }
+    handles.clear();
+    db.reset();
+  }
+  void Put(int cf, const std::string& key) {
+    ASSERT_OK(db->Put(WriteOptions(), handles[cf], key,
+                      DBWalPartitionCoverageTest::ValueOf(key)));
+  }
+  bool Has(int cf, const std::string& key) {
+    std::string value;
+    const Status s = db->Get(ReadOptions(), handles[cf], key, &value);
+    EXPECT_TRUE(s.ok() || s.IsNotFound()) << key << ": " << s.ToString();
+    if (s.ok()) {
+      EXPECT_EQ(DBWalPartitionCoverageTest::ValueOf(key), value) << key;
+    }
+    return s.ok();
+  }
+  // '1' for each of reissued0..7 present, '0' for each absent; `cfs` names
+  // each one's column family.
+  std::string Reissued(const std::vector<int>& cfs) {
+    std::string bits;
+    for (size_t i = 0; i < cfs.size(); ++i) {
+      bits += Has(cfs[i], "reissued" + std::to_string(i)) ? '1' : '0';
+    }
+    return bits;
+  }
+  // The first crash image's acknowledged writes are present and its cut ones
+  // absent.
+  void AssertFirstImage(int cf0, int cf1) {
+    EXPECT_TRUE(Has(cf0, "kept_0"));
+    EXPECT_TRUE(Has(cf1, "kept_1"));
+    EXPECT_FALSE(Has(cf0, "lost")) << "recovered although it was cut";
+    for (int i = 0; i < 4; ++i) {
+      EXPECT_FALSE(Has(cf1, "above_" + std::to_string(i)))
+          << "recovered although it was cut";
+    }
+  }
+};
+
+// The first crash image of GC33 Q2's DB-level tests, as in
+// GC27SecondPointInTimeReopenAfterUnreadVoid at two partitions (cf0 on
+// partition 0, cf1 on partition 1): partition 0 loses its unsynced `lost`;
+// partition 1 holds four records above it and then the void of a burned
+// index.
+void GC33LostRecordBelowVoid(DBWalPartitionCoverageTest* fixture, Env* env,
+                             const std::string& dbname, const Options& options,
+                             int cf0, int cf1) {
+  GC33Db d;
+  ASSERT_OK(fixture->OpenCopy(dbname, 2, options,
+                              DBWalPartitionCoverageTest::kPointInTime,
+                              &d.handles, &d.db));
+  d.Put(cf0, "kept_0");
+  d.Put(cf1, "kept_1");
+  DBImpl* impl = static_cast_with_check<DBImpl>(d.db->GetRootDB());
+  const uint64_t lost_wal = impl->TEST_CurrentWalNumber(0);
+  uint64_t lost_begin = 0;
+  ASSERT_OK(env->GetFileSize(LogFileName(dbname, lost_wal), &lost_begin));
+  d.Put(cf0, "lost");
+  for (int i = 0; i < 4; ++i) {
+    d.Put(cf1, "above_" + std::to_string(i));
+  }
+  // Burns cf1's next index: the record fails its protection check, and the
+  // index is covered by a void in partition 1's WAL.
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WriteToWAL:log_entry", [](void* arg) {
+        Slice* const log_entry = static_cast<Slice*>(arg);
+        char* const data = const_cast<char*>(log_entry->data());
+        data[log_entry->size() - 1] ^= 0xff;
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  WriteBatch burned(/*reserved_bytes=*/0, /*max_bytes=*/0,
+                    /*protection_bytes_per_key=*/8,
+                    /*default_cf_ts_sz=*/0);
+  ASSERT_OK(burned.Put(d.handles[cf1], "burned", "v"));
+  ASSERT_NOK(d.db->Write(WriteOptions(), &burned));
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:log_entry");
+  d.Close();
+  // The crash drops partition 0's unsynced `lost`.
+  ASSERT_OK(test::TruncateFile(env, LogFileName(dbname, lost_wal), lost_begin));
+}
+}  // namespace
+
+// GC33 Q2 (GC31 comparison's lost-reissue probe): a superseded void at or
+// above its declarer's start does not explain its index once the reissued
+// record there is lost. The point-in-time reopen of the first crash image
+// stops at `lost`, declares partition 1's WAL obsolete from the cut (its void
+// included), and reissues eight writes, all to partition 1 except
+// reissued<k>, which goes to partition 0; the second crash drops only
+// reissued<k>. Point-in-time then recovers exactly reissued0..k-1, and
+// tolerate and absolute fail closed on the hole, as before GC31; k=7 is a
+// lost tail, which every mode opens without. Fails at the GC31 base for k=4,
+// where the reissued record lands on the void's index: the superseded void
+// explains the hole, and every mode opens with reissued5..7 above it
+// (11110111).
+// Neuter: let every superseded void explain its index; k=4 fails as at the
+// base.
+TEST_P(DBWalPartitionCoverageTest, GC33LostReissueAtSupersededVoidKeepsPrefix) {
+  if (GetParam()) {
+    return;
+  }
+  for (int k = 2; k <= 7; ++k) {
+    SCOPED_TRACE("k=" + std::to_string(k));
+    Options options = IndexedWalOptions(CurrentOptions());
+    options.disable_auto_compactions = true;
+    options.avoid_flush_during_recovery = true;
+    DestroyAndReopen(options);
+    OpenWithPartitions(2, options);
+    const int cf0 = cf_for_partition_[0];
+    const int cf1 = cf_for_partition_[1];
+    Close();
+    GC33LostRecordBelowVoid(this, env_, dbname_, options, cf0, cf1);
+    ASSERT_FALSE(HasFatalFailure());
+
+    GC33Db d;
+    ASSERT_OK(OpenCopy(dbname_, 2, options, kPointInTime, &d.handles, &d.db));
+    d.AssertFirstImage(cf0, cf1);
+    const uint64_t new_p0 = static_cast_with_check<DBImpl>(d.db->GetRootDB())
+                                ->TEST_CurrentWalNumber(0);
+    std::vector<int> cfs;
+    uint64_t cut = 0;
+    for (int i = 0; i < 8; ++i) {
+      if (i == k) {
+        ASSERT_OK(env_->GetFileSize(LogFileName(dbname_, new_p0), &cut));
+      }
+      cfs.push_back(i == k ? cf0 : cf1);
+      d.Put(cfs.back(), "reissued" + std::to_string(i));
+    }
+    d.Close();
+    // The second crash drops reissued<k> only.
+    ASSERT_OK(test::TruncateFile(env_, LogFileName(dbname_, new_p0), cut));
+
+    const std::string expected = std::string(k, '1') + std::string(8 - k, '0');
+    const std::string copy = dbname_ + "_gc33_q2_lost_reissue";
+    for (const WALRecoveryMode mode : {kPointInTime, kTolerate, kAbsolute}) {
+      SCOPED_TRACE("wal_recovery_mode=" +
+                   std::to_string(static_cast<int>(mode)));
+      CopyDir(dbname_, copy);
+      const Status s = OpenCopy(copy, 2, options, mode, &d.handles, &d.db);
+      if (mode == kPointInTime || k == 7) {
+        ASSERT_OK(s);
+        d.AssertFirstImage(cf0, cf1);
+        EXPECT_EQ(expected, d.Reissued(cfs));
+        d.Close();
+      } else {
+        if (s.ok()) {
+          ADD_FAILURE() << "opened with " << d.Reissued(cfs);
+          d.Close();
+          continue;
+        }
+        EXPECT_TRUE(s.IsCorruption()) << s.ToString();
+        EXPECT_NE(std::string::npos,
+                  s.ToString().find("unexplained hole at wal_index " +
+                                    std::to_string(k + 4) + " "))
+            << s.ToString();
+      }
+    }
+  }
+}
+
+// GC33 Q2 (GC31 comparison's "variant 2"): GC19's exception clears a pending
+// discard only for a void the open seeded past. The second reopen's eight
+// writes go to partitions {1, 1, 1, 0, 0, 1, 1, 1}, so reissued3 lands on a
+// superseded record's index and reissued4 on the superseded void's; the
+// second crash drops both. Point-in-time recovers reissued0..2, tolerate and
+// absolute fail closed on the hole at wal_index 7, and skip opens skipping
+// the holes (11100111). Passes at the GC31 base.
+// Neuter: widen the exception to every superseded void; every mode opens
+// with 11100111.
+TEST_P(DBWalPartitionCoverageTest, GC33PendingDiscardKeepsPrefix) {
+  if (GetParam()) {
+    return;
+  }
+  Options options = IndexedWalOptions(CurrentOptions());
+  options.disable_auto_compactions = true;
+  options.avoid_flush_during_recovery = true;
+  DestroyAndReopen(options);
+  OpenWithPartitions(2, options);
+  const int cf0 = cf_for_partition_[0];
+  const int cf1 = cf_for_partition_[1];
+  Close();
+  GC33LostRecordBelowVoid(this, env_, dbname_, options, cf0, cf1);
+  ASSERT_FALSE(HasFatalFailure());
+
+  GC33Db d;
+  ASSERT_OK(OpenCopy(dbname_, 2, options, kPointInTime, &d.handles, &d.db));
+  d.AssertFirstImage(cf0, cf1);
+  const uint64_t new_p0 = static_cast_with_check<DBImpl>(d.db->GetRootDB())
+                              ->TEST_CurrentWalNumber(0);
+  const std::vector<int> cfs = {cf1, cf1, cf1, cf0, cf0, cf1, cf1, cf1};
+  uint64_t cut = 0;
+  for (int i = 0; i < 8; ++i) {
+    if (i == 3) {
+      ASSERT_OK(env_->GetFileSize(LogFileName(dbname_, new_p0), &cut));
+    }
+    d.Put(cfs[i], "reissued" + std::to_string(i));
+  }
+  d.Close();
+  // The second crash drops reissued3 and reissued4.
+  ASSERT_OK(test::TruncateFile(env_, LogFileName(dbname_, new_p0), cut));
+
+  const std::string copy = dbname_ + "_gc33_q2_pending";
+  for (const WALRecoveryMode mode :
+       {kPointInTime, kTolerate, kAbsolute, kSkip}) {
+    SCOPED_TRACE("wal_recovery_mode=" + std::to_string(static_cast<int>(mode)));
+    CopyDir(dbname_, copy);
+    const Status s = OpenCopy(copy, 2, options, mode, &d.handles, &d.db);
+    if (mode == kPointInTime || mode == kSkip) {
+      ASSERT_OK(s);
+      d.AssertFirstImage(cf0, cf1);
+      EXPECT_EQ(mode == kPointInTime ? "11100000" : "11100111",
+                d.Reissued(cfs));
+      d.Close();
+    } else {
+      if (s.ok()) {
+        ADD_FAILURE() << "opened with " << d.Reissued(cfs);
+        d.Close();
+        continue;
+      }
+      EXPECT_TRUE(s.IsCorruption()) << s.ToString();
+      EXPECT_NE(std::string::npos,
+                s.ToString().find("unexplained hole at wal_index 7 "))
+          << s.ToString();
+    }
+  }
+}
+
+// GC31 Q12 at the DB level, ported from Muse's GC31 candidate
+// (pwal/ab/gc31-muse-PR37 @ 140529fcbd75): a recovery declaration in the
+// older-binary shape (no span, no head floor) still supersedes voids by
+// first_obsolete alone, and its voids explain their indices, since an open
+// whose declarer attests no start is taken to have seeded past them. The
+// point-in-time reopen of the first crash image writes its declaration WAL
+// span-less and floor-less under the two sync points; eight round-robin
+// writes then reissue every cut index, the void's included, and the second
+// reopen, in every recovery mode, opens with every acknowledged key, and
+// without `lost` and `above_*`. Passes at the GC31 base (it failed before
+// GC31 with "bears records and a void cover").
+// Neuter: restore the declarer-start condition in
+// WALIndexMerger::VoidSuperseded; the second reopen fails with "bears
+// records and a void cover".
+TEST_P(DBWalPartitionCoverageTest, GC31OlderBinaryDeclarationCoversVoid) {
+  if (GetParam()) {
+    return;
+  }
+  Options options = IndexedWalOptions(CurrentOptions());
+  options.disable_auto_compactions = true;
+  options.avoid_flush_during_recovery = true;
+  DestroyAndReopen(options);
+  OpenWithPartitions(2, options);
+  const int cf0 = cf_for_partition_[0];
+  const int cf1 = cf_for_partition_[1];
+  Close();
+  GC33LostRecordBelowVoid(this, env_, dbname_, options, cf0, cf1);
+  ASSERT_FALSE(HasFatalFailure());
+
+  // The point-in-time reopen writes its declaration WAL span-less and
+  // floor-less: the older-binary shape.
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::StartWALFile:WriteSpan",
+      [](void* arg) { *static_cast<bool*>(arg) = false; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WriteWALIndexHeadFloors:Write",
+      [](void* arg) { *static_cast<bool*>(arg) = false; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  GC33Db d;
+  ASSERT_OK(OpenCopy(dbname_, 2, options, kPointInTime, &d.handles, &d.db));
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::StartWALFile:WriteSpan");
+  SyncPoint::GetInstance()->ClearCallBack(
+      "DBImpl::WriteWALIndexHeadFloors:Write");
+  d.AssertFirstImage(cf0, cf1);
+  std::vector<int> cfs;
+  for (int i = 0; i < 8; ++i) {
+    cfs.push_back(i % 2 == 0 ? cf0 : cf1);
+    d.Put(cfs.back(), "reissued" + std::to_string(i));
+  }
+  d.Close();
+  const std::string copy = dbname_ + "_gc31_q12_open";
+  for (const WALRecoveryMode mode :
+       {kPointInTime, kTolerate, kAbsolute, kSkip}) {
+    SCOPED_TRACE("wal_recovery_mode=" + std::to_string(static_cast<int>(mode)));
+    CopyDir(dbname_, copy);
+    ASSERT_OK(OpenCopy(copy, 2, options, mode, &d.handles, &d.db));
+    d.AssertFirstImage(cf0, cf1);
+    EXPECT_EQ("11111111", d.Reissued(cfs));
+    d.Close();
+  }
 }
 
 // GC27 Q2 (former M4-F1.1, GC25 carry-over; AMB-M4-23): above one partition

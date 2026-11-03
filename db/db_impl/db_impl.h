@@ -3316,13 +3316,19 @@ class DBImpl : public DB
     // Announced before the count is read, and the ender reads the
     // announcement after its decrement (both sequentially consistent), so
     // either this check sees zero or the ender sees the announcement and
-    // signals, taking mutex_ (EndUnpublishedSyncGroup).
-    unpublished_sync_group_waiters_.fetch_add(1);
+    // signals, taking mutex_ (EndUnpublishedSyncGroup). At one partition no
+    // sync group is counted, so nothing is announced.
+    const bool announce = NumWalPartitions() > 1;
+    if (announce) {
+      unpublished_sync_group_waiters_.fetch_add(1);
+    }
     while (unpublished_sync_groups_.load() != 0) {
       TEST_SYNC_POINT("DBImpl::WaitForUnpublishedSyncGroups:Wait");
       bg_cv_.Wait();
     }
-    unpublished_sync_group_waiters_.fetch_sub(1);
+    if (announce) {
+      unpublished_sync_group_waiters_.fetch_sub(1);
+    }
   }
 
   // TaskType is used to identify tasks in thread-pool, currently only
@@ -3377,6 +3383,18 @@ class DBImpl : public DB
 
   // REQUIRES: mutex locked and in write thread.
   Status HandleWriteBufferManagerFlush(WriteContext* write_context);
+
+  // Runs HandleWriteBufferManagerFlush() with every partition quiesced.
+  // Above one partition that stops every partition, so it quiesces only if
+  // the flush will switch a memtable or request a flush; otherwise only the
+  // flush's accounting refresh and scheduling run.
+  // REQUIRES: mutex locked and in write thread.
+  Status QuiescedWriteBufferManagerFlush(WriteContext* write_context);
+
+  // Whether HandleWriteBufferManagerFlush() would select a column family to
+  // switch or flush now. Changes nothing.
+  // REQUIRES: mutex locked.
+  bool WriteBufferManagerFlushWouldAct();
 
   // Column families and memory eligible for a WriteBufferManager flush.
   struct FlushableCFs {
@@ -4863,6 +4881,9 @@ class DBImpl : public DB
   // like the single relaxed load at one partition, it may lag appends in
   // flight.
   uint64_t WalsTotalSize() const {
+    if (NumWalPartitions() == 1) {
+      return wals_total_size_.LoadRelaxed();
+    }
     uint64_t total = wals_total_size_.LoadRelaxed();
     for (const auto& size : wal_partition_sizes_) {
       total += size.obj_.LoadRelaxed();
