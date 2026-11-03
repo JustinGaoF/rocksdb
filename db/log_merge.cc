@@ -525,7 +525,8 @@ Status WALIndexMerger::ComputeLowerBound() {
   // successor, so a loss below every surviving record surfaces as a hole only
   // through the floor.
   bool use_head_floors = true;
-  // Lets the prefix oracle's G-20 self-test drop every lower-bound witness.
+  // Lets the prefix oracle's lower-bound self-test drop every lower-bound
+  // witness.
   TEST_SYNC_POINT_CALLBACK("WALIndexMerger::ComputeLowerBound:UseHeadFloors",
                            &use_head_floors);
   for (auto& s : states_) {
@@ -632,7 +633,7 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
         holders.push_back(&state);
       }
     }
-    // A void a declaration supersedes (D-2) never contradicts a holder. It
+    // A void a declaration supersedes never contradicts a holder. It
     // still explains the index when no live record bears it only if the
     // declaring open seeded past it; at or above the declarer's start it is
     // obsolete like a superseded record, and the index is superseded-only.

@@ -11134,6 +11134,11 @@ struct FU14SnapshotRace {
       ASSERT_OK(
           txn->CommitAndTryCreateSnapshot(nullptr, /*ts=*/10, &t1_snapshot));
     });
+    JoinThreadsOnExit join_t1({&t1}, [&] {
+      std::lock_guard<std::mutex> lock(mu);
+      release_t1 = true;
+      cv.notify_all();
+    });
     {
       std::unique_lock<std::mutex> lock(mu);
       cv.wait(lock, [&] { return t1_held; });
@@ -11234,6 +11239,12 @@ TEST(TransactionPartitionedWalTest, EmptyDisableWalCommitSnapshotIsPublished) {
       });
   port::Thread w(
       [&] { ASSERT_OK(race.db->Put(WriteOptions(), w_cf, "k", "new")); });
+  auto release = [&] {
+    std::lock_guard<std::mutex> lock(mu);
+    release_w = true;
+    cv.notify_all();
+  };
+  JoinThreadsOnExit join_w({&w}, release);
   {
     std::unique_lock<std::mutex> lock(mu);
     ASSERT_TRUE(
@@ -11249,6 +11260,7 @@ TEST(TransactionPartitionedWalTest, EmptyDisableWalCommitSnapshotIsPublished) {
     ASSERT_OK(txn->CommitAndTryCreateSnapshot(nullptr, /*ts=*/10, &snapshot));
     published_at_return = race.db->GetLatestSequenceNumber();
   });
+  JoinThreadsOnExit join_t({&t}, release);
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(30);
   while (race.db_impl->TEST_WalDurabilityWaiters() != 1) {

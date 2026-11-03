@@ -5100,6 +5100,8 @@ TEST_F(WritePreparedPartitionedWalTest, ConcurrentRecoverableStateCaching) {
 
   std::atomic<bool> writers_done{false};
   std::vector<port::Thread> writers;
+  // A writer waits at most 30 s for a round, so it ends on its own.
+  JoinThreadsOnExit join_writers(&writers, [] {});
   for (size_t p = 0; p < kPartitions; ++p) {
     writers.emplace_back([&, p] {
       ColumnFamilyHandle* cf = CfOnPartition(p);
@@ -5190,6 +5192,12 @@ TEST_F(WritePreparedPartitionedWalTest, HigherSequenceRecoverableStateWins) {
     is_a = true;
     ASSERT_OK(CommitWithState(CfOnPartition(0), "a", "low"));
   });
+  auto release = [&] {
+    std::lock_guard<std::mutex> lock(mu);
+    b_committed = true;
+    cv.notify_all();
+  };
+  JoinThreadsOnExit join_a({&a}, release);
   {
     std::unique_lock<std::mutex> lock(mu);
     ASSERT_TRUE(
@@ -5197,6 +5205,7 @@ TEST_F(WritePreparedPartitionedWalTest, HigherSequenceRecoverableStateWins) {
   }
   port::Thread b(
       [&] { ASSERT_OK(CommitWithState(CfOnPartition(1), "b", "high")); });
+  JoinThreadsOnExit join_b({&b}, release);
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(30);
   while (db_impl->TEST_WalDurabilityWaiters() == 0 &&
@@ -5282,8 +5291,10 @@ TEST_F(WritePreparedPartitionedWalTest, RecoverableStateSlotsTakeHighest) {
         held_thread = true;
         ASSERT_OK(txn_a->Commit());
       });
+      JoinThreadsOnExit join_a({&a}, release);
       ASSERT_TRUE(wait_held());
       port::Thread b([&] { ASSERT_OK(txn_b->Commit()); });
+      JoinThreadsOnExit join_b({&b}, release);
       const auto deadline =
           std::chrono::steady_clock::now() + std::chrono::seconds(30);
       while (db_impl->TEST_WalDurabilityWaiters() == 0 &&
@@ -5515,12 +5526,19 @@ TEST_F(WritePreparedPartitionedWalTest,
     is_a = true;
     ASSERT_OK(txn_a->Prepare());
   });
+  auto release = [&] {
+    std::lock_guard<std::mutex> lock(mu);
+    release_a = true;
+    cv.notify_all();
+  };
+  JoinThreadsOnExit join_a({&a}, release);
   {
     std::unique_lock<std::mutex> lock(mu);
     ASSERT_TRUE(
         cv.wait_for(lock, std::chrono::seconds(30), [&] { return a_held; }));
   }
   port::Thread b([&] { ASSERT_OK(txn_b->Prepare()); });
+  JoinThreadsOnExit join_b({&b}, release);
   // B parks before its callback, waiting for A's range.
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(30);
@@ -5846,12 +5864,19 @@ TEST_P(WritePreparedTransactionTest, HigherCommitsWaitForHeldPrepareBelowThem) {
     is_a = true;
     ASSERT_OK(txn_a->Prepare());
   });
+  auto release = [&] {
+    std::lock_guard<std::mutex> lock(mu);
+    release_a = true;
+    cv.notify_all();
+  };
+  JoinThreadsOnExit join_a({&a}, release);
   {
     std::unique_lock<std::mutex> lock(mu);
     ASSERT_TRUE(
         cv.wait_for(lock, std::chrono::seconds(30), [&] { return a_held; }));
   }
   std::vector<port::Thread> writers;
+  JoinThreadsOnExit join_writers(&writers, release);
   for (size_t p = 1; p <= kWriters; ++p) {
     writers.emplace_back(
         [&, p] { ASSERT_OK(db->Put(WriteOptions(), cf_on(p), "evict", "v")); });
@@ -6171,6 +6196,11 @@ TEST_F(WritePreparedPartitionedWalTest,
               /*wal_used=*/nullptr, /*log_ref=*/0, /*disable_memtable=*/false,
               /*seq_used=*/nullptr, /*batch_cnt=*/1, &failing_callback);
         });
+        JoinThreadsOnExit join_lower({&lower}, [&] {
+          std::lock_guard<std::mutex> lock(mu);
+          release_lower = true;
+          cv.notify_all();
+        });
         {
           std::unique_lock<std::mutex> lock(mu);
           ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(30),
@@ -6377,6 +6407,11 @@ TEST_P(WritePreparedTransactionTest,
     WriteOptions sync_wo;
     sync_wo.sync = true;
     sync_status = db->Put(sync_wo, cf_on(0), "sync", "v");
+  });
+  JoinThreadsOnExit join_sync_writer({&sync_writer}, [&] {
+    std::lock_guard<std::mutex> lock(mu);
+    release = true;
+    cv.notify_all();
   });
   {
     std::unique_lock<std::mutex> lock(mu);

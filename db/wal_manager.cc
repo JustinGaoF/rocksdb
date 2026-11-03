@@ -133,7 +133,7 @@ Status WalManager::CheckWalsReadableAndUnpartitioned(
     if (!head.ok() && !head.IsNotFound() &&
         (db_options_.wal_partitions > 1 ||
          (version_set != nullptr && version_set->wal_index_guard() != 0))) {
-      // An indexed DB: which partition wrote it is unknown (D-GC27b).
+      // An indexed DB: which partition wrote it is unknown.
       return Status::NotSupported(
           "GetUpdatesSince: WAL " + std::to_string(wal->LogNumber()) + ": " +
           head.ToString() +

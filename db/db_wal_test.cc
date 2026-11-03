@@ -7947,10 +7947,10 @@ TEST_P(DBWALIndexRollbackTest,
                    " crash=" + std::to_string(crash));
       Options indexed = IndexedOptions(partitions);
       indexed.WAL_ttl_seconds = archive ? 1000 : 0;
-      DestroyAndReopen(indexed);
-      CreateAndReopenWithCF(cfs, indexed);
+      ASSERT_NO_FATAL_FAILURE(DestroyAndReopen(indexed));
+      ASSERT_NO_FATAL_FAILURE(CreateAndReopenWithCF(cfs, indexed));
       written_.clear();
-      WriteEveryColumnFamily("a");
+      ASSERT_NO_FATAL_FAILURE(WriteEveryColumnFamily("a"));
       // Every partition holds records, none of them flushed.
       if (partitions > 1) {
         EXPECT_EQ(partitions, WalPartitionsAppendedTo(db_.get()));
@@ -7981,13 +7981,15 @@ TEST_P(DBWALIndexRollbackTest,
       // this instance writes, to drop what it left unsynced.
       std::unique_ptr<FaultInjectionTestEnv> fault_env(
           new FaultInjectionTestEnv(env_));
+      // On any exit, the DB, which may be on fault_env, closes first.
+      Defer close_before_env([&] { Close(); });
       if (crash) {
         none.env = fault_env.get();
       }
-      ReopenWithColumnFamilies(names, none);
+      ASSERT_NO_FATAL_FAILURE(ReopenWithColumnFamilies(names, none));
       ASSERT_EQ(1u, dbfull()->TEST_NumWalPartitions());
       VerifyWritten();
-      WriteEveryColumnFamily("b");
+      ASSERT_NO_FATAL_FAILURE(WriteEveryColumnFamily("b"));
       // With one partition the indexed WALs stay live until step 2's flush
       // (avoid_flush_during_recovery), and so does the guard. A kNone open
       // of a partitioned set flushes it at open, so the guard clears there
@@ -8001,7 +8003,7 @@ TEST_P(DBWALIndexRollbackTest,
         Close();
         ASSERT_OK(fault_env->DropUnsyncedFileData());
         none.env = env_;
-        ReopenWithColumnFamilies(names, none);
+        ASSERT_NO_FATAL_FAILURE(ReopenWithColumnFamilies(names, none));
         VerifyWritten();
         EXPECT_EQ(guard_at_step_1, ManifestWALIndexGuard(env_, dbname_) != 0);
       }
@@ -8047,7 +8049,7 @@ TEST_P(DBWALIndexRollbackTest,
       }
 
       // 5. Reopen once more with kNone, and close: the guard clears.
-      ReopenWithColumnFamilies(names, none);
+      ASSERT_NO_FATAL_FAILURE(ReopenWithColumnFamilies(names, none));
       Close();
       // 6, 7. The check finds no indexed WAL and the guard clear.
       output.clear();
@@ -8058,7 +8060,7 @@ TEST_P(DBWALIndexRollbackTest,
       EXPECT_EQ(0u, ManifestWALIndexGuard(env_, dbname_));
 
       // An open with kNone at one partition accepts the DB, with every key.
-      ReopenWithColumnFamilies(names, none);
+      ASSERT_NO_FATAL_FAILURE(ReopenWithColumnFamilies(names, none));
       VerifyWritten();
       Close();
       Destroy(none);
@@ -8080,12 +8082,20 @@ TEST_P(DBWALIndexRollbackTest, RollbackProcedureWaitsForPreparedTransaction) {
   for (const bool commit : {true, false}) {
     SCOPED_TRACE("commit=" + std::to_string(commit));
     Options indexed = IndexedOptions(partitions);
-    DestroyAndReopen(indexed);
-    CreateAndReopenWithCF(cfs, indexed);
+    ASSERT_NO_FATAL_FAILURE(DestroyAndReopen(indexed));
+    ASSERT_NO_FATAL_FAILURE(CreateAndReopenWithCF(cfs, indexed));
     Close();
 
     std::vector<ColumnFamilyHandle*> handles;
     std::unique_ptr<TransactionDB> txn_db;
+    // On any exit, every handle is destroyed before the DB closes.
+    Defer close_on_exit([&] {
+      for (ColumnFamilyHandle* handle : handles) {
+        EXPECT_OK(txn_db->DestroyColumnFamilyHandle(handle));
+      }
+      handles.clear();
+      txn_db.reset();
+    });
     auto open = [&](const Options& options) {
       std::vector<ColumnFamilyDescriptor> column_families;
       for (const std::string& name : names) {
@@ -8097,10 +8107,12 @@ TEST_P(DBWALIndexRollbackTest, RollbackProcedureWaitsForPreparedTransaction) {
       txn_db.reset(opened);
     };
     auto close = [&]() {
-      for (ColumnFamilyHandle* handle : handles) {
-        ASSERT_OK(txn_db->DestroyColumnFamilyHandle(handle));
+      // Each handle leaves `handles` once destroyed, so that close_on_exit
+      // destroys only what is left.
+      while (!handles.empty()) {
+        ASSERT_OK(txn_db->DestroyColumnFamilyHandle(handles.back()));
+        handles.pop_back();
       }
-      handles.clear();
       txn_db.reset();
     };
     auto get = [&](int cf, const std::string& key) {
@@ -8119,7 +8131,7 @@ TEST_P(DBWALIndexRollbackTest, RollbackProcedureWaitsForPreparedTransaction) {
     WriteOptions sync;
     sync.sync = true;
 
-    open(indexed);
+    ASSERT_NO_FATAL_FAILURE(open(indexed));
     for (int cf = 0; cf < static_cast<int>(handles.size()); ++cf) {
       ASSERT_OK(txn_db->Put(sync, handles[cf], "a" + std::to_string(cf), "a"));
     }
