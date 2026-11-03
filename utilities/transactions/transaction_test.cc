@@ -10515,6 +10515,112 @@ TEST(TransactionPartitionedWalTest, SwitchWALFindsOldestWalAcrossPartitions) {
   ASSERT_OK(DestroyDB(dbname, options));
 }
 
+// GC31 Q1: a prepared transaction pins the oldest WAL with
+// unable_to_release_oldest_log_ set, so every further write's SwitchWAL
+// would return at once and none may quiesce. The first write still acts (it
+// flushes and sets the flag); after the commit the next switch acts again.
+TEST(TransactionPartitionedWalTest,
+     SwitchWalQuiesceSkippedWhilePrepareRetainsOldestWal) {
+  constexpr size_t kPartitions = 8;
+  const std::string dbname =
+      test::PerThreadDBPath("transaction_partitioned_wal_quiesce_skip");
+  Options options;
+  options.create_if_missing = true;
+  options.wal_partitions = kPartitions;
+  options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  options.track_and_verify_wals_in_manifest = true;
+  options.avoid_flush_during_shutdown = true;
+  ASSERT_OK(DestroyDB(dbname, options));
+  TransactionDB* db = nullptr;
+  std::vector<ColumnFamilyHandle*> handles;
+  Transaction* txn = nullptr;
+  Defer release([&] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    delete txn;
+    if (db != nullptr) {
+      for (ColumnFamilyHandle* handle : handles) {
+        db->DestroyColumnFamilyHandle(handle).PermitUncheckedError();
+      }
+      delete db;
+    }
+  });
+  ASSERT_OK(TransactionDB::Open(options, TransactionDBOptions(), dbname, &db));
+  DBImpl* db_impl = static_cast_with_check<DBImpl>(db->GetRootDB());
+  ASSERT_EQ(kPartitions, db_impl->TEST_NumWalPartitions());
+
+  // One CF on partition 0 (the prepare pins partition 0's open WAL, numbered
+  // below every other partition's) and one elsewhere.
+  ColumnFamilyHandle* cf0 = nullptr;
+  ColumnFamilyHandle* cf1 = nullptr;
+  size_t created = 0;
+  while (cf0 == nullptr || cf1 == nullptr) {
+    ColumnFamilyHandle* handle = nullptr;
+    ASSERT_OK(db->CreateColumnFamily(ColumnFamilyOptions(options),
+                                     "cf" + std::to_string(created + 1),
+                                     &handle));
+    handles.push_back(handle);
+    ++created;
+    WriteBatch batch;
+    ASSERT_OK(WriteBatchInternal::Put(&batch, handle->GetID(), "key", "value"));
+    size_t partition = kPartitions;
+    ASSERT_OK(
+        DBImpl::TEST_WalPartitionForWrite(batch, kPartitions, &partition));
+    if (partition == 0 && cf0 == nullptr) {
+      cf0 = handle;
+    } else if (partition != 0 && cf1 == nullptr) {
+      cf1 = handle;
+    }
+    ASSERT_LT(created, 100U);
+  }
+
+  SyncPoint::GetInstance()->EnableProcessing();
+  txn = db->BeginTransaction(WriteOptions());
+  ASSERT_OK(txn->SetName("xid"));
+  ASSERT_OK(txn->Put(cf0, "prepared", "value"));
+  ASSERT_OK(txn->Prepare());
+  const uint64_t prep_log = txn->GetLogNumber();
+  ASSERT_EQ(db_impl->TEST_CurrentWalNumber(0), prep_log);
+  for (size_t p = 0; p < kPartitions; ++p) {
+    ASSERT_GE(db_impl->TEST_AliveWalFiles(p).front().first, prep_log);
+  }
+
+  ASSERT_OK(db->SetDBOptions({{"max_total_wal_size", "1"}}));
+  std::atomic<int> quiesces{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WaitForPendingWrites:BeforeBlock",
+      [&](void*) { quiesces.fetch_add(1); });
+  ASSERT_OK(db->Put(WriteOptions(), cf0, "trigger", "v"));
+  ASSERT_TRUE(db_impl->TEST_UnableToReleaseOldestLog());
+  quiesces.store(0);
+  for (int i = 0; i < 200; ++i) {
+    ASSERT_OK(db->Put(WriteOptions(), i % 2 ? cf1 : cf0,
+                      "k" + std::to_string(i), "v"));
+  }
+  EXPECT_EQ(0, quiesces.load());
+
+  ASSERT_OK(txn->Commit());
+  delete txn;
+  txn = nullptr;
+  // The next switch acts and the WAL retires.
+  ASSERT_OK(db->Put(WriteOptions(), cf0, "after-commit", "v"));
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while (db_impl->TEST_AliveWalFiles(0).front().first == prep_log &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  EXPECT_GT(db_impl->TEST_AliveWalFiles(0).front().first, prep_log);
+  EXPECT_FALSE(db_impl->TEST_UnableToReleaseOldestLog());
+  for (ColumnFamilyHandle* handle : handles) {
+    ASSERT_OK(db->DestroyColumnFamilyHandle(handle));
+  }
+  handles.clear();
+  delete db;
+  db = nullptr;
+  ASSERT_OK(DestroyDB(dbname, options));
+}
+
 // CDR-F017 with a WriteCommitted prepare: the prepare keeps a WAL written
 // before WAL indexing live across the upgrade to two partitions, so the next
 // recovery set is that unindexed WAL followed by partitioned indexed ones.

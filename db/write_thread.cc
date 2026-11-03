@@ -771,9 +771,21 @@ void WriteThread::ExitAsBatchGroupFollower(Writer* w) {
 
   assert(w->state == STATE_PARALLEL_MEMTABLE_WRITER);
   assert(w != write_group->leader);
-  // OK at one WAL partition. Above one the group may have failed (an insert,
-  // or the leader's WAL append, see WriteGroup::wal_status), and every
-  // writer, the leader included, gets that outcome.
+  TEST_SYNC_POINT("WriteThread::ExitAsBatchGroupFollower:Start");
+  if (write_group->single_wal_partition) {
+    // Upstream's follower exit exactly: the group status is OK, and the
+    // leader's own status is untouched (in release builds the leader
+    // returns its own status, whatever a follower's insert did).
+    assert(write_group->status.ok());
+    ExitAsBatchGroupLeader(*write_group, write_group->status);
+    assert(w->status.ok());
+    assert(w->state == STATE_COMPLETED);
+    SetState(write_group->leader, STATE_COMPLETED);
+    return;
+  }
+  // Above one WAL partition the group may have failed (an insert, or the
+  // leader's WAL append, see WriteGroup::wal_status), and every writer,
+  // the leader included, gets that outcome.
   Status status = write_group->status;
   ExitAsBatchGroupLeader(*write_group, status);
   // The exit hands every non-leader member the group outcome, so the exiting

@@ -381,7 +381,8 @@ void DBImpl::FindObsoleteFiles(JobContext* job_context, bool force,
   });
 
   // The deques are empty when called during recovery, in which case there
-  // can't yet be any tracked obsolete logs
+  // can't yet be any tracked obsolete logs. Accepted (A11): this all-N
+  // take runs once per background job, off the write path.
   LockWalWriteMutexes();
 
   // Partitions are visited in ascending index order (see the WAL deque
@@ -425,11 +426,11 @@ void DBImpl::FindObsoleteFiles(JobContext* job_context, bool force,
           job_context->log_delete_files.push_back(earliest.number);
         }
         if (job_context->size_log_to_delete == 0) {
-          job_context->prev_wals_total_size = wals_total_size_.LoadRelaxed();
+          job_context->prev_wals_total_size = WalsTotalSize();
           job_context->num_alive_wal_files = num_alive_wal_files;
         }
         job_context->size_log_to_delete += earliest.size;
-        wals_total_size_.FetchSubRelaxed(earliest.size);
+        SubWalsTotalSize(p, earliest.size);
       }
     }
     UnlockWalWriteMutexes();
@@ -488,10 +489,11 @@ void DBImpl::FindObsoleteFiles(JobContext* job_context, bool force,
   // We're just cleaning up for DB::Write().
   assert(job_context->wals_to_free.empty());
   {
-    // Take over every partition's free list under all N: appends hold the
-    // appending partition's mutex, so holding all N excludes every appender.
-    AllWalWriteMutexesLock wal_locks(this);
+    // Take over each partition's free list under only its mutex: every
+    // other accessor of WalsToFree(p) (retirement pushes, CloseHelper's
+    // free, the test-only size) holds p's mutex or all N.
     for (size_t p = 0; p < NumWalPartitions(); ++p) {
+      WalWriteMutexLock wal_lock(&WalWriteMutex(p));
       for (auto* writer : WalsToFree(p)) {
         job_context->wals_to_free.push_back(writer);
       }

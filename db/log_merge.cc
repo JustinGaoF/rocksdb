@@ -234,25 +234,16 @@ WALIndexMerger::MemberState* WALIndexMerger::FindState(uint64_t wal_number) {
   return nullptr;
 }
 
-bool WALIndexMerger::VoidSuperseded(uint64_t wal_number, uint64_t index,
-                                    uint64_t* declarer) const {
-  bool superseded = false;
+bool WALIndexMerger::VoidSuperseded(uint64_t wal_number, uint64_t index) const {
+  // D-2 literal reach (Q12): first_obsolete alone decides, whatever the
+  // declaring WAL's attested start, and also when the declarer attests
+  // none (older binaries' declarations included).
   for (const auto& d : states_) {
-    if (!d.member->Supersedes(wal_number, index)) {
-      continue;
-    }
-    uint64_t start = d.member->HeadFloor();
-    Member::PredecessorSpan span;
-    if (d.member->AttestedSpan(&span) &&
-        span.last != std::numeric_limits<uint64_t>::max()) {
-      start = std::max(start, span.last + 1);
-    }
-    if (start != 0 && index >= start) {
-      superseded = true;
-      *declarer = std::min(*declarer, d.member->wal_number());
+    if (d.member->Supersedes(wal_number, index)) {
+      return true;
     }
   }
-  return superseded;
+  return false;
 }
 
 namespace {
@@ -623,17 +614,17 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
         holders.push_back(&state);
       }
     }
-    // Voids a declaration supersedes are obsolete like superseded records
-    // (D-2): they neither contradict a holder nor explain the index, which is
-    // then superseded-only.
+    // Voids a declaration supersedes (D-2) cannot contradict a reissued
+    // record, but they still explain the index when no live record bears
+    // it (Q12): supersession does not erase the explanation.
     std::vector<uint64_t> void_wals;
     bool superseded_void = false;
-    uint64_t void_declarer = std::numeric_limits<uint64_t>::max();
+    std::vector<uint64_t> superseded_void_wals;
     for (auto& state : states_) {
       if (state.member->VoidCovers(expected_)) {
-        if (VoidSuperseded(state.member->wal_number(), expected_,
-                           &void_declarer)) {
+        if (VoidSuperseded(state.member->wal_number(), expected_)) {
           superseded_void = true;
+          superseded_void_wals.push_back(state.member->wal_number());
         } else {
           void_wals.push_back(state.member->wal_number());
         }
@@ -734,7 +725,7 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
       expected_++;
       return Result::kRecord;
     }
-    const bool had_holders = !holders.empty() || superseded_void;
+    const bool had_holders = !holders.empty();
     for (auto* h : holders) {
       h->has_lookahead = false;  // superseded copies explain themselves.
     }
@@ -745,15 +736,19 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
         break;
       }
     }
-    if (void_covered || swallowed_covered) {
+    if (void_covered || superseded_void || swallowed_covered) {
       // A void in a WAL older than the declaration predates the cut, and an
       // open at N=1 seeds past such voids: the pending indices below it were
-      // never reissued.
+      // never reissued. Superseded voids clear like plain ones:
+      // supersession does not erase the explanation (Q12).
       for (auto& state : states_) {
         if (pending_discarded_ != 0 &&
             state.member->wal_number() < pending_declarer_ &&
-            std::find(void_wals.begin(), void_wals.end(),
-                      state.member->wal_number()) != void_wals.end()) {
+            (std::find(void_wals.begin(), void_wals.end(),
+                       state.member->wal_number()) != void_wals.end() ||
+             std::find(superseded_void_wals.begin(), superseded_void_wals.end(),
+                       state.member->wal_number()) !=
+                 superseded_void_wals.end())) {
           pending_discarded_ = 0;
         }
       }
@@ -812,7 +807,9 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
           pending_declarer_ = std::numeric_limits<uint64_t>::max();
         }
         // The declaration is written to the lowest-numbered WAL its open
-        // creates, so every WAL below the declarer predates the cut.
+        // creates, so every WAL below the declarer predates the cut. Only
+        // superseded record copies reach here: a superseded void explains
+        // the index above instead of arming a pending discard (Q12).
         for (auto* h : holders) {
           for (auto& state : states_) {
             if (state.member->Supersedes(h->member->wal_number(), expected_)) {
@@ -821,7 +818,6 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
             }
           }
         }
-        pending_declarer_ = std::min(pending_declarer_, void_declarer);
         expected_++;
         continue;
       }

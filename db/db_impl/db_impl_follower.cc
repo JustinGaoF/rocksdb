@@ -74,6 +74,7 @@ Status DBImplFollower::Recover(
     default_cf_handle_ = new ColumnFamilyHandleImpl(
         versions_->GetColumnFamilySet()->GetDefault(), this, &mutex_);
     default_cf_internal_stats_ = default_cf_handle_->cfd()->internal_stats();
+    default_cf_internal_stats_->SizeDBStatsShards(NumWalPartitions());
 
     // Start the periodic catch-up thread
     // TODO: See if it makes sense to have a threadpool, rather than a thread

@@ -149,6 +149,10 @@ class InternalStats {
     kIntStatsWriteBufferManagerLimitStopsCounts,
     kIntStatsNumMax,
   };
+  // The per-partition shards below index the first seven stats by their
+  // enum values.
+  static_assert(kIntStatsWalFileBytes == 0 && kIntStatsWriteWithWal == 6,
+                "sharded DB stats must be enum values 0..6");
 
   static const std::map<InternalDBStatsType, DBStatInfo> db_stats_type_to_info;
 
@@ -551,6 +555,11 @@ class InternalStats {
     for (int i = 0; i < kIntStatsNumMax; i++) {
       db_stats_[i].store(0);
     }
+    for (size_t s = 0; s < num_db_stats_shards_; s++) {
+      for (int i = 0; i < kNumShardedDBStats; i++) {
+        db_stats_shards_[s].stats[i].store(0, std::memory_order_relaxed);
+      }
+    }
     for (int i = 0; i < INTERNAL_CF_STATS_ENUM_MAX; i++) {
       cf_stats_count_[i] = 0;
       cf_stats_value_[i] = 0;
@@ -619,8 +628,39 @@ class InternalStats {
     }
   }
 
+  // Sizes the per-partition shards below. Called once, single-threaded, when
+  // the DB opens; only the default CF's instance is sized, since every hot
+  // add targets it.
+  void SizeDBStatsShards(size_t num_partitions) {
+    if (db_stats_shards_ != nullptr) {
+      assert(num_db_stats_shards_ == num_partitions);
+      return;
+    }
+    db_stats_shards_ =
+        std::unique_ptr<DBStatsShard[]>(new DBStatsShard[num_partitions]);
+    num_db_stats_shards_ = num_partitions;
+  }
+
+  // Adds to the calling partition's shard (N > 1 only): a relaxed add on a
+  // line no other partition writes. Only this partition's leader and its
+  // gate syncs add here. Readers sum the shards (GetDBStats).
+  void AddDBStatsPartition(InternalDBStatsType type, uint64_t value,
+                           size_t partition) {
+    assert(type >= 0 && type < kNumShardedDBStats);
+    assert(partition < num_db_stats_shards_);
+    db_stats_shards_[partition].stats[type].fetch_add(
+        value, std::memory_order_relaxed);
+  }
+
   uint64_t GetDBStats(InternalDBStatsType type) {
-    return db_stats_[type].load(std::memory_order_relaxed);
+    uint64_t total = db_stats_[type].load(std::memory_order_relaxed);
+    if (type >= 0 && type < kNumShardedDBStats) {
+      for (size_t i = 0; i < num_db_stats_shards_; i++) {
+        total +=
+            db_stats_shards_[i].stats[type].load(std::memory_order_relaxed);
+      }
+    }
+    return total;
   }
 
   HistogramImpl* GetFileReadHist(int level) {
@@ -702,6 +742,21 @@ class InternalStats {
 
   // Per-DB stats
   std::atomic<uint64_t> db_stats_[kIntStatsNumMax];
+  // The seven write-path stats (kIntStatsWalFileBytes..kIntStatsWriteWithWal,
+  // enum values 0..6), sharded per WAL partition for N > 1. Each shard is
+  // one cache line, written only by its partition's leader and gate syncs.
+  static constexpr int kNumShardedDBStats = 7;
+  struct ALIGN_AS(CACHE_LINE_SIZE) DBStatsShard {
+    DBStatsShard() {
+      for (int i = 0; i < kNumShardedDBStats; i++) {
+        stats[i].store(0, std::memory_order_relaxed);
+      }
+    }
+    std::atomic<uint64_t> stats[kNumShardedDBStats];
+  };
+  // Fixed array (not a vector: shards are neither movable nor copyable).
+  std::unique_ptr<DBStatsShard[]> db_stats_shards_;
+  size_t num_db_stats_shards_ = 0;
   // Per-ColumnFamily stats
   uint64_t cf_stats_value_[INTERNAL_CF_STATS_ENUM_MAX];
   uint64_t cf_stats_count_[INTERNAL_CF_STATS_ENUM_MAX];

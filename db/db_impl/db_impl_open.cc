@@ -946,6 +946,9 @@ Status DBImpl::Recover(
     default_cf_handle_ = new ColumnFamilyHandleImpl(
         versions_->GetColumnFamilySet()->GetDefault(), this, &mutex_);
     default_cf_internal_stats_ = default_cf_handle_->cfd()->internal_stats();
+    // Per-partition shards for the write-path DB stats (N > 1); every hot
+    // add targets this instance.
+    default_cf_internal_stats_->SizeDBStatsShards(NumWalPartitions());
 
     // Recover from all newer log files than the ones named in the
     // descriptor (new log files may have been added by the previous
@@ -3681,7 +3684,7 @@ Status DBImpl::RestoreAliveLogFiles(const std::vector<uint64_t>& wal_numbers) {
   assert(immutable_db_options_.avoid_flush_during_recovery);
   // Mark these as alive so they'll be considered for deletion later by
   // FindObsoleteFiles()
-  wals_total_size_.StoreRelaxed(0);
+  ResetWalsTotalSize();
   WalEmpty(0) = false;
   uint64_t min_wal_with_unflushed_data =
       versions_->MinLogNumberWithUnflushedData();
@@ -3706,7 +3709,6 @@ Status DBImpl::RestoreAliveLogFiles(const std::vector<uint64_t>& wal_numbers) {
     if (!s.ok()) {
       break;
     }
-    wals_total_size_.FetchAddRelaxed(log.size);
     // A closed WAL is never written again, so its deque only decides its
     // retirement order. One whose marker named no partition, or a partition
     // this open does not have, goes to partition 0.
@@ -3717,6 +3719,7 @@ Status DBImpl::RestoreAliveLogFiles(const std::vector<uint64_t>& wal_numbers) {
         recorded->second < NumWalPartitions()) {
       wal_partition = recorded->second;
     }
+    AddWalsTotalSize(wal_partition, log.size);
     AddRecoveredAliveWal(wal_partition, log);
   }
   return s;

@@ -141,6 +141,9 @@ class WriteThread {
     // the exit to the leader (STATE_PARALLEL_GROUP_EXIT) instead of running
     // it.
     bool leader_exits = false;
+    // Whether the DB has one WAL partition (either usage). Set by DBImpl;
+    // ExitAsBatchGroupFollower takes upstream's path exactly when true.
+    bool single_wal_partition = true;
 
     struct Iterator {
       Writer* writer;

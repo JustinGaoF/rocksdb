@@ -277,9 +277,11 @@ class WalDurabilityTracker {
   static_assert(sizeof(Partition) % CACHE_LINE_SIZE == 0);
 
   std::vector<Partition> partitions_;
-  std::atomic<uint64_t> safe_point_{0};
+  // Own cache line each, apart from the partitions_ header and each other:
+  // every gate reads the safe point, and every allocation CASes the bound.
+  ALIGN_AS(CACHE_LINE_SIZE) std::atomic<uint64_t> safe_point_ { 0 };
   // The highest sequence registered so far, which bounds every scan.
-  std::atomic<uint64_t> registered_high_{0};
+  ALIGN_AS(CACHE_LINE_SIZE) std::atomic<uint64_t> registered_high_ { 0 };
   const bool safe_point_test_hook_;
 };
 

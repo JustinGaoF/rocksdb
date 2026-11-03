@@ -5220,6 +5220,80 @@ TEST_F(WritePreparedPartitionedWalTest, HigherSequenceRecoverableStateWins) {
   ASSERT_EQ("NOT_FOUND", GetState(CfOnPartition(0)));
 }
 
+TEST_F(WritePreparedPartitionedWalTest, RecoverableStateSlotsTakeHighest) {
+  // GC31 Q7: two partitions cache states with sequences s1 < s2 in either
+  // order; WriteRecoverableState writes s2's state and leaves every slot
+  // empty.
+  for (int order = 0; order < 2; ++order) {
+    const bool a_first = (order == 0);
+    SCOPED_TRACE(a_first ? "A-first" : "B-first");
+    if (order > 0) {
+      Close();
+      ASSERT_OK(DestroyDB(dbname_, options_));
+      cf_names_.clear();
+    }
+    constexpr size_t kPartitions = 2;
+    Open(kPartitions);
+    DBImpl* db_impl = static_cast_with_check<DBImpl>(db_->GetRootDB());
+
+    if (a_first) {
+      ASSERT_OK(CommitWithState(CfOnPartition(0), "a", "low"));
+      ASSERT_OK(CommitWithState(CfOnPartition(1), "b", "high"));
+    } else {
+      // B caches first with the higher sequence; A caches after.
+      static thread_local bool is_a = false;
+      std::mutex mu;
+      std::condition_variable cv;
+      bool a_parked = false;
+      bool b_committed = false;
+      SyncPoint::GetInstance()->SetCallBack(
+          "DBImpl::WriteGroupToWAL:BeforeCacheRecoverableState", [&](void*) {
+            if (!is_a) {
+              return;
+            }
+            std::unique_lock<std::mutex> lock(mu);
+            a_parked = true;
+            cv.notify_all();
+            cv.wait_for(lock, std::chrono::seconds(30),
+                        [&] { return b_committed; });
+          });
+      port::Thread a([&] {
+        is_a = true;
+        ASSERT_OK(CommitWithState(CfOnPartition(0), "a", "low"));
+      });
+      {
+        std::unique_lock<std::mutex> lock(mu);
+        ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(30),
+                                [&] { return a_parked; }));
+      }
+      port::Thread b(
+          [&] { ASSERT_OK(CommitWithState(CfOnPartition(1), "b", "high")); });
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(30);
+      while (db_impl->TEST_WalDurabilityWaiters() == 0 &&
+             std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      ASSERT_EQ(1U, db_impl->TEST_WalDurabilityWaiters());
+      {
+        std::lock_guard<std::mutex> lock(mu);
+        b_committed = true;
+        cv.notify_all();
+      }
+      a.join();
+      b.join();
+      SyncPoint::GetInstance()->ClearCallBack(
+          "DBImpl::WriteGroupToWAL:BeforeCacheRecoverableState");
+    }
+
+    FlushAll();
+    EXPECT_TRUE(db_impl->TEST_CachedRecoverableStateEmpty());
+    Reopen();
+    EXPECT_EQ("high", GetState(CfOnPartition(1)));
+    EXPECT_EQ("NOT_FOUND", GetState(CfOnPartition(0)));
+  }
+}
+
 // G-56: prepares routed to different partitions reach PreparedHeap::push out
 // of sequence order. push inserts each in place, so every entry is popped at
 // its commit and closing the DB passes `assert(heap_.empty())` in

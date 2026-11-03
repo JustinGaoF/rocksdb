@@ -297,6 +297,7 @@ Status DBImplSecondary::Recover(
   default_cf_handle_ = new ColumnFamilyHandleImpl(
       versions_->GetColumnFamilySet()->GetDefault(), this, &mutex_);
   default_cf_internal_stats_ = default_cf_handle_->cfd()->internal_stats();
+  default_cf_internal_stats_->SizeDBStatsShards(NumWalPartitions());
 
   // TODO: update options_file_number_ needed?
 
