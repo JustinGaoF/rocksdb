@@ -351,8 +351,8 @@ class WALIndexMerger {
   // nothing was emitted. Recovery attributes each record to its source WAL
   // for filtering, memtable log references, and per-file cuts.
   const Member* GetLastEmittedMember() const { return last_emitted_member_; }
-  // Checksum of the most recently emitted record, captured when it was pulled
-  // (ported from D126834369): an unindexed record drains after its member
+  // Checksum of the most recently emitted record, captured when it was pulled:
+  // an unindexed record drains after its member
   // read past it, so the member's current checksum is a later record's.
   uint64_t GetLastEmittedChecksum() const { return last_emitted_checksum_; }
   // Details of the most recently skipped tail gap. Valid after kTailGap.
@@ -480,8 +480,8 @@ class WALIndexMerger {
 
   MemberState* FindState(uint64_t wal_number);
 
-  // Whether a declaration obsoletes the void `wal_number` holds over `index`
-  // (D-2): a supersession record names a file and its first obsolete index,
+  // Whether a declaration obsoletes the void `wal_number` holds over `index`:
+  // a supersession record names a file and its first obsolete index,
   // and reaches every void of the file at or above that index, whatever
   // start the declaring WAL attests (none included). A superseded void never
   // contradicts a record at its index, but still explains the index when no
@@ -489,8 +489,9 @@ class WALIndexMerger {
   bool VoidSuperseded(uint64_t wal_number, uint64_t index) const;
   // Whether an open seeded past the void `wal_number` holds over `index`: no
   // declaration superseding it attests a start (its span's last plus one,
-  // or its head floor) at or below `index`. Only such a void tells GC19's
-  // exception that the pending indices below it were never reissued.
+  // or its head floor) at or below `index`. Only such a void tells the
+  // merge that the pending superseded-only indices below it were never
+  // reissued.
   bool VoidSeededPast(uint64_t wal_number, uint64_t index) const;
 
   std::vector<std::unique_ptr<Member>> members_;

@@ -368,7 +368,7 @@ class Repairer {
           fs->OptimizeForLogRead(file_options_), log, &wal_partition);
       if (!head.ok() && !head.IsNotFound() && indexed) {
         // Which partition wrote it is unknown, so it may be a partitioned
-        // WAL (D-GC27b).
+        // WAL.
         return Status::NotSupported(
             "RepairDB: WAL " + std::to_string(log) + ": " + head.ToString() +
             "; the DB is indexed (wal_partitions > 1 or the MANIFEST WAL "

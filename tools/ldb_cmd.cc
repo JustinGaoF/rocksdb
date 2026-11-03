@@ -3207,7 +3207,7 @@ void DumpWalFiles(Options options, const std::string& dir_or_file,
           log_number, &wal_partition);
       if (!head.ok() && !head.IsNotFound() &&
           (options.wal_partitions > 1 || wal_index_guard_set)) {
-        // An indexed DB: which partition wrote it is unknown (D-GC27b).
+        // An indexed DB: which partition wrote it is unknown.
         if (exec_state) {
           *exec_state = LDBCommandExecuteResult::Failed(
               Status::NotSupported(
@@ -3612,7 +3612,7 @@ void CheckWALIndexCommand::DoCommand() {
   PrepareOptions();
   if (GetExecuteState().IsFailed() && !wal_dir_.empty()) {
     // The shared OPTIONS load failed, but an explicit --wal_dir is all the
-    // check needs from it (ported from D126568250).
+    // check needs from it.
     exec_state_.Reset();
   }
   std::string wal_dir = wal_dir_;

@@ -382,8 +382,7 @@ void DBImpl::FindObsoleteFiles(JobContext* job_context, bool force,
 
   // The deques are empty when called during recovery, in which case there
   // can't yet be any tracked obsolete logs
-  // Accepted cost (audit A11): all N, once per background job, off the write
-  // path.
+  // Accepted cost: all N, once per background job, off the write path.
   LockWalWriteMutexes();
 
   // Partitions are visited in ascending index order (see the WAL deque

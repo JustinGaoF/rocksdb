@@ -416,6 +416,11 @@ Status DBImpl::Resume() {
 // 5. Detach the quarantined handles, then clear the cutoff only if a concurrent
 //    failure did not extend it. Any failure before completion leaves the hard
 //    background error and quarantine in place.
+// 6. Above one partition, explain the burned WAL indices. One burned in a WAL
+//    the flush retired needs no I/O: the predecessor spans of the WALs after
+//    it put it below every recovery's lower bound. A failure here leaves the
+//    hard background error but not the quarantine: step 5 already detached
+//    every WAL the cutoff covered and cleared it.
 Status DBImpl::ResumeImpl(DBRecoverContext context,
                           Env::IOActivity io_activity) {
   mutex_.AssertHeld();
@@ -644,7 +649,7 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
     // burns are never explained and the retry path is unchanged. The reason
     // is normalized too: the waits below treat only kErrorRecovery as
     // resuming (WaitForFlushMemTables), and the work is a full recovery
-    // flush. Ported from GC24's closed loser (Muse).
+    // flush.
     if (context.flush_reason == FlushReason::kErrorRecoveryRetryFlush &&
         NumWalPartitions() > 1 && BurnedWalIndicesPending()) {
       context.flush_reason = FlushReason::kErrorRecovery;
@@ -2451,7 +2456,7 @@ Status DBImpl::FlushWAL(const WriteOptions& write_options, bool sync) {
       // "flush the buffered WAL data" covers all partitions. Each buffer is
       // written under its own partition's mutex only, which excludes a
       // concurrent AddRecord on it (see WriteToWAL), one partition at a
-      // time (D-F2d).
+      // time.
       for (size_t p = 0; p < NumWalPartitions(); ++p) {
         WalWriteMutexLock wl(&WalWriteMutex(p));
         const LogWriterNumber* current_wal = CurrentWalOrNull(p);
@@ -2596,8 +2601,8 @@ IOStatus DBImpl::SyncWalImpl(bool include_current_wal,
     // Nothing else inspected here is carried past the release: the claim
     // loop re-checks emptiness under WalWriteMutex(p), and because this block
     // marks nothing and the claim loop has no early exit, the return below
-    // cannot leave a partition marked getting_synced. Accepted cost (audit
-    // A11): all N once per SyncWAL or background sync, off the write path.
+    // cannot leave a partition marked getting_synced. Accepted cost: all N
+    // once per SyncWAL or background sync, off the write path.
     AllWalWriteMutexesLock l(this);
 
     // maybe_active_number and need_wal_dir_sync are consumed after the claim
@@ -2641,10 +2646,10 @@ IOStatus DBImpl::SyncWalImpl(bool include_current_wal,
   // matter its number: with cur_wal_number_ the lowest live number, a number
   // bound would skip every other partition's WAL. Above one partition every
   // multi-partition marker claims in ascending order and never waits holding
-  // a mark (D-GC31e (i)): finding a partition marked by another marker, it
+  // a mark: finding a partition marked by another marker, it
   // releases every mark it took, waits for that partition alone, and starts
   // over. With one partition there is nothing to interleave, and the claim
-  // waits in place, as before.
+  // waits in place.
   if (NumWalPartitions() > 1) {
     TEST_SYNC_POINT("DBImpl::SyncWalImpl:TakesSyncMarkMutex");
   }
@@ -5629,7 +5634,7 @@ std::unique_ptr<MultiScan> DBImpl::NewMultiScan(
 }
 
 namespace {
-// Above one partition a write is inserted before it is published (D-9), and
+// Above one partition a write is inserted before it is published, and
 // it can still fail afterwards, with a lower range. A tailing iterator reads
 // the memtables at kMaxSequenceNumber, so it shows an entry only once its
 // sequence is published, checked on every visibility test: writes show up

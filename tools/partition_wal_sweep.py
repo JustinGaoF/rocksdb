@@ -4,13 +4,13 @@
 # COPYING file in the root directory) and Apache 2.0 License
 # (found in the LICENSE.Apache file in the root directory).
 
-"""Reproducible N sweep for partitioned WALs (GC16, G-53).
+"""Reproducible N sweep for partitioned WALs.
 
 Runs a db_bench matrix over WAL partitions x injected append latency x sync
-mode x value size, parses throughput, write-latency percentiles, the GC13
-histograms and the GC15 latency-FileSystem counters out of each run, and
-evaluates the Tasks:975 abandon trigger (D-G53 (A): p99 gate wait over p99
-write latency at N=8 on the injected profile).
+mode x value size, parses throughput, write-latency percentiles, the WAL
+partition histograms and the latency-FileSystem counters out of each run,
+and evaluates the abandon trigger for partitioned WALs (p99 gate wait over
+p99 write latency at N=8 on the injected profile).
 
 The script builds nothing itself: it takes a db_bench binary path and an
 output directory. Every cell runs at least 3 times; the output reports the
@@ -88,7 +88,7 @@ QUICK_VALUE_SIZES = (100,)
 QUICK_REPS = 3
 QUICK_NUM = 2000
 
-# The trigger's designated "injected-latency profile" (D-G53 (A)): mid-range
+# The trigger's designated "injected-latency profile": mid-range
 # injected latency for a networked WAL device, the realistic sync mix, and
 # KB-scale values. The trigger table shows every (latency, sync) cell at N=8
 # so the choice is auditable.
@@ -550,7 +550,8 @@ def slow_vs_even(aggregates):
 
 
 def compute_trigger(aggregates, threads):
-    """D-G53 (A): p99 gate wait over p99 write latency at N=8, injected.
+    """The abandon trigger: p99 gate wait over p99 write latency at N=8,
+    injected.
 
     Refuses uninjected cells: comparing injected against uninjected measures
     the injector, not the watermark.
@@ -729,7 +730,7 @@ def write_outputs(args, results):
     trigger_rows, verdict = compute_trigger(aggregates, args.threads)
     results["trigger_rows"] = trigger_rows
     results["trigger_verdict"] = verdict
-    md += ["", "## Abandon trigger (D-G53 (A)) at N=8",
+    md += ["", "## Abandon trigger at N=8",
            "append_us sync size threads gate_p99_us write_p99_us ratio"]
     for r in trigger_rows:
         md.append("%d %s %d %d %s %s %.4f"
