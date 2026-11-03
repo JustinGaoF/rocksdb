@@ -295,7 +295,7 @@ Status DBImpl::ValidateOptions(
   return s;
 }
 
-// M1.4 gate dispositions by (partition_wal_usage, wal_partitions), as Open
+// Startup gate dispositions by (partition_wal_usage, wal_partitions), as Open
 // enforces them. "Indexed" is any usage that writes WAL index records. "OK"
 // is Open OK. "Option" is a NotSupported naming wal_partitions and the
 // option, checked before the kNone rejection. "kNone" is the NotSupported
@@ -434,7 +434,7 @@ Status DBImpl::ValidateOptions(const DBOptions& db_options) {
   }
 
   if (db_options.wal_partitions > 1 && !db_options.paranoid_checks) {
-    // A failed WAL append must stop the DB (D-1): without a background error
+    // A failed WAL append must stop the DB: without a background error
     // its range pins every partition's completion gates, and point-in-time
     // recovery would apply records above the hole it leaves.
     return Status::NotSupported(
@@ -1601,7 +1601,7 @@ Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& wal_numbers,
     // one file's replay into the next, which the merge's concurrent pulls
     // cannot reproduce, so an indexed single-chain set keeps the sequential
     // path under track_and_verify_wals (below). A partitioned set merges
-    // whatever the option says (D-3): file order is not its order.
+    // whatever the option says: file order is not its order.
     uint64_t unindexed_high = 0;
     uint64_t indexed_low = 0;
     bool superseding = false;
@@ -2067,7 +2067,7 @@ Status DBImpl::ProcessLogFilesMerged(
                              immutable_db_options_.wal_recovery_mode ==
                                  WALRecoveryMode::kSkipAnyCorruptedRecords);
   // Skip mode skips an unexplained hole and applies the records above it, as
-  // it skips unreadable records with one WAL (D-10); every other mode stops
+  // it skips unreadable records with one WAL; every other mode stops
   // there.
   merger.SetSkipUnexplainedHoles(immutable_db_options_.wal_recovery_mode ==
                                  WALRecoveryMode::kSkipAnyCorruptedRecords);
@@ -2122,8 +2122,8 @@ Status DBImpl::ProcessLogFilesMerged(
     // land at the seed, and SecondOpenAfterSupersessionRedeclaresTheSameCut
     // pins their values. Ported from D126193586.
     // The cut is the seed itself, not the member's first index above it: the
-    // declaration also obsoletes the member's voids at or above the seed
-    // (D-2), and a void can lie below the member's first record, as Resume's
+    // declaration also obsoletes the member's voids at or above the seed,
+    // and a void can lie below the member's first record, as Resume's
     // explanation void lies ahead of the records written after it.
     if (!recovered_wal_partitions_.empty()) {
       first_obsolete = next_wal_index_;
@@ -2359,7 +2359,7 @@ Status DBImpl::ProcessLogFilesMerged(
     const bool stop_before = stop_replay_for_corruption;
     const bool filter_before = stop_replay_by_wal_filter;
     // A member's report can sit in the shared status, its gap not surfaced
-    // yet, when this record fails on its own (Review-M3 L-b). Point-in-time
+    // yet, when this record fails on its own. Point-in-time
     // recovery must stop at the record either way: set the report aside while
     // the record is processed, and put it back for its gap to consume.
     Status pending_report;
@@ -2414,7 +2414,7 @@ Status DBImpl::ProcessLogFilesMerged(
                 (!has_header || batch_count != 0);
       // The sequences this record's writer allocated, as its replay advanced
       // them. seq_per_batch writers allocate per batch, not per entry, so
-      // those openers keep the first-sequence rule (D-GC27c).
+      // those openers keep the first-sequence rule.
       if (!seq_per_batch_ && !dropped && emitted_index != 0 && has_header &&
           batch_seq != 0 && *next_sequence > batch_seq) {
         merger.NoteConsumed(*next_sequence - batch_seq);
@@ -2698,7 +2698,7 @@ Status DBImpl::ProcessLogFilesMerged(
                 ", which no void older than its cut explains; open read-only "
                 "to read the prefix below it";
   if (status.ok() && !read_only) {
-    // D-2: a WAL that may hold a void at or above the seed is superseded from
+    // A WAL that may hold a void at or above the seed is superseded from
     // the seed too, so the reissued indices do not contradict it. The
     // declaring WAL starts at the seed (its span or head floor), which is
     // where the declaration's reach over voids begins. With one partition
@@ -4164,7 +4164,7 @@ IOStatus DBImpl::StartWALFile(
   // partition only) writes no span and keeps that layout.
   bool write_span = wal_index_predecessor.wal_number != 0 &&
                     immutable_db_options_.recycle_log_file_num == 0;
-  // Lets the prefix oracle's G-20 self-test write WALs without spans.
+  // Lets the prefix oracle's self-test write WALs without spans.
   TEST_SYNC_POINT_CALLBACK("DBImpl::StartWALFile:WriteSpan", &write_span);
   if (io_s.ok() && write_span) {
     io_s = new_log->AddWALIndexPredecessorSpanRecord(

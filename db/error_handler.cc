@@ -360,7 +360,7 @@ void ErrorHandler::HandleKnownErrors(const Status& bg_err,
     if (wal_related && reason == BackgroundErrorReason::kWriteCallback &&
         db_->NumWalPartitions() > 1 &&
         (s.ok() || s.severity() < new_bg_err.severity())) {
-      // D-1: above one partition a failed WAL write leaves its range pinned
+      // Above one partition a failed WAL write leaves its range pinned
       // below every later write on every partition, and only recovery from
       // this error releases it. Listeners are told, but cannot suppress or
       // soften it.

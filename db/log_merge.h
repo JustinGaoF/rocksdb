@@ -480,8 +480,8 @@ class WALIndexMerger {
 
   MemberState* FindState(uint64_t wal_number);
 
-  // Whether a declaration obsoletes the void `wal_number` holds over `index`
-  // (D-2): a supersession record names a file and its first obsolete index,
+  // Whether a declaration obsoletes the void `wal_number` holds over `index`:
+  // a supersession record names a file and its first obsolete index,
   // and reaches every void of the file at or above that index, whatever
   // start the declaring WAL attests (none included). A superseded void never
   // contradicts a record at its index, but still explains the index when no
@@ -489,8 +489,8 @@ class WALIndexMerger {
   bool VoidSuperseded(uint64_t wal_number, uint64_t index) const;
   // Whether an open seeded past the void `wal_number` holds over `index`: no
   // declaration superseding it attests a start (its span's last plus one,
-  // or its head floor) at or below `index`. Only such a void tells GC19's
-  // exception that the pending indices below it were never reissued.
+  // or its head floor) at or below `index`. Only such a void clears a
+  // pending discard: the pending indices below it were never reissued.
   bool VoidSeededPast(uint64_t wal_number, uint64_t index) const;
 
   std::vector<std::unique_ptr<Member>> members_;

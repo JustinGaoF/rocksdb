@@ -3207,7 +3207,7 @@ void DumpWalFiles(Options options, const std::string& dir_or_file,
           log_number, &wal_partition);
       if (!head.ok() && !head.IsNotFound() &&
           (options.wal_partitions > 1 || wal_index_guard_set)) {
-        // An indexed DB: which partition wrote it is unknown (D-GC27b).
+        // An indexed DB: which partition wrote it is unknown.
         if (exec_state) {
           *exec_state = LDBCommandExecuteResult::Failed(
               Status::NotSupported(

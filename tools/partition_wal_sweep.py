@@ -4,12 +4,12 @@
 # COPYING file in the root directory) and Apache 2.0 License
 # (found in the LICENSE.Apache file in the root directory).
 
-"""Reproducible N sweep for partitioned WALs (GC16, G-53).
+"""Reproducible N sweep for partitioned WALs.
 
 Runs a db_bench matrix over WAL partitions x injected append latency x sync
-mode x value size, parses throughput, write-latency percentiles, the GC13
-histograms and the GC15 latency-FileSystem counters out of each run, and
-evaluates the Tasks:975 abandon trigger (D-G53 (A): p99 gate wait over p99
+mode x value size, parses throughput, write-latency percentiles, the
+partitioned-WAL histograms and the latency-injecting-FileSystem counters out
+of each run, and evaluates the abandon trigger (p99 gate wait over p99
 write latency at N=8 on the injected profile).
 
 The script builds nothing itself: it takes a db_bench binary path and an
@@ -27,11 +27,11 @@ by the criterion fixed in REPRO_METRICS / REPRO_MAX_DELTA.
 
 Example:
   tools/partition_wal_sweep.py --db-bench buck-out/.../db_bench \\
-      --output-dir /tmp/gc16-sweep
-  tools/partition_wal_sweep.py --db-bench ... --output-dir /tmp/gc16-quick \\
+      --output-dir /tmp/pwal-sweep
+  tools/partition_wal_sweep.py --db-bench ... --output-dir /tmp/pwal-quick \\
       --quick
-  tools/partition_wal_sweep.py --db-bench ... --output-dir /tmp/gc16-quick2 \\
-      --quick --compare_to /tmp/gc16-quick/results.json
+  tools/partition_wal_sweep.py --db-bench ... --output-dir /tmp/pwal-quick2 \\
+      --quick --compare_to /tmp/pwal-quick/results.json
 """
 
 import argparse
@@ -88,7 +88,7 @@ QUICK_VALUE_SIZES = (100,)
 QUICK_REPS = 3
 QUICK_NUM = 2000
 
-# The trigger's designated "injected-latency profile" (D-G53 (A)): mid-range
+# The trigger's designated "injected-latency profile": mid-range
 # injected latency for a networked WAL device, the realistic sync mix, and
 # KB-scale values. The trigger table shows every (latency, sync) cell at N=8
 # so the choice is auditable.
@@ -550,7 +550,7 @@ def slow_vs_even(aggregates):
 
 
 def compute_trigger(aggregates, threads):
-    """D-G53 (A): p99 gate wait over p99 write latency at N=8, injected.
+    """Abandon trigger: p99 gate wait over p99 write latency at N=8, injected.
 
     Refuses uninjected cells: comparing injected against uninjected measures
     the injector, not the watermark.
