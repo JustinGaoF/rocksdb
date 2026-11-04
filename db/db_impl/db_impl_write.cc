@@ -2890,10 +2890,24 @@ Status DBImpl::PreprocessWrite(const WriteOptions& write_options,
   if (UNLIKELY(status.ok() && write_buffer_manager_->ShouldFlush())) {
     if (write_buffer_manager_->TryAcquireLocalFlush()) {
       InstrumentedMutexLock l(&mutex_);
-      CloseMemTableSwitchGate();
-      WaitForPendingWrites();
-      status = HandleWriteBufferManagerFlush(write_context);
-      OpenMemTableSwitchGate();
+      // Above one partition the quiesce stops every partition, so it runs
+      // only if the flush would act; on a skip the flush scheduling still
+      // runs, without the gate. Closing the gate releases mutex_, so decide
+      // again once it is closed.
+      const bool partitioned = NumWalPartitions() > 1;
+      bool acted = false;
+      if (!partitioned || WriteBufferManagerFlushWouldAct()) {
+        CloseMemTableSwitchGate();
+        if (!partitioned || WriteBufferManagerFlushWouldAct()) {
+          WaitForPendingWrites();
+          status = HandleWriteBufferManagerFlush(write_context);
+          acted = true;
+        }
+        OpenMemTableSwitchGate();
+      }
+      if (partitioned && !acted) {
+        MaybeScheduleFlushOrCompaction();
+      }
     }
   }
 
@@ -4941,6 +4955,24 @@ Status DBImpl::SwitchWAL(WriteContext* write_context) {
   return status;
 }
 
+bool DBImpl::WriteBufferManagerFlushWouldAct() {
+  mutex_.AssertHeld();
+  if (immutable_db_options_.atomic_flush) {
+    autovector<ColumnFamilyData*> cfds;
+    SelectColumnFamiliesForAtomicFlush(&cfds);
+    return !cfds.empty();
+  }
+  const WriteBufferFlushPolicy policy = write_buffer_manager_->flush_policy();
+  const bool flush_largest =
+      policy == WriteBufferFlushPolicy::kFlushLargest ||
+      policy == WriteBufferFlushPolicy::kFlushLargestAcrossDBs;
+  const FlushableCFs flushable = CollectFlushableCFs(
+      /*include_waiting_immutable=*/policy ==
+      WriteBufferFlushPolicy::kFlushLargestAcrossDBs);
+  // MaybeFlushStatsCF() only extends a non-empty selection.
+  return (flush_largest ? flushable.largest : flushable.oldest) != nullptr;
+}
+
 Status DBImpl::HandleWriteBufferManagerFlush(WriteContext* write_context) {
   mutex_.AssertHeld();
   assert(write_context != nullptr);
@@ -5209,10 +5241,23 @@ Status DBImpl::WriteBufferManagerStallWrites(size_t wal_partition,
     if (!retry_local_flush || !write_buffer_manager_->ShouldStall()) {
       return Status::OK();
     }
-    CloseMemTableSwitchGate();
-    WaitForPendingWrites();
-    Status status = HandleWriteBufferManagerFlush(write_context);
-    OpenMemTableSwitchGate();
+    // As in PreprocessWrite: above one partition the quiesce runs only if
+    // the flush would act; on a skip the flush scheduling still runs.
+    const bool partitioned = NumWalPartitions() > 1;
+    Status status;
+    bool acted = false;
+    if (!partitioned || WriteBufferManagerFlushWouldAct()) {
+      CloseMemTableSwitchGate();
+      if (!partitioned || WriteBufferManagerFlushWouldAct()) {
+        WaitForPendingWrites();
+        status = HandleWriteBufferManagerFlush(write_context);
+        acted = true;
+      }
+      OpenMemTableSwitchGate();
+    }
+    if (partitioned && !acted) {
+      MaybeScheduleFlushOrCompaction();
+    }
     if (!status.ok()) {
       return status;
     }

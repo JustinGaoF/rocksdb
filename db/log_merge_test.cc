@@ -2129,13 +2129,16 @@ TEST_P(LogMergeTest, GC27VoidCoverPlusSupersededDataFromStartMerges) {
   }
 }
 
-// GC31 Q12 (D-2, owner ruling 2026-11-02): a superseded void still explains
-// its index when no live record bears it. 121 starts at 3 and declares 120
-// obsolete from 3, superseding 120's void over 3; no reissued record bears 3,
-// so the void explains it, and 121's record at 4 above it is emitted: no
-// hole, with or without continuing past discarded holes (skip mode).
-// Neuter: drop "a superseded void still explains its index"; the merge stops
-// at 3 as a superseded-only index.
+// GC33 (D-GC33c): rewritten from GC31 Q12's layout. GC31's span [1, 2]
+// put 120's void over 3 at its declarer's start, where GC31's guard ("a
+// superseded void still explains its index") hid a lost reissue; the GC31
+// comparison moved that case back to GC27SupersededVoidDoesNotExplainItsIndex
+// (restored below). This layout keeps the half GC31 got right, with 121's
+// span [1, 3] (start 4): the void over 3 lies below the start, so the open
+// seeded past it and it explains its index in every mode, with or without
+// continuing past discarded holes (skip mode).
+// Neuter: let no superseded void explain its index; the merge stops at 3 as
+// a superseded-only index.
 TEST_P(LogMergeTest, SupersededVoidStillExplainsUnbornIndex) {
   for (const bool continue_past_discarded : {false, true}) {
     SCOPED_TRACE(continue_past_discarded ? "skip" : "every other mode");
@@ -2146,7 +2149,7 @@ TEST_P(LogMergeTest, SupersededVoidStillExplainsUnbornIndex) {
     ASSERT_OK(old.Data("o2", 2, 2));
     ASSERT_OK(old.Void(3, 3));
     ASSERT_OK(young.Marker());
-    ASSERT_OK(young.Span(120, 1, 2));
+    ASSERT_OK(young.Span(120, 1, 3));
     ASSERT_OK(young.Sup(120, 3));
     ASSERT_OK(young.Data("n4", 4, 4));
 
@@ -2351,6 +2354,99 @@ TEST_P(LogMergeTest, GC27VoidCoverPlusDataNamesWals) {
             merger->GetError().ToString().find(
                 "index 2 bears records (WAL 121) and a void cover (WAL 120)"))
       << merger->GetError().ToString();
+}
+
+// GC33 (D-GC33b, D-GC33c): restored from GC27, with the body it had at
+// pwal/gc30-join. A superseded void explains its index only if the open
+// seeded past it; this one lies at its declarer's start (121 attests 120 as
+// [1, 2], so start 3; the void covers 3), so its index is superseded-only
+// and the live record at 4 above it stops the merge at a pending-discard
+// frontier. GC31 Q12's guard reversed this test as
+// SupersededVoidStillExplainsUnbornIndex; the GC31 comparison showed the
+// reversal hides a lost reissue at or above the declarer's start.
+// Neuter: let every superseded void explain its index (the base's rule);
+// the merge ends clean with {1, 2, 4}.
+TEST_P(LogMergeTest, GC27SupersededVoidDoesNotExplainItsIndex) {
+  MemberFile old(120, recyclable());
+  MemberFile young(121, recyclable());
+  ASSERT_OK(old.Marker());
+  ASSERT_OK(old.Data("o1", 1, 1));
+  ASSERT_OK(old.Data("o2", 2, 2));
+  ASSERT_OK(old.Void(3, 3));
+  ASSERT_OK(young.Marker());
+  ASSERT_OK(young.Span(120, 1, 2));
+  ASSERT_OK(young.Sup(120, 3));
+  ASSERT_OK(young.Data("n4", 4, 4));
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(old, old.Bytes()));
+  members.push_back(MakeMember(young, young.Bytes()));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kFrontier, driven.outcome);
+  EXPECT_EQ(3U, merger->GetFrontier());
+  EXPECT_TRUE(merger->FrontierIsPendingDiscard());
+  ASSERT_EQ(std::vector<uint64_t>({1, 2}), DrivenIndices(driven));
+}
+
+// GC33 Q2 (D-GC33b): a superseded void at or above its declarer's start
+// explains nothing. 121 starts at 3 (span last 2) and declares 120 obsolete
+// from 3; index 3 is superseded-only (a pending discard, declarer 121), and
+// the voids over 4..5 do not show that 3 was never reissued, so the live
+// record at 6 means its reissued copy was lost: the frontier is 3, pending.
+// Neuter: widen GC19's pending exception to superseded voids (Muse's GC31
+// change); the merge ends clean with {1, 2, 6}.
+TEST_P(LogMergeTest, GC33SupersededVoidAboveStartKeepsPending) {
+  MemberFile old(120, recyclable());
+  MemberFile young(121, recyclable());
+  ASSERT_OK(old.Marker());
+  ASSERT_OK(old.Data("o1", 1, 1));
+  ASSERT_OK(old.Data("o2", 2, 2));
+  ASSERT_OK(old.Data("o3", 3, 3));
+  ASSERT_OK(old.Void(4, 5));
+  ASSERT_OK(young.Marker());
+  ASSERT_OK(young.Span(120, 1, 2));
+  ASSERT_OK(young.Sup(120, 3));
+  ASSERT_OK(young.Data("n6", 6, 6));
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(old, old.Bytes()));
+  members.push_back(MakeMember(young, young.Bytes()));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kFrontier, driven.outcome)
+      << merger->GetError().ToString();
+  EXPECT_EQ(3U, merger->GetFrontier());
+  EXPECT_TRUE(merger->FrontierIsPendingDiscard());
+  ASSERT_EQ(std::vector<uint64_t>({1, 2}), DrivenIndices(driven));
+}
+
+// GC33 Q2 control: the same with 121's span [1, 5] (start 6), so the voids
+// over 4..5 lie below the start and the open seeded past them: they explain
+// their indices and clear the pending discard at 3, and the merge ends clean
+// with {1, 2, 6}.
+TEST_P(LogMergeTest, GC33SupersededVoidBelowStartClearsPending) {
+  MemberFile old(120, recyclable());
+  MemberFile young(121, recyclable());
+  ASSERT_OK(old.Marker());
+  ASSERT_OK(old.Data("o1", 1, 1));
+  ASSERT_OK(old.Data("o2", 2, 2));
+  ASSERT_OK(old.Data("o3", 3, 3));
+  ASSERT_OK(old.Void(4, 5));
+  ASSERT_OK(young.Marker());
+  ASSERT_OK(young.Span(120, 1, 5));
+  ASSERT_OK(young.Sup(120, 3));
+  ASSERT_OK(young.Data("n6", 6, 6));
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(old, old.Bytes()));
+  members.push_back(MakeMember(young, young.Bytes()));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome)
+      << merger->GetError().ToString();
+  ASSERT_EQ(std::vector<uint64_t>({1, 2, 6}), DrivenIndices(driven));
+  EXPECT_TRUE(driven.gaps.empty());
 }
 
 INSTANTIATE_TEST_CASE_P(LogMerge, LogMergeTest,

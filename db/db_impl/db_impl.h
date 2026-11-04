@@ -3316,13 +3316,19 @@ class DBImpl : public DB
     // Announced before the count is read, and the ender reads the
     // announcement after its decrement (both sequentially consistent), so
     // either this check sees zero or the ender sees the announcement and
-    // signals, taking mutex_ (EndUnpublishedSyncGroup).
-    unpublished_sync_group_waiters_.fetch_add(1);
+    // signals, taking mutex_ (EndUnpublishedSyncGroup). Above one
+    // partition only: at N=1 the count is never raised, so no announcement.
+    const bool announce = NumWalPartitions() > 1;
+    if (announce) {
+      unpublished_sync_group_waiters_.fetch_add(1);
+    }
     while (unpublished_sync_groups_.load() != 0) {
       TEST_SYNC_POINT("DBImpl::WaitForUnpublishedSyncGroups:Wait");
       bg_cv_.Wait();
     }
-    unpublished_sync_group_waiters_.fetch_sub(1);
+    if (announce) {
+      unpublished_sync_group_waiters_.fetch_sub(1);
+    }
   }
 
   // TaskType is used to identify tasks in thread-pool, currently only
@@ -3377,6 +3383,11 @@ class DBImpl : public DB
 
   // REQUIRES: mutex locked and in write thread.
   Status HandleWriteBufferManagerFlush(WriteContext* write_context);
+
+  // Whether HandleWriteBufferManagerFlush() would switch a memtable or
+  // request a flush now. Changes nothing.
+  // REQUIRES: mutex locked.
+  bool WriteBufferManagerFlushWouldAct();
 
   // Column families and memory eligible for a WriteBufferManager flush.
   struct FlushableCFs {
@@ -4861,8 +4872,11 @@ class DBImpl : public DB
   }
   // The live WALs' total size, summed over the partitions with relaxed loads:
   // like the single relaxed load at one partition, it may lag appends in
-  // flight.
+  // flight. At N=1 the single counter above is read directly, as upstream.
   uint64_t WalsTotalSize() const {
+    if (NumWalPartitions() == 1) {
+      return wals_total_size_.LoadRelaxed();
+    }
     uint64_t total = wals_total_size_.LoadRelaxed();
     for (const auto& size : wal_partition_sizes_) {
       total += size.obj_.LoadRelaxed();

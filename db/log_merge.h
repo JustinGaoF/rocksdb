@@ -484,13 +484,16 @@ class WALIndexMerger {
   // (D-2): a supersession record names a file and its first obsolete index,
   // and reaches every void of the file at or above that index, whatever
   // start the declaring WAL attests (none included). A superseded void never
-  // contradicts a record at its index, but still explains the index when no
-  // live record bears it.
-  bool VoidSuperseded(uint64_t wal_number, uint64_t index) const;
+  // contradicts a record at its index; it explains the index only if the
+  // open seeded past it (VoidSeededPast). Sets *declarer to the lowest
+  // declaring WAL.
+  bool VoidSuperseded(uint64_t wal_number, uint64_t index,
+                      uint64_t* declarer) const;
   // Whether an open seeded past the void `wal_number` holds over `index`: no
   // declaration superseding it attests a start (its span's last plus one,
-  // or its head floor) at or below `index`. Only such a void tells GC19's
-  // exception that the pending indices below it were never reissued.
+  // or its head floor) at or below `index`. Only such a void explains its
+  // index, and only it tells GC19's exception that the pending indices
+  // below it were never reissued.
   bool VoidSeededPast(uint64_t wal_number, uint64_t index) const;
 
   std::vector<std::unique_ptr<Member>> members_;

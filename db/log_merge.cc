@@ -234,13 +234,16 @@ WALIndexMerger::MemberState* WALIndexMerger::FindState(uint64_t wal_number) {
   return nullptr;
 }
 
-bool WALIndexMerger::VoidSuperseded(uint64_t wal_number, uint64_t index) const {
+bool WALIndexMerger::VoidSuperseded(uint64_t wal_number, uint64_t index,
+                                    uint64_t* declarer) const {
+  bool superseded = false;
   for (const auto& d : states_) {
     if (d.member->Supersedes(wal_number, index)) {
-      return true;
+      superseded = true;
+      *declarer = std::min(*declarer, d.member->wal_number());
     }
   }
-  return false;
+  return superseded;
 }
 
 bool WALIndexMerger::VoidSeededPast(uint64_t wal_number, uint64_t index) const {
@@ -629,20 +632,30 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
         holders.push_back(&state);
       }
     }
-    // A void a declaration supersedes (D-2) never contradicts a holder, but
-    // still explains the index when no live record bears it.
+    // A void a declaration supersedes (D-2) never contradicts a holder. It
+    // explains the index only if the open seeded past it: a void at or
+    // above its declarer's start may have been reissued, so with no live
+    // record its index is superseded-only (a pending discard below).
     std::vector<uint64_t> void_wals;
     std::vector<uint64_t> seeded_void_wals;
-    bool superseded_void = false;
+    bool seeded_superseded_void = false;
+    bool unseeded_superseded_void = false;
+    uint64_t void_declarer = std::numeric_limits<uint64_t>::max();
     for (auto& state : states_) {
       if (state.member->VoidCovers(expected_)) {
         const uint64_t wal = state.member->wal_number();
-        if (VoidSuperseded(wal, expected_)) {
-          superseded_void = true;
-        } else {
+        uint64_t declarer = std::numeric_limits<uint64_t>::max();
+        const bool superseded = VoidSuperseded(wal, expected_, &declarer);
+        const bool seeded = VoidSeededPast(wal, expected_);
+        if (!superseded) {
           void_wals.push_back(wal);
+        } else if (seeded) {
+          seeded_superseded_void = true;
+        } else {
+          unseeded_superseded_void = true;
+          void_declarer = std::min(void_declarer, declarer);
         }
-        if (VoidSeededPast(wal, expected_)) {
+        if (seeded) {
           seeded_void_wals.push_back(wal);
         }
       }
@@ -742,7 +755,7 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
       expected_++;
       return Result::kRecord;
     }
-    const bool had_holders = !holders.empty();
+    const bool had_holders = !holders.empty() || unseeded_superseded_void;
     for (auto* h : holders) {
       h->has_lookahead = false;  // superseded copies explain themselves.
     }
@@ -753,7 +766,7 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
         break;
       }
     }
-    if (void_covered || superseded_void || swallowed_covered) {
+    if (void_covered || seeded_superseded_void || swallowed_covered) {
       // A void in a WAL older than the declaration predates the cut, and an
       // open at N=1 seeds past such voids: the pending indices below it were
       // never reissued. A superseded void at or above its declarer's start
@@ -830,6 +843,7 @@ WALIndexMerger::Result WALIndexMerger::Next(Slice* record) {
             }
           }
         }
+        pending_declarer_ = std::min(pending_declarer_, void_declarer);
         expected_++;
         continue;
       }
