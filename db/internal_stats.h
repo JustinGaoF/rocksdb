@@ -656,6 +656,11 @@ class InternalStats {
   }
 
   uint64_t GetDBStats(InternalDBStatsType type) {
+    // At N=1 there are no shards (SetNumDBStatsShards runs only at N>1), so
+    // the single counter is read directly, as upstream.
+    if (num_db_stats_shards_ == 0) {
+      return db_stats_[type].load(std::memory_order_relaxed);
+    }
     uint64_t value = db_stats_[type].load(std::memory_order_relaxed);
     if (type < kNumShardedDBStats) {
       for (size_t s = 0; s < num_db_stats_shards_; ++s) {

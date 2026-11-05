@@ -421,6 +421,11 @@ Status DBImpl::Resume() {
 //    it put it below every recovery's lower bound. A failure here leaves the
 //    hard background error but not the quarantine: step 5 already detached
 //    every WAL the cutoff covered and cleared it.
+// 7. Above one partition, persist the last allocated sequence again: a
+//    straggler that passed its stopped-DB check before the error can allocate
+//    above the step 2 reservation, and fails at its fence. Hold allocation
+//    back until the release closes the fences, so no sequence a fenced write
+//    allocated is issued again, after a reopen either.
 Status DBImpl::ResumeImpl(DBRecoverContext context,
                           Env::IOActivity io_activity) {
   mutex_.AssertHeld();
@@ -579,6 +584,8 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
     }
   }
 
+  // Above one partition, the sequence the reservation below persisted.
+  SequenceNumber persisted_reservation = 0;
   if (s.ok() && context.IsWALWriteErrorRecovery() &&
       (context.failed_wal_sequence > 0 || NumWalPartitions() > 1)) {
     // A WAL error can be reported after the whole record reached storage but
@@ -627,6 +634,7 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
                                 BackgroundErrorReason::kManifestWrite);
     }
     if (s.ok()) {
+      persisted_reservation = reserved_sequence;
       ROCKS_LOG_INFO(immutable_db_options_.info_log,
                      "[WAL recovery] Persisted sequence reservation through "
                      "#%" PRIu64,
@@ -803,6 +811,12 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
   job_context.Clean();
   mutex_.Lock();
 
+  if (s.ok() && context.IsWALWriteErrorRecovery() && NumWalPartitions() > 1) {
+    // Step 7: a straggler may have allocated above the reservation since.
+    // From here until ClearBGError closes the fences, allocation waits.
+    s = HoldSequencesForWalRecoveryRelease(persisted_reservation, read_options,
+                                           write_options);
+  }
   TEST_SYNC_POINT("DBImpl::ResumeImpl:BeforeClearBGError");
   if (s.ok()) {
     // Will notify and unblock threads waiting for error recovery to finish.
@@ -828,6 +842,8 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
     // See https://github.com/facebook/rocksdb/pull/7715#issuecomment-754947952
     error_handler_.GetRecoveryError().PermitUncheckedError();
   }
+  // ClearBGError ended the hold, unless it failed before closing the fences.
+  ReleaseSequenceReservation();
 
   // Check for shutdown again before scheduling further compactions,
   // since we released and re-acquired the lock above
@@ -1223,6 +1239,7 @@ Status DBImpl::CloseHelper() {
   bg_cv_.SignalAll();
   error_handler_.CancelErrorRecoveryForShutDown();
   while (!error_handler_.ReadyForShutdown()) {
+    TEST_SYNC_POINT("DBImpl::CloseHelper:WaitForRecovery");
     bg_cv_.Wait();
   }
   mutex_.Unlock();

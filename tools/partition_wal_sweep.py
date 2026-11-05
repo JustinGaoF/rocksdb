@@ -27,11 +27,11 @@ by the criterion fixed in REPRO_METRICS / REPRO_MAX_DELTA.
 
 Example:
   tools/partition_wal_sweep.py --db-bench buck-out/.../db_bench \\
-      --output-dir /tmp/gc16-sweep
-  tools/partition_wal_sweep.py --db-bench ... --output-dir /tmp/gc16-quick \\
+      --output-dir <out-dir>
+  tools/partition_wal_sweep.py --db-bench ... --output-dir <quick-dir> \\
       --quick
-  tools/partition_wal_sweep.py --db-bench ... --output-dir /tmp/gc16-quick2 \\
-      --quick --compare_to /tmp/gc16-quick/results.json
+  tools/partition_wal_sweep.py --db-bench ... --output-dir <quick-dir-2> \\
+      --quick --compare_to <quick-dir>/results.json
 """
 
 import argparse

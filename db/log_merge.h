@@ -1,4 +1,4 @@
-//  Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.
+//  Copyright (c) Meta Platforms, Inc. and affiliates.
 //  This source code is licensed under both the GPLv2 (found in the
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
@@ -489,10 +489,10 @@ class WALIndexMerger {
   // Whether an open seeded past the void `wal_number` holds over `index`: no
   // declaration superseding it attests a start (its span's last plus one,
   // or its head floor) at or below `index`. Only such a void explains its
-  // index when no live record bears it, and tells GC19's exception that the
-  // pending indices below it were never reissued; one at or above the start
-  // may have been reissued, so its index is superseded-only. Sets *declarer
-  // to the lowest WAL declaring such a start.
+  // index when no live record bears it, and clears a pending discard below
+  // it: the pending indices below it were never reissued; one at or above the
+  // start may have been reissued, so its index is superseded-only. Sets
+  // *declarer to the lowest WAL declaring such a start.
   bool VoidSeededPast(uint64_t wal_number, uint64_t index,
                       uint64_t* declarer) const;
 

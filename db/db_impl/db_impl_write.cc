@@ -1358,9 +1358,9 @@ Status DBImpl::WriteImpl(
   // its WAL append failed before anything was inserted (see the exit).
   bool registered_applied_range = false;
   bool release_unapplied_range = false;
-  // Ruling 4d: above one partition a group with a WAL record launches its
-  // memtable writers as soon as its sequences are assigned, before its WAL
-  // append, and publishes only once both are done (WriteGroup::wal_status).
+  // Above one partition a group with a WAL record launches its memtable
+  // writers as soon as its sequences are assigned, before its WAL append, and
+  // publishes only once both are done (WriteGroup::wal_status).
   bool insert_during_append = false;
   // Above one partition a sync write becomes visible only once it is
   // durable. Its group inserts every batch before it exits, but publishes
@@ -1584,9 +1584,9 @@ Status DBImpl::WriteImpl(
     // We're optimistic, updating the stats before we successfully
     // commit.  That lets us release our leader status early.
     // Branches rather than a per-stat lambda: with the completion gate's
-    // capture below, they keep WriteImpl's stack frame as before GC31, and
-    // so the stack placement of the pipelined writers below it, which
-    // one-partition throughput depends on.
+    // capture below, they keep WriteImpl's stack frame as it was before the
+    // DB stats were sharded, and so the stack placement of the pipelined
+    // writers below it, which one-partition throughput depends on.
     auto stats = default_cf_internal_stats_;
     auto write_done_by_other = write_group.size - 1;
     if (NumWalPartitions() > 1 && !two_write_queues_) {
@@ -3093,6 +3093,13 @@ IOStatus DBImpl::AllocateSequenceAndWALIndex(
 
   {
     SequenceWalIndexLock lock(this);
+    while (UNLIKELY(sequence_reservation_held_)) {
+      // A file-scoped recovery is releasing its reservation: allocate only
+      // once its fences are closed (HoldSequencesForWalRecoveryRelease).
+      TEST_SYNC_POINT(
+          "DBImpl::AllocateSequenceAndWALIndex:WaitForReservationRelease");
+      sequence_reservation_released_cv_.Wait();
+    }
     if (wal_index_enabled && write_wal &&
         next_wal_index_ == std::numeric_limits<uint64_t>::max()) {
       return IOStatus::Corruption("WAL index exhausted");
@@ -3553,6 +3560,9 @@ void DBImpl::ClearWalDurabilityBGError() {
     }
     wal_gate_fence_high_.store(high, std::memory_order_release);
   }
+  // The fences are closed: an allocation the recovery held back lands above
+  // them.
+  ReleaseSequenceReservation();
   // Durability first: the applied frontier this publishes must stay below
   // every range still pending its append. The trackers feed only the gates
   // and publication; recovery and the indeterminate-write fence still see the
@@ -3574,6 +3584,60 @@ void DBImpl::ClearWalDurabilityBGError() {
                          /*wal_record=*/true);
   }
   failed_wal_ranges_.clear();
+}
+
+Status DBImpl::HoldSequencesForWalRecoveryRelease(
+    SequenceNumber reserved, const ReadOptions& read_options,
+    const WriteOptions& write_options) {
+  mutex_.AssertHeld();
+  assert(NumWalPartitions() > 1);
+  while (true) {
+    SequenceNumber last_allocated = 0;
+    {
+      SequenceWalIndexLock lock(this);
+      last_allocated = versions_->LastAllocatedSequence();
+      if (last_allocated <= reserved) {
+        sequence_reservation_held_ = true;
+        return Status::OK();
+      }
+    }
+    // A straggler allocated above the reservation. The MANIFEST write
+    // releases mutex_; stragglers may allocate meanwhile, so read again.
+    VersionEdit edit;
+    edit.SetLastSequence(last_allocated);
+    auto* cfh =
+        static_cast_with_check<ColumnFamilyHandleImpl>(default_cf_handle_);
+    assert(cfh);
+    Status s = versions_->LogAndApply(cfh->cfd(), read_options, write_options,
+                                      &edit, &mutex_, directories_.GetDbDir());
+    if (!s.ok()) {
+      if (versions_->io_status().IsIOError()) {
+        error_handler_.SetBGError(versions_->io_status(),
+                                  BackgroundErrorReason::kManifestWrite);
+      }
+      ROCKS_LOG_WARN(immutable_db_options_.info_log,
+                     "[WAL recovery] Failed to persist sequence reservation "
+                     "through #%" PRIu64 ": %s",
+                     last_allocated, s.ToString().c_str());
+      return s;
+    }
+    ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                   "[WAL recovery] Persisted sequence reservation through "
+                   "#%" PRIu64 " (allocated after the first)",
+                   last_allocated);
+    reserved = last_allocated;
+  }
+}
+
+void DBImpl::ReleaseSequenceReservation() {
+  mutex_.AssertHeld();
+  // Written only under mutex_, so read here without the allocation mutex.
+  if (!sequence_reservation_held_) {
+    return;
+  }
+  SequenceWalIndexLock lock(this);
+  sequence_reservation_held_ = false;
+  sequence_reservation_released_cv_.SignalAll();
 }
 
 Status DBImpl::BurnedWALIndexLanded(uint64_t wal_number, uint64_t wal_index,

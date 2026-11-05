@@ -3582,6 +3582,22 @@ class DBImpl : public DB
   // falls inside a fence.
   void ClearWalDurabilityBGError();
 
+  // N>1 file-scoped recovery only, with mutex_ held, right before
+  // ErrorHandler::ClearBGError. A straggler -- a leader that passed its
+  // stopped-DB check before the error -- can allocate above the reservation
+  // ResumeImpl persisted through `reserved`, and fails at its fence. Persists
+  // the last allocated sequence until it stops moving, then holds allocation
+  // back until ClearWalDurabilityBGError has closed the fences, so every
+  // sequence a fenced write allocated lies within a persisted reservation and
+  // is never issued again, a reopen included. Allocation resumes above the
+  // closed fences (ReleaseSequenceReservation).
+  Status HoldSequencesForWalRecoveryRelease(SequenceNumber reserved,
+                                            const ReadOptions& read_options,
+                                            const WriteOptions& write_options);
+  // Ends the hold above, if any, and wakes the allocations it held back.
+  // mutex_ held.
+  void ReleaseSequenceReservation();
+
   // N>1 only. Writes a void cover for every index in burned_wal_indices_ into
   // partition 0's current WAL, which recovery's rotation installed, and syncs
   // it and the WAL directory, so no later recovery reads the burned index as
@@ -4427,8 +4443,12 @@ class DBImpl : public DB
   //     which holds the partition's WAL mutex. The paths that take it under
   //     mutex_ are rotation (SwitchMemtable, reading next_wal_index_), Open
   //     (the post-recovery marker's allocation and WriteWALIndexHeadFloors'
-  //     read), and the test hooks. It is never held across I/O or batch
-  //     merging, and nothing waits on a condition variable bound to it.
+  //     read), a file-scoped recovery's hold and its release
+  //     (HoldSequencesForWalRecoveryRelease, ReleaseSequenceReservation), and
+  //     the test hooks. It is never held across I/O or batch merging. Only an
+  //     allocation the hold keeps back waits on a condition variable bound to
+  //     it (sequence_reservation_released_cv_), with no other mutex held; the
+  //     release, under mutex_, waits for no writer.
   //  4. Sync markers hold no mutex across partitions while they claim: a
   //     gate sync (SyncWalsFromCompletionGate) and SyncWalImpl claim in
   //     ascending partition order, one WAL mutex at a time. Above one
@@ -4663,6 +4683,11 @@ class DBImpl : public DB
   // state it guards.
   ALIGN_AS(CACHE_LINE_SIZE) InstrumentedMutex sequence_wal_index_mutex_;
   uint64_t next_wal_index_ = log::kWALIndexStartNumber;
+  // Set while a file-scoped recovery above one partition holds allocation
+  // back, from its last sequence reservation to the release that closes the
+  // gate fences (HoldSequencesForWalRecoveryRelease). Written under mutex_
+  // and this mutex; allocation reads it under this mutex.
+  bool sequence_reservation_held_ = false;
   // Guards the parked durability waiters (wal_durability_cv_), the gate
   // fences and the burned-index list. A leaf below mutex_ and the WAL
   // mutexes; only a tracker partition's mutex is taken under it.
@@ -4748,6 +4773,9 @@ class DBImpl : public DB
   // before injecting a failure; CloseHelper waits for it to drain before
   // teardown frees the mutex and the waiters' condition variables.
   std::atomic<size_t> wal_durability_waiters_{0};
+  // Signalled when sequence_reservation_held_ clears.
+  InstrumentedCondVar sequence_reservation_released_cv_{
+      &sequence_wal_index_mutex_};
 #ifndef NDEBUG
   // Every acquisition of sequence_wal_index_mutex_ (SequenceWalIndexLock).
   std::atomic<uint64_t> sequence_wal_index_mutex_takes_{0};

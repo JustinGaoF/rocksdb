@@ -5882,15 +5882,14 @@ TEST_P(DBWritePartitionTest, GateSyncFailureWakesParkedGate) {
           cv.wait(lock, [&] { return release_a; });
         }
       });
-  SyncPoint::GetInstance()->SetCallBack("DBImpl::WriteToWAL:AfterAddRecord",
-                                        [&](void*) {
-                                          std::lock_guard<std::mutex> lock(mu);
-                                          if (a_in_append && !release_a &&
-                                              !w_appended) {
-                                            w_appended = true;
-                                            cv.notify_all();
-                                          }
-                                        });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WriteToWAL:AfterAddRecord", [&](void*) {
+        std::lock_guard<std::mutex> lock(mu);
+        if (a_in_append && !release_a && !w_appended) {
+          w_appended = true;
+          cv.notify_all();
+        }
+      });
   SyncPoint::GetInstance()->SetCallBack(
       "DBImpl::SyncWalsFromCompletionGate:AfterGateSync", [&](void* arg) {
         std::lock_guard<std::mutex> lock(mu);
@@ -6331,14 +6330,14 @@ TEST_P(DBWritePartitionTest, SyncLedGroupAsyncMembersReturnBeforeFsync) {
       run_writer("s", sync_wo, &s_status, &s_seq);
       s_returned.store(true);
     });
-    ASSERT_TRUE(wait_for([&] { return s_waiting; }));
+    EXPECT_TRUE(wait_for([&] { return s_waiting; }));
     port::Thread a1_thread([&] { run_async("a1", &a1_status, &a1_seq); });
     port::Thread a2_thread([&] { run_async("a2", &a2_status, &a2_seq); });
     port::Thread s2_thread([&] {
       run_writer("s2", sync_wo, &s2_status, &s2_seq);
       s2_returned.store(true);
     });
-    ASSERT_TRUE(wait_for([&] { return fsync_held; }));
+    EXPECT_TRUE(wait_for([&] { return fsync_held; }));
     // The async members return OK and are visible while the sync is held;
     // the sync members are parked and invisible.
     EXPECT_TRUE(wait_for([&] { return async_returned == 2; }));
@@ -6355,6 +6354,7 @@ TEST_P(DBWritePartitionTest, SyncLedGroupAsyncMembersReturnBeforeFsync) {
     EXPECT_EQ("NOT_FOUND", Get(cf, "s2"));
     {
       std::lock_guard<std::mutex> lock(mu);
+      release_s = true;
       release_fsync = true;
       cv.notify_all();
     }
@@ -9350,7 +9350,7 @@ TEST_P(DBWritePartitionTest, UnlockedFsyncRacesWithSyncCallersAndRotation) {
         port::Thread s([&] {
           s_status = Put(cf_for_partition_[0], "s" + tag, "v", sync_wo);
         });
-        ASSERT_TRUE(hold.WaitHeld());
+        EXPECT_TRUE(hold.WaitHeld());
         Status racer_status;
         port::Thread r([&] {
           if (racer == "flush") {
@@ -9537,7 +9537,7 @@ TEST_P(DBWritePartitionTest, ParkedWriterHelpsGateSyncButReturnsAfterIt) {
     s_thread_id.store(std::this_thread::get_id());
     s_status = Put(cf_for_partition_[1], "s", "v", sync_wo);
   });
-  ASSERT_TRUE(hold_start.WaitHeld());
+  EXPECT_TRUE(hold_start.WaitHeld());
   std::atomic<std::thread::id> w_thread_id{std::thread::id()};
   GC28Hold w_parks;
   w_parks.Arm("DBImpl::WaitForWalDurability:BeforePark",
@@ -9549,7 +9549,7 @@ TEST_P(DBWritePartitionTest, ParkedWriterHelpsGateSyncButReturnsAfterIt) {
     w_status = Put(cf_for_partition_[3], "w", "v");
     w_done.store(true);
   });
-  ASSERT_TRUE(w_parks.WaitHits(1));
+  EXPECT_TRUE(w_parks.WaitHits(1));
   // S's thread runs the sync; its first claimed partition's fsync is held.
   // Fsyncs on W's thread are counted.
   std::atomic<int> w_fsyncs{0};
@@ -9563,8 +9563,8 @@ TEST_P(DBWritePartitionTest, ParkedWriterHelpsGateSyncButReturnsAfterIt) {
                      return std::this_thread::get_id() == s_thread_id.load();
                    });
   hold_start.Release();
-  ASSERT_TRUE(hold_s_fsync.WaitHeld());
-  ASSERT_TRUE(w_parks.WaitHits(2, std::chrono::seconds(10)))
+  EXPECT_TRUE(hold_s_fsync.WaitHeld());
+  EXPECT_TRUE(w_parks.WaitHits(2, std::chrono::seconds(10)))
       << "the parked writer did not help and park again";
   EXPECT_EQ(1, w_fsyncs.load());
   EXPECT_FALSE(w_done.load());
@@ -9933,13 +9933,23 @@ TEST_P(DBWritePartitionTest, TargetedWakeOnPublish) {
           cv.wait(lock, [&] { return release_gen >= my_gen; });
         }
       });
+  // Arms the hold of the next append: call it before starting the writer
+  // to hold, then wait_in_append().
   auto hold_next_append = [&] {
-    std::unique_lock<std::mutex> lock(mu);
+    std::lock_guard<std::mutex> lock(mu);
     hold_append = true;
     h_in_append = false;
     ++hold_gen;
-    ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(30),
-                            [&] { return h_in_append; }));
+  };
+  auto wait_in_append = [&] {
+    std::unique_lock<std::mutex> lock(mu);
+    return cv.wait_for(lock, std::chrono::seconds(30),
+                       [&] { return h_in_append; });
+  };
+  auto release_append = [&] {
+    std::lock_guard<std::mutex> lock(mu);
+    ++release_gen;
+    cv.notify_all();
   };
   std::atomic<std::thread::id> w2_thread_id{std::thread::id()};
   GC28Hold w2_woken;
@@ -9947,17 +9957,19 @@ TEST_P(DBWritePartitionTest, TargetedWakeOnPublish) {
                GC28OnThread(&w2_thread_id), /*hold=*/false);
 
   Status h1_status;
+  hold_next_append();
   port::Thread h1_thread(
       [&] { h1_status = Put(cf_h, "h1", "v", WriteOptions()); });
-  hold_next_append();
+  ASSERT_TRUE(wait_in_append());
   Status w1_status;
   port::Thread w1_thread(
       [&] { w1_status = Put(cf_w, "w1", "v", WriteOptions()); });
   ASSERT_TRUE(WaitForDurabilityWaiters(1));
   Status h2_status;
+  hold_next_append();
   port::Thread h2_thread(
       [&] { h2_status = Put(cf_h2, "h2", "v", WriteOptions()); });
-  hold_next_append();
+  ASSERT_TRUE(wait_in_append());
   Status w2_status;
   std::atomic<bool> w2_done{false};
   port::Thread w2_thread([&] {
@@ -9967,33 +9979,29 @@ TEST_P(DBWritePartitionTest, TargetedWakeOnPublish) {
   });
   ASSERT_TRUE(WaitForDurabilityWaiters(2));
 
-  // Releasing H1 covers W1 (target h+1) but not W2 (target h+3).
-  {
-    std::lock_guard<std::mutex> lock(mu);
-    ++release_gen;
-    cv.notify_all();
-  }
-  ASSERT_OK(RunWithin(std::chrono::seconds(30), [&] {
+  // Releasing H1 covers W1 (target h+1) but not W2 (target h+3). Every held
+  // writer is released and every thread joined before the checks.
+  release_append();
+  const Status w1_joined = RunWithin(std::chrono::seconds(30), [&] {
     w1_thread.join();
     return w1_status;
-  }));
-  ASSERT_OK(w1_status);
-  EXPECT_FALSE(w2_done.load());
-  EXPECT_EQ(0, w2_woken.Hits());
-  EXPECT_EQ(1U, dbfull()->TEST_WalDurabilityWaiters());
-  {
-    std::lock_guard<std::mutex> lock(mu);
-    ++release_gen;
-    cv.notify_all();
-  }
+  });
+  const bool w2_done_early = w2_done.load();
+  const int w2_wakes_early = w2_woken.Hits();
+  const size_t waiters_early = dbfull()->TEST_WalDurabilityWaiters();
+  release_append();
   h1_thread.join();
   h2_thread.join();
-  ASSERT_OK(RunWithin(std::chrono::seconds(30), [&] {
+  const Status w2_joined = RunWithin(std::chrono::seconds(30), [&] {
     w2_thread.join();
     return w2_status;
-  }));
-  ASSERT_OK(w2_status);
+  });
   SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:log_entry");
+  ASSERT_OK(w1_joined);
+  EXPECT_FALSE(w2_done_early);
+  EXPECT_EQ(0, w2_wakes_early);
+  EXPECT_EQ(1U, waiters_early);
+  ASSERT_OK(w2_joined);
   ASSERT_OK(h1_status);
   ASSERT_OK(h2_status);
   EXPECT_EQ("v", Get(cf_h, "h1"));
@@ -10047,13 +10055,23 @@ TEST_P(DBWritePartitionTest, TargetedWakeOnWalAdvance) {
           cv.wait(lock, [&] { return release_gen >= my_gen; });
         }
       });
+  // Arms the hold of the next append: call it before starting the writer
+  // to hold, then wait_in_append().
   auto hold_next_append = [&] {
-    std::unique_lock<std::mutex> lock(mu);
+    std::lock_guard<std::mutex> lock(mu);
     hold_append = true;
     h_in_append = false;
     ++hold_gen;
-    ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(30),
-                            [&] { return h_in_append; }));
+  };
+  auto wait_in_append = [&] {
+    std::unique_lock<std::mutex> lock(mu);
+    return cv.wait_for(lock, std::chrono::seconds(30),
+                       [&] { return h_in_append; });
+  };
+  auto release_append = [&] {
+    std::lock_guard<std::mutex> lock(mu);
+    ++release_gen;
+    cv.notify_all();
   };
   // H1, once its append completed, is held before it publishes.
   std::atomic<std::thread::id> h1_thread_id{std::thread::id()};
@@ -10065,11 +10083,12 @@ TEST_P(DBWritePartitionTest, TargetedWakeOnWalAdvance) {
                     GC28OnThread(&s1_thread_id), /*hold=*/false);
 
   Status h1_status;
+  hold_next_append();
   port::Thread h1_thread([&] {
     h1_thread_id.store(std::this_thread::get_id());
     h1_status = Put(cf_h, "h1", "v", WriteOptions());
   });
-  hold_next_append();
+  ASSERT_TRUE(wait_in_append());
   Status s1_status;
   port::Thread s1_thread([&] {
     s1_thread_id.store(std::this_thread::get_id());
@@ -10077,9 +10096,10 @@ TEST_P(DBWritePartitionTest, TargetedWakeOnWalAdvance) {
   });
   ASSERT_TRUE(WaitForDurabilityWaiters(1));
   Status h2_status;
+  hold_next_append();
   port::Thread h2_thread(
       [&] { h2_status = Put(cf_h2, "h2", "v", WriteOptions()); });
-  hold_next_append();
+  ASSERT_TRUE(wait_in_append());
   Status s2_status;
   std::atomic<bool> s2_done{false};
   port::Thread s2_thread([&] {
@@ -10089,36 +10109,33 @@ TEST_P(DBWritePartitionTest, TargetedWakeOnWalAdvance) {
   ASSERT_TRUE(WaitForDurabilityWaiters(2));
 
   // Releasing H1's append covers S1 (target h+1) but not S2 (target h+3).
-  {
-    std::lock_guard<std::mutex> lock(mu);
-    ++release_gen;
-    cv.notify_all();
-  }
-  ASSERT_TRUE(h1_appended.WaitHeld());
-  ASSERT_TRUE(s1_publishing.WaitHits(1, std::chrono::seconds(10)))
-      << "S1 was not woken by the WAL advance";
+  // Every held writer is released and every thread joined before the
+  // checks, so a failing check leaves no writer blocked in the DB.
+  release_append();
+  const bool h1_held = h1_appended.WaitHeld();
+  const bool s1_woken = s1_publishing.WaitHits(1, std::chrono::seconds(10));
   // S2 may wake to help S1's gate sync, but its own target stays uncovered.
-  EXPECT_FALSE(s2_done.load());
-  EXPECT_EQ("NOT_FOUND", Get(cf_s, "s2"));
+  const bool s2_done_early = s2_done.load();
+  const std::string s2_early = Get(cf_s, "s2");
   h1_appended.Release();
-  ASSERT_OK(RunWithin(std::chrono::seconds(30), [&] {
+  const Status s1_joined = RunWithin(std::chrono::seconds(30), [&] {
     s1_thread.join();
     return s1_status;
-  }));
-  ASSERT_OK(s1_status);
-  {
-    std::lock_guard<std::mutex> lock(mu);
-    ++release_gen;
-    cv.notify_all();
-  }
+  });
+  release_append();
   h1_thread.join();
   h2_thread.join();
-  ASSERT_OK(RunWithin(std::chrono::seconds(30), [&] {
+  const Status s2_joined = RunWithin(std::chrono::seconds(30), [&] {
     s2_thread.join();
     return s2_status;
-  }));
-  ASSERT_OK(s2_status);
+  });
   SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:log_entry");
+  ASSERT_TRUE(h1_held);
+  EXPECT_TRUE(s1_woken) << "S1 was not woken by the WAL advance";
+  EXPECT_FALSE(s2_done_early);
+  EXPECT_EQ("NOT_FOUND", s2_early);
+  ASSERT_OK(s1_joined);
+  ASSERT_OK(s2_joined);
   ASSERT_OK(h1_status);
   ASSERT_OK(h2_status);
   EXPECT_EQ("v", Get(cf_h, "h1"));
@@ -18242,23 +18259,28 @@ TEST_P(DBWalAppendFailureTest, FileScopedResumeRacesSyncWalAndSyncWrite) {
   // it before the retire loop; the SyncWAL() joined there reports success
   // while the DB is still stopped.
   // Every WAL the MANIFEST tracks with a synced size is at least that long on
-  // disk, before the resume, where the calls are joined, after it and after
-  // the next SyncWAL(). The WALs before the failure are rotated out and
-  // synced first, so the MANIFEST tracks their sizes when the resume starts.
+  // disk: before the resume, where the calls are joined before the flush,
+  // and after the resume once a rotation and SyncWAL() record the next WALs'
+  // sizes. The WALs before the failure are rotated out and synced first, so
+  // the MANIFEST tracks their sizes until the recovery flush makes them
+  // obsolete; each check compares at least one WAL.
   // Neuter: record a closed WAL's synced size one byte beyond its synced
-  // size; the check before the resume fails.
+  // size; the check before the resume fails. Neuter: skip that rotation and
+  // sync; the checks compare no WAL.
   struct Step {
     const char* sync_point;
     bool join_inside;
+    // Before the recovery flush: the rotated WALs' synced sizes are tracked.
+    bool before_flush;
   };
   const std::vector<Step> steps = {
-      {"DBImpl::ResumeImpl:AfterSyncSeq", false},
-      {"DBImpl::FlushAllColumnFamilies:BeforeAtomicFlushMemTables", true},
-      {"DBImpl::ResumeImpl:AfterFlush", false},
-      {"DBImpl::ResumeImpl:BeforeRetire", true},
-      {"DBImpl::ResumeImpl:RetireWal", false},
-      {"DBImpl::ResumeImpl:AfterRetire", false},
-      {"DBImpl::ResumeImpl:BeforeClearBGError", false},
+      {"DBImpl::ResumeImpl:AfterSyncSeq", false, true},
+      {"DBImpl::FlushAllColumnFamilies:BeforeAtomicFlushMemTables", true, true},
+      {"DBImpl::ResumeImpl:AfterFlush", false, false},
+      {"DBImpl::ResumeImpl:BeforeRetire", true, false},
+      {"DBImpl::ResumeImpl:RetireWal", false, false},
+      {"DBImpl::ResumeImpl:AfterRetire", false, false},
+      {"DBImpl::ResumeImpl:BeforeClearBGError", false, false},
   };
   for (const GC32Case& c : GC32Cases()) {
     for (const Step& step : steps) {
@@ -18315,7 +18337,9 @@ TEST_P(DBWalAppendFailureTest, FileScopedResumeRacesSyncWalAndSyncWrite) {
             EXPECT_NOK(call->Join());
           }
           calls.clear();
-          check_synced_sizes();
+          if (step.before_flush) {
+            EXPECT_GT(check_synced_sizes(), 0U);
+          }
         } else {
           std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
@@ -18337,11 +18361,12 @@ TEST_P(DBWalAppendFailureTest, FileScopedResumeRacesSyncWalAndSyncWrite) {
       for (const uint64_t wal : synced) {
         EXPECT_GT(wal, failed_wal);
       }
-      check_synced_sizes();
       fail_fs_->Disarm();
       GC32PutOnEveryWithin(this, "after");
+      // SyncWAL() records synced sizes of closed WALs only.
+      ASSERT_OK(dbfull()->TEST_SwitchMemtable());
       ASSERT_OK(dbfull()->SyncWAL());
-      check_synced_sizes();
+      EXPECT_GT(check_synced_sizes(), 0U);
       ReopenWithPartitions(c.partitions, options);
       GC32ExpectOnEvery(this, "before", "value");
       GC32ExpectOnEvery(this, "after", "value");
@@ -18700,10 +18725,15 @@ TEST_P(DBWritePartitionTest, WbmFlushQuiesceSkippedWhenNothingToSwitch) {
   // true for every write group, and the blocked pools hold every flush. The
   // first writes switch each partition's column family once; from then on
   // each is flushing and nothing is selectable, so 200 writes from 8
-  // threads switch nothing and quiesce no partition. Fails at the base,
-  // where every write group that reaches the manager's branch quiesces.
+  // threads switch nothing and quiesce no partition. Once the pools run and
+  // the flushes finish, the next write's flush acts, once. Fails at the
+  // base, where every write group that reaches the manager's branch
+  // quiesces.
   // Neuter: drop the pre-check; every such group quiesces.
+  // Neuter: let the pre-check never find a switch; the refill switches
+  // nothing.
   if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS("N > 1 rejects two_write_queues");
     return;
   }
   constexpr size_t kPartitions = 8;
@@ -18737,6 +18767,7 @@ TEST_P(DBWritePartitionTest, WbmFlushQuiesceSkippedWhenNothingToSwitch) {
     immutable_before.push_back(GC33Immutable(this, handle));
   }
   quiesces.Reset();
+  GC31Counter switches("DBImpl::SwitchMemtable:AfterCreateWAL");
   std::vector<port::Thread> threads;
   for (int t = 0; t < kThreads; ++t) {
     threads.emplace_back([&, t] {
@@ -18750,10 +18781,24 @@ TEST_P(DBWritePartitionTest, WbmFlushQuiesceSkippedWhenNothingToSwitch) {
     thread.join();
   }
   EXPECT_EQ(0, quiesces.Get());
+  EXPECT_EQ(0, switches.Get());
   for (size_t i = 0; i < handles_.size(); ++i) {
     EXPECT_EQ(immutable_before[i], GC33Immutable(this, handles_[i])) << i;
   }
   EXPECT_EQ("v", Get(cf_for_partition_[kThreads - 1], "t7_24"));
+
+  // Once the pools run, the held flushes finish; the reservation keeps the
+  // manager past its limit, so the next write's flush acts, once.
+  pools.Release();
+  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+  quiesces.Reset();
+  for (int i = 0; switches.Get() == 0; ++i) {
+    ASSERT_LT(i, 1000);
+    ASSERT_OK(Put(cf_for_partition_[i % kPartitions],
+                  "refill" + std::to_string(i), "v"));
+  }
+  EXPECT_EQ(1, quiesces.Get());
+  EXPECT_EQ(1, switches.Get());
   options.write_buffer_manager->ScheduleFreeMem(4 * kBufferSize);
   options.write_buffer_manager->FreeMem(4 * kBufferSize);
 }
@@ -18770,6 +18815,7 @@ TEST_P(DBWritePartitionTest, WbmFlushDecidedAgainAfterGateCloses) {
   // without draining any partition: one quiesce in all, D's.
   // Neuter: decide only before closing; A drains too (two quiesces).
   if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS("N > 1 rejects two_write_queues");
     return;
   }
   constexpr size_t kPartitions = 4;
@@ -18851,10 +18897,13 @@ TEST_P(DBWalAppendFailureTest, FileScopedResumeStragglerAboveReservation) {
   // its flush, releases S: S allocates above the reservation and before the
   // failed ranges are released. S fails at its fence, and stays invisible
   // after the resume, after the next writes and after a reopen in every
-  // recovery mode; every later write in the same instance takes a sequence
-  // above S's, and the published sequence covers every allocated one.
+  // recovery mode; every later write takes a sequence above S's, in the same
+  // instance and after a reopen before any further write, and the published
+  // sequence covers every allocated one.
   // Neuter: let the recovery flush keep entries above the open fence; S is
-  // readable after the resume and its live SST holds it.
+  // readable after the resume and its live SST holds it. Neuter: drop the
+  // reservation the release persists; a reopen recovers the sequence below
+  // S's, and the next write reuses S's sequence.
   for (const GC32Case& c : GC32Cases()) {
     SCOPED_TRACE(c.Name());
     Options options = FailureOptions();
@@ -18884,14 +18933,14 @@ TEST_P(DBWalAppendFailureTest, FileScopedResumeStragglerAboveReservation) {
     Writer straggler([&] { return Put(cf_s, "S", "v"); });
     {
       std::unique_lock<std::mutex> lock(mu);
-      ASSERT_TRUE(
+      EXPECT_TRUE(
           cv.wait_for(lock, std::chrono::seconds(30), [&] { return held; }));
     }
     fail_fs_->Arm(dbfull()->TEST_CurrentWalNumber(c.failing),
                   FileScoped("injected"));
-    ASSERT_NOK(Put(cf_a, "A", "v"));
+    EXPECT_NOK(Put(cf_a, "A", "v"));
     fail_fs_->Disarm();
-    ASSERT_NOK(dbfull()->TEST_GetBGError());
+    EXPECT_NOK(dbfull()->TEST_GetBGError());
 
     SequenceNumber reserved = 0;
     SequenceNumber straggler_top = 0;
@@ -18917,6 +18966,15 @@ TEST_P(DBWalAppendFailureTest, FileScopedResumeStragglerAboveReservation) {
         "DBImpl::FlushAllColumnFamilies:BeforeAtomicFlushMemTables");
     SyncPoint::GetInstance()->ClearCallBack(
         "DBImpl::WriteImpl:BeforeLeaderEnters");
+    if (!fired.load()) {
+      // S is still held: release and join it before failing.
+      {
+        std::lock_guard<std::mutex> lock(mu);
+        release = true;
+        cv.notify_all();
+      }
+      straggler.Join().PermitUncheckedError();
+    }
     ASSERT_TRUE(fired.load());
     EXPECT_NOK(straggler_status);
     EXPECT_GT(straggler_top, reserved);
@@ -18926,6 +18984,19 @@ TEST_P(DBWalAppendFailureTest, FileScopedResumeStragglerAboveReservation) {
     EXPECT_EQ("NOT_FOUND", Get(cf_s, "S"));
     GC32ExpectFencedGone(this, options, c, /*check_ssts=*/true);
     EXPECT_FALSE(LiveSstHasKey(this, options, cf_s, "S"));
+    // S's sequences are not issued again after a reopen before any further
+    // write, in any recovery mode: the release persisted them.
+    const WALRecoveryMode resume_mode = options.wal_recovery_mode;
+    for (const WALRecoveryMode mode : GC32RecoveryModes()) {
+      SCOPED_TRACE(static_cast<int>(mode));
+      options.wal_recovery_mode = mode;
+      ReopenWithPartitions(c.partitions, options);
+      EXPECT_GE(db_->GetLatestSequenceNumber(), straggler_top);
+    }
+    options.wal_recovery_mode = resume_mode;
+    ReopenWithPartitions(c.partitions, options);
+    ASSERT_OK(Put(cf_for_partition_[c.other()], "first", "v"));
+    EXPECT_GT(db_->GetLatestSequenceNumber(), straggler_top);
     GC32PutOnEveryWithin(this, "after");
     EXPECT_GT(db_->GetLatestSequenceNumber(), straggler_top);
     EXPECT_EQ("NOT_FOUND", Get(cf_s, "S"));
@@ -18938,6 +19009,80 @@ TEST_P(DBWalAppendFailureTest, FileScopedResumeStragglerAboveReservation) {
       EXPECT_EQ("NOT_FOUND", Get(cf_for_partition_[c.other()], "S"));
       EXPECT_GT(db_->GetLatestSequenceNumber(), straggler_top);
     }
+    Close();
+  }
+}
+
+TEST_P(DBWalAppendFailureTest,
+       FileScopedResumeHoldsAllocationUntilFencesClose) {
+  // From its last sequence reservation to the release that closes the gate
+  // fences, a file-scoped recovery holds allocation back. An allocation
+  // arriving then (here right before ClearBGError) waits, and lands above
+  // every fence the release closed, instead of inside one and above every
+  // persisted reservation, where a reopen would issue its sequence again.
+  // Neuter: drop the hold (HoldSequencesForWalRecoveryRelease leaves
+  // sequence_reservation_held_ clear); the allocation does not wait, and the
+  // release closes a fence at its sequence.
+  for (const GC32Case& c : GC32Cases()) {
+    SCOPED_TRACE(c.Name());
+    Options options = FailureOptions();
+    GC32Open(this, options, c.partitions);
+    WriteOptions sync_write;
+    sync_write.sync = true;
+    GC32PutOnEvery(this, "before", sync_write);
+    fail_fs_->Arm(dbfull()->TEST_CurrentWalNumber(c.failing),
+                  FileScoped("injected"));
+    ASSERT_NOK(Put(cf_for_partition_[c.failing], "A", "v"));
+    fail_fs_->Disarm();
+    ASSERT_NOK(dbfull()->TEST_GetBGError());
+
+    std::mutex mu;
+    std::condition_variable cv;
+    bool allocation_waiting = false;
+    bool allocation_done = false;
+    SequenceNumber held_at = 0;
+    SequenceNumber before = 0;
+    IOStatus allocated;
+    std::unique_ptr<port::Thread> allocator;
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::AllocateSequenceAndWALIndex:WaitForReservationRelease",
+        [&](void*) {
+          std::lock_guard<std::mutex> lock(mu);
+          allocation_waiting = true;
+          cv.notify_all();
+        });
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::ResumeImpl:BeforeClearBGError", [&](void*) {
+          held_at = dbfull()->GetVersionSet()->LastAllocatedSequence();
+          allocator.reset(new port::Thread([&] {
+            uint64_t wal_index = 0;
+            allocated = dbfull()->TEST_AllocateSequenceAndWALIndex(
+                1, /*write_wal=*/false, &before, &wal_index);
+            std::lock_guard<std::mutex> lock(mu);
+            allocation_done = true;
+            cv.notify_all();
+          }));
+          std::unique_lock<std::mutex> lock(mu);
+          cv.wait_for(lock, std::chrono::seconds(30),
+                      [&] { return allocation_waiting || allocation_done; });
+        });
+    const Status resume = dbfull()->Resume();
+    SyncPoint::GetInstance()->ClearCallBack(
+        "DBImpl::ResumeImpl:BeforeClearBGError");
+    SyncPoint::GetInstance()->ClearCallBack(
+        "DBImpl::AllocateSequenceAndWALIndex:WaitForReservationRelease");
+    ASSERT_NE(nullptr, allocator);
+    allocator->join();
+    ASSERT_OK(resume);
+    ASSERT_OK(allocated);
+    EXPECT_TRUE(allocation_waiting);
+    EXPECT_EQ(held_at, before);
+    const auto fences = dbfull()->TEST_WalGateFences();
+    ASSERT_FALSE(fences.empty());
+    for (const auto& fence : fences) {
+      EXPECT_LE(fence.second, before);
+    }
+    GC32PutOnEveryWithin(this, "after");
     Close();
   }
 }
@@ -20764,7 +20909,7 @@ TEST_P(DBWalAppendFailureTest, FailedGateSyncFailsZeroCountWriteAbove) {
   Writer b([&] { return Put(cf_b, "key_b", "value_b", sync_wo); });
   {
     std::unique_lock<std::mutex> lock(mu);
-    ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(30),
+    EXPECT_TRUE(cv.wait_for(lock, std::chrono::seconds(30),
                             [&] { return b_in_fsync; }));
   }
   // B is inserted but not published while its fsync runs.
@@ -20777,7 +20922,7 @@ TEST_P(DBWalAppendFailureTest, FailedGateSyncFailsZeroCountWriteAbove) {
   });
   {
     std::unique_lock<std::mutex> lock(mu);
-    ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(30),
+    EXPECT_TRUE(cv.wait_for(lock, std::chrono::seconds(30),
                             [&] { return z_in_append; }));
   }
   fail_fs_->Arm(wal1, Retryable("injected sync error"));
@@ -20788,23 +20933,25 @@ TEST_P(DBWalAppendFailureTest, FailedGateSyncFailsZeroCountWriteAbove) {
   }
   const Status b_status = b.Join();
   fail_fs_->Disarm();
-  ASSERT_NOK(b_status);
-  EXPECT_TRUE(b_status.IsIOError());
+  // The fences while Z is still held; Z is released and joined before the
+  // checks.
   const auto fences = dbfull()->TEST_WalGateFences();
-  ASSERT_EQ(1U, fences.size());
-  EXPECT_EQ(b_last + 1, fences[0].first);
-  EXPECT_EQ(kMaxSequenceNumber, fences[0].second);
   {
     std::lock_guard<std::mutex> lock(mu);
     release_z = true;
     cv.notify_all();
   }
   const Status z_status = z.Join();
-  ASSERT_NOK(z_status);
-  EXPECT_TRUE(z_status.IsIOError());
   SyncPoint::GetInstance()->ClearCallBack(
       "DBImpl::SyncWalPartitionFiles:BeforeSyncPartition");
   SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:log_entry");
+  ASSERT_NOK(b_status);
+  EXPECT_TRUE(b_status.IsIOError());
+  ASSERT_EQ(1U, fences.size());
+  EXPECT_EQ(b_last + 1, fences[0].first);
+  EXPECT_EQ(kMaxSequenceNumber, fences[0].second);
+  ASSERT_NOK(z_status);
+  EXPECT_TRUE(z_status.IsIOError());
   EXPECT_EQ("NOT_FOUND", Get(cf_b, "key_b"));
   ASSERT_OK(dbfull()->Resume());
 }
@@ -24706,7 +24853,7 @@ TEST_P(DBWritePartitionTest, ImportWaitsForPendingSyncGroup) {
     });
     {
       std::unique_lock<std::mutex> lock(mu);
-      ASSERT_TRUE(
+      EXPECT_TRUE(
           cv.wait_for(lock, std::chrono::seconds(30), [&] { return held; }));
     }
     Status import_status;
