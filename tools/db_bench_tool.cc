@@ -1771,6 +1771,14 @@ DEFINE_uint64(wal_latency_jitter_us, 0,
               "deterministic extra delay in [0, this] derived from "
               "--wal_latency_seed, the WAL number and the operation index.");
 DEFINE_uint64(wal_latency_seed, 0, "Seed of the WAL latency jitter.");
+DEFINE_double(wal_append_bandwidth_mbps, 0,
+              "With --inject_wal_latency, each WAL append also costs its bytes "
+              "at this many MiB/s. 0 disables.");
+DEFINE_double(wal_sync_bandwidth_mbps, 0,
+              "With --inject_wal_latency, each WAL Sync or Fsync also costs "
+              "the bytes appended to that WAL since its last successful sync "
+              "at this many MiB/s (a RangeSync of n bytes, at most n of them). "
+              "0 disables.");
 DEFINE_int32(sync_write_one_in, 0,
              "In the fill/write benchmarks, make every Nth write batch "
              "sync=true (1 syncs every batch). 0 disables, leaving --sync in "
@@ -1779,8 +1787,9 @@ DEFINE_int32(sync_write_one_in, 0,
 DEFINE_int32(wal_slow_partition, -1,
              "With --inject_wal_latency and --wal_partitions N > 1, run "
              "partition P's WALs at 10x the default append/sync/jitter "
-             "latency, to show the straggler cost the durability watermark "
-             "imposes. -1 disables. Each WAL's partition is read from its WAL "
+             "latency and a tenth of the WAL bandwidths, to show the "
+             "straggler cost the durability watermark imposes. -1 disables. "
+             "Each WAL's partition is read from its WAL "
              "index marker on the first append, so the override follows the "
              "partition across rotations. Needs --wal_compression=none. "
              "Benchmark-only.");
@@ -12113,6 +12122,24 @@ int db_bench_tool(int argc, char** argv, ToolHooks& hooks) {
   // outlives all DB usage; the FileSystem is kept to print its counters.
   static std::shared_ptr<ROCKSDB_NAMESPACE::LatencyInjectionFileSystem>
       wal_latency_fs;
+  if (FLAGS_wal_append_bandwidth_mbps != 0 ||
+      FLAGS_wal_sync_bandwidth_mbps != 0) {
+    if (!(FLAGS_wal_append_bandwidth_mbps >= 0 &&
+          FLAGS_wal_append_bandwidth_mbps <= 1e12 &&
+          FLAGS_wal_sync_bandwidth_mbps >= 0 &&
+          FLAGS_wal_sync_bandwidth_mbps <= 1e12)) {
+      fprintf(stderr,
+              "--wal_append_bandwidth_mbps and --wal_sync_bandwidth_mbps "
+              "need values in [0, 1e12]\n");
+      db_bench_exit(1);
+    }
+    if (!FLAGS_inject_wal_latency) {
+      fprintf(stderr,
+              "--wal_append_bandwidth_mbps and --wal_sync_bandwidth_mbps "
+              "need --inject_wal_latency\n");
+      db_bench_exit(1);
+    }
+  }
   if (FLAGS_wal_slow_partition >= 0) {
     if (!FLAGS_inject_wal_latency) {
       fprintf(stderr, "--wal_slow_partition needs --inject_wal_latency\n");
@@ -12139,6 +12166,15 @@ int db_bench_tool(int argc, char** argv, ToolHooks& hooks) {
     latency.append_micros = FLAGS_wal_append_latency_us;
     latency.sync_micros = FLAGS_wal_sync_latency_us;
     latency.jitter_micros = FLAGS_wal_latency_jitter_us;
+    // MiB/s to bytes/s; a positive bandwidth never rounds down to off.
+    auto bytes_per_sec = [](double mbps) -> uint64_t {
+      return mbps > 0 ? std::max<uint64_t>(
+                            1, static_cast<uint64_t>(mbps * 1048576 + 0.5))
+                      : 0;
+    };
+    latency.append_bytes_per_sec =
+        bytes_per_sec(FLAGS_wal_append_bandwidth_mbps);
+    latency.sync_bytes_per_sec = bytes_per_sec(FLAGS_wal_sync_bandwidth_mbps);
     wal_latency_fs =
         std::make_shared<ROCKSDB_NAMESPACE::LatencyInjectionFileSystem>(
             FLAGS_env->GetFileSystem(), latency, FLAGS_wal_latency_seed);
@@ -12148,6 +12184,12 @@ int db_bench_tool(int argc, char** argv, ToolHooks& hooks) {
       slow.append_micros = 10 * FLAGS_wal_append_latency_us;
       slow.sync_micros = 10 * FLAGS_wal_sync_latency_us;
       slow.jitter_micros = 10 * FLAGS_wal_latency_jitter_us;
+      // A tenth of each bandwidth, so the size term is 10x too.
+      auto tenth = [](uint64_t bandwidth) -> uint64_t {
+        return bandwidth > 0 ? std::max<uint64_t>(1, bandwidth / 10) : 0;
+      };
+      slow.append_bytes_per_sec = tenth(latency.append_bytes_per_sec);
+      slow.sync_bytes_per_sec = tenth(latency.sync_bytes_per_sec);
       fs = std::make_shared<ROCKSDB_NAMESPACE::SlowWalPartitionFileSystem>(
           wal_latency_fs, static_cast<uint32_t>(FLAGS_wal_slow_partition),
           slow);

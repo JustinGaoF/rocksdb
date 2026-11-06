@@ -28,6 +28,12 @@ namespace ROCKSDB_NAMESPACE {
 // blob writes are untouched and pay nothing. Each WAL takes the latency set
 // for its file number, or the default.
 //
+// Each WAL is modelled as its own device with a base latency and, optionally,
+// a bandwidth: an append also costs its bytes at the append bandwidth, and a
+// sync also costs the bytes it makes durable (those appended since the WAL's
+// last successful sync; for a RangeSync of n bytes, at most n of them) at the
+// sync bandwidth.
+//
 // The delay is a sleep in the calling thread before the wrapped operation:
 // the caller blocks holding whatever it holds, as it would on slow storage,
 // and the operation takes effect only after the delay, so a crash during the
@@ -43,6 +49,10 @@ class LatencyInjectionFileSystem : public FileSystemWrapper {
     uint64_t append_micros = 0;
     uint64_t sync_micros = 0;
     uint64_t jitter_micros = 0;
+    // Bytes per second an append moves; 0 = no size term.
+    uint64_t append_bytes_per_sec = 0;
+    // Bytes per second a sync makes durable; 0 = no size term.
+    uint64_t sync_bytes_per_sec = 0;
   };
 
   struct Counters {
@@ -52,11 +62,14 @@ class LatencyInjectionFileSystem : public FileSystemWrapper {
     uint64_t append_bytes = 0;
     // Sync, Fsync and RangeSync calls.
     uint64_t syncs = 0;
-    // Delay requested by this wrapper.
+    // Delay requested by this wrapper, size term included.
     uint64_t injected_sleep_micros = 0;
     // Time spent in the operations: the injected delay plus the wrapped
     // FileSystem's own time.
     uint64_t wall_micros = 0;
+    // The part of injected_sleep_micros that the bandwidths charged for
+    // bytes appended or made durable.
+    uint64_t size_sleep_micros = 0;
 
     std::string ToString() const;
   };
@@ -99,6 +112,11 @@ class LatencyInjectionFileSystem : public FileSystemWrapper {
   // Zeroes the counters. Jitter schedules continue where they were.
   void ResetCounters();
 
+  // Microseconds to move `bytes` at `bytes_per_sec`, rounded up; 0 when
+  // either is 0. Exact without overflow for any byte count up to 2^44 and
+  // any bandwidth.
+  static uint64_t TransferMicros(uint64_t bytes, uint64_t bytes_per_sec);
+
  private:
   struct AtomicCounters {
     std::atomic<uint64_t> appends{0};
@@ -106,8 +124,10 @@ class LatencyInjectionFileSystem : public FileSystemWrapper {
     std::atomic<uint64_t> syncs{0};
     std::atomic<uint64_t> injected_sleep_micros{0};
     std::atomic<uint64_t> wall_micros{0};
+    std::atomic<uint64_t> size_sleep_micros{0};
 
-    void Record(bool is_sync, uint64_t bytes, uint64_t injected, uint64_t wall);
+    void Record(bool is_sync, uint64_t bytes, uint64_t injected,
+                uint64_t size_injected, uint64_t wall);
     Counters Load() const;
     void Reset();
   };
@@ -119,8 +139,14 @@ class LatencyInjectionFileSystem : public FileSystemWrapper {
     std::atomic<uint64_t> append_micros{0};
     std::atomic<uint64_t> sync_micros{0};
     std::atomic<uint64_t> jitter_micros{0};
+    std::atomic<uint64_t> append_bytes_per_sec{0};
+    std::atomic<uint64_t> sync_bytes_per_sec{0};
     // Index of the next operation on this WAL, the jitter schedule's key.
     std::atomic<uint64_t> next_op{0};
+    // Bytes appended (successfully) since the last successful sync. A sync
+    // takes the bytes it charges out of this count before it runs and puts
+    // them back if it fails.
+    std::atomic<uint64_t> unsynced_bytes{0};
     AtomicCounters counters;
   };
 
@@ -131,7 +157,8 @@ class LatencyInjectionFileSystem : public FileSystemWrapper {
   std::shared_ptr<WalState> GetOrCreateState(uint64_t wal_number);
   IOStatus WrapIfWal(const std::string& fname, IOStatus s,
                      std::unique_ptr<FSWritableFile>* result);
-  // Delays, then runs `op`, then records the operation.
+  // Delays, then runs `op`, then records the operation. For an append,
+  // `bytes` is its size; for a sync, the most bytes it can make durable.
   template <typename Op>
   IOStatus Delayed(WalState* state, bool is_sync, uint64_t bytes, Op op);
 
@@ -140,6 +167,8 @@ class LatencyInjectionFileSystem : public FileSystemWrapper {
   std::atomic<uint64_t> default_append_micros_;
   std::atomic<uint64_t> default_sync_micros_;
   std::atomic<uint64_t> default_jitter_micros_;
+  std::atomic<uint64_t> default_append_bytes_per_sec_;
+  std::atomic<uint64_t> default_sync_bytes_per_sec_;
   mutable port::Mutex mutex_;
   std::map<uint64_t, std::shared_ptr<WalState>> wals_;
 };
