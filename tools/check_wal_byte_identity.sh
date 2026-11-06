@@ -6,7 +6,8 @@
 #
 # Checks that two db_bench builds write byte-identical WAL files for a fixed
 # single-threaded workload, in each of these configurations:
-#   none       partition_wal_usage=none (wal_partitions=1)
+#   none       db_bench's defaults: no partition flag, so partition_wal_usage
+#              none and one WAL, the only format an upstream db_bench has
 #   indexed    partition_wal_usage=partition_by_column_family, one partition
 #   partitions partition_wal_usage=partition_by_column_family, four
 #              partitions over eight column families, without pipelined
@@ -16,11 +17,15 @@
 # Usage: tools/check_wal_byte_identity.sh DB_BENCH_A DB_BENCH_B
 #
 # Build both with DEBUG_LEVEL=0 make db_bench, for example the parent commit
-# as A and the commit under test as B. Passing the same binary twice checks
-# that the workload is deterministic. For each configuration the script
-# prints the SHA-256 of every WAL file both builds wrote, then MATCH or
-# MISMATCH; it exits non-zero if any configuration mismatches. The databases
-# go under $TEST_TMPDIR (or /tmp).
+# (or upstream) as A and the commit under test as B. Passing the same binary
+# twice checks that the workload is deterministic. `indexed` and `partitions`
+# need a partition-aware build (one whose db_bench has
+# --partition_wal_usage); when either build lacks it, the script prints
+# "SKIP <config>: <binary> does not support it" for them, so `none` alone
+# compares a build with upstream's db_bench. For each configuration it runs,
+# the script prints the SHA-256 of every WAL file both builds wrote, then
+# MATCH or MISMATCH; it exits non-zero if any configuration mismatches or a
+# db_bench run fails. The databases go under $TEST_TMPDIR (or /tmp).
 
 set -euo pipefail
 
@@ -37,7 +42,7 @@ COMMON_ARGS="--benchmarks=fillseq --threads=1 --num=10000 --seed=20260928 \
 --disable_auto_compactions=1"
 
 declare -A CONFIG_ARGS=(
-  [none]="--partition_wal_usage=none"
+  [none]=""
   [indexed]="--partition_wal_usage=partition_by_column_family"
   [partitions]="--partition_wal_usage=partition_by_column_family \
 --wal_partitions=4 --num_column_families=8 --enable_pipelined_write=0"
@@ -56,8 +61,27 @@ wal_hashes() {
   (cd "$db" && sha256sum -- *.log)
 }
 
+# Whether build $1 has the --partition_wal_usage flag.
+supports_partitions() {
+  local help
+  help=$("$1" --help 2>&1 || true)
+  [[ "$help" == *"-partition_wal_usage"* ]]
+}
+
 status=0
 for config in none indexed partitions; do
+  if [ "$config" != none ]; then
+    unsupported=""
+    for build in "$DB_BENCH_A" "$DB_BENCH_B"; do
+      if [ -z "$unsupported" ] && ! supports_partitions "$build"; then
+        unsupported=$build
+      fi
+    done
+    if [ -n "$unsupported" ]; then
+      echo "SKIP $config: $unsupported does not support it"
+      continue
+    fi
+  fi
   hashes_a=$(wal_hashes "$DB_BENCH_A" "$config" a)
   hashes_b=$(wal_hashes "$DB_BENCH_B" "$config" b)
   echo "== $config: ${CONFIG_ARGS[$config]}"

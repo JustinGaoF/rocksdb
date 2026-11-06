@@ -1617,7 +1617,7 @@ TEST_P(BackupEngineTest, BackupWithoutFlushDuringWritesIsPrefix) {
   std::vector<uint64_t> acked_before;
   {
     PartitionWriters writers(db_.get(), handles, cf_ids, kMaxKeys);
-    writers.WaitForAcked(20);
+    ASSERT_TRUE(writers.WaitForAcked(20));
     acked_before = writers.Acked();
     ASSERT_OK(RunWithin(std::chrono::seconds(30), [&] {
       return backup_engine_->CreateNewBackup(db_.get(),
@@ -1673,7 +1673,11 @@ TEST_P(BackupEngineTest, BackupWithoutFlushRacingLockWAL) {
       }
     });
     for (int b = 0; b < kBackups; ++b) {
-      writers.WaitForAcked(static_cast<uint64_t>(b + 1) * 10);
+      // Not fatal here: `locker` must be joined first.
+      EXPECT_TRUE(writers.WaitForAcked(static_cast<uint64_t>(b + 1) * 10));
+      if (HasFailure()) {
+        break;
+      }
       acked_before[b] = writers.Acked();
       ASSERT_OK(RunWithin(std::chrono::seconds(30), [&] {
         return backup_engine_->CreateNewBackup(db_.get(),

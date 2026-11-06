@@ -132,7 +132,7 @@ TEST_F(LdbCmdTest, MemEnv) {
 }
 
 // `ldb dump_wal` prints every record of an indexed WAL with its sequence and
-// count, and finds no sequence gap in it.
+// count, and refuses to gap-check it alone (GC34 Q4).
 TEST_F(LdbCmdTest, DumpWalPrintsIndexedRecords) {
   Env* env = TryLoadCustomOrDefaultEnv();
   Options opts;
@@ -186,9 +186,13 @@ TEST_F(LdbCmdTest, DumpWalPrintsIndexedRecords) {
                                              "5,3,"};
   EXPECT_EQ(expected, rows) << out;
 
-  ASSERT_EQ(0, dump("--only_print_seqno_gaps", &out, &err));
-  EXPECT_EQ("", err);
-  EXPECT_EQ("", out);
+  // GC34 Q4: the gap check of one WAL of an indexed DB is refused, even at
+  // N=1: the MANIFEST guard cannot tell whether older WALs came from an N>1
+  // open.
+  EXPECT_NE(0, dump("--only_print_seqno_gaps", &out, &err));
+  EXPECT_NE(std::string::npos, (out + err).find("the DB is indexed"))
+      << out << err;
+  EXPECT_EQ(std::string::npos, out.find("Prev batch")) << out;
   ASSERT_OK(DestroyDB(dbname, opts));
 }
 
@@ -295,10 +299,16 @@ INSTANTIATE_TEST_CASE_P(WalPartitions8, LdbCmdWalPartitionsTest,
 
 // `ldb dump_wal` on each partition's current WAL prints that WAL's records,
 // and names the partition of every file but partition 0's; together the files
-// hold every write exactly once. `--only_print_seqno_gaps` checks partition
-// 0's file and refuses every other one. `dump_live_files`, which opens the
+// hold every write exactly once. `--only_print_seqno_gaps` refuses every one
+// of them, partition 0's included (GC34 Q4): the writes go round-robin across
+// the partitions, so other WALs hold the sequences between partition 0's
+// records, and an indexed DB refuses at N=1 too (the MANIFEST guard), where
+// older WALs may come from an N>1 open. A DB that does not index its WALs
+// gap-checks its WAL as upstream does. `dump_live_files`, which opens the
 // DB, lists every partition's current WAL. Ported from
 // D127115188's DumpWalShowsPartitionAndRefusesGapsAtN8.
+// Neuter (GC34 Q4): drop the single-file refusal in DumpWalFiles; partition
+// 0's gap check exits 0 at N=8 with false "Prev batch" gaps.
 TEST_P(LdbCmdWalPartitionsTest, DumpWalAtWalPartitions) {
   Env* env = TryLoadCustomOrDefaultEnv();
   const uint32_t num_partitions = GetParam();
@@ -321,15 +331,19 @@ TEST_P(LdbCmdWalPartitionsTest, DumpWalAtWalPartitions) {
     column_families.emplace_back("cf" + std::to_string(cf_id), opts);
   }
   std::vector<uint64_t> current_wals(num_partitions);
+  constexpr int kRounds = 3;
   {
     std::vector<ColumnFamilyHandle*> handles;
     std::unique_ptr<DB> db;
     ASSERT_OK(DB::Open(opts, dbname, column_families, &handles, &db));
-    for (uint32_t p = 0; p < num_partitions; ++p) {
-      ASSERT_OK(db->Put(WriteOptions(), handles[cf_ids[p]],
-                        "key" + std::to_string(p), "value"));
-      current_wals[p] =
-          static_cast<DBImpl*>(db.get())->TEST_CurrentWalNumber(p);
+    for (int round = 0; round < kRounds; ++round) {
+      for (uint32_t p = 0; p < num_partitions; ++p) {
+        ASSERT_OK(db->Put(
+            WriteOptions(), handles[cf_ids[p]],
+            "key" + std::to_string(p) + "_" + std::to_string(round), "value"));
+        current_wals[p] =
+            static_cast<DBImpl*>(db.get())->TEST_CurrentWalNumber(p);
+      }
     }
     for (ColumnFamilyHandle* handle : handles) {
       ASSERT_OK(db->DestroyColumnFamilyHandle(handle));
@@ -370,14 +384,11 @@ TEST_P(LdbCmdWalPartitionsTest, DumpWalAtWalPartitions) {
         << output;
     const int gaps =
         run({"dump_wal", wal_arg, "--only_print_seqno_gaps"}, &output);
-    if (p == 0) {
-      EXPECT_EQ(0, gaps) << output;
-    } else {
-      EXPECT_NE(0, gaps) << output;
-      EXPECT_NE(std::string::npos, output.find("wal_partitions > 1")) << output;
-    }
+    EXPECT_NE(0, gaps) << output;
+    EXPECT_NE(std::string::npos, output.find("wal_partitions > 1")) << output;
+    EXPECT_EQ(std::string::npos, output.find("Prev batch")) << output;
   }
-  EXPECT_EQ(num_partitions, records);
+  EXPECT_EQ(num_partitions * kRounds, records);
 
   const int live_files = run({"dump_live_files", "--db=" + dbname}, &output);
   if (num_partitions == 1) {
@@ -396,6 +407,33 @@ TEST_P(LdbCmdWalPartitionsTest, DumpWalAtWalPartitions) {
     }
   }
   ASSERT_OK(DestroyDB(dbname, opts));
+
+  if (num_partitions == 1) {
+    // A DB that does not index its WALs: no refusal, as upstream.
+    SCOPED_TRACE("partition_wal_usage none");
+    opts.partition_wal_usage = PartitionWALUsage::kNone;
+    uint64_t wal = 0;
+    {
+      std::vector<ColumnFamilyHandle*> handles;
+      std::unique_ptr<DB> db;
+      ASSERT_OK(DB::Open(opts, dbname, column_families, &handles, &db));
+      for (int round = 0; round < kRounds; ++round) {
+        ASSERT_OK(db->Put(WriteOptions(), handles[cf_ids[0]],
+                          "key" + std::to_string(round), "value"));
+      }
+      wal = static_cast<DBImpl*>(db.get())->TEST_CurrentWalNumber(0);
+      for (ColumnFamilyHandle* handle : handles) {
+        ASSERT_OK(db->DestroyColumnFamilyHandle(handle));
+      }
+    }
+    EXPECT_EQ(0, run({"dump_wal", "--walfile=" + LogFileName(dbname, wal),
+                      "--only_print_seqno_gaps"},
+                     &output))
+        << output;
+    EXPECT_EQ(std::string::npos, output.find("indexed")) << output;
+    EXPECT_EQ(std::string::npos, output.find("Prev batch")) << output;
+    ASSERT_OK(DestroyDB(dbname, opts));
+  }
 }
 
 // GC27 Q5 (d) (L13, K4; D-GC27b): a WAL whose head cannot be read is of an

@@ -2090,8 +2090,10 @@ Status DBImpl::ProcessLogFilesMerged(
   const WALRecoveryMode wal_recovery_mode =
       immutable_db_options_.wal_recovery_mode;
 
-  // Highest applied index per WAL, for cuts. Emitted-but-dropped records
-  // (point-in-time or filter drops) do not advance it.
+  // Highest applied index per WAL, for cuts. A record is applied when
+  // ProcessLogRecord says its replay inserted it, a WriteCommitted prepare
+  // included; emitted-but-dropped records (point-in-time stops, filter
+  // drops, reported or empty records) do not advance it.
   std::unordered_map<uint64_t, uint64_t> applied_max;
   std::unordered_set<uint64_t> superseded;
   auto record_cut = [&](uint64_t wal_number) {
@@ -2118,9 +2120,11 @@ Status DBImpl::ProcessLogFilesMerged(
     // Below the seed the member holds only applied, filter-ignored or empty
     // records, except under skip, where members read past corruption: an
     // unreadable record there stays uncut, as the sequential path leaves it
-    // for the next skip open to skip again. N=1 is exempt: its cuts already
-    // land at the seed, and SecondOpenAfterSupersessionRedeclaresTheSameCut
-    // pins their values.
+    // for the next skip open to skip again. N=1 is exempt and cuts past the
+    // member's applied high: one WAL is written at a time, so above that
+    // high the member holds only its unread tail and filter-ignored or empty
+    // records, never a replayed one, and
+    // SecondOpenAfterSupersessionRedeclaresTheSameCut pins these values.
     // The cut is the seed itself, not the member's first index above it: the
     // declaration also obsoletes the member's voids at or above the seed,
     // and a void can lie below the member's first record, as Resume's
@@ -2394,11 +2398,13 @@ Status DBImpl::ProcessLogFilesMerged(
         }
       }
     } else {
+      bool applied = false;
       Status process_status = ProcessLogRecord(
           record, reader_member->reader(), running_ts_sz, wal_number, fname,
           read_only, job_id, log_file_dropped, &reporter, &record_checksum,
           &last_seqno_observed, next_sequence, &stop_replay_for_corruption,
-          &status, &stop_replay_by_wal_filter, version_edits, &flushed);
+          &status, &stop_replay_by_wal_filter, version_edits, &flushed,
+          &applied);
       if (!process_status.ok()) {
         return process_status;
       }
@@ -2407,11 +2413,12 @@ Status DBImpl::ProcessLogFilesMerged(
           !seqno_check_status.ok()) {
         return seqno_check_status;
       }
-      // Applied unless next_sequence stood still on a non-empty batch: the
-      // inserter advances it even for skipped column families, so stillness
-      // means the record never reached the memtable.
-      dropped = (*next_sequence == prev_next_sequence) &&
-                (!has_header || batch_count != 0);
+      // Applied when its replay inserted it: it was not too small, not
+      // stopped by point-in-time, not ignored by the WAL filter, and its
+      // insert did not fail. Sequence movement cannot tell: a WriteCommitted
+      // prepare is applied (it rebuilds its recovered transaction) without
+      // moving next_sequence.
+      dropped = !applied;
       // The sequences this record's writer allocated, as its replay advanced
       // them. seq_per_batch writers allocate per batch, not per entry, so
       // those openers keep the first-sequence rule.
@@ -2934,7 +2941,8 @@ Status DBImpl::ProcessLogFile(
         record, reader, running_ts_sz, wal_number, fname, read_only, job_id,
         logFileDropped, &reporter, &record_checksum, &last_seqno_observed,
         next_sequence, stop_replay_for_corruption, &status,
-        stop_replay_by_wal_filter, version_edits, flushed);
+        stop_replay_by_wal_filter, version_edits, flushed,
+        /*applied=*/nullptr);
 
     if (!process_status.ok()) {
       return process_status;
@@ -3100,7 +3108,8 @@ Status DBImpl::ProcessLogRecord(
     SequenceNumber* last_seqno_observed, SequenceNumber* next_sequence,
     bool* stop_replay_for_corruption, Status* status,
     bool* stop_replay_by_wal_filter,
-    std::unordered_map<int, VersionEdit>* version_edits, bool* flushed) {
+    std::unordered_map<int, VersionEdit>* version_edits, bool* flushed,
+    bool* applied) {
   assert(reporter);
   assert(last_seqno_observed);
   assert(stop_replay_for_corruption);
@@ -3172,6 +3181,12 @@ Status DBImpl::ProcessLogRecord(
     reporter->Corruption(record.size(), process_status);
     process_status = Status::OK();
     return process_status;
+  }
+  // Inserted, or its insert error ignored (paranoid_checks off). A
+  // WriteCommitted prepare counts: it rebuilds its recovered transaction
+  // instead.
+  if (applied != nullptr) {
+    *applied = true;
   }
 
   process_status = MaybeWriteLevel0TableForRecovery(

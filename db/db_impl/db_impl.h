@@ -2990,7 +2990,8 @@ class DBImpl : public DB
       SequenceNumber* last_seqno_observed, SequenceNumber* next_sequence,
       bool* stop_replay_for_corruption, Status* status,
       bool* stop_replay_by_wal_filter,
-      std::unordered_map<int, VersionEdit>* version_edits, bool* flushed);
+      std::unordered_map<int, VersionEdit>* version_edits, bool* flushed,
+      bool* applied);
 
   Status InitializeWriteBatchForLogRecord(
       Slice record, const std::unique_ptr<log::Reader>& reader,
@@ -3523,14 +3524,15 @@ class DBImpl : public DB
   // without `published` for its records below to complete before its range
   // publishes (RunSyncGate). Its only other exits: the status of
   // a gate fence holding `target` (a range at or below it failed, so it can
-  // never be acknowledged, even once recovery covers it), and
-  // ShutdownInProgress once shutdown begins while still uncovered. Any other
-  // background error leaves it waiting, as one WAL leaves a group whose
-  // append succeeded. Called without holding any mutex; takes
-  // wal_durability_wait_mutex_ only to check fences and park, never together
-  // with mutex_.
+  // never be acknowledged, even once recovery covers it), and, unless the
+  // caller's own range is already marked applied (`applied`: it publishes
+  // once the ranges below it do), ShutdownInProgress once shutdown begins
+  // while still uncovered. Any other background error leaves it waiting, as
+  // one WAL leaves a group whose append succeeded. Called without holding any
+  // mutex; takes wal_durability_wait_mutex_ only to check fences and park,
+  // never together with mutex_.
   Status WaitForWalDurability(SequenceNumber target, bool wal_record,
-                              bool published);
+                              bool published, bool applied);
 
   // Whether the frontiers cover `target` for a waiter with these legs (see
   // WaitForWalDurability). Publication implies durability for a range with

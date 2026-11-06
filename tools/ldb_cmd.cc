@@ -3178,6 +3178,21 @@ void DumpWalFiles(Options options, const std::string& dir_or_file,
       }
       return;
     }
+    if (only_print_seqno_gaps &&
+        (options.wal_partitions > 1 || wal_index_guard_set)) {
+      // One WAL of an indexed DB: other WALs, partition 0's included when
+      // it was written at N>1, may hold the sequences between its records.
+      if (exec_state) {
+        *exec_state = LDBCommandExecuteResult::Failed(
+            Status::NotSupported(
+                "--only_print_seqno_gaps: " + dir_or_file +
+                ": the DB is indexed (wal_partitions > 1 or the MANIFEST WAL "
+                "index guard), so sequence numbers may interleave across its "
+                "WALs and gaps within one file are not real gaps")
+                .ToString());
+      }
+      return;
+    }
     DumpWalFile(options, dir_or_file, print_header, print_values,
                 only_print_seqno_gaps, is_write_committed, ucmps, exec_state,
                 &prev_batch_seqno, &prev_batch_count);
@@ -3502,14 +3517,23 @@ void WALDumperCommand::DoCommand() {
   PrepareOptions();
   // The DB is indexed when the options say wal_partitions > 1 or the MANIFEST
   // WAL index guard is set, which covers the default wal_partitions of 1.
-  // The guard is read from --db, else from the --walfile directory; with no
-  // readable MANIFEST there, the options alone decide.
+  // The guard is read from --db, else from the --walfile directory (the
+  // file's directory for a single WAL); with no readable MANIFEST there, the
+  // options alone decide.
   bool wal_index_guard_set = false;
   if (only_print_seqno_gaps_) {
+    std::string guard_path = db_path_.empty() ? wal_file_ : db_path_;
+    std::vector<std::string> children;
+    if (db_path_.empty() &&
+        (!options_.env->GetChildren(wal_file_, &children).ok() ||
+         children.empty())) {
+      // A single WAL file (as DumpWalFiles tells): its directory's MANIFEST.
+      const size_t sep = wal_file_.rfind(kFilePathSeparator);
+      guard_path = sep == std::string::npos ? "." : wal_file_.substr(0, sep);
+    }
     uint64_t guard = 0;
     const Status s = VersionSet::ReadWALIndexGuard(
-        db_path_.empty() ? wal_file_ : db_path_,
-        options_.env->GetFileSystem().get(), &guard);
+        guard_path, options_.env->GetFileSystem().get(), &guard);
     wal_index_guard_set = s.ok() && guard != 0;
   }
   DumpWalFiles(options_, wal_file_, print_header_, print_values_,

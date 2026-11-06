@@ -2045,6 +2045,7 @@ PartitionWriters::PartitionWriters(
                                  "value" + std::to_string(i));
         EXPECT_OK(s);
         if (!s.ok()) {
+          failed_.store(true);
           return;
         }
         acked_[p].store(i + 1);
@@ -2053,12 +2054,16 @@ PartitionWriters::PartitionWriters(
   }
 }
 
-void PartitionWriters::WaitForAcked(uint64_t count) {
+bool PartitionWriters::WaitForAcked(uint64_t count) {
   for (const std::atomic<uint64_t>& acked : acked_) {
-    while (acked.load() < count && !stop_.load()) {
+    while (acked.load() < count) {
+      if (failed_.load() || stop_.load()) {
+        return false;
+      }
       std::this_thread::yield();
     }
   }
+  return true;
 }
 
 std::vector<uint64_t> PartitionWriters::Acked() const {

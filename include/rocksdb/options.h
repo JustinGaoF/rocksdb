@@ -1626,7 +1626,11 @@ struct DBOptions {
   // and writes stop until DB::Resume().
   // As with one WAL, a reopen without DB::Resume() after a failed sync or WAL
   // append may recover a failed write whose record reached the WAL, and so
-  // may a backup or checkpoint taken before DB::Resume().
+  // may a backup or checkpoint taken before DB::Resume(). The same holds for
+  // a write that Close() or CancelAllBackgroundWork() fails with
+  // ShutdownInProgress before its sync or before the writes ordered ahead of
+  // it publish: it is never visible in the session, but its record may be
+  // recovered on reopen.
   //
   // Enabling more than one partition is a rollout step: every binary that may
   // read these WAL files (the DB itself on reopen or rollback, ldb, backup and
