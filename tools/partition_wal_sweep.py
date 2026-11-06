@@ -7,10 +7,11 @@
 """Reproducible N sweep for partitioned WALs.
 
 Runs a db_bench matrix over WAL partitions x injected append latency x sync
-mode x value size, parses throughput, write-latency percentiles, the WAL
-partition histograms and the latency-FileSystem counters out of each run,
-and evaluates the abandon trigger for partitioned WALs (p99 gate wait over
-p99 write latency at N=8 on the injected profile).
+mode x value size (x WAL bandwidth, with --bandwidths-mbps), parses
+throughput, write-latency percentiles, the WAL partition histograms and the
+latency-FileSystem counters out of each run, and evaluates the abandon
+trigger for partitioned WALs (p99 gate wait over p99 write latency at N=8 on
+the injected profile).
 
 The script builds nothing itself: it takes a db_bench binary path and an
 output directory. Every cell runs at least 3 times; the output reports the
@@ -136,6 +137,10 @@ def parse_args(argv):
     p.add_argument("--sync-modes", default=None,
                    help="comma sync-mode list out of none,mix,all")
     p.add_argument("--value-sizes", default=None, help="comma value-size list")
+    p.add_argument("--bandwidths-mbps", default="0",
+                   help="comma WAL bandwidth list in MiB/s, each applied to "
+                   "both --wal_append_bandwidth_mbps and "
+                   "--wal_sync_bandwidth_mbps; 0 = no size term (default: 0)")
     p.add_argument("--num", type=int, default=2000,
                    help="db_bench --num per thread; 2000 x 16 threads = 32k "
                    "writes per cell, enough for a stable p99 (default: 2000)")
@@ -222,15 +227,22 @@ def build_matrix(args):
         num = args.num
     if args.reps is not None:
         reps = args.reps
+    bandwidths = tuple(float(x) for x in args.bandwidths_mbps.split(","))
+    if any(not bw >= 0 for bw in bandwidths):
+        raise ValueError("bad bandwidth: %s" % args.bandwidths_mbps)
     cells = []
     seen = set()
 
     def add(cell):
-        # The trigger and slow cells can repeat a matrix cell; run it once.
-        key = config_key(cell) + (cell["rep"],)
-        if key not in seen:
-            seen.add(key)
-            cells.append(cell)
+        # Every cell runs at every bandwidth, so each N>1 cell has N=1 cells
+        # of its own bandwidth.
+        for bw in bandwidths:
+            c = dict(cell, bandwidth_mbps=bw)
+            # The trigger and slow cells can repeat a matrix cell; run it once.
+            key = config_key(c) + (c["rep"],)
+            if key not in seen:
+                seen.add(key)
+                cells.append(c)
 
     for n in ns:
         usages = ("none", "partition_by_column_family") if n == 1 else (
@@ -310,6 +322,9 @@ def cell_command(args, cell, cell_dir):
             "--wal_latency_jitter_us=%d" % (cell["append_us"] // 10),
             "--wal_latency_seed=%d" % cell["seed"],
         ]
+        if cell["bandwidth_mbps"]:
+            cmd += ["--wal_append_bandwidth_mbps=%g" % cell["bandwidth_mbps"],
+                    "--wal_sync_bandwidth_mbps=%g" % cell["bandwidth_mbps"]]
     if cell["sync"] == "all":
         cmd.append("--sync")
     elif cell["sync"] == "mix":
@@ -333,10 +348,12 @@ STAT_RE = re.compile(
     r"COUNT : (\d+) SUM : (\d+)$", re.MULTILINE)
 FS_ALL_RE = re.compile(
     r"all WALs: appends=(\d+) append_bytes=(\d+) syncs=(\d+) "
-    r"injected_sleep_micros=(\d+) wall_micros=(\d+)")
+    r"injected_sleep_micros=(\d+) wall_micros=(\d+)"
+    r"(?: size_sleep_micros=(\d+))?")
 FS_WAL_RE = re.compile(
     r"WAL (\d+): appends=(\d+) append_bytes=(\d+) syncs=(\d+) "
-    r"injected_sleep_micros=(\d+) wall_micros=(\d+)")
+    r"injected_sleep_micros=(\d+) wall_micros=(\d+)"
+    r"(?: size_sleep_micros=(\d+))?")
 
 
 def parse_run(output, cell):
@@ -378,6 +395,8 @@ def parse_run(output, cell):
         metrics["fs_syncs"] = int(m.group(3))
         metrics["fs_injected_sleep_us"] = int(m.group(4))
         metrics["fs_wall_us"] = int(m.group(5))
+        if m.group(6) is not None:
+            metrics["fs_size_sleep_us"] = int(m.group(6))
         wals = {}
         for m in FS_WAL_RE.finditer(text):
             wals[int(m.group(1))] = {
@@ -386,6 +405,8 @@ def parse_run(output, cell):
                 "injected_sleep_us": int(m.group(5)),
                 "wall_us": int(m.group(6)),
             }
+            if m.group(7) is not None:
+                wals[int(m.group(1))]["size_sleep_us"] = int(m.group(7))
         if not wals:
             raise ValueError("no per-WAL counters")
         metrics["wals"] = wals
@@ -479,17 +500,26 @@ def aggregate(reps):
 
 
 CONFIG_FIELDS = ("n", "usage", "append_us", "sync", "value_size",
-                 "slow_partition", "injected", "threads")
+                 "slow_partition", "injected", "threads", "bandwidth_mbps")
 
 
 def config_key(cell):
     return tuple(cell[k] for k in CONFIG_FIELDS)
 
 
+def stored_key(config):
+    """config_key of a results.json config; one written before the bandwidth
+    axis has bandwidth 0."""
+    return tuple(config.get(k, 0) if k == "bandwidth_mbps" else config[k]
+                 for k in CONFIG_FIELDS)
+
+
 def cell_label(key):
-    n, usage, lat, sync, size, slow, injected, threads = key
+    n, usage, lat, sync, size, slow, injected, threads, bw = key
     label = "N=%d %s %dus %s %dB t%d" % (
         n, "knone" if usage == "none" else "idx", lat, sync, size, threads)
+    if bw:
+        label += " %gMiBps" % bw
     if slow >= 0:
         label += " slow%d" % slow
     if not injected:
@@ -507,14 +537,14 @@ def tput_verdict(ratio):
 
 def compare_baselines(aggregates):
     """Every N>1 cell against both N=1 cells (kNone and indexed) of the same
-    latency profile and thread count."""
+    latency profile, bandwidth and thread count."""
     rows = []
     for key, agg in sorted(aggregates.items()):
-        n, _usage, lat, sync, size, slow, injected, threads = key
+        n, _usage, lat, sync, size, slow, injected, threads, bw = key
         if n == 1 or slow >= 0:
             continue
         for usage in ("none", "partition_by_column_family"):
-            base_key = (1, usage, lat, sync, size, -1, injected, threads)
+            base_key = (1, usage, lat, sync, size, -1, injected, threads, bw)
             base = aggregates.get(base_key)
             if base is None:
                 continue
@@ -558,7 +588,7 @@ def compute_trigger(aggregates, threads):
     """
     rows = []
     for key, agg in sorted(aggregates.items()):
-        n, _usage, lat, sync, size, slow, injected, cell_threads = key
+        n, _usage, lat, sync, size, slow, injected, cell_threads, bw = key
         if n != 8 or slow >= 0:
             continue
         if not injected:
@@ -566,7 +596,8 @@ def compute_trigger(aggregates, threads):
         gate = agg["gate_wait_p99"]["median"]
         write = agg["write_p99_us"]["median"]
         rows.append({"append_us": lat, "sync": sync, "value_size": size,
-                     "threads": cell_threads, "cell": cell_label(key),
+                     "threads": cell_threads, "bandwidth_mbps": bw,
+                     "cell": cell_label(key),
                      "gate_p99_us": gate, "write_p99_us": write,
                      "ratio": gate / write if write else None})
     verdict = None
@@ -574,7 +605,7 @@ def compute_trigger(aggregates, threads):
         if (r["append_us"] == TRIGGER_LATENCY_US and
                 r["sync"] == TRIGGER_SYNC_MODE and
                 r["value_size"] == TRIGGER_VALUE_SIZE and
-                r["threads"] == threads):
+                r["threads"] == threads and not r["bandwidth_mbps"]):
             verdict = {"cell": r, "threshold": TRIGGER_THRESHOLD,
                        "fires": r["ratio"] is not None and
                        r["ratio"] > TRIGGER_THRESHOLD}
@@ -600,21 +631,28 @@ def fmt(v, width=0):
 
 def render_table(aggregates, keys, title):
     """Human-readable table: one row per config, median (spread in JSON)."""
-    header = ("N", "usage", "append_us", "sync", "size", "slow", "threads",
-              "steady", "ops/s", "us/op", "wr_p50", "wr_p99", "wr_p99.9",
+    # The bandwidth column appears only when a cell has a size term, so
+    # tables without one read as before the bandwidth axis.
+    show_bw = any(k[8] for k in keys)
+    header = ("N", "usage", "append_us", "sync", "size", "slow", "threads")
+    if show_bw:
+        header += ("bw_mbps",)
+    header += ("steady", "ops/s", "us/op", "wr_p50", "wr_p99", "wr_p99.9",
               "gate_p50", "gate_p99", "join_p50", "join_p99",
               "fsync/wr", "cap_med", "cap_hit<=", "fanout_med", "barr_p99",
               "mtx_p99", "mtxall_p99")
     lines = [title, " ".join(h.rjust(8) for h in header)]
     for key in sorted(keys):
-        n, usage, lat, sync, size, slow, _inj, threads = key
+        n, usage, lat, sync, size, slow, _inj, threads, bw = key
         agg = aggregates[key]
         use = "knone" if usage == "none" else "idx"
         st = agg["steady"]
         row = [fmt(n, 8), use.rjust(8), fmt(lat, 8), sync.rjust(8),
-               fmt(size, 8), fmt(slow, 8), fmt(threads, 8),
-               ("%d/%d/%d" % (st["steady"], st["unsteady"], st["na"]))
-               .rjust(8)]
+               fmt(size, 8), fmt(slow, 8), fmt(threads, 8)]
+        if show_bw:
+            row.append(("%g" % bw).rjust(8))
+        row.append(("%d/%d/%d" % (st["steady"], st["unsteady"], st["na"]))
+                   .rjust(8))
         for k in ("ops_per_sec", "micros_per_op", "write_p50_us",
                   "write_p99_us", "write_p999_us", "gate_wait_p50",
                   "gate_wait_p99", "join_wait_p50", "join_wait_p99",
@@ -638,11 +676,11 @@ def reproducibility(results, previous_path):
              "and every %s median within %d%% of the earlier median"
              % ("/".join(REPRO_METRICS), REPRO_MAX_DELTA * 100),
              "cell metric this earlier delta ok"]
-    earlier = {tuple(a["config"][k] for k in CONFIG_FIELDS): a["agg"]
+    earlier = {stored_key(a["config"]): a["agg"]
                for a in previous.get("aggregates", [])}
     failed = []
     for a in results["aggregates"]:
-        key = tuple(a["config"][k] for k in CONFIG_FIELDS)
+        key = stored_key(a["config"])
         if key not in earlier:
             continue
         for metric in REPRO_METRICS:

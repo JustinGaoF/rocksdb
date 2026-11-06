@@ -66,6 +66,33 @@ int ValidateNumDbsFlags() {
   return 0;
 }
 
+int ValidateWalLatencyFlags() {
+  const bool bandwidth_set = FLAGS_wal_append_bandwidth_mbps != 0 ||
+                             FLAGS_wal_sync_bandwidth_mbps != 0;
+  if (bandwidth_set && !(FLAGS_wal_append_bandwidth_mbps >= 0 &&
+                         FLAGS_wal_append_bandwidth_mbps <= 1e12 &&
+                         FLAGS_wal_sync_bandwidth_mbps >= 0 &&
+                         FLAGS_wal_sync_bandwidth_mbps <= 1e12)) {
+    return ReturnValidationError(
+        "--wal_append_bandwidth_mbps and --wal_sync_bandwidth_mbps need "
+        "values in [0, 1e12]");
+  }
+  if (FLAGS_wal_latency_seed < -1) {
+    return ReturnValidationError("--wal_latency_seed must be -1 or above");
+  }
+  if (!FLAGS_inject_wal_latency &&
+      (FLAGS_wal_append_latency_us != 0 || FLAGS_wal_sync_latency_us != 0 ||
+       FLAGS_wal_latency_jitter_us != 0 || bandwidth_set ||
+       FLAGS_wal_latency_seed != -1)) {
+    return ReturnValidationError(
+        "--wal_append_latency_us, --wal_sync_latency_us, "
+        "--wal_latency_jitter_us, --wal_append_bandwidth_mbps, "
+        "--wal_sync_bandwidth_mbps and --wal_latency_seed need "
+        "--inject_wal_latency");
+  }
+  return 0;
+}
+
 int ValidateFileScopedWalWriteFaultFlags() {
   if (!FLAGS_file_scope_wal_write_faults) {
     return 0;
@@ -246,6 +273,12 @@ int db_stress_tool(int argc, char** argv) {
   }
   {
     int rc = ValidateFileScopedWalWriteFaultFlags();
+    if (rc != 0) {
+      return rc;
+    }
+  }
+  {
+    int rc = ValidateWalLatencyFlags();
     if (rc != 0) {
       return rc;
     }
