@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <functional>
+#include <mutex>
 #include <set>
 #include <string>
 #include <vector>
@@ -26,11 +27,14 @@ using Latency = LatencyInjectionFileSystem::Latency;
 using Counters = LatencyInjectionFileSystem::Counters;
 
 Latency MakeLatency(uint64_t append_micros, uint64_t sync_micros,
-                    uint64_t jitter_micros) {
+                    uint64_t jitter_micros, uint64_t append_bytes_per_sec = 0,
+                    uint64_t sync_bytes_per_sec = 0) {
   Latency latency;
   latency.append_micros = append_micros;
   latency.sync_micros = sync_micros;
   latency.jitter_micros = jitter_micros;
+  latency.append_bytes_per_sec = append_bytes_per_sec;
+  latency.sync_bytes_per_sec = sync_bytes_per_sec;
   return latency;
 }
 
@@ -98,6 +102,66 @@ class OverloadCountingFS : public FileSystemWrapper {
   OverloadCounts counts;
 };
 
+// Fails the first `failures` Sync/Fsync/RangeSync calls on any file it
+// creates, then passes through. Appends always pass.
+class SyncFailingFile : public FSWritableFileOwnerWrapper {
+ public:
+  SyncFailingFile(std::unique_ptr<FSWritableFile>&& file,
+                  std::atomic<int>* remaining)
+      : FSWritableFileOwnerWrapper(std::move(file)), remaining_(remaining) {}
+
+  IOStatus Sync(const IOOptions& options, IODebugContext* dbg) override {
+    if (TakeFailure()) {
+      return IOStatus::IOError("injected sync failure");
+    }
+    return target()->Sync(options, dbg);
+  }
+  IOStatus Fsync(const IOOptions& options, IODebugContext* dbg) override {
+    if (TakeFailure()) {
+      return IOStatus::IOError("injected sync failure");
+    }
+    return target()->Fsync(options, dbg);
+  }
+  IOStatus RangeSync(uint64_t offset, uint64_t nbytes, const IOOptions& options,
+                     IODebugContext* dbg) override {
+    if (TakeFailure()) {
+      return IOStatus::IOError("injected sync failure");
+    }
+    return target()->RangeSync(offset, nbytes, options, dbg);
+  }
+
+ private:
+  bool TakeFailure() {
+    int left = remaining_->load();
+    while (left > 0 && !remaining_->compare_exchange_weak(left, left - 1)) {
+    }
+    return left > 0;
+  }
+
+  std::atomic<int>* remaining_;
+};
+
+class SyncFailingFS : public FileSystemWrapper {
+ public:
+  SyncFailingFS(const std::shared_ptr<FileSystem>& base, int failures)
+      : FileSystemWrapper(base), remaining_(failures) {}
+  const char* Name() const override { return "SyncFailingFS"; }
+
+  IOStatus NewWritableFile(const std::string& fname,
+                           const FileOptions& file_opts,
+                           std::unique_ptr<FSWritableFile>* result,
+                           IODebugContext* dbg) override {
+    IOStatus s = target()->NewWritableFile(fname, file_opts, result, dbg);
+    if (s.ok()) {
+      result->reset(new SyncFailingFile(std::move(*result), &remaining_));
+    }
+    return s;
+  }
+
+ private:
+  std::atomic<int> remaining_;
+};
+
 }  // namespace
 
 class LatencyInjectionFSTest : public DBTestBase {
@@ -147,6 +211,7 @@ class LatencyInjectionFSTest : public DBTestBase {
     EXPECT_EQ(expected.append_bytes, actual.append_bytes);
     EXPECT_EQ(expected.syncs, actual.syncs);
     EXPECT_EQ(expected.injected_sleep_micros, actual.injected_sleep_micros);
+    EXPECT_EQ(expected.size_sleep_micros, actual.size_sleep_micros);
   }
 
   // Counters accumulated by `op`, from the wrapper's aggregate.
@@ -160,6 +225,8 @@ class LatencyInjectionFSTest : public DBTestBase {
     delta.syncs = after.syncs - before.syncs;
     delta.injected_sleep_micros =
         after.injected_sleep_micros - before.injected_sleep_micros;
+    delta.size_sleep_micros =
+        after.size_sleep_micros - before.size_sleep_micros;
     delta.wall_micros = after.wall_micros - before.wall_micros;
     return delta;
   }
@@ -588,6 +655,233 @@ TEST_F(LatencyInjectionFSTest, ChecksumHandoffReachesVerificationOverload) {
   EXPECT_EQ(5 * kAppendMicros, delta.injected_sleep_micros);
   EXPECT_EQ(5, counting_fs->counts.append_with_info.load() - with_info_before);
   Close();
+}
+
+TEST_F(LatencyInjectionFSTest, SizeDelayMicrosArithmetic) {
+  // Q1: the size term's formula and its edges: exact multiples, rounding up,
+  // zero bytes, a zero rate, and a 4 GiB append at 1 byte/s (no overflow).
+  using LIFS = LatencyInjectionFileSystem;
+  EXPECT_EQ(0u, LIFS::SizeDelayMicros(0, 1000000));
+  EXPECT_EQ(0u, LIFS::SizeDelayMicros(100, 0));
+  EXPECT_EQ(100u, LIFS::SizeDelayMicros(100, 1000000));
+  EXPECT_EQ(1u, LIFS::SizeDelayMicros(1, 1000000));
+  EXPECT_EQ(1500u, LIFS::SizeDelayMicros(1500, 1000000));
+  EXPECT_EQ(1u, LIFS::SizeDelayMicros(1, 3000000));
+  EXPECT_EQ(1000000u, LIFS::SizeDelayMicros(1000000, 1000000));
+  EXPECT_EQ(79u, LIFS::SizeDelayMicros(4096, 50u << 20));
+  EXPECT_EQ(33334u, LIFS::SizeDelayMicros(100000, 3000000));
+  EXPECT_EQ(4294967296ULL * 1000000ULL,
+            LIFS::SizeDelayMicros(4294967296ULL, 1));
+}
+
+TEST_F(LatencyInjectionFSTest, AppendDelayScalesWithBytes) {
+  // Q1: with base 0 and a known append bandwidth, each append sleeps
+  // ceil(bytes * 1e6 / rate), reported as the size term inside the injected
+  // sleep. A new default bandwidth applies to the already-open WAL at once.
+  using LIFS = LatencyInjectionFileSystem;
+  constexpr uint64_t kBps = 1000000;  // 1 byte/us: the delay equals the size.
+  InstallWrapper(MakeLatency(0, 0, 0, kBps, 0), /*seed=*/0, nullptr);
+  std::unique_ptr<FSWritableFile> wal = OpenThroughWrapper("000050.log");
+  const uint64_t elapsed = ElapsedMicros([&] {
+    for (size_t size : {0, 1, 100, 1500, 100000}) {
+      ASSERT_OK(wal->Append(std::string(size, 'a'), IOOptions(), nullptr));
+    }
+  });
+  constexpr uint64_t kExpected = 0 + 1 + 100 + 1500 + 100000;
+  Counters counters = latency_fs_->GetWalCounters(50);
+  EXPECT_EQ(kExpected, counters.size_sleep_micros);
+  EXPECT_EQ(kExpected, counters.injected_sleep_micros);
+  EXPECT_GE(elapsed, kExpected);
+  EXPECT_EQ(5u, counters.appends);
+  EXPECT_EQ(kExpected, counters.append_bytes);
+
+  constexpr uint64_t kOddBps = 3000000;
+  latency_fs_->SetDefaultLatency(MakeLatency(0, 0, 0, kOddBps, 0));
+  ASSERT_OK(wal->Append(std::string(100000, 'b'), IOOptions(), nullptr));
+  constexpr uint64_t kOddExpected = 33334;  // ceil(1e5 * 1e6 / 3e6).
+  EXPECT_EQ(kOddExpected, LIFS::SizeDelayMicros(100000, kOddBps));
+  counters = latency_fs_->GetWalCounters(50);
+  EXPECT_EQ(kExpected + kOddExpected, counters.size_sleep_micros);
+  EXPECT_EQ(kExpected + kOddExpected, counters.injected_sleep_micros);
+  ASSERT_OK(wal->Close(IOOptions(), nullptr));
+}
+
+TEST_F(LatencyInjectionFSTest, AppendBandwidthPerWalOverride) {
+  // Q1: each WAL is charged by its own bandwidth: an override on one WAL,
+  // the default on another, and the default again once cleared.
+  InstallWrapper(MakeLatency(0, 0, 0, 1000000, 0), /*seed=*/0, nullptr);
+  latency_fs_->SetWalLatency(51, MakeLatency(0, 0, 0, 2000000, 0));
+  std::unique_ptr<FSWritableFile> slow = OpenThroughWrapper("000051.log");
+  std::unique_ptr<FSWritableFile> fast = OpenThroughWrapper("000052.log");
+  ASSERT_OK(slow->Append(std::string(10000, 'a'), IOOptions(), nullptr));
+  ASSERT_OK(fast->Append(std::string(10000, 'b'), IOOptions(), nullptr));
+  EXPECT_EQ(5000u, latency_fs_->GetWalCounters(51).size_sleep_micros);
+  EXPECT_EQ(10000u, latency_fs_->GetWalCounters(52).size_sleep_micros);
+  latency_fs_->ClearWalLatency(51);
+  ASSERT_OK(slow->Append(std::string(10000, 'c'), IOOptions(), nullptr));
+  EXPECT_EQ(15000u, latency_fs_->GetWalCounters(51).size_sleep_micros);
+  ASSERT_OK(slow->Close(IOOptions(), nullptr));
+  ASSERT_OK(fast->Close(IOOptions(), nullptr));
+}
+
+TEST_F(LatencyInjectionFSTest, AppendSizeTermOnEveryAppendEntryPoint) {
+  // Q1: all four append overloads charge the size term (the EveryEntryPoint
+  // pattern, for the size term).
+  InstallWrapper(MakeLatency(0, 0, 0, 1000000, 0), /*seed=*/0, nullptr);
+  DataVerificationInfo info;
+  const std::vector<std::function<IOStatus(FSWritableFile*)>> entry_points = {
+      [](FSWritableFile* f) { return f->Append("abc", IOOptions(), nullptr); },
+      [&](FSWritableFile* f) {
+        return f->Append("abc", IOOptions(), info, nullptr);
+      },
+      [](FSWritableFile* f) {
+        return f->PositionedAppend("abc", 0, IOOptions(), nullptr);
+      },
+      [&](FSWritableFile* f) {
+        return f->PositionedAppend("abc", 0, IOOptions(), info, nullptr);
+      },
+  };
+  uint64_t wal_number = 60;
+  for (const auto& call : entry_points) {
+    std::unique_ptr<FSWritableFile> wal =
+        OpenThroughWrapper("0000" + std::to_string(wal_number) + ".log");
+    ASSERT_OK(call(wal.get()));
+    const Counters counters = latency_fs_->GetWalCounters(wal_number);
+    EXPECT_EQ(3u, counters.size_sleep_micros) << wal_number;
+    EXPECT_EQ(3u, counters.injected_sleep_micros) << wal_number;
+    EXPECT_EQ(1u, counters.appends) << wal_number;
+    ASSERT_OK(wal->Close(IOOptions(), nullptr));
+    ++wal_number;
+  }
+}
+
+TEST_F(LatencyInjectionFSTest, SyncChargesBytesSinceLastSync) {
+  // Q2: each Sync/Fsync sleeps for the bytes appended since the previous
+  // successful sync at the sync bandwidth and resets the count; a sync with
+  // nothing new sleeps only its base.
+  constexpr uint64_t kSyncBase = 100;
+  InstallWrapper(MakeLatency(0, kSyncBase, 0, 0, 1000000), /*seed=*/0, nullptr);
+  std::unique_ptr<FSWritableFile> wal = OpenThroughWrapper("000070.log");
+  ASSERT_OK(wal->Append(std::string(1000, 'a'), IOOptions(), nullptr));
+  ASSERT_OK(wal->Sync(IOOptions(), nullptr));
+  ASSERT_OK(wal->Append(std::string(2000, 'b'), IOOptions(), nullptr));
+  ASSERT_OK(wal->Fsync(IOOptions(), nullptr));
+  ASSERT_OK(wal->Sync(IOOptions(), nullptr));
+  const Counters counters = latency_fs_->GetWalCounters(70);
+  EXPECT_EQ(3u, counters.syncs);
+  EXPECT_EQ(3000u, counters.append_bytes);
+  EXPECT_EQ(3000u, counters.size_sleep_micros);
+  EXPECT_EQ(3 * kSyncBase + 3000, counters.injected_sleep_micros);
+  ASSERT_OK(wal->Close(IOOptions(), nullptr));
+}
+
+TEST_F(LatencyInjectionFSTest, RangeSyncChargesUnsyncedPartOfRange) {
+  // Q2: a RangeSync of n bytes is charged for min(n, unsynced) and lowers
+  // the count by that amount.
+  InstallWrapper(MakeLatency(0, 0, 0, 0, 1000000), /*seed=*/0, nullptr);
+  std::unique_ptr<FSWritableFile> wal = OpenThroughWrapper("000071.log");
+  ASSERT_OK(wal->Append(std::string(5000, 'a'), IOOptions(), nullptr));
+  ASSERT_OK(wal->RangeSync(0, 2000, IOOptions(), nullptr));
+  EXPECT_EQ(2000u, latency_fs_->GetWalCounters(71).size_sleep_micros);
+  ASSERT_OK(wal->RangeSync(0, 10000, IOOptions(), nullptr));
+  EXPECT_EQ(5000u, latency_fs_->GetWalCounters(71).size_sleep_micros);
+  ASSERT_OK(wal->RangeSync(0, 100, IOOptions(), nullptr));
+  ASSERT_OK(wal->Sync(IOOptions(), nullptr));
+  const Counters counters = latency_fs_->GetWalCounters(71);
+  EXPECT_EQ(4u, counters.syncs);
+  EXPECT_EQ(5000u, counters.size_sleep_micros);
+  EXPECT_EQ(5000u, counters.injected_sleep_micros);
+  ASSERT_OK(wal->Close(IOOptions(), nullptr));
+}
+
+TEST_F(LatencyInjectionFSTest, FailedSyncKeepsUnsyncedBytes) {
+  // Q2: a failed sync sleeps for its claim but makes nothing durable: the
+  // bytes stay unsynced and the next successful sync charges them again.
+  auto failing_fs =
+      std::make_shared<SyncFailingFS>(FileSystem::Default(), /*failures=*/1);
+  InstallWrapper(MakeLatency(0, 0, 0, 0, 1000000), /*seed=*/0, failing_fs);
+  std::unique_ptr<FSWritableFile> wal = OpenThroughWrapper("000072.log");
+  ASSERT_OK(wal->Append(std::string(1000, 'a'), IOOptions(), nullptr));
+  EXPECT_FALSE(wal->Sync(IOOptions(), nullptr).ok());
+  ASSERT_OK(wal->Append(std::string(2000, 'b'), IOOptions(), nullptr));
+  ASSERT_OK(wal->Sync(IOOptions(), nullptr));
+  const Counters counters = latency_fs_->GetWalCounters(72);
+  EXPECT_EQ(2u, counters.syncs);
+  EXPECT_EQ(3000u, counters.append_bytes);
+  EXPECT_EQ(4000u, counters.size_sleep_micros);
+  EXPECT_EQ(4000u, counters.injected_sleep_micros);
+  ASSERT_OK(wal->Close(IOOptions(), nullptr));
+}
+
+TEST_F(LatencyInjectionFSTest, SyncSizeTermThroughDbWrites) {
+  // Q2 through a real DB: with a sync bandwidth set, sync=true Puts at N=1
+  // record a size term of one ceiling per sync over the append_bytes the
+  // counters show: between ceil(total) and ceil(total) + syncs.
+  using LIFS = LatencyInjectionFileSystem;
+  constexpr uint64_t kSyncBps = 50u << 20;  // 50 MiB/s.
+  InstallWrapper(MakeLatency(0, 0, 0, 0, kSyncBps), /*seed=*/0, nullptr);
+  Options options = WrappedOptions();
+  options.manual_wal_flush = false;
+  Reopen(options);
+  WriteOptions sync_wo;
+  sync_wo.sync = true;
+  ASSERT_OK(Put("warmup", "v", sync_wo));  // Drains any unsynced bytes.
+  constexpr int kWrites = 10;
+  const Counters delta = AggregateDelta([&] {
+    for (int i = 0; i < kWrites; ++i) {
+      ASSERT_OK(Put("k" + std::to_string(i), std::string(1000, 'v'), sync_wo));
+    }
+  });
+  EXPECT_EQ(static_cast<uint64_t>(kWrites), delta.appends);
+  EXPECT_EQ(static_cast<uint64_t>(kWrites), delta.syncs);
+  const uint64_t floor = LIFS::SizeDelayMicros(delta.append_bytes, kSyncBps);
+  EXPECT_GE(delta.size_sleep_micros, floor);
+  EXPECT_LE(delta.size_sleep_micros, floor + delta.syncs);
+  EXPECT_EQ(delta.size_sleep_micros, delta.injected_sleep_micros);
+  Close();
+}
+
+TEST_F(LatencyInjectionFSTest, ConcurrentAppendsAndSyncsChargeEveryByteOnce) {
+  // Q2: concurrent appends and syncs on one WAL charge every appended byte
+  // exactly once: at 1 byte/us the size term equals append_bytes. Appends
+  // are serialized (the file below makes no thread-safety promise); syncs
+  // race with everything, which is what the claim has to survive.
+  constexpr int kThreads = 4;
+  constexpr int kAppendsPerThread = 50;
+  constexpr size_t kSize = 100;
+  InstallWrapper(MakeLatency(0, 0, 0, 0, 1000000), /*seed=*/0, nullptr);
+  std::unique_ptr<FSWritableFile> wal = OpenThroughWrapper("000073.log");
+  std::mutex append_mu;
+  std::atomic<int> failures{0};
+  std::vector<port::Thread> threads;
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&] {
+      for (int i = 0; i < kAppendsPerThread; ++i) {
+        {
+          std::lock_guard<std::mutex> lock(append_mu);
+          if (!wal->Append(std::string(kSize, 'x'), IOOptions(), nullptr)
+                   .ok()) {
+            failures.fetch_add(1);
+            return;
+          }
+        }
+        if (!wal->Sync(IOOptions(), nullptr).ok()) {
+          failures.fetch_add(1);
+          return;
+        }
+      }
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  EXPECT_EQ(0, failures.load());
+  ASSERT_OK(wal->Sync(IOOptions(), nullptr));
+  const Counters counters = latency_fs_->GetWalCounters(73);
+  EXPECT_EQ(kThreads * kAppendsPerThread * kSize, counters.append_bytes);
+  EXPECT_EQ(counters.append_bytes, counters.size_sleep_micros);
+  EXPECT_EQ(counters.size_sleep_micros, counters.injected_sleep_micros);
+  ASSERT_OK(wal->Close(IOOptions(), nullptr));
 }
 
 }  // namespace ROCKSDB_NAMESPACE

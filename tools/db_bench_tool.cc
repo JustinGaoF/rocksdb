@@ -1771,6 +1771,13 @@ DEFINE_uint64(wal_latency_jitter_us, 0,
               "deterministic extra delay in [0, this] derived from "
               "--wal_latency_seed, the WAL number and the operation index.");
 DEFINE_uint64(wal_latency_seed, 0, "Seed of the WAL latency jitter.");
+DEFINE_double(wal_append_bandwidth_mbps, 0,
+              "With --inject_wal_latency, MiB/s at which a WAL append's bytes "
+              "add delay (ceil(bytes * 1e6 / rate) microseconds per append). "
+              "0 disables the append size term.");
+DEFINE_double(wal_sync_bandwidth_mbps, 0,
+              "With --inject_wal_latency, MiB/s at which the bytes a WAL sync "
+              "makes durable add delay. 0 disables the sync size term.");
 DEFINE_int32(sync_write_one_in, 0,
              "In the fill/write benchmarks, make every Nth write batch "
              "sync=true (1 syncs every batch). 0 disables, leaving --sync in "
@@ -12134,11 +12141,30 @@ int db_bench_tool(int argc, char** argv, ToolHooks& hooks) {
       db_bench_exit(1);
     }
   }
+  if (FLAGS_wal_append_bandwidth_mbps < 0 ||
+      FLAGS_wal_sync_bandwidth_mbps < 0) {
+    fprintf(stderr,
+            "--wal_append_bandwidth_mbps and --wal_sync_bandwidth_mbps must "
+            "not be negative\n");
+    db_bench_exit(1);
+  }
+  if ((FLAGS_wal_append_bandwidth_mbps > 0 ||
+       FLAGS_wal_sync_bandwidth_mbps > 0) &&
+      !FLAGS_inject_wal_latency) {
+    fprintf(stderr,
+            "--wal_append_bandwidth_mbps/--wal_sync_bandwidth_mbps need "
+            "--inject_wal_latency\n");
+    db_bench_exit(1);
+  }
   if (FLAGS_inject_wal_latency) {
     ROCKSDB_NAMESPACE::LatencyInjectionFileSystem::Latency latency;
     latency.append_micros = FLAGS_wal_append_latency_us;
     latency.sync_micros = FLAGS_wal_sync_latency_us;
     latency.jitter_micros = FLAGS_wal_latency_jitter_us;
+    latency.append_bytes_per_sec =
+        static_cast<uint64_t>(FLAGS_wal_append_bandwidth_mbps * 1048576.0);
+    latency.sync_bytes_per_sec =
+        static_cast<uint64_t>(FLAGS_wal_sync_bandwidth_mbps * 1048576.0);
     wal_latency_fs =
         std::make_shared<ROCKSDB_NAMESPACE::LatencyInjectionFileSystem>(
             FLAGS_env->GetFileSystem(), latency, FLAGS_wal_latency_seed);
@@ -12148,6 +12174,16 @@ int db_bench_tool(int argc, char** argv, ToolHooks& hooks) {
       slow.append_micros = 10 * FLAGS_wal_append_latency_us;
       slow.sync_micros = 10 * FLAGS_wal_sync_latency_us;
       slow.jitter_micros = 10 * FLAGS_wal_latency_jitter_us;
+      // A tenth of the bandwidth, so the slow partition stays 10x slower on
+      // the size term too (kept at 1 byte/s rather than 0 when tiny).
+      slow.append_bytes_per_sec =
+          latency.append_bytes_per_sec == 0
+              ? 0
+              : std::max<uint64_t>(1, latency.append_bytes_per_sec / 10);
+      slow.sync_bytes_per_sec =
+          latency.sync_bytes_per_sec == 0
+              ? 0
+              : std::max<uint64_t>(1, latency.sync_bytes_per_sec / 10);
       fs = std::make_shared<ROCKSDB_NAMESPACE::SlowWalPartitionFileSystem>(
           wal_latency_fs, static_cast<uint32_t>(FLAGS_wal_slow_partition),
           slow);

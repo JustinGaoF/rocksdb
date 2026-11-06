@@ -7,10 +7,10 @@
 """Reproducible N sweep for partitioned WALs.
 
 Runs a db_bench matrix over WAL partitions x injected append latency x sync
-mode x value size, parses throughput, write-latency percentiles, the WAL
-partition histograms and the latency-FileSystem counters out of each run,
-and evaluates the abandon trigger for partitioned WALs (p99 gate wait over
-p99 write latency at N=8 on the injected profile).
+mode x value size x WAL bandwidth, parses throughput, write-latency
+percentiles, the WAL partition histograms and the latency-FileSystem counters
+out of each run, and evaluates the abandon trigger for partitioned WALs (p99
+gate wait over p99 write latency at N=8 on the injected profile).
 
 The script builds nothing itself: it takes a db_bench binary path and an
 output directory. Every cell runs at least 3 times; the output reports the
@@ -95,6 +95,7 @@ QUICK_NUM = 2000
 TRIGGER_LATENCY_US = 1000
 TRIGGER_SYNC_MODE = "mix"
 TRIGGER_VALUE_SIZE = 1024
+TRIGGER_BANDWIDTH_MBPS = 0
 TRIGGER_THRESHOLD = 0.10
 # Thread counts the trigger table covers at N=8 for every sync mode: the
 # --threads cells plus extra N=8 cells at each count below that differs.
@@ -136,6 +137,11 @@ def parse_args(argv):
     p.add_argument("--sync-modes", default=None,
                    help="comma sync-mode list out of none,mix,all")
     p.add_argument("--value-sizes", default=None, help="comma value-size list")
+    p.add_argument("--bandwidths-mbps", default=None,
+                   help="comma WAL-bandwidth list in MiB/s, applied to both "
+                   "the append and the sync size term (default: 0 = off)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print the cell list and commands without running")
     p.add_argument("--num", type=int, default=2000,
                    help="db_bench --num per thread; 2000 x 16 threads = 32k "
                    "writes per cell, enough for a stable p99 (default: 2000)")
@@ -220,6 +226,7 @@ def build_matrix(args):
                       (args.value_sizes or "100,1024").split(","))
         reps = FULL_REPS
         num = args.num
+    bws = tuple(float(x) for x in (args.bandwidths_mbps or "0").split(","))
     if args.reps is not None:
         reps = args.reps
     cells = []
@@ -239,14 +246,16 @@ def build_matrix(args):
             for lat in lats:
                 for sync in syncs:
                     for size in sizes:
-                        for rep in range(reps):
-                            add({
-                                "n": n, "usage": usage, "append_us": lat,
-                                "sync": sync, "value_size": size, "rep": rep,
-                                "seed": args.seed_base + rep,
-                                "num": num, "slow_partition": -1,
-                                "injected": True, "threads": args.threads,
-                            })
+                        for bw in bws:
+                            for rep in range(reps):
+                                add({
+                                    "n": n, "usage": usage, "append_us": lat,
+                                    "sync": sync, "value_size": size,
+                                    "rep": rep, "seed": args.seed_base + rep,
+                                    "num": num, "slow_partition": -1,
+                                    "injected": True, "threads": args.threads,
+                                    "bandwidth_mbps": bw,
+                                })
     # The trigger profile, or the --quick one, at N=8 and every trigger
     # thread count, for every sync mode, with both N=1 baselines at each
     # thread count so every N=8 trigger cell has its comparison.
@@ -255,31 +264,33 @@ def build_matrix(args):
     if 8 in ns and t_lat in lats and t_size in sizes:
         for threads in TRIGGER_THREAD_COUNTS:
             for sync in syncs:
-                for n, usage in ((8, "partition_by_column_family"),
-                                 (1, "none"),
-                                 (1, "partition_by_column_family")):
-                    for rep in range(reps):
-                        add({
-                            "n": n, "usage": usage, "append_us": t_lat,
-                            "sync": sync, "value_size": t_size, "rep": rep,
-                            "seed": args.seed_base + rep, "num": num,
-                            "slow_partition": -1, "injected": True,
-                            "threads": threads,
-                        })
+                for bw in bws:
+                    for n, usage in ((8, "partition_by_column_family"),
+                                     (1, "none"),
+                                     (1, "partition_by_column_family")):
+                        for rep in range(reps):
+                            add({
+                                "n": n, "usage": usage, "append_us": t_lat,
+                                "sync": sync, "value_size": t_size, "rep": rep,
+                                "seed": args.seed_base + rep, "num": num,
+                                "slow_partition": -1, "injected": True,
+                                "threads": threads, "bandwidth_mbps": bw,
+                            })
     if not args.no_slow_cell:
-        # One slow partition at N=8, mirroring the trigger profile (or the
-        # --quick one) so the straggler cost reads directly against the
-        # even N=8 cell.
+        # One slow partition at N=8 per bandwidth, mirroring the trigger
+        # profile (or the --quick one) so the straggler cost reads directly
+        # against the even N=8 cell of the same bandwidth.
         t_sync = syncs[-1] if args.quick else TRIGGER_SYNC_MODE
-        for rep in range(reps):
-            add({
-                "n": 8, "usage": "partition_by_column_family",
-                "append_us": t_lat, "sync": t_sync,
-                "value_size": t_size, "rep": rep,
-                "seed": args.seed_base + rep, "num": num,
-                "slow_partition": 7, "injected": True,
-                "threads": args.threads,
-            })
+        for bw in bws:
+            for rep in range(reps):
+                add({
+                    "n": 8, "usage": "partition_by_column_family",
+                    "append_us": t_lat, "sync": t_sync,
+                    "value_size": t_size, "rep": rep,
+                    "seed": args.seed_base + rep, "num": num,
+                    "slow_partition": 7, "injected": True,
+                    "threads": args.threads, "bandwidth_mbps": bw,
+                })
     return cells
 
 
@@ -310,6 +321,12 @@ def cell_command(args, cell, cell_dir):
             "--wal_latency_jitter_us=%d" % (cell["append_us"] // 10),
             "--wal_latency_seed=%d" % cell["seed"],
         ]
+        if cell["bandwidth_mbps"] != 0:
+            cmd += [
+                "--wal_append_bandwidth_mbps=%g"
+                % cell["bandwidth_mbps"],
+                "--wal_sync_bandwidth_mbps=%g" % cell["bandwidth_mbps"],
+            ]
     if cell["sync"] == "all":
         cmd.append("--sync")
     elif cell["sync"] == "mix":
@@ -333,10 +350,12 @@ STAT_RE = re.compile(
     r"COUNT : (\d+) SUM : (\d+)$", re.MULTILINE)
 FS_ALL_RE = re.compile(
     r"all WALs: appends=(\d+) append_bytes=(\d+) syncs=(\d+) "
-    r"injected_sleep_micros=(\d+) wall_micros=(\d+)")
+    r"injected_sleep_micros=(\d+) wall_micros=(\d+)"
+    r"(?: size_sleep_micros=(\d+))?")
 FS_WAL_RE = re.compile(
     r"WAL (\d+): appends=(\d+) append_bytes=(\d+) syncs=(\d+) "
-    r"injected_sleep_micros=(\d+) wall_micros=(\d+)")
+    r"injected_sleep_micros=(\d+) wall_micros=(\d+)"
+    r"(?: size_sleep_micros=(\d+))?")
 
 
 def parse_run(output, cell):
@@ -378,6 +397,7 @@ def parse_run(output, cell):
         metrics["fs_syncs"] = int(m.group(3))
         metrics["fs_injected_sleep_us"] = int(m.group(4))
         metrics["fs_wall_us"] = int(m.group(5))
+        metrics["fs_size_sleep_us"] = int(m.group(6)) if m.group(6) else 0
         wals = {}
         for m in FS_WAL_RE.finditer(text):
             wals[int(m.group(1))] = {
@@ -385,6 +405,7 @@ def parse_run(output, cell):
                 "append_bytes": int(m.group(3)), "syncs": int(m.group(4)),
                 "injected_sleep_us": int(m.group(5)),
                 "wall_us": int(m.group(6)),
+                "size_sleep_us": int(m.group(7)) if m.group(7) else 0,
             }
         if not wals:
             raise ValueError("no per-WAL counters")
@@ -457,7 +478,7 @@ def check_coverage(cell, metrics):
 
 AGG_KEYS = ["ops_per_sec", "micros_per_op", "write_p50_us", "write_p99_us",
             "write_p999_us", "fsyncs_per_write", "cap_hit_rate_upper",
-            "trigger_ratio"] + [
+            "trigger_ratio", "fs_size_sleep_us"] + [
     "%s_%s" % (short, stat)
     for short, _ in HISTOGRAMS
     for stat in ("p50", "p99", "count", "sum")]
@@ -479,7 +500,7 @@ def aggregate(reps):
 
 
 CONFIG_FIELDS = ("n", "usage", "append_us", "sync", "value_size",
-                 "slow_partition", "injected", "threads")
+                 "slow_partition", "injected", "threads", "bandwidth_mbps")
 
 
 def config_key(cell):
@@ -487,9 +508,11 @@ def config_key(cell):
 
 
 def cell_label(key):
-    n, usage, lat, sync, size, slow, injected, threads = key
+    n, usage, lat, sync, size, slow, injected, threads, bw = key
     label = "N=%d %s %dus %s %dB t%d" % (
         n, "knone" if usage == "none" else "idx", lat, sync, size, threads)
+    if bw != 0:
+        label += " bw%g" % bw
     if slow >= 0:
         label += " slow%d" % slow
     if not injected:
@@ -510,11 +533,11 @@ def compare_baselines(aggregates):
     latency profile and thread count."""
     rows = []
     for key, agg in sorted(aggregates.items()):
-        n, _usage, lat, sync, size, slow, injected, threads = key
+        n, _usage, lat, sync, size, slow, injected, threads, bw = key
         if n == 1 or slow >= 0:
             continue
         for usage in ("none", "partition_by_column_family"):
-            base_key = (1, usage, lat, sync, size, -1, injected, threads)
+            base_key = (1, usage, lat, sync, size, -1, injected, threads, bw)
             base = aggregates.get(base_key)
             if base is None:
                 continue
@@ -558,7 +581,7 @@ def compute_trigger(aggregates, threads):
     """
     rows = []
     for key, agg in sorted(aggregates.items()):
-        n, _usage, lat, sync, size, slow, injected, cell_threads = key
+        n, _usage, lat, sync, size, slow, injected, cell_threads, bw = key
         if n != 8 or slow >= 0:
             continue
         if not injected:
@@ -566,7 +589,8 @@ def compute_trigger(aggregates, threads):
         gate = agg["gate_wait_p99"]["median"]
         write = agg["write_p99_us"]["median"]
         rows.append({"append_us": lat, "sync": sync, "value_size": size,
-                     "threads": cell_threads, "cell": cell_label(key),
+                     "threads": cell_threads, "bandwidth_mbps": bw,
+                     "cell": cell_label(key),
                      "gate_p99_us": gate, "write_p99_us": write,
                      "ratio": gate / write if write else None})
     verdict = None
@@ -574,7 +598,8 @@ def compute_trigger(aggregates, threads):
         if (r["append_us"] == TRIGGER_LATENCY_US and
                 r["sync"] == TRIGGER_SYNC_MODE and
                 r["value_size"] == TRIGGER_VALUE_SIZE and
-                r["threads"] == threads):
+                r["threads"] == threads and
+                r["bandwidth_mbps"] == TRIGGER_BANDWIDTH_MBPS):
             verdict = {"cell": r, "threshold": TRIGGER_THRESHOLD,
                        "fires": r["ratio"] is not None and
                        r["ratio"] > TRIGGER_THRESHOLD}
@@ -600,21 +625,26 @@ def fmt(v, width=0):
 
 def render_table(aggregates, keys, title):
     """Human-readable table: one row per config, median (spread in JSON)."""
-    header = ("N", "usage", "append_us", "sync", "size", "slow", "threads",
-              "steady", "ops/s", "us/op", "wr_p50", "wr_p99", "wr_p99.9",
-              "gate_p50", "gate_p99", "join_p50", "join_p99",
-              "fsync/wr", "cap_med", "cap_hit<=", "fanout_med", "barr_p99",
-              "mtx_p99", "mtxall_p99")
+    show_bw = any(k[8] != 0 for k in keys)
+    header = ("N", "usage", "append_us") + (("bw_MBps",) if show_bw else ()) + (
+        "sync", "size", "slow", "threads",
+        "steady", "ops/s", "us/op", "wr_p50", "wr_p99", "wr_p99.9",
+        "gate_p50", "gate_p99", "join_p50", "join_p99",
+        "fsync/wr", "cap_med", "cap_hit<=", "fanout_med", "barr_p99",
+        "mtx_p99", "mtxall_p99")
     lines = [title, " ".join(h.rjust(8) for h in header)]
     for key in sorted(keys):
-        n, usage, lat, sync, size, slow, _inj, threads = key
+        n, usage, lat, sync, size, slow, _inj, threads, bw = key
         agg = aggregates[key]
         use = "knone" if usage == "none" else "idx"
         st = agg["steady"]
-        row = [fmt(n, 8), use.rjust(8), fmt(lat, 8), sync.rjust(8),
-               fmt(size, 8), fmt(slow, 8), fmt(threads, 8),
-               ("%d/%d/%d" % (st["steady"], st["unsteady"], st["na"]))
-               .rjust(8)]
+        row = [fmt(n, 8), use.rjust(8), fmt(lat, 8)]
+        if show_bw:
+            row.append(fmt(bw, 8))
+        row += [sync.rjust(8),
+                fmt(size, 8), fmt(slow, 8), fmt(threads, 8),
+                ("%d/%d/%d" % (st["steady"], st["unsteady"], st["na"]))
+                .rjust(8)]
         for k in ("ops_per_sec", "micros_per_op", "write_p50_us",
                   "write_p99_us", "write_p999_us", "gate_wait_p50",
                   "gate_wait_p99", "join_wait_p50", "join_wait_p99",
@@ -638,7 +668,9 @@ def reproducibility(results, previous_path):
              "and every %s median within %d%% of the earlier median"
              % ("/".join(REPRO_METRICS), REPRO_MAX_DELTA * 100),
              "cell metric this earlier delta ok"]
-    earlier = {tuple(a["config"][k] for k in CONFIG_FIELDS): a["agg"]
+    # An older results.json has no bandwidth_mbps: those cells ran with the
+    # size term off.
+    earlier = {tuple(a["config"].get(k, 0) for k in CONFIG_FIELDS): a["agg"]
                for a in previous.get("aggregates", [])}
     failed = []
     for a in results["aggregates"]:
@@ -730,13 +762,18 @@ def write_outputs(args, results):
     trigger_rows, verdict = compute_trigger(aggregates, args.threads)
     results["trigger_rows"] = trigger_rows
     results["trigger_verdict"] = verdict
+    show_bw = any(r["bandwidth_mbps"] != 0 for r in trigger_rows)
     md += ["", "## Abandon trigger at N=8",
-           "append_us sync size threads gate_p99_us write_p99_us ratio"]
+           "append_us sync size threads " + ("bw_MBps " if show_bw else "") +
+           "gate_p99_us write_p99_us ratio"]
     for r in trigger_rows:
-        md.append("%d %s %d %d %s %s %.4f"
-                  % (r["append_us"], r["sync"], r["value_size"], r["threads"],
-                     fmt(r["gate_p99_us"]), fmt(r["write_p99_us"]),
-                     r["ratio"] if r["ratio"] is not None else -1))
+        fields = [str(r["append_us"]), r["sync"], str(r["value_size"]),
+                  str(r["threads"])]
+        if show_bw:
+            fields.append("%g" % r["bandwidth_mbps"])
+        fields += [fmt(r["gate_p99_us"]), fmt(r["write_p99_us"]),
+                   "%.4f" % (r["ratio"] if r["ratio"] is not None else -1)]
+        md.append(" ".join(fields))
     worst = max((r for r in trigger_rows if r["ratio"] is not None),
                 key=lambda r: r["ratio"], default=None)
     worst_text = ("; worst injected N=8 cell %s ratio %.4f"
@@ -777,6 +814,14 @@ def main(argv):
         return 2
     print("sweep: %d runs (%d cells) -> %s"
           % (len(cells), len({config_key(c) for c in cells}), args.output_dir))
+    if args.dry_run:
+        for i, cell in enumerate(cells):
+            cmd, _db_dir = cell_command(
+                args, cell, os.path.join(args.output_dir, "cell-%04d" % i))
+            print("%s rep=%d: %s"
+                  % (cell_label(config_key(cell)), cell["rep"],
+                     " ".join(cmd)))
+        return 0
 
     results = {"environment": collect_environment(args), "runs": []}
     failures = 0

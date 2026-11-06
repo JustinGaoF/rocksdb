@@ -27,6 +27,22 @@ uint64_t JitterMicros(uint64_t seed, uint64_t wal_number, uint64_t op_index,
 }
 }  // namespace
 
+uint64_t LatencyInjectionFileSystem::ClaimUnsyncedBytes(WalState* state,
+                                                        uint64_t limit) {
+  // One CAS loop claims each byte exactly once: concurrent syncs split the
+  // count between them, and appends that land after a claim stay for the
+  // next sync, so a sync is charged for at most what was appended before it
+  // started, nothing twice and nothing lost.
+  uint64_t unsynced = state->unsynced_bytes.load(std::memory_order_relaxed);
+  while (true) {
+    const uint64_t claim = unsynced < limit ? unsynced : limit;
+    if (state->unsynced_bytes.compare_exchange_weak(
+            unsynced, unsynced - claim, std::memory_order_relaxed)) {
+      return claim;
+    }
+  }
+}
+
 template <typename Op>
 IOStatus LatencyInjectionFileSystem::Delayed(WalState* state, bool is_sync,
                                              uint64_t bytes, Op op) {
@@ -34,15 +50,28 @@ IOStatus LatencyInjectionFileSystem::Delayed(WalState* state, bool is_sync,
   const bool has_override = state->has_override.load(std::memory_order_acquire);
   uint64_t delay;
   uint64_t jitter;
+  uint64_t bytes_per_sec;
   if (has_override) {
     delay = is_sync ? state->sync_micros.load(std::memory_order_relaxed)
                     : state->append_micros.load(std::memory_order_relaxed);
     jitter = state->jitter_micros.load(std::memory_order_relaxed);
+    bytes_per_sec =
+        is_sync ? state->sync_bytes_per_sec.load(std::memory_order_relaxed)
+                : state->append_bytes_per_sec.load(std::memory_order_relaxed);
   } else {
     delay = is_sync ? default_sync_micros_.load(std::memory_order_relaxed)
                     : default_append_micros_.load(std::memory_order_relaxed);
     jitter = default_jitter_micros_.load(std::memory_order_relaxed);
+    bytes_per_sec =
+        is_sync ? default_sync_bytes_per_sec_.load(std::memory_order_relaxed)
+                : default_append_bytes_per_sec_.load(std::memory_order_relaxed);
   }
+  // The size term: an append is charged for its own bytes; a sync claims up
+  // to `bytes` of what was appended since the last successful sync.
+  const uint64_t size_bytes =
+      is_sync ? ClaimUnsyncedBytes(state, bytes) : bytes;
+  const uint64_t size_delay = SizeDelayMicros(size_bytes, bytes_per_sec);
+  delay += size_delay;
   const uint64_t op_index =
       state->next_op.fetch_add(1, std::memory_order_relaxed);
   if (jitter > 0) {
@@ -53,8 +82,17 @@ IOStatus LatencyInjectionFileSystem::Delayed(WalState* state, bool is_sync,
   }
   IOStatus s = op();
   const uint64_t wall = clock_->NowMicros() - start;
-  const uint64_t ok_bytes = s.ok() ? bytes : 0;
-  state->counters.Record(is_sync, ok_bytes, delay, wall);
+  if (is_sync) {
+    if (!s.ok()) {
+      // A failed sync makes nothing durable: its claim goes back for the
+      // next successful sync to charge.
+      state->unsynced_bytes.fetch_add(size_bytes, std::memory_order_relaxed);
+    }
+  } else if (s.ok()) {
+    state->unsynced_bytes.fetch_add(bytes, std::memory_order_relaxed);
+  }
+  const uint64_t ok_bytes = !is_sync && s.ok() ? bytes : 0;
+  state->counters.Record(is_sync, ok_bytes, delay, size_delay, wall);
   return s;
 }
 
@@ -98,18 +136,18 @@ class LatencyInjectionFileSystem::WalFile : public FSWritableFileOwnerWrapper {
   }
 
   IOStatus Sync(const IOOptions& options, IODebugContext* dbg) override {
-    return fs_->Delayed(state_.get(), /*is_sync=*/true, /*bytes=*/0,
+    return fs_->Delayed(state_.get(), /*is_sync=*/true, kAllUnsyncedBytes,
                         [&] { return target()->Sync(options, dbg); });
   }
 
   IOStatus Fsync(const IOOptions& options, IODebugContext* dbg) override {
-    return fs_->Delayed(state_.get(), /*is_sync=*/true, /*bytes=*/0,
+    return fs_->Delayed(state_.get(), /*is_sync=*/true, kAllUnsyncedBytes,
                         [&] { return target()->Fsync(options, dbg); });
   }
 
   IOStatus RangeSync(uint64_t offset, uint64_t nbytes, const IOOptions& options,
                      IODebugContext* dbg) override {
-    return fs_->Delayed(state_.get(), /*is_sync=*/true, /*bytes=*/0, [&] {
+    return fs_->Delayed(state_.get(), /*is_sync=*/true, nbytes, [&] {
       return target()->RangeSync(offset, nbytes, options, dbg);
     });
   }
@@ -122,6 +160,7 @@ class LatencyInjectionFileSystem::WalFile : public FSWritableFileOwnerWrapper {
 void LatencyInjectionFileSystem::AtomicCounters::Record(bool is_sync,
                                                         uint64_t bytes,
                                                         uint64_t injected,
+                                                        uint64_t size,
                                                         uint64_t wall) {
   if (is_sync) {
     syncs.fetch_add(1, std::memory_order_relaxed);
@@ -131,6 +170,9 @@ void LatencyInjectionFileSystem::AtomicCounters::Record(bool is_sync,
   }
   if (injected > 0) {
     injected_sleep_micros.fetch_add(injected, std::memory_order_relaxed);
+  }
+  if (size > 0) {
+    size_sleep_micros.fetch_add(size, std::memory_order_relaxed);
   }
   wall_micros.fetch_add(wall, std::memory_order_relaxed);
 }
@@ -143,6 +185,7 @@ LatencyInjectionFileSystem::AtomicCounters::Load() const {
   c.syncs = syncs.load(std::memory_order_relaxed);
   c.injected_sleep_micros =
       injected_sleep_micros.load(std::memory_order_relaxed);
+  c.size_sleep_micros = size_sleep_micros.load(std::memory_order_relaxed);
   c.wall_micros = wall_micros.load(std::memory_order_relaxed);
   return c;
 }
@@ -152,15 +195,33 @@ void LatencyInjectionFileSystem::AtomicCounters::Reset() {
   append_bytes.store(0, std::memory_order_relaxed);
   syncs.store(0, std::memory_order_relaxed);
   injected_sleep_micros.store(0, std::memory_order_relaxed);
+  size_sleep_micros.store(0, std::memory_order_relaxed);
   wall_micros.store(0, std::memory_order_relaxed);
+}
+
+uint64_t LatencyInjectionFileSystem::SizeDelayMicros(uint64_t bytes,
+                                                     uint64_t bytes_per_sec) {
+  if (bytes == 0 || bytes_per_sec == 0) {
+    return 0;
+  }
+  if (bytes > UINT64_MAX / 1000000) {
+    // Beyond any append (4 GiB is 2^32): saturate instead of overflowing.
+    return UINT64_MAX;
+  }
+  // ceil(scaled / rate) as quotient plus one for a nonzero remainder, so no
+  // addition can overflow.
+  const uint64_t scaled = bytes * 1000000;
+  return scaled / bytes_per_sec + (scaled % bytes_per_sec != 0 ? 1 : 0);
 }
 
 std::string LatencyInjectionFileSystem::Counters::ToString() const {
   char buf[256];
   snprintf(buf, sizeof(buf),
            "appends=%" PRIu64 " append_bytes=%" PRIu64 " syncs=%" PRIu64
-           " injected_sleep_micros=%" PRIu64 " wall_micros=%" PRIu64,
-           appends, append_bytes, syncs, injected_sleep_micros, wall_micros);
+           " injected_sleep_micros=%" PRIu64 " wall_micros=%" PRIu64
+           " size_sleep_micros=%" PRIu64,
+           appends, append_bytes, syncs, injected_sleep_micros, wall_micros,
+           size_sleep_micros);
   return buf;
 }
 
@@ -172,7 +233,9 @@ LatencyInjectionFileSystem::LatencyInjectionFileSystem(
       clock_(SystemClock::Default()),
       default_append_micros_(default_latency.append_micros),
       default_sync_micros_(default_latency.sync_micros),
-      default_jitter_micros_(default_latency.jitter_micros) {}
+      default_jitter_micros_(default_latency.jitter_micros),
+      default_append_bytes_per_sec_(default_latency.append_bytes_per_sec),
+      default_sync_bytes_per_sec_(default_latency.sync_bytes_per_sec) {}
 
 LatencyInjectionFileSystem::~LatencyInjectionFileSystem() = default;
 
@@ -243,6 +306,10 @@ void LatencyInjectionFileSystem::SetDefaultLatency(const Latency& latency) {
   default_sync_micros_.store(latency.sync_micros, std::memory_order_relaxed);
   default_jitter_micros_.store(latency.jitter_micros,
                                std::memory_order_relaxed);
+  default_append_bytes_per_sec_.store(latency.append_bytes_per_sec,
+                                      std::memory_order_relaxed);
+  default_sync_bytes_per_sec_.store(latency.sync_bytes_per_sec,
+                                    std::memory_order_relaxed);
 }
 
 void LatencyInjectionFileSystem::SetWalLatency(uint64_t wal_number,
@@ -251,6 +318,10 @@ void LatencyInjectionFileSystem::SetWalLatency(uint64_t wal_number,
   state->append_micros.store(latency.append_micros, std::memory_order_relaxed);
   state->sync_micros.store(latency.sync_micros, std::memory_order_relaxed);
   state->jitter_micros.store(latency.jitter_micros, std::memory_order_relaxed);
+  state->append_bytes_per_sec.store(latency.append_bytes_per_sec,
+                                    std::memory_order_relaxed);
+  state->sync_bytes_per_sec.store(latency.sync_bytes_per_sec,
+                                  std::memory_order_relaxed);
   state->has_override.store(true, std::memory_order_release);
 }
 
@@ -277,6 +348,7 @@ LatencyInjectionFileSystem::GetAggregateCounters() const {
     total.append_bytes += c.append_bytes;
     total.syncs += c.syncs;
     total.injected_sleep_micros += c.injected_sleep_micros;
+    total.size_sleep_micros += c.size_sleep_micros;
     total.wall_micros += c.wall_micros;
   }
   return total;
