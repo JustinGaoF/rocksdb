@@ -1511,7 +1511,7 @@ TEST_P(WritePreparedTransactionTest, OlderSnapshotListNeverWins) {
   });
   {
     std::unique_lock<std::mutex> lock(mu);
-    ASSERT_TRUE(
+    EXPECT_TRUE(
         cv.wait_for(lock, std::chrono::seconds(30), [&] { return x_paused; }));
   }
   wp_db->SetDBSnapshots(newer_snapshots);
@@ -5408,7 +5408,7 @@ TEST_F(WritePreparedPartitionedWalTest, SnapshotBelowHeapTopMovingBackwards) {
   });
   {
     std::unique_lock<std::mutex> lock(mu);
-    ASSERT_TRUE(
+    EXPECT_TRUE(
         cv.wait_for(lock, std::chrono::seconds(30), [&] { return a_held; }));
   }
   // B allocates above A and reaches the heap first; it is published only
@@ -5420,7 +5420,7 @@ TEST_F(WritePreparedPartitionedWalTest, SnapshotBelowHeapTopMovingBackwards) {
   });
   {
     std::unique_lock<std::mutex> lock(mu);
-    ASSERT_TRUE(
+    EXPECT_TRUE(
         cv.wait_for(lock, std::chrono::seconds(30), [&] { return b_pushed; }));
   }
   // B parks in its completion gate until A is applied.
@@ -6017,7 +6017,7 @@ TEST_P(WritePreparedTransactionTest, PrepareBelowMaxEvictedAtNPartitions) {
   });
   {
     std::unique_lock<std::mutex> lock(mu);
-    ASSERT_TRUE(
+    EXPECT_TRUE(
         cv.wait_for(lock, std::chrono::seconds(30), [&] { return a_held; }));
   }
   // One commit per other partition; with two cache entries the third evicts
@@ -6029,7 +6029,7 @@ TEST_P(WritePreparedTransactionTest, PrepareBelowMaxEvictedAtNPartitions) {
   }
   {
     std::unique_lock<std::mutex> lock(mu);
-    ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(30),
+    EXPECT_TRUE(cv.wait_for(lock, std::chrono::seconds(30),
                             [&] { return committed_while_held >= kWriters; }));
     release_a = true;
     cv.notify_all();

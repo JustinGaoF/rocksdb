@@ -297,8 +297,8 @@ void ErrorHandler::CancelErrorRecoveryForShutDown() {
 void ErrorHandler::HandleKnownErrors(const Status& bg_err,
                                      BackgroundErrorReason reason,
                                      const DBRecoverContext& context,
-                                     bool wal_related,
-                                     bool allow_auto_recovery) {
+                                     bool wal_related, bool allow_auto_recovery,
+                                     bool fence_related) {
   db_mutex_->AssertHeld();
   if (bg_err.ok()) {
     return;
@@ -364,6 +364,16 @@ void ErrorHandler::HandleKnownErrors(const Status& bg_err,
       // below every later write on every partition, and only recovery from
       // this error releases it. Listeners are told, but cannot suppress or
       // soften it.
+      s = new_bg_err;
+    }
+    if (fence_related && db_->NumWalPartitions() > 1 &&
+        (s.ok() || s.severity() < new_bg_err.severity())) {
+      // Above one partition a memtable-insert or gate failure installs a
+      // fence that pins every later write on every partition, and only
+      // recovery releases it. Listeners are told, but cannot suppress or
+      // soften it. Only the two fence sites pass fence_related; any other
+      // error, whatever its reason, stays suppressible, and N=1 keeps
+      // upstream's suppressible behaviour.
       s = new_bg_err;
     }
     if (!s.ok() && (s.severity() > bg_error_.severity())) {
@@ -437,28 +447,30 @@ void ErrorHandler::HandleKnownErrors(const Status& bg_err,
 //    BackgroundErrorReason reason) will be called to handle other error cases
 //    such as delegating to SstFileManager to handle no space error.
 void ErrorHandler::SetBGError(const Status& bg_status,
-                              BackgroundErrorReason reason, bool wal_related) {
+                              BackgroundErrorReason reason, bool wal_related,
+                              bool fence_related) {
   SetBGErrorImpl(bg_status, reason, wal_related, DBRecoverContext(),
-                 /*allow_auto_recovery=*/true);
+                 /*allow_auto_recovery=*/true, fence_related);
 }
 
 void ErrorHandler::SetBGError(const Status& bg_status,
                               BackgroundErrorReason reason, bool wal_related,
                               DBRecoverContext context) {
   SetBGErrorImpl(bg_status, reason, wal_related, std::move(context),
-                 /*allow_auto_recovery=*/true);
+                 /*allow_auto_recovery=*/true, /*fence_related=*/false);
 }
 
 void ErrorHandler::SetBGErrorNoAutoRecovery(const Status& bg_status,
                                             BackgroundErrorReason reason) {
   SetBGErrorImpl(bg_status, reason, /*wal_related=*/false, DBRecoverContext(),
-                 /*allow_auto_recovery=*/false);
+                 /*allow_auto_recovery=*/false, /*fence_related=*/false);
 }
 
 void ErrorHandler::SetBGErrorImpl(const Status& bg_status,
                                   BackgroundErrorReason reason,
                                   bool wal_related, DBRecoverContext context,
-                                  bool allow_auto_recovery) {
+                                  bool allow_auto_recovery,
+                                  bool fence_related) {
   db_mutex_->AssertHeld();
   Status tmp_status = bg_status;
   IOStatus bg_io_err = status_to_io_status(std::move(tmp_status));
@@ -604,7 +616,7 @@ void ErrorHandler::SetBGErrorImpl(const Status& bg_status,
     return;
   }
   HandleKnownErrors(new_bg_io_err, reason, context, wal_related,
-                    allow_auto_recovery);
+                    allow_auto_recovery, fence_related);
 }
 
 void ErrorHandler::AddFilesToQuarantine(

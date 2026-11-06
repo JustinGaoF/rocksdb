@@ -463,8 +463,11 @@ TEST_P(DBWALSyncMarkOwnershipTest, SyncClosedWalsLeavesOtherSyncsMark) {
       owner_status = db_->SyncWAL();
     }
   });
-  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable(handles_[1]));
-  ASSERT_EQ(cur, dbfull()->TEST_GetCurrentLogNumber());
+  // EXPECT_*, not ASSERT_*: the owner thread is joinable until the join
+  // below, and a fatal return here would destroy it joinable and abort the
+  // binary. FlushChecked releases the owner either way.
+  EXPECT_OK(dbfull()->TEST_WaitForFlushMemTable(handles_[1]));
+  EXPECT_EQ(cur, dbfull()->TEST_GetCurrentLogNumber());
   EXPECT_EQ((Marks{{cur, true}}), dbfull()->TEST_WalSyncMarks(0));
   TEST_SYNC_POINT("DBWALSyncMarkOwnershipTest:FlushChecked");
   owner.join();
@@ -530,12 +533,15 @@ TEST_F(DBWALTest, SyncClosedWalsEmptiedByWaitLeavesLaterMark) {
 
   // The first SyncWAL marks the old WAL and parks; flushing cf 0 then
   // rotates, and the flush's SyncClosedWals waits on the marked old WAL.
+  // EXPECT_*, not ASSERT_*: the first thread is joinable until the join
+  // below, and a fatal return here would destroy it joinable and abort the
+  // binary. ReleaseFirst releases it either way.
   port::Thread first([&]() { ASSERT_OK(db_->SyncWAL()); });
   FlushOptions no_wait;
   no_wait.wait = false;
-  ASSERT_OK(db_->Flush(no_wait, handles_[0]));
+  EXPECT_OK(db_->Flush(no_wait, handles_[0]));
   const uint64_t cur = dbfull()->TEST_GetCurrentLogNumber();
-  ASSERT_GT(cur, old_wal);
+  EXPECT_GT(cur, old_wal);
   TEST_SYNC_POINT("SyncClosedWalsEmptiedByWait:ClosedWalsWaiting");
   TEST_SYNC_POINT("SyncClosedWalsEmptiedByWait:ReleaseFirst");
   first.join();
@@ -545,8 +551,10 @@ TEST_F(DBWALTest, SyncClosedWalsEmptiedByWaitLeavesLaterMark) {
   TEST_SYNC_POINT("SyncClosedWalsEmptiedByWait:StartSecond");
   using Marks = std::vector<std::pair<uint64_t, bool>>;
   ASSERT_EQ((Marks{{cur, false}}), dbfull()->TEST_WalSyncMarks(0));
+  // EXPECT_*, not ASSERT_*: the second thread is joinable until the join
+  // below. FlushChecked releases it either way.
   port::Thread second([&]() { ASSERT_OK(db_->SyncWAL()); });
-  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable(handles_[0]));
+  EXPECT_OK(dbfull()->TEST_WaitForFlushMemTable(handles_[0]));
   EXPECT_EQ((Marks{{cur, true}}), dbfull()->TEST_WalSyncMarks(0));
   TEST_SYNC_POINT("SyncClosedWalsEmptiedByWait:FlushChecked");
   second.join();
@@ -8709,18 +8717,20 @@ TEST_F(DBWALTest, SplitWalMutexConcurrentManualFlush) {
     }
     // Flush surface across the whole write phase, with periodic flushes so
     // rotated WALs become obsolete while writes are still resolving.
+    // EXPECT_*, not ASSERT_*: the writers are joinable until the joins
+    // below, and the loop exits on their fixed write counts.
     int rounds = 0;
     bool lock_cycled = false;
     while (puts_done.load() < kTotalWrites) {
-      ASSERT_OK(db_->FlushWAL(false));
+      EXPECT_OK(db_->FlushWAL(false));
       (void)dbfull()->WALBufferIsEmpty();
       if (++rounds % 100 == 0) {
-        ASSERT_OK(Flush());
+        EXPECT_OK(Flush());
       }
       if (!lock_cycled && puts_done.load() >= kTotalWrites / 2) {
         // Writes stall for the hold, then proceed after UnlockWAL.
-        ASSERT_OK(db_->LockWAL());
-        ASSERT_OK(db_->UnlockWAL());
+        EXPECT_OK(db_->LockWAL());
+        EXPECT_OK(db_->UnlockWAL());
         lock_cycled = true;
       }
     }

@@ -79,7 +79,7 @@ class ErrorHandler {
                                     Status::Code code, Status::SubCode subcode);
 
   void SetBGError(const Status& bg_err, BackgroundErrorReason reason,
-                  bool wal_related = false);
+                  bool wal_related = false, bool fence_related = false);
   void SetBGError(const Status& bg_err, BackgroundErrorReason reason,
                   bool wal_related, DBRecoverContext context);
 
@@ -179,10 +179,10 @@ class ErrorHandler {
 
   void SetBGErrorImpl(const Status& bg_err, BackgroundErrorReason reason,
                       bool wal_related, DBRecoverContext context,
-                      bool allow_auto_recovery);
+                      bool allow_auto_recovery, bool fence_related);
   void HandleKnownErrors(const Status& bg_err, BackgroundErrorReason reason,
                          const DBRecoverContext& context, bool wal_related,
-                         bool allow_auto_recovery);
+                         bool allow_auto_recovery, bool fence_related);
   // REQUIRES: db_mutex_ held. When replacing the general recovery context,
   // retain WAL facts accumulated from concurrent errors independently.
   void UpdateRecoveryContext(const DBRecoverContext& context,

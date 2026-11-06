@@ -2990,7 +2990,12 @@ class DBImpl : public DB
       SequenceNumber* last_seqno_observed, SequenceNumber* next_sequence,
       bool* stop_replay_for_corruption, Status* status,
       bool* stop_replay_by_wal_filter,
-      std::unordered_map<int, VersionEdit>* version_edits, bool* flushed);
+      std::unordered_map<int, VersionEdit>* version_edits, bool* flushed,
+      // Set to whether the record's replay inserted it: a WriteCommitted
+      // prepare rebuilt into its recovered transaction counts although it
+      // moves no sequence, while point-in-time and filter drops, corrupt
+      // records and failed inserts do not.
+      bool* record_applied);
 
   Status InitializeWriteBatchForLogRecord(
       Slice record, const std::unique_ptr<log::Reader>& reader,
@@ -3523,14 +3528,17 @@ class DBImpl : public DB
   // without `published` for its records below to complete before its range
   // publishes (RunSyncGate). Its only other exits: the status of
   // a gate fence holding `target` (a range at or below it failed, so it can
-  // never be acknowledged, even once recovery covers it), and
-  // ShutdownInProgress once shutdown begins while still uncovered. Any other
-  // background error leaves it waiting, as one WAL leaves a group whose
-  // append succeeded. Called without holding any mutex; takes
+  // never be acknowledged, even once recovery covers it), and, for a waiter
+  // whose range is not yet applied (`range_applied` false), ShutdownInProgress
+  // once shutdown begins while still uncovered. A waiter whose range is
+  // already applied keeps waiting through shutdown: its range publishes once
+  // the ranges below it do, so failing it would leave a failed write visible.
+  // Any other background error leaves it waiting, as one WAL leaves a group
+  // whose append succeeded. Called without holding any mutex; takes
   // wal_durability_wait_mutex_ only to check fences and park, never together
   // with mutex_.
   Status WaitForWalDurability(SequenceNumber target, bool wal_record,
-                              bool published);
+                              bool published, bool range_applied);
 
   // Whether the frontiers cover `target` for a waiter with these legs (see
   // WaitForWalDurability). Publication implies durability for a range with
@@ -3672,9 +3680,11 @@ class DBImpl : public DB
   // Runs a write group's completion gate: waits until the durability
   // frontier covers `target`. A sync group's sync writers wait here, then
   // sync once (RunSyncGate). Returns the outcome to merge into the status
-  // handed to followers. With `published` the wait also covers publication
-  // (see WaitForWalDurability).
-  Status RunCompletionGate(SequenceNumber target, bool published);
+  // handed to followers. With `published` the wait also covers publication;
+  // `range_applied` tells the wait whether the group's range is already
+  // applied (see WaitForWalDurability).
+  Status RunCompletionGate(SequenceNumber target, bool published,
+                           bool range_applied);
 
   // N>1 only. The completion gate of a sync group's sync writers, whose
   // range [low, target] on `wal_partition` is written to the WAL and

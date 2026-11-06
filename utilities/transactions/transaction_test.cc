@@ -13,7 +13,9 @@
 #include <thread>
 
 #include "db/db_impl/db_impl.h"
+#include "db/log_reader.h"
 #include "db/write_batch_internal.h"
+#include "file/sequence_file_reader.h"
 #include "port/port.h"
 #include "rocksdb/attribute_groups.h"
 #include "rocksdb/compaction_filter.h"
@@ -11672,6 +11674,341 @@ TEST(TransactionPartitionedWalTest,
     delete db;
     db = nullptr;
     ASSERT_OK(DestroyDB(dbname, options));
+  }
+}
+
+namespace {
+// WAL indices of a WAL file's records, in file order.
+Status GC34ReadWalIndices(Env* env, const std::string& dbname,
+                          uint64_t wal_number, std::vector<uint64_t>* indices) {
+  std::unique_ptr<SequentialFileReader> file_reader;
+  Status s = SequentialFileReader::Create(
+      env->GetFileSystem(), LogFileName(dbname, wal_number), FileOptions(),
+      &file_reader, /*dbg=*/nullptr, /*rate_limiter=*/nullptr);
+  if (!s.ok()) {
+    return s;
+  }
+  log::Reader reader(/*info_log=*/nullptr, std::move(file_reader),
+                     /*reporter=*/nullptr, /*checksum=*/true, wal_number);
+  std::string scratch;
+  Slice record;
+  while (reader.ReadRecord(&record, &scratch)) {
+    indices->push_back(reader.GetLastReadWALIndex());
+  }
+  return Status::OK();
+}
+
+// The first wal_index `declaring_wal` declares superseded in `cut_wal`.
+Status GC34FirstSupersededWALIndex(Env* env, const std::string& dbname,
+                                   uint64_t declaring_wal, uint64_t cut_wal,
+                                   uint64_t* first_obsolete) {
+  std::unique_ptr<SequentialFileReader> file_reader;
+  Status s = SequentialFileReader::Create(
+      env->GetFileSystem(), LogFileName(dbname, declaring_wal), FileOptions(),
+      &file_reader, /*dbg=*/nullptr, /*rate_limiter=*/nullptr);
+  if (!s.ok()) {
+    return s;
+  }
+  log::Reader reader(/*info_log=*/nullptr, std::move(file_reader),
+                     /*reporter=*/nullptr, /*checksum=*/true, declaring_wal);
+  std::string scratch;
+  Slice record;
+  while (reader.ReadRecord(&record, &scratch)) {
+  }
+  *first_obsolete = reader.GetFirstSupersededWALIndex(cut_wal);
+  return Status::OK();
+}
+}  // namespace
+
+// GC34 Q1: a replayed WriteCommitted prepare counts as applied in merged
+// recovery, so its index is never cut. One leg: write k1, prepare xid holding
+// k2, write a large k3 and tear its record with a 50-byte truncation; open1
+// in point-in-time recovers xid; write "after" and commit; open2 must see
+// after/k2/k1 present and k3 absent (in point-in-time, tolerate and skip).
+// Absolute fails closed on the persisting torn tail, as upstream does, so its
+// legs expect "truncated record body"; a bogus cut fails them with an
+// "unexplained hole" instead. At N=2 an intact k0 opens the torn partition's
+// WAL (a sole torn record fails open1 at the damaged-head guard, correctly),
+// so the prepare sits at index 3, the torn record at 4 and k4 at 5 above the
+// hole, and open1 ends with a broke_early stop; the prepare's index must not
+// be cut there either.
+// Neuter: restore the stillness rule for "applied" in ProcessLogFilesMerged;
+// the N=1 and N=2 WRITE_COMMITTED legs fail at open2 (and the cut reads 2
+// at N=1, 3 at N=2).
+// `crash_db` marks the DB crashed before deletion (TEST_Crash is private to
+// the test class, so the TEST body supplies it): xid stays prepared across
+// the phase-2 close by design, and WritePreparedTxnDB would otherwise assert
+// on its non-empty prepared heap.
+void GC34RunPrepareCutLeg(size_t num_partitions, TxnDBWritePolicy write_policy,
+                          WALRecoveryMode open2_mode,
+                          const std::function<void(TransactionDB*)>& crash_db) {
+  const std::string dbname = test::PerThreadDBPath(
+      "gc34_prepare_cut_n" + std::to_string(num_partitions) + "_p" +
+      std::to_string(static_cast<int>(write_policy)) + "_m" +
+      std::to_string(static_cast<int>(open2_mode)));
+  SCOPED_TRACE("N=" + std::to_string(num_partitions) +
+               " policy=" + std::to_string(static_cast<int>(write_policy)) +
+               " mode=" + std::to_string(static_cast<int>(open2_mode)));
+  Options options;
+  options.create_if_missing = true;
+  options.wal_partitions = static_cast<uint32_t>(num_partitions);
+  options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  options.track_and_verify_wals_in_manifest = true;
+  options.avoid_flush_during_recovery = true;
+  options.avoid_flush_during_shutdown = true;
+  options.disable_auto_compactions = true;
+  ASSERT_OK(DestroyDB(dbname, options));
+  TransactionDBOptions txn_db_options;
+  txn_db_options.write_policy = write_policy;
+  TransactionDB* db = nullptr;
+  std::vector<ColumnFamilyHandle*> handles;
+  // Releases what the test holds on every exit, including an early
+  // return from a failed assertion.
+  auto crash_close_db = [&]() {
+    crash_db(db);
+    for (ColumnFamilyHandle* handle : handles) {
+      db->DestroyColumnFamilyHandle(handle).PermitUncheckedError();
+    }
+    handles.clear();
+    delete db;
+    db = nullptr;
+  };
+  Defer release([&] {
+    if (db != nullptr) {
+      crash_close_db();
+    }
+  });
+  auto close_db = [&]() -> Status {
+    Status s;
+    if (db != nullptr) {
+      for (ColumnFamilyHandle* handle : handles) {
+        Status hs = db->DestroyColumnFamilyHandle(handle);
+        if (s.ok()) {
+          s = hs;
+        }
+      }
+      handles.clear();
+      crash_db(db);
+      delete db;
+      db = nullptr;
+    }
+    return s;
+  };
+  std::vector<std::string> cf_names = {kDefaultColumnFamilyName};
+  auto open_db = [&]() -> Status {
+    std::vector<ColumnFamilyDescriptor> cf_descs;
+    for (const auto& name : cf_names) {
+      cf_descs.emplace_back(name, ColumnFamilyOptions(options));
+    }
+    return TransactionDB::Open(options, txn_db_options, dbname, cf_descs,
+                               &handles, &db);
+  };
+
+  // Phase 1: create column families covering every partition.
+  size_t prep_cf_index = 0;
+  size_t torn_cf_index = 0;
+  ASSERT_OK(TransactionDB::Open(options, txn_db_options, dbname, &db));
+  if (num_partitions > 1) {
+    std::vector<size_t> cf_name_index_for_partition(num_partitions, 0);
+    std::vector<bool> covered(num_partitions, false);
+    size_t num_covered = 0;
+    while (num_covered < num_partitions) {
+      ASSERT_LT(cf_names.size(), 100u) << "partition left uncovered";
+      ColumnFamilyHandle* handle = nullptr;
+      const std::string name = "cf" + std::to_string(cf_names.size());
+      ASSERT_OK(
+          db->CreateColumnFamily(ColumnFamilyOptions(options), name, &handle));
+      handles.push_back(handle);
+      cf_names.push_back(name);
+      WriteBatch batch;
+      ASSERT_OK(
+          WriteBatchInternal::Put(&batch, handle->GetID(), "key", "value"));
+      size_t partition = num_partitions;
+      ASSERT_OK(
+          DBImpl::TEST_WalPartitionForWrite(batch, num_partitions, &partition));
+      if (!covered[partition]) {
+        covered[partition] = true;
+        cf_name_index_for_partition[partition] = cf_names.size() - 1;
+        ++num_covered;
+      }
+    }
+    prep_cf_index = cf_name_index_for_partition[0];
+    torn_cf_index = cf_name_index_for_partition[1];
+  }
+  ASSERT_OK(close_db());
+
+  // Phase 2: k1 (index 1), prepare xid holding k2 (index 2), large k3
+  // (index 3, torn below), and at N=2 k4 above the hole (index 4). At N=2
+  // an intact k0 opens the torn partition's WAL first, shifting the
+  // prepare to 3, the tear to 4 and k4 to 5.
+  WriteOptions sync_wo;
+  sync_wo.sync = true;
+  uint64_t prep_wal = 0;
+  uint64_t torn_wal_number = 0;
+  {
+    ASSERT_OK(open_db());
+    DBImpl* db_impl = static_cast_with_check<DBImpl>(db->GetRootDB());
+    ColumnFamilyHandle* prep_cf = handles[prep_cf_index];
+    ColumnFamilyHandle* torn_cf = handles[torn_cf_index];
+    if (num_partitions > 1) {
+      ASSERT_OK(db->Put(sync_wo, torn_cf, "k0", "v0"));
+    }
+    ASSERT_OK(db->Put(sync_wo, prep_cf, "k1", "v1"));
+    Transaction* txn = db->BeginTransaction(sync_wo);
+    ASSERT_NE(nullptr, txn);
+    ASSERT_OK(txn->SetName("xid"));
+    ASSERT_OK(txn->Put(prep_cf, "k2", "v2"));
+    ASSERT_OK(txn->Prepare());
+    delete txn;
+    ASSERT_OK(db->Put(sync_wo, torn_cf, "k3", std::string(200, 'x')));
+    if (num_partitions > 1) {
+      ASSERT_OK(db->Put(sync_wo, prep_cf, "k4", "v4"));
+    }
+    prep_wal = db_impl->TEST_CurrentWalNumber(0);
+    torn_wal_number = prep_wal;
+    if (num_partitions > 1) {
+      torn_wal_number = db_impl->TEST_CurrentWalNumber(1);
+    }
+    ASSERT_OK(db->SyncWAL());
+    ASSERT_OK(close_db());
+  }
+
+  // Phase 3: check the layout, then tear k3's record. The torn WAL's last
+  // record holds a 200-byte value, so 50 bytes tear inside it.
+  Env* env = Env::Default();
+  {
+    std::vector<uint64_t> prep_indices;
+    ASSERT_OK(GC34ReadWalIndices(env, dbname, prep_wal, &prep_indices));
+    if (num_partitions > 1) {
+      std::vector<uint64_t> torn_indices;
+      ASSERT_OK(
+          GC34ReadWalIndices(env, dbname, torn_wal_number, &torn_indices));
+      const std::vector<uint64_t> expected_prep{2, 3, 5};
+      const std::vector<uint64_t> expected_torn{1, 4};
+      ASSERT_EQ(expected_prep, prep_indices);
+      ASSERT_EQ(expected_torn, torn_indices);
+    } else {
+      const std::vector<uint64_t> expected{1, 2, 3};
+      ASSERT_EQ(expected, prep_indices);
+      // The repro truncates the highest-numbered WAL; it must be this one.
+      std::vector<std::string> children;
+      ASSERT_OK(env->GetChildren(dbname, &children));
+      uint64_t max_log = 0;
+      for (const auto& child : children) {
+        uint64_t number = 0;
+        FileType type = kInfoLogFile;
+        if (ParseFileName(child, &number, &type) && type == kWalFile) {
+          max_log = std::max(max_log, number);
+        }
+      }
+      ASSERT_EQ(prep_wal, max_log);
+    }
+  }
+  const std::string torn_fname = LogFileName(dbname, torn_wal_number);
+  uint64_t wal_size = 0;
+  ASSERT_OK(env->GetFileSize(torn_fname, &wal_size));
+  ASSERT_OK(test::TruncateFile(env, torn_fname, wal_size - 50));
+
+  // Phase 4: open1 in point-in-time recovers xid; write "after" and commit.
+  uint64_t declaring_wal = 0;
+  options.wal_recovery_mode = WALRecoveryMode::kPointInTimeRecovery;
+  {
+    ASSERT_OK(open_db());
+    DBImpl* db_impl = static_cast_with_check<DBImpl>(db->GetRootDB());
+    declaring_wal = db_impl->TEST_CurrentWalNumber(0);
+    ColumnFamilyHandle* prep_cf = handles[prep_cf_index];
+    ColumnFamilyHandle* torn_cf = handles[torn_cf_index];
+    Transaction* recovered = db->GetTransactionByName("xid");
+    ASSERT_NE(nullptr, recovered) << "acknowledged prepare lost in open1";
+    std::string value;
+    ASSERT_OK(db->Get(ReadOptions(), prep_cf, "k1", &value));
+    ASSERT_EQ("v1", value);
+    if (num_partitions > 1) {
+      ASSERT_OK(db->Get(ReadOptions(), torn_cf, "k0", &value));
+      ASSERT_EQ("v0", value);
+      ASSERT_TRUE(db->Get(ReadOptions(), prep_cf, "k4", &value).IsNotFound());
+    }
+    ASSERT_OK(db->Put(sync_wo, prep_cf, "after", "v"));
+    ASSERT_OK(recovered->Commit());
+    delete recovered;
+    ASSERT_OK(close_db());
+  }
+
+  // Phase 5: the cut must sit above the replayed prepare (index 2 at N=1,
+  // index 3 at N=2).
+  {
+    const uint64_t expected_cut = num_partitions > 1 ? 4U : 3U;
+    uint64_t prep_cut = 0;
+    ASSERT_OK(GC34FirstSupersededWALIndex(env, dbname, declaring_wal, prep_wal,
+                                          &prep_cut));
+    EXPECT_EQ(expected_cut, prep_cut)
+        << "prepare's index cut although replayed";
+    if (num_partitions > 1) {
+      uint64_t torn_cut = 0;
+      ASSERT_OK(GC34FirstSupersededWALIndex(env, dbname, declaring_wal,
+                                            torn_wal_number, &torn_cut));
+      EXPECT_EQ(expected_cut, torn_cut) << "torn WAL cut below its torn index";
+    }
+  }
+
+  // Phase 6: open2 in the given mode sees the committed data, not the tear.
+  // Absolute fails closed on the persisting torn tail instead of opening.
+  options.wal_recovery_mode = open2_mode;
+  if (open2_mode == WALRecoveryMode::kAbsoluteConsistency) {
+    Status s = open_db();
+    if (s.ok()) {
+      // Unexpected: close before failing so the cleanup stays correct.
+      EXPECT_OK(close_db());
+    } else {
+      db = nullptr;
+      handles.clear();
+    }
+    ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+    EXPECT_NE(std::string::npos, s.ToString().find("truncated record body"))
+        << s.ToString();
+    ASSERT_OK(DestroyDB(dbname, options));
+    return;
+  }
+  {
+    ASSERT_OK(open_db()) << "open2 failed";
+    ColumnFamilyHandle* prep_cf = handles[prep_cf_index];
+    ColumnFamilyHandle* torn_cf = handles[torn_cf_index];
+    std::string value;
+    ASSERT_OK(db->Get(ReadOptions(), prep_cf, "after", &value));
+    ASSERT_EQ("v", value);
+    ASSERT_OK(db->Get(ReadOptions(), prep_cf, "k2", &value));
+    ASSERT_EQ("v2", value);
+    ASSERT_OK(db->Get(ReadOptions(), prep_cf, "k1", &value));
+    ASSERT_EQ("v1", value);
+    ASSERT_TRUE(db->Get(ReadOptions(), torn_cf, "k3", &value).IsNotFound());
+    if (num_partitions > 1) {
+      ASSERT_OK(db->Get(ReadOptions(), torn_cf, "k0", &value));
+      ASSERT_EQ("v0", value);
+      ASSERT_TRUE(db->Get(ReadOptions(), prep_cf, "k4", &value).IsNotFound());
+    }
+    ASSERT_OK(close_db());
+  }
+  ASSERT_OK(DestroyDB(dbname, options));
+}
+
+TEST(TransactionPartitionedWalTest, GC34ReplayedPrepareIsNotCut) {
+  const size_t kNumPartitions[] = {1, 2};
+  const TxnDBWritePolicy kPolicies[] = {WRITE_COMMITTED, WRITE_PREPARED,
+                                        WRITE_UNPREPARED};
+  const WALRecoveryMode kModes[] = {
+      WALRecoveryMode::kPointInTimeRecovery,
+      WALRecoveryMode::kTolerateCorruptedTailRecords,
+      WALRecoveryMode::kAbsoluteConsistency,
+      WALRecoveryMode::kSkipAnyCorruptedRecords};
+  auto crash_db = [](TransactionDB* db) {
+    static_cast<PessimisticTransactionDB*>(db)->TEST_Crash();
+  };
+  for (size_t n : kNumPartitions) {
+    for (TxnDBWritePolicy policy : kPolicies) {
+      for (WALRecoveryMode mode : kModes) {
+        GC34RunPrepareCutLeg(n, policy, mode, crash_db);
+      }
+    }
   }
 }
 

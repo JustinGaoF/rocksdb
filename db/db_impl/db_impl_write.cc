@@ -1822,7 +1822,9 @@ Status DBImpl::WriteImpl(
       const SequenceNumber gate_target = last_sequence;
       write_group.completion_gate = [this, gate_low, gate_target]() {
         (void)gate_low;
-        return RunCompletionGate(gate_target, /*published=*/true);
+        // The group's range is applied as it exits.
+        return RunCompletionGate(gate_target, /*published=*/true,
+                                 /*range_applied=*/true);
       };
     } else if (sync_group && io_s.ok()) {
       // The sync writers' range, [sync_low, gate_target], is inserted
@@ -1843,8 +1845,10 @@ Status DBImpl::WriteImpl(
         // group exits; they complete once it is visible, before the fsync.
         write_group.async_writers_gate = [this, sync_low, group,
                                           disable_memtable]() {
+          // The async writers' range is applied as the group exits.
           Status s = WaitForWalDurability(sync_low - 1, /*wal_record=*/true,
-                                          /*published=*/true);
+                                          /*published=*/true,
+                                          /*range_applied=*/true);
           if (s.ok()) {
             for (auto* writer : *group) {
               if (!writer->sync && writer->post_memtable_callback) {
@@ -1876,8 +1880,11 @@ Status DBImpl::WriteImpl(
       // above the published frontier.
       const SequenceNumber gate_target = last_sequence;
       write_group.completion_gate = [this, gate_target]() {
+        // The group's range is applied as it exits, although it has no WAL
+        // record.
         return WaitForWalDurability(gate_target, /*wal_record=*/false,
-                                    /*published=*/true);
+                                    /*published=*/true,
+                                    /*range_applied=*/true);
       };
     }
     if (has_post_memtable_callback && write_group.completion_gate) {
@@ -2860,7 +2867,10 @@ void DBImpl::HandleMemTableInsertFailure(const Status& status,
   // column family and didn't specify ignore_missing_column_families.
   mutex_.Lock();
   assert(!error_handler_.IsBGWorkStopped());
-  error_handler_.SetBGError(status, BackgroundErrorReason::kMemTable);
+  // Fenced at N>1 below: listeners cannot suppress an error that installs
+  // a WAL gate fence, so the fence never stands without a visible stop.
+  error_handler_.SetBGError(status, BackgroundErrorReason::kMemTable,
+                            /*wal_related=*/false, /*fence_related=*/true);
   if (NumWalPartitions() > 1) {
     Status bg_error = error_handler_.GetBGError();
     InstallWalGateFence(first_sequence, bg_error.ok() ? status : bg_error,
@@ -3374,7 +3384,7 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
 }
 
 Status DBImpl::WaitForWalDurability(SequenceNumber target, bool wal_record,
-                                    bool published) {
+                                    bool published, bool range_applied) {
   StopWatch wait_sw(immutable_db_options_.clock, WalPartitionStats(),
                     WAL_DURABILITY_WAIT_MICROS);
   auto covered = [this, target, wal_record, published]() {
@@ -3448,15 +3458,18 @@ Status DBImpl::WaitForWalDurability(SequenceNumber target, bool wal_record,
   if (covered()) {
     s = WalGateFenceStatus(target);
   } else {
-    // Park until the frontier covers the target, a fence holds it, or
-    // shutdown begins. A fence, the background-error leg and shutdown are
-    // signaled under the wait mutex, which the checks hold, so none can slip
-    // between the check and the park. A frontier advance is signaled only to
-    // the waiters it covers (SignalWalDurabilityWaiters): it either sees this
-    // waiter's target, and then takes the mutex, or this check sees the
-    // advance. Any other background error only wakes the waiter to recheck: a
-    // group whose append succeeded is acknowledged once covered, as with one
-    // WAL. The waiter holds no other mutex (LOCK ORDER rule 9). The wait has
+    // Park until the frontier covers the target, a fence holds it, or, for
+    // a waiter whose range is not yet applied, shutdown begins. A fence, the
+    // background-error leg and shutdown are signaled under the wait mutex,
+    // which the checks hold, so none can slip between the check and the
+    // park. A frontier advance is signaled only to the waiters it covers
+    // (SignalWalDurabilityWaiters): it either sees this waiter's target, and
+    // then takes the mutex, or this check sees the advance. Any other
+    // background error only wakes the waiter to recheck: a group whose
+    // append succeeded is acknowledged once covered, as with one WAL. An
+    // applied waiter likewise re-parks on the shutdown wake: its range
+    // publishes once the ranges below it do, so it ends covered or fenced.
+    // The waiter holds no other mutex (LOCK ORDER rule 9). The wait has
     // no timeout: a missed wake would hang, loudly, instead of hiding behind
     // a poll.
     InstrumentedMutexLock l(&wal_durability_wait_mutex_);
@@ -3471,7 +3484,7 @@ Status DBImpl::WaitForWalDurability(SequenceNumber target, bool wal_record,
       if (!s.ok() || covered()) {
         break;
       }
-      if (shutting_down_.load(std::memory_order_acquire)) {
+      if (!range_applied && shutting_down_.load(std::memory_order_acquire)) {
         s = Status::ShutdownInProgress("parked write");
         break;
       }
@@ -3933,9 +3946,11 @@ SequenceNumber DBImpl::UnreleasedWalGateFenceLow() {
   return low;
 }
 
-Status DBImpl::RunCompletionGate(SequenceNumber target, bool published) {
+Status DBImpl::RunCompletionGate(SequenceNumber target, bool published,
+                                 bool range_applied) {
   TEST_SYNC_POINT("DBImpl::RunCompletionGate:BeforeWait");
-  return WaitForWalDurability(target, /*wal_record=*/true, published);
+  return WaitForWalDurability(target, /*wal_record=*/true, published,
+                              range_applied);
 }
 
 IOStatus DBImpl::WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
@@ -4214,7 +4229,11 @@ Status DBImpl::RunSyncGate(size_t wal_partition, SequenceNumber low,
   // Wait until every record at or below `target` is written, then run one
   // coalesced gate sync, which claims only the WALs holding what the group
   // needs.
-  Status s = RunCompletionGate(target, /*published=*/false);
+  // The sync range publishes only after the fsync below, so it is not yet
+  // applied: a shutdown here fails it, and FailUnpublishedSyncRange fences
+  // it, never published.
+  Status s = RunCompletionGate(target, /*published=*/false,
+                               /*range_applied=*/false);
   if (s.ok()) {
     s = RunCoalescedGateSync(low, target, [&](SequenceNumber claim_bound) {
       return SyncWalsFromCompletionGate(
@@ -4259,7 +4278,9 @@ Status DBImpl::RunSyncGate(size_t wal_partition, SequenceNumber low,
   }
   EndUnpublishedSyncGroup();
   if (s.ok()) {
-    s = WaitForWalDurability(target, /*wal_record=*/true, /*published=*/true);
+    // The range published just above, so it is applied.
+    s = WaitForWalDurability(target, /*wal_record=*/true, /*published=*/true,
+                             /*range_applied=*/true);
   }
   return s;
 }
@@ -4282,8 +4303,10 @@ void DBImpl::FailUnpublishedSyncRange(size_t wal_partition, SequenceNumber low,
   }
   if (error_handler_.GetBGError().ok() && !status.IsShutdownInProgress()) {
     // A failed callback, which, as in the group, stops the DB; likewise any
-    // failure once the range's entries may be in a memtable.
-    error_handler_.SetBGError(status, BackgroundErrorReason::kWriteCallback);
+    // failure once the range's entries may be in a memtable. Fenced below:
+    // listeners cannot suppress an error that installs a WAL gate fence.
+    error_handler_.SetBGError(status, BackgroundErrorReason::kWriteCallback,
+                              /*wal_related=*/false, /*fence_related=*/true);
   }
   // As a failed append's range (WALIOStatusCheck): never published, its
   // entries dropped by every flush from now on, recovery's included, and
@@ -4298,8 +4321,11 @@ Status DBImpl::WaitUntilRangesBelowPublished(SequenceNumber low,
                                              bool wal_record) {
   assert(NumWalPartitions() > 1);
   // A disableWAL group registered no record, so the frontier may never pass
-  // its own range; publication of the ranges below is what it needs.
-  Status s = WaitForWalDurability(low - 1, wal_record, /*published=*/true);
+  // its own range; publication of the ranges below is what it needs. Every
+  // caller waits before its own range is applied, so a shutdown here fails
+  // it, never visible (fenced when it may have inserted).
+  Status s = WaitForWalDurability(low - 1, wal_record, /*published=*/true,
+                                  /*range_applied=*/false);
   if (!s.ok() && !s.IsShutdownInProgress() && WalGateFenceStatus(low).ok()) {
     // The fence ends below this group: Resume() covered the failure before
     // this group allocated, so it cannot fail with it.

@@ -1541,13 +1541,18 @@ class PartitionWriters {
                    const std::vector<uint32_t>& cf_ids, uint64_t max_keys);
   ~PartitionWriters() { Stop(); }
 
-  // Waits until every writer has `count` writes acknowledged.
-  void WaitForAcked(uint64_t count);
+  // Waits until every writer has `count` writes acknowledged. Returns the
+  // first writer's error promptly if a Put fails, instead of spinning until
+  // the harness timeout; callers assert the result.
+  Status WaitForAcked(uint64_t count);
   std::vector<uint64_t> Acked() const;
   void Stop();
 
  private:
   std::atomic<bool> stop_{false};
+  std::atomic<bool> failed_{false};
+  port::Mutex mu_;
+  Status first_error_;
   std::vector<std::atomic<uint64_t>> acked_;
   std::vector<port::Thread> threads_;
 };

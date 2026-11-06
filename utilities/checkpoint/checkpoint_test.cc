@@ -1478,7 +1478,7 @@ TEST_P(CheckpointTest, CheckpointConcurrentWritesArePrefix) {
   std::vector<uint64_t> acked_before;
   {
     PartitionWriters writers(db_.get(), handles_, cf_ids, kMaxKeys);
-    writers.WaitForAcked(20);
+    ASSERT_OK(writers.WaitForAcked(20));
     acked_before = writers.Acked();
     Checkpoint* checkpoint = nullptr;
     ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
@@ -1546,7 +1546,7 @@ TEST_P(CheckpointTest, CheckpointRacingLockWAL) {
       }
     });
     for (int c = 0; c < kCheckpoints; ++c) {
-      writers.WaitForAcked(static_cast<uint64_t>(c + 1) * 10);
+      ASSERT_OK(writers.WaitForAcked(static_cast<uint64_t>(c + 1) * 10));
       acked_before[c] = writers.Acked();
       Checkpoint* checkpoint = nullptr;
       ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));

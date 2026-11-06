@@ -989,8 +989,10 @@ void DBImpl::CancelAllBackgroundWork(bool wait) {
   shutting_down_.store(true, std::memory_order_release);
   bg_cv_.SignalAll();
   if (NumWalPartitions() > 1) {
-    // Writes parked in their completion gate return ShutdownInProgress
-    // unless already covered, as a stalled write does.
+    // Writes parked in their completion gate whose range is not yet applied
+    // return ShutdownInProgress unless already covered, as a stalled write
+    // does; a waiter whose range is already applied keeps waiting for it to
+    // publish or fence, so it ends covered or fenced, never failed-visible.
     InstrumentedMutexLock seq_lock(&wal_durability_wait_mutex_);
     wal_durability_cv_.SignalAll();
   }
@@ -1264,8 +1266,11 @@ Status DBImpl::CloseHelper() {
   if (NumWalPartitions() > 1) {
     // The shutdown marker woke every write parked in its completion gate;
     // the gate's mutex and cv are freed with this DB, so wait for them to
-    // leave. A write reaching its gate after this point is a write
-    // concurrent with Close(), which is unsupported.
+    // leave. Waiters whose range is not yet applied leave at once; applied
+    // waiters stay until the ranges below them publish or fence, which the
+    // in-flight appends and gate fsyncs below them finish, so the drain is
+    // bounded by in-flight I/O. A write reaching its gate after this point
+    // is a write concurrent with Close(), which is unsupported.
     InstrumentedMutexLock seq_lock(&wal_durability_wait_mutex_);
     while (wal_durability_waiters_.load(std::memory_order_relaxed) > 0) {
       wal_durability_cv_.Wait();

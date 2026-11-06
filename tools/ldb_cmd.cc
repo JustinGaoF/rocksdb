@@ -3178,6 +3178,21 @@ void DumpWalFiles(Options options, const std::string& dir_or_file,
       }
       return;
     }
+    if (only_print_seqno_gaps &&
+        (options.wal_partitions > 1 || wal_index_guard_set)) {
+      // As in the directory branch: one file's sequences may interleave with
+      // the other partitions', so gaps in file order are not real gaps. Fail
+      // closed on purpose: the guard is set by every indexing opener, so an
+      // N=1 partition_by_column_family DB refuses too.
+      if (exec_state) {
+        *exec_state = LDBCommandExecuteResult::Failed(
+            "--only_print_seqno_gaps: " + dir_or_file +
+            ": the DB is indexed (wal_partitions > 1 or the MANIFEST WAL "
+            "index guard is set), so sequence numbers may interleave across "
+            "WAL files and gaps in file order are not real gaps");
+      }
+      return;
+    }
     DumpWalFile(options, dir_or_file, print_header, print_values,
                 only_print_seqno_gaps, is_write_committed, ucmps, exec_state,
                 &prev_batch_seqno, &prev_batch_count);
@@ -3507,9 +3522,21 @@ void WALDumperCommand::DoCommand() {
   bool wal_index_guard_set = false;
   if (only_print_seqno_gaps_) {
     uint64_t guard = 0;
+    // The guard lives in the MANIFEST beside the WAL: with --db that is the
+    // DB directory, else the --walfile's directory when it names a file.
+    std::string guard_dir = db_path_;
+    if (guard_dir.empty()) {
+      std::vector<std::string> children;
+      if (options_.env->GetChildren(wal_file_, &children).ok() &&
+          !children.empty()) {
+        guard_dir = wal_file_;
+      } else {
+        const size_t sep = wal_file_.rfind(kFilePathSeparator);
+        guard_dir = sep == std::string::npos ? "." : wal_file_.substr(0, sep);
+      }
+    }
     const Status s = VersionSet::ReadWALIndexGuard(
-        db_path_.empty() ? wal_file_ : db_path_,
-        options_.env->GetFileSystem().get(), &guard);
+        guard_dir, options_.env->GetFileSystem().get(), &guard);
     wal_index_guard_set = s.ok() && guard != 0;
   }
   DumpWalFiles(options_, wal_file_, print_header_, print_values_,

@@ -2090,8 +2090,10 @@ Status DBImpl::ProcessLogFilesMerged(
   const WALRecoveryMode wal_recovery_mode =
       immutable_db_options_.wal_recovery_mode;
 
-  // Highest applied index per WAL, for cuts. Emitted-but-dropped records
-  // (point-in-time or filter drops) do not advance it.
+  // Highest applied index per WAL, for cuts. Only records whose replay
+  // inserted advance it: point-in-time and filter drops, corrupt records
+  // and failed inserts do not, while a WriteCommitted prepare rebuilt
+  // into its recovered transaction does although it moves no sequence.
   std::unordered_map<uint64_t, uint64_t> applied_max;
   std::unordered_set<uint64_t> superseded;
   auto record_cut = [&](uint64_t wal_number) {
@@ -2115,12 +2117,16 @@ Status DBImpl::ProcessLogFilesMerged(
     // index order and surfaces a missing index as a gap before passing it, so
     // every unread record of the member is at or above the seed, and a
     // point-in-time drop ends the drive at an index above every applied one.
-    // Below the seed the member holds only applied, filter-ignored or empty
-    // records, except under skip, where members read past corruption: an
-    // unreadable record there stays uncut, as the sequential path leaves it
-    // for the next skip open to skip again. N=1 is exempt: its cuts already
-    // land at the seed, and SecondOpenAfterSupersessionRedeclaresTheSameCut
-    // pins their values.
+    // Below the seed the member holds only applied records (inserted by
+    // their replay, even when they moved no sequence, as a WriteCommitted
+    // prepare rebuilt into its recovered transaction), filter-ignored or
+    // empty records, or records reported corrupt or failed on insert,
+    // except under skip, where members read past corruption: an
+    // unreadable record there stays uncut, as the sequential path leaves
+    // it for the next skip open to skip again. N=1 cuts at its applied
+    // high plus one, at or below the seed and always above every applied
+    // index, and SecondOpenAfterSupersessionRedeclaresTheSameCut pins
+    // their values.
     // The cut is the seed itself, not the member's first index above it: the
     // declaration also obsoletes the member's voids at or above the seed,
     // and a void can lie below the member's first record, as Resume's
@@ -2394,11 +2400,13 @@ Status DBImpl::ProcessLogFilesMerged(
         }
       }
     } else {
+      bool record_applied = false;
       Status process_status = ProcessLogRecord(
           record, reader_member->reader(), running_ts_sz, wal_number, fname,
           read_only, job_id, log_file_dropped, &reporter, &record_checksum,
           &last_seqno_observed, next_sequence, &stop_replay_for_corruption,
-          &status, &stop_replay_by_wal_filter, version_edits, &flushed);
+          &status, &stop_replay_by_wal_filter, version_edits, &flushed,
+          &record_applied);
       if (!process_status.ok()) {
         return process_status;
       }
@@ -2407,11 +2415,12 @@ Status DBImpl::ProcessLogFilesMerged(
           !seqno_check_status.ok()) {
         return seqno_check_status;
       }
-      // Applied unless next_sequence stood still on a non-empty batch: the
-      // inserter advances it even for skipped column families, so stillness
-      // means the record never reached the memtable.
-      dropped = (*next_sequence == prev_next_sequence) &&
-                (!has_header || batch_count != 0);
+      // Applied when the replay inserted the record, whether or not
+      // next_sequence moved: a WriteCommitted prepare rebuilds its
+      // recovered transaction without consuming a sequence. Corrupt
+      // records and failed inserts are not applied even when the
+      // sequence advanced before they failed.
+      dropped = !record_applied;
       // The sequences this record's writer allocated, as its replay advanced
       // them. seq_per_batch writers allocate per batch, not per entry, so
       // those openers keep the first-sequence rule.
@@ -2930,11 +2939,14 @@ Status DBImpl::ProcessLogFile(
 
     // FIXME(hx235): consolidate `process_status` and `status`
     SequenceNumber prev_next_sequence = *next_sequence;
+    // The sequential path seeds from every record it read, so it ignores
+    // what the record did.
+    bool record_applied = false;
     Status process_status = ProcessLogRecord(
         record, reader, running_ts_sz, wal_number, fname, read_only, job_id,
         logFileDropped, &reporter, &record_checksum, &last_seqno_observed,
         next_sequence, stop_replay_for_corruption, &status,
-        stop_replay_by_wal_filter, version_edits, flushed);
+        stop_replay_by_wal_filter, version_edits, flushed, &record_applied);
 
     if (!process_status.ok()) {
       return process_status;
@@ -3100,12 +3112,14 @@ Status DBImpl::ProcessLogRecord(
     SequenceNumber* last_seqno_observed, SequenceNumber* next_sequence,
     bool* stop_replay_for_corruption, Status* status,
     bool* stop_replay_by_wal_filter,
-    std::unordered_map<int, VersionEdit>* version_edits, bool* flushed) {
+    std::unordered_map<int, VersionEdit>* version_edits, bool* flushed,
+    bool* record_applied) {
   assert(reporter);
   assert(last_seqno_observed);
   assert(stop_replay_for_corruption);
   assert(status);
   assert(stop_replay_by_wal_filter);
+  assert(record_applied);
 
   Status process_status;
   bool has_valid_writes = false;
@@ -3117,6 +3131,7 @@ Status DBImpl::ProcessLogRecord(
     reporter->Corruption(record.size(),
                          Status::Corruption("log record too small"));
     assert(process_status.ok());
+    *record_applied = false;
     return process_status;
   }
 
@@ -3124,6 +3139,7 @@ Status DBImpl::ProcessLogRecord(
       record, reader, running_ts_sz, &batch, new_batch, batch_to_use,
       record_checksum);
   if (!process_status.ok()) {
+    *record_applied = false;
     return process_status;
   }
   assert(batch_to_use);
@@ -3136,6 +3152,7 @@ Status DBImpl::ProcessLogRecord(
         Status::Corruption("sequence " + std::to_string(*last_seqno_observed) +
                            " is too large"));
     assert(process_status.ok());
+    *record_applied = false;
     return process_status;
   }
 
@@ -3144,6 +3161,7 @@ Status DBImpl::ProcessLogRecord(
   if (*stop_replay_for_corruption) {
     logFileDropped();
     assert(process_status.ok());
+    *record_applied = false;
     return process_status;
   }
 
@@ -3153,6 +3171,7 @@ Status DBImpl::ProcessLogRecord(
                                           *stop_replay_by_wal_filter,
                                           *batch_to_use)) {
     assert(process_status.ok());
+    *record_applied = false;
     return process_status;
   } else {
     // FIXME(hx235): Handle the potential non-okay `status` when
@@ -3171,8 +3190,12 @@ Status DBImpl::ProcessLogRecord(
     // set in `InvokeWalFilterIfNeededOnWalRecord` through passing `*status`
     reporter->Corruption(record.size(), process_status);
     process_status = Status::OK();
+    *record_applied = false;
     return process_status;
   }
+  // Inserted, whether or not next_sequence moved: a WriteCommitted prepare
+  // rebuilds its recovered transaction without consuming a sequence.
+  *record_applied = true;
 
   process_status = MaybeWriteLevel0TableForRecovery(
       has_valid_writes, read_only, wal_number, job_id, next_sequence,

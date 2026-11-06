@@ -132,7 +132,9 @@ TEST_F(LdbCmdTest, MemEnv) {
 }
 
 // `ldb dump_wal` prints every record of an indexed WAL with its sequence and
-// count, and finds no sequence gap in it.
+// count, while `--only_print_seqno_gaps` refuses it: the DB is indexed, so
+// sequences may interleave across files (GC34 Q4; an N=1 indexed DB refuses
+// too, fail-closed).
 TEST_F(LdbCmdTest, DumpWalPrintsIndexedRecords) {
   Env* env = TryLoadCustomOrDefaultEnv();
   Options opts;
@@ -186,9 +188,9 @@ TEST_F(LdbCmdTest, DumpWalPrintsIndexedRecords) {
                                              "5,3,"};
   EXPECT_EQ(expected, rows) << out;
 
-  ASSERT_EQ(0, dump("--only_print_seqno_gaps", &out, &err));
-  EXPECT_EQ("", err);
-  EXPECT_EQ("", out);
+  ASSERT_NE(0, dump("--only_print_seqno_gaps", &out, &err));
+  EXPECT_NE(std::string::npos, (err + out).find("interleave")) << err << out;
+  EXPECT_EQ(std::string::npos, (err + out).find("Prev batch")) << err << out;
   ASSERT_OK(DestroyDB(dbname, opts));
 }
 
@@ -295,10 +297,11 @@ INSTANTIATE_TEST_CASE_P(WalPartitions8, LdbCmdWalPartitionsTest,
 
 // `ldb dump_wal` on each partition's current WAL prints that WAL's records,
 // and names the partition of every file but partition 0's; together the files
-// hold every write exactly once. `--only_print_seqno_gaps` checks partition
-// 0's file and refuses every other one. `dump_live_files`, which opens the
-// DB, lists every partition's current WAL. Ported from
-// D127115188's DumpWalShowsPartitionAndRefusesGapsAtN8.
+// hold every write exactly once. `--only_print_seqno_gaps` refuses every
+// file, partition 0's included: the DB is indexed, so sequences interleave
+// across files. A kNone DB's WAL still gap-checks with no refusal.
+// `dump_live_files`, which opens the DB, lists every partition's current WAL.
+// Ported from D127115188's DumpWalShowsPartitionAndRefusesGapsAtN8.
 TEST_P(LdbCmdWalPartitionsTest, DumpWalAtWalPartitions) {
   Env* env = TryLoadCustomOrDefaultEnv();
   const uint32_t num_partitions = GetParam();
@@ -321,13 +324,21 @@ TEST_P(LdbCmdWalPartitionsTest, DumpWalAtWalPartitions) {
     column_families.emplace_back("cf" + std::to_string(cf_id), opts);
   }
   std::vector<uint64_t> current_wals(num_partitions);
+  constexpr int kRounds = 4;
   {
     std::vector<ColumnFamilyHandle*> handles;
     std::unique_ptr<DB> db;
     ASSERT_OK(DB::Open(opts, dbname, column_families, &handles, &db));
+    // Round-robin across the partitions' column families, so every WAL's
+    // sequences interleave with the others'.
+    for (int r = 0; r < kRounds; ++r) {
+      for (uint32_t p = 0; p < num_partitions; ++p) {
+        ASSERT_OK(db->Put(WriteOptions(), handles[cf_ids[p]],
+                          "key" + std::to_string(p) + "_" + std::to_string(r),
+                          "value"));
+      }
+    }
     for (uint32_t p = 0; p < num_partitions; ++p) {
-      ASSERT_OK(db->Put(WriteOptions(), handles[cf_ids[p]],
-                        "key" + std::to_string(p), "value"));
       current_wals[p] =
           static_cast<DBImpl*>(db.get())->TEST_CurrentWalNumber(p);
     }
@@ -336,7 +347,9 @@ TEST_P(LdbCmdWalPartitionsTest, DumpWalAtWalPartitions) {
     }
   }
 
-  auto run = [&](std::vector<std::string> args, std::string* output) {
+  auto run_with = [&](const Options& run_opts,
+                      std::vector<ColumnFamilyDescriptor>* run_cfs,
+                      std::vector<std::string> args, std::string* output) {
     args.insert(args.begin(), "./ldb");
     std::vector<const char*> argv;
     for (const std::string& arg : args) {
@@ -346,10 +359,13 @@ TEST_P(LdbCmdWalPartitionsTest, DumpWalAtWalPartitions) {
     testing::internal::CaptureStderr();
     const int code =
         LDBCommandRunner::RunCommand(static_cast<int>(argv.size()), argv.data(),
-                                     opts, LDBOptions(), &column_families);
+                                     run_opts, LDBOptions(), run_cfs);
     *output = testing::internal::GetCapturedStderr();
     *output += testing::internal::GetCapturedStdout();
     return code;
+  };
+  auto run = [&](std::vector<std::string> args, std::string* output) {
+    return run_with(opts, &column_families, std::move(args), output);
   };
   std::string output;
   size_t records = 0;
@@ -370,14 +386,15 @@ TEST_P(LdbCmdWalPartitionsTest, DumpWalAtWalPartitions) {
         << output;
     const int gaps =
         run({"dump_wal", wal_arg, "--only_print_seqno_gaps"}, &output);
-    if (p == 0) {
-      EXPECT_EQ(0, gaps) << output;
-    } else {
-      EXPECT_NE(0, gaps) << output;
-      EXPECT_NE(std::string::npos, output.find("wal_partitions > 1")) << output;
-    }
+    // Every partition's file refuses, partition 0's included: the DB is
+    // indexed (wal_partitions > 1, or the MANIFEST guard at N=1), so
+    // sequences may interleave across files and gaps in file order are not
+    // real gaps.
+    EXPECT_NE(0, gaps) << output;
+    EXPECT_NE(std::string::npos, output.find("interleave")) << output;
+    EXPECT_EQ(std::string::npos, output.find("Prev batch")) << output;
   }
-  EXPECT_EQ(num_partitions, records);
+  EXPECT_EQ(num_partitions * static_cast<uint32_t>(kRounds), records);
 
   const int live_files = run({"dump_live_files", "--db=" + dbname}, &output);
   if (num_partitions == 1) {
@@ -396,6 +413,37 @@ TEST_P(LdbCmdWalPartitionsTest, DumpWalAtWalPartitions) {
     }
   }
   ASSERT_OK(DestroyDB(dbname, opts));
+
+  // kNone control: an unindexed DB's WAL gap-checks as upstream, with no
+  // refusal.
+  {
+    SCOPED_TRACE("knone");
+    Options none_opts;
+    none_opts.env = env;
+    none_opts.create_if_missing = true;
+    const std::string none_dbname = test::PerThreadDBPath(env, "ldb_cmd_none");
+    ASSERT_OK(DestroyDB(none_dbname, none_opts));
+    std::vector<ColumnFamilyDescriptor> none_cfs = {
+        ColumnFamilyDescriptor(kDefaultColumnFamilyName, none_opts)};
+    uint64_t none_wal = 0;
+    {
+      std::unique_ptr<DB> db;
+      ASSERT_OK(DB::Open(none_opts, none_dbname, &db));
+      for (int i = 0; i < 8; ++i) {
+        ASSERT_OK(db->Put(WriteOptions(), "k" + std::to_string(i), "v"));
+      }
+      none_wal = static_cast<DBImpl*>(db.get())->TEST_CurrentWalNumber(0);
+    }
+    const std::string wal_arg =
+        "--walfile=" + LogFileName(none_dbname, none_wal);
+    const int gaps =
+        run_with(none_opts, &none_cfs,
+                 {"dump_wal", wal_arg, "--only_print_seqno_gaps"}, &output);
+    EXPECT_EQ(0, gaps) << output;
+    EXPECT_EQ(std::string::npos, output.find("Prev batch")) << output;
+    EXPECT_EQ(std::string::npos, output.find("interleave")) << output;
+    ASSERT_OK(DestroyDB(none_dbname, none_opts));
+  }
 }
 
 // GC27 Q5 (d) (L13, K4; D-GC27b): a WAL whose head cannot be read is of an
