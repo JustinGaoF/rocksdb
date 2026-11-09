@@ -1121,7 +1121,13 @@ Status DBImpl::WriteImpl(
                         /*_ingest_wbwi=*/wbwi != nullptr, trace_batch);
   StopWatch write_sw(immutable_db_options_.clock, stats_, DB_WRITE);
 
-  write_thread_.JoinBatchGroup(&w);
+  {
+    // Time blocked waiting to join a write batch group: the queueing that
+    // write-partition routing could relieve.
+    StopWatch join_sw(immutable_db_options_.clock, JoinWaitStats(),
+                      JOIN_BATCH_GROUP_WAIT_MICROS);
+    write_thread_.JoinBatchGroup(&w);
+  }
   if (w.state == WriteThread::STATE_PARALLEL_MEMTABLE_CALLER) {
     write_thread_.SetMemWritersEachStride(&w);
   }
@@ -1380,6 +1386,11 @@ Status DBImpl::WriteImpl(
       RecordTick(stats_, WRITE_DONE_BY_OTHER, write_done_by_other);
     }
     RecordInHistogram(stats_, BYTES_PER_WRITE, total_byte_size);
+    // One sample per write group: the group-size distribution, and the number
+    // of compatible writers the size cap turned away.
+    RecordInHistogram(stats_, WRITERS_PER_WRITE_GROUP, write_group.size);
+    RecordInHistogram(stats_, WRITE_GROUP_CAP_EXCLUDED,
+                      write_group.num_cap_excluded);
 
     if (write_options.disableWAL) {
       has_unpersisted_data_.store(true, std::memory_order_relaxed);
@@ -1644,7 +1655,13 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
                         /*_pre_release_callback=*/nullptr,
                         /*_post_memtable_callback=*/nullptr,
                         /*_ingest_wbwi=*/false, trace_batch);
-  write_thread_.JoinBatchGroup(&w);
+  {
+    // Time blocked waiting to join a write batch group: the queueing that
+    // write-partition routing could relieve.
+    StopWatch join_sw(immutable_db_options_.clock, JoinWaitStats(),
+                      JOIN_BATCH_GROUP_WAIT_MICROS);
+    write_thread_.JoinBatchGroup(&w);
+  }
   TEST_SYNC_POINT("DBImplWrite::PipelinedWriteImpl:AfterJoinBatchGroup");
   if (w.state == WriteThread::STATE_GROUP_LEADER) {
     WriteThread::WriteGroup wal_write_group;
@@ -1746,6 +1763,11 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
     stats->AddDBStats(InternalStats::kIntStatsBytesWritten, total_byte_size);
     RecordTick(stats_, BYTES_WRITTEN, total_byte_size);
     RecordInHistogram(stats_, BYTES_PER_WRITE, total_byte_size);
+    // One sample per write group: the group-size distribution, and the number
+    // of compatible writers the size cap turned away.
+    RecordInHistogram(stats_, WRITERS_PER_WRITE_GROUP, wal_write_group.size);
+    RecordInHistogram(stats_, WRITE_GROUP_CAP_EXCLUDED,
+                      wal_write_group.num_cap_excluded);
 
     PERF_TIMER_STOP(write_pre_and_post_process_time);
 
@@ -1944,7 +1966,13 @@ Status DBImpl::WriteImplWALOnly(
                         /*_ingest_wbwi=*/false, trace_batch);
   StopWatch write_sw(immutable_db_options_.clock, stats_, DB_WRITE);
 
-  write_thread->JoinBatchGroup(&w);
+  {
+    // Time blocked waiting to join a write batch group: the queueing that
+    // write-partition routing could relieve.
+    StopWatch join_sw(immutable_db_options_.clock, JoinWaitStats(),
+                      JOIN_BATCH_GROUP_WAIT_MICROS);
+    write_thread->JoinBatchGroup(&w);
+  }
   assert(w.state != WriteThread::STATE_PARALLEL_MEMTABLE_WRITER);
   if (w.state == WriteThread::STATE_COMPLETED) {
     if (wal_used != nullptr) {
@@ -2046,6 +2074,11 @@ Status DBImpl::WriteImplWALOnly(
     RecordTick(stats_, WRITE_DONE_BY_OTHER, write_done_by_other);
   }
   RecordInHistogram(stats_, BYTES_PER_WRITE, total_byte_size);
+  // One sample per write group: the group-size distribution, and the number
+  // of compatible writers the size cap turned away.
+  RecordInHistogram(stats_, WRITERS_PER_WRITE_GROUP, write_group.size);
+  RecordInHistogram(stats_, WRITE_GROUP_CAP_EXCLUDED,
+                    write_group.num_cap_excluded);
 
   PERF_TIMER_STOP(write_pre_and_post_process_time);
 
@@ -2572,6 +2605,8 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
   // manual_wal_flush_ feature (by UNLIKELY) instead of the more common case
   // when we do not need any locking.
   if (UNLIKELY(needs_locking)) {
+    StopWatch lock_sw(immutable_db_options_.clock, WalPartitionStats(),
+                      WAL_WRITE_MUTEX_WAIT_MICROS);
     WalWriteMutex(wal_context.wal_partition).Lock();
   }
   IOStatus io_s = log_writer->MaybeAddUserDefinedTimestampSizeRecord(
