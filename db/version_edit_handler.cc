@@ -659,6 +659,10 @@ Status VersionEditHandler::ExtractInfoFromVersionEdit(ColumnFamilyData* cfd,
       version_set_->ApplyCommittedOptionsFileNumber(
           edit.GetCommittedOptionsFileNumber());
     }
+    if (edit.HasWALIndexGuard()) {
+      assert(version_set_ != nullptr);
+      version_set_->wal_index_guard_ = edit.GetWALIndexGuard();
+    }
     if (!version_edit_params_.HasPrevLogNumber()) {
       version_edit_params_.SetPrevLogNumber(0);
     }
