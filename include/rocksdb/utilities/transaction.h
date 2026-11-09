@@ -259,6 +259,12 @@ class Transaction {
   // notifier will be notified upon next snapshot creation. Nullable.
   // ret non-null output argument storing a shared_ptr to the newly created
   // snapshot.
+  // With wal_partitions > 1, the snapshot's place is reserved before this
+  // transaction's writes become visible, so that flush and compaction keep
+  // what the snapshot will see. Until this call returns, the reservation is
+  // counted as an unreleased snapshot by the "rocksdb.num-snapshots",
+  // "rocksdb.oldest-snapshot-time" and "rocksdb.oldest-snapshot-sequence"
+  // properties. No API returns it.
   Status CommitAndTryCreateSnapshot(
       std::shared_ptr<TransactionNotifier> notifier =
           std::shared_ptr<TransactionNotifier>(),
