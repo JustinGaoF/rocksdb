@@ -246,6 +246,15 @@ Status DB::OpenForReadOnly(const Options& options, const std::string& dbname,
 
   *dbptr = nullptr;
 
+  if (options.wal_partitions != 1) {
+    // The same wal_partitions checks a read-write open applies, ahead of the
+    // fully compacted path, which would otherwise skip them.
+    s = DBImpl::ValidateOptions(DBOptions(options));
+    if (!s.ok()) {
+      return s;
+    }
+  }
+
   // Try to first open DB as fully compacted DB
   s = CompactedDBImpl::Open(options, dbname, dbptr);
   if (s.ok()) {
@@ -292,6 +301,14 @@ Status DBImplReadOnly::OpenForReadOnlyWithoutCheck(
     bool error_if_wal_file_exists) {
   *dbptr = nullptr;
   handles->clear();
+
+  if (db_options.wal_partitions != 1) {
+    // The same wal_partitions checks a read-write open applies.
+    Status s = ValidateOptions(db_options);
+    if (!s.ok()) {
+      return s;
+    }
+  }
 
   SuperVersionContext sv_context(/* create_superversion */ true);
   DBImplReadOnly* impl = new DBImplReadOnly(db_options, dbname);
