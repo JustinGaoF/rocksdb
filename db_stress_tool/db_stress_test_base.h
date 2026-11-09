@@ -23,6 +23,7 @@
 #include "rocksdb/user_defined_index.h"
 #include "rocksdb/utilities/checkpoint.h"
 #include "utilities/fault_injection_fs.h"
+#include "utilities/latency_injection_fs.h"
 
 namespace ROCKSDB_NAMESPACE {
 class SystemClock;
@@ -645,6 +646,10 @@ class StressTest {
   std::shared_ptr<DbStressFSWrapper> db_stress_fs_;
   // Wraps db_stress_fs_ when NeedsFaultInjection(). Null otherwise.
   std::shared_ptr<FaultInjectionTestFS> db_fault_injection_fs_;
+  // With --inject_wal_latency, wraps the outermost FS above (the fault FS
+  // when there is one), so WAL delays happen before the fault FS records the
+  // operation. Null otherwise. Declared before db_env_, which it feeds.
+  std::shared_ptr<LatencyInjectionFileSystem> db_latency_fs_;
   // Wraps the outermost FS above. Set as options_.env for all DB I/O.
   std::unique_ptr<CompositeEnvWrapper> db_env_;
   std::shared_ptr<Cache> compressed_cache_;

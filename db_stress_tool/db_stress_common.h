@@ -400,6 +400,13 @@ DECLARE_bool(async_io);
 DECLARE_string(wal_compression);
 DECLARE_string(partition_wal_usage);
 DECLARE_uint32(wal_partitions);
+DECLARE_bool(inject_wal_latency);
+DECLARE_uint64(wal_append_latency_us);
+DECLARE_uint64(wal_sync_latency_us);
+DECLARE_uint64(wal_latency_jitter_us);
+DECLARE_double(wal_append_bandwidth_mbps);
+DECLARE_double(wal_sync_bandwidth_mbps);
+DECLARE_int64(wal_latency_seed);
 DECLARE_bool(verify_sst_unique_id_in_manifest);
 DECLARE_bool(fast_sst_open);
 
