@@ -291,6 +291,61 @@ public enum HistogramType {
    */
   IO_DISPATCHER_ASYNC_READ_PREFETCH_LEAD_MICROS((byte) 0x4E),
 
+  /**
+   * Number of writers in a write batch group.
+   */
+  WRITERS_PER_WRITE_GROUP((byte) 0x4F),
+
+  /**
+   * Number of writers excluded from a write batch group by the size cap.
+   */
+  WRITE_GROUP_CAP_EXCLUDED((byte) 0x50),
+
+  /**
+   * Time a write spends blocked waiting to join a write batch group.
+   */
+  JOIN_BATCH_GROUP_WAIT_MICROS((byte) 0x51),
+
+  /**
+   * Time a write group waits in its completion gate.
+   */
+  WAL_DURABILITY_WAIT_MICROS((byte) 0x52),
+
+  /**
+   * Time from a write group's WAL append start to its completion.
+   */
+  WAL_PARTITION_COMPLETION_MICROS((byte) 0x53),
+
+  /**
+   * Number of WAL partitions a sync write group fsynced.
+   */
+  WAL_SYNC_FSYNCED_PARTITIONS((byte) 0x54),
+
+  /**
+   * Number of WAL partitions with unsynced bytes when a sync write group claimed them.
+   */
+  WAL_SYNC_UNSYNCED_PARTITIONS((byte) 0x55),
+
+  /**
+   * Time a sync write group spends syncing across WAL partitions.
+   */
+  WAL_SYNC_BARRIER_MICROS((byte) 0x56),
+
+  /**
+   * Time external file ingestion holds writers out of every WAL partition.
+   */
+  WAL_PARTITION_INGESTION_STALL_MICROS((byte) 0x57),
+
+  /**
+   * Time a WAL append waits for its partition's WAL write mutex.
+   */
+  WAL_WRITE_MUTEX_WAIT_MICROS((byte) 0x58),
+
+  /**
+   * Time to take every partition's WAL write mutex at once.
+   */
+  WAL_WRITE_MUTEX_ALL_WAIT_MICROS((byte) 0x59),
+
   // 0x3E is reserved for backwards compatibility on current minor version.
   HISTOGRAM_ENUM_MAX((byte) 0x3E);
 

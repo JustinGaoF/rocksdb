@@ -510,7 +510,15 @@ size_t WriteThread::EnterAsBatchGroupLeader(Writer* leader,
     assert(w->link_newer);
     w = w->link_newer;
 
-    if ((w->sync && !leader->sync) ||
+    // Whether w joins the group, and if not, why. The three tests below
+    // evaluate the same clauses in the same order as the single disjunction
+    // they replace, so group formation is unchanged; splitting them attributes
+    // a size-cap exclusion separately from the compatibility exclusions. The
+    // cap test runs only for writers that passed every compatibility check --
+    // in particular w->batch is non-null there, so ByteSize is safe, exactly
+    // as before.
+    bool incompatible =
+        (w->sync && !leader->sync) ||
         // Do not include a sync write into a batch handled by a non-sync write.
         (w->no_slowdown != leader->no_slowdown) ||
         // Do not mix writes that are ok with delays with the ones that request
@@ -524,13 +532,18 @@ size_t WriteThread::EnterAsBatchGroupLeader(Writer* leader,
         (w->batch == nullptr) ||
         // Do not include those writes with nullptr batch. Those are not writes
         // those are something else. They want to be alone
-        (w->callback != nullptr && !w->callback->AllowWriteBatching()) ||
         // dont batch writes that don't want to be batched
-        (size + WriteBatchInternal::ByteSize(w->batch) > max_size) ||
-        // Do not make batch too big
-        (leader->ingest_wbwi || w->ingest_wbwi)
-        // ingesting WBWI needs to be its own group
-    ) {
+        (w->callback != nullptr && !w->callback->AllowWriteBatching());
+    // Do not make batch too big
+    bool over_cap = !incompatible &&
+                    (size + WriteBatchInternal::ByteSize(w->batch) > max_size);
+    // ingesting WBWI needs to be its own group
+    bool ingest_wbwi =
+        !incompatible && !over_cap && (leader->ingest_wbwi || w->ingest_wbwi);
+    if (incompatible || over_cap || ingest_wbwi) {
+      if (over_cap) {
+        ++write_group->num_cap_excluded;
+      }
       // remove from list
       w->link_older->link_newer = w->link_newer;
       if (w->link_newer != nullptr) {
