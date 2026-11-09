@@ -1051,6 +1051,12 @@ DEFINE_string(partition_wal_usage, "none",
 static enum ROCKSDB_NAMESPACE::PartitionWALUsage FLAGS_partition_wal_usage_e =
     ROCKSDB_NAMESPACE::PartitionWALUsage::kNone;
 
+DEFINE_uint32(wal_partitions, ROCKSDB_NAMESPACE::Options().wal_partitions,
+              "DBOptions::wal_partitions. Values above 1 also set the "
+              "testing-only experimental_allow_wal_partitions_for_testing "
+              "and track_and_verify_wals_in_manifest, and need "
+              "--partition_wal_usage other than none.");
+
 DEFINE_string(wal_dir, "", "If not empty, use the given dir for WAL");
 
 DEFINE_string(truth_db, "/dev/shm/truth_db/dbbench",
@@ -5990,6 +5996,9 @@ class Benchmark {
     options.manual_wal_flush = FLAGS_manual_wal_flush;
     options.wal_compression = FLAGS_wal_compression_e;
     options.partition_wal_usage = FLAGS_partition_wal_usage_e;
+    options.wal_partitions = FLAGS_wal_partitions;
+    options.experimental_allow_wal_partitions_for_testing =
+        FLAGS_wal_partitions > 1;
     options.ttl = FLAGS_fifo_compaction_ttl;
     options.compaction_options_fifo = CompactionOptionsFIFO(
         FLAGS_fifo_compaction_max_table_files_size_mb * 1024 * 1024,
@@ -6525,7 +6534,7 @@ class Benchmark {
 
     options.allow_data_in_errors = FLAGS_allow_data_in_errors;
     options.track_and_verify_wals_in_manifest =
-        FLAGS_track_and_verify_wals_in_manifest;
+        FLAGS_track_and_verify_wals_in_manifest || FLAGS_wal_partitions > 1;
     options.track_and_verify_wals = FLAGS_track_and_verify_wals;
     options.async_wal_precreate = FLAGS_async_wal_precreate;
 
@@ -12160,6 +12169,11 @@ int db_bench_tool(int argc, char** argv, ToolHooks& hooks) {
       db_bench_exit(1);
     }
     FLAGS_partition_wal_usage_e = parsed_db_options.partition_wal_usage;
+  }
+  if (FLAGS_wal_partitions < 1) {
+    fprintf(stderr, "wal_partitions must be at least 1, got %" PRIu32 "\n",
+            FLAGS_wal_partitions);
+    db_bench_exit(1);
   }
 
   FLAGS_compressed_secondary_cache_compression_type_e = StringToCompressionType(
