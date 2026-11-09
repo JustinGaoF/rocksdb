@@ -13,6 +13,7 @@
 #include <thread>
 
 #include "db/db_impl/db_impl.h"
+#include "db/write_batch_internal.h"
 #include "port/port.h"
 #include "rocksdb/attribute_groups.h"
 #include "rocksdb/compaction_filter.h"
@@ -10375,6 +10376,296 @@ TEST_P(CommitBypassMemtableTest, WBWIOpCountMismatchWBCount) {
     ASSERT_EQ(Get("meta"), "2");
     delete txn;
   }
+}
+
+TEST(TransactionPartitionedWalTest, CommitBypassMemtableCommitsNormally) {
+  // At N>1 WriteImpl refuses WriteBatchWithIndex ingestion, which the
+  // bypass-memtable commit uses. A transaction that qualifies for it, by
+  // commit_bypass_memtable or by a size threshold, commits through the
+  // memtable instead, as with blob direct write: Commit succeeds, the data is
+  // visible, and it survives a reopen.
+  constexpr size_t kPartitions = 2;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::ValidateOptions:AllowWalPartitions",
+      [](void* arg) { *static_cast<bool*>(arg) = true; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  const std::string dbname =
+      test::PerThreadDBPath("transaction_partitioned_wal_bypass");
+  Options options;
+  options.create_if_missing = true;
+  options.allow_2pc = true;
+  options.wal_partitions = kPartitions;
+  options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  options.track_and_verify_wals_in_manifest = true;
+  ASSERT_OK(DestroyDB(dbname, options));
+  TransactionDB* db = nullptr;
+  Defer release([&] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    delete db;
+  });
+  ASSERT_OK(TransactionDB::Open(options, TransactionDBOptions(), dbname, &db));
+
+  for (int variant = 0; variant < 2; ++variant) {
+    SCOPED_TRACE("variant=" + std::to_string(variant));
+    TransactionOptions txn_options;
+    if (variant == 0) {
+      txn_options.commit_bypass_memtable = true;
+    } else {
+      txn_options.large_txn_commit_optimize_threshold = 1;
+    }
+    std::unique_ptr<Transaction> txn(
+        db->BeginTransaction(WriteOptions(), txn_options));
+    ASSERT_NE(txn, nullptr);
+    const std::string key = "key" + std::to_string(variant);
+    ASSERT_OK(txn->Put(key, "value"));
+    ASSERT_OK(txn->SetName("xid" + std::to_string(variant)));
+    ASSERT_OK(txn->Prepare());
+    ASSERT_OK(txn->Commit());
+    std::string value;
+    ASSERT_OK(db->Get(ReadOptions(), key, &value));
+    ASSERT_EQ("value", value);
+  }
+
+  delete db;
+  db = nullptr;
+  ASSERT_OK(TransactionDB::Open(options, TransactionDBOptions(), dbname, &db));
+  for (int variant = 0; variant < 2; ++variant) {
+    std::string value;
+    ASSERT_OK(db->Get(ReadOptions(), "key" + std::to_string(variant), &value));
+    ASSERT_EQ("value", value);
+  }
+}
+
+TEST(TransactionPartitionedWalTest, SwitchWALFindsOldestWalAcrossPartitions) {
+  // CDR-F018: at N=2 a prepare routed to partition 1 pins that partition's
+  // WAL after partition 0's older WAL has retired, so the DB's oldest live
+  // WAL is partition 1's. A max_total_wal_size-driven SwitchWAL must find it
+  // pinned by the outstanding prepare and give up on releasing it, as at
+  // N=1, instead of comparing against partition 0's newer WAL.
+  constexpr size_t kPartitions = 2;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::ValidateOptions:AllowWalPartitions",
+      [](void* arg) { *static_cast<bool*>(arg) = true; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  const std::string dbname =
+      test::PerThreadDBPath("transaction_partitioned_wal_switch");
+  Options options;
+  options.create_if_missing = true;
+  options.wal_partitions = kPartitions;
+  options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  options.track_and_verify_wals_in_manifest = true;
+  ASSERT_OK(DestroyDB(dbname, options));
+  TransactionDB* db = nullptr;
+  std::vector<ColumnFamilyHandle*> handles;
+  Transaction* txn = nullptr;
+  // Releases what the test holds on every exit, including an early
+  // return from a failed assertion.
+  Defer release([&] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    delete txn;
+    if (db != nullptr) {
+      for (ColumnFamilyHandle* handle : handles) {
+        db->DestroyColumnFamilyHandle(handle).PermitUncheckedError();
+      }
+      delete db;
+    }
+  });
+  ASSERT_OK(TransactionDB::Open(options, TransactionDBOptions(), dbname, &db));
+  DBImpl* db_impl = static_cast_with_check<DBImpl>(db->GetRootDB());
+  ASSERT_EQ(kPartitions, db_impl->TEST_NumWalPartitions());
+
+  // Column family ids follow creation order; create until one routes to
+  // each partition.
+  std::vector<ColumnFamilyHandle*> cf_for_partition(kPartitions, nullptr);
+  size_t num_covered = 0;
+  while (num_covered < kPartitions) {
+    ColumnFamilyHandle* handle = nullptr;
+    ASSERT_OK(db->CreateColumnFamily(ColumnFamilyOptions(options),
+                                     "cf" + std::to_string(handles.size() + 1),
+                                     &handle));
+    handles.push_back(handle);
+    WriteBatch batch;
+    ASSERT_OK(WriteBatchInternal::Put(&batch, handle->GetID(), "key", "value"));
+    size_t partition = kPartitions;
+    ASSERT_OK(
+        DBImpl::TEST_WalPartitionForWrite(batch, kPartitions, &partition));
+    if (cf_for_partition[partition] == nullptr) {
+      cf_for_partition[partition] = handle;
+      ++num_covered;
+    }
+  }
+  auto flush_all = [&] {
+    ASSERT_OK(db->Flush(FlushOptions()));
+    for (ColumnFamilyHandle* handle : handles) {
+      ASSERT_OK(db->Flush(FlushOptions(), handle));
+    }
+  };
+
+  txn = db->BeginTransaction(WriteOptions());
+  ASSERT_OK(txn->SetName("xid"));
+  ASSERT_OK(txn->Put(cf_for_partition[1], "prepared", "value"));
+  ASSERT_OK(txn->Prepare());
+  const uint64_t prep_log = txn->GetLogNumber();
+  ASSERT_EQ(db_impl->TEST_CurrentWalNumber(1), prep_log);
+  ASSERT_EQ(db_impl->TEST_FindMinLogContainingOutstandingPrep(), prep_log);
+
+  for (int round = 0; round < 2; ++round) {
+    for (size_t p = 0; p < kPartitions; ++p) {
+      ASSERT_OK(db->Put(WriteOptions(), cf_for_partition[p],
+                        "k" + std::to_string(round), "v"));
+    }
+    flush_all();
+  }
+  // Partition 0's WAL from the prepare's generation retired; the prepare
+  // keeps partition 1's alive, and it is now the oldest live WAL.
+  ASSERT_EQ(prep_log, db_impl->TEST_AliveWalFiles(1).front().first);
+  ASSERT_GT(db_impl->TEST_AliveWalFiles(0).front().first, prep_log);
+  ASSERT_FALSE(db_impl->TEST_UnableToReleaseOldestLog());
+
+  // The next write finds the WALs over max_total_wal_size and switches.
+  ASSERT_OK(db->SetDBOptions({{"max_total_wal_size", "1"}}));
+  ASSERT_OK(db->Put(WriteOptions(), cf_for_partition[0], "trigger", "v"));
+  ASSERT_TRUE(db_impl->TEST_UnableToReleaseOldestLog());
+  ASSERT_EQ(prep_log, db_impl->TEST_AliveWalFiles(1).front().first);
+
+  ASSERT_OK(txn->Commit());
+  delete txn;
+  txn = nullptr;
+  for (ColumnFamilyHandle* handle : handles) {
+    ASSERT_OK(db->DestroyColumnFamilyHandle(handle));
+  }
+  handles.clear();
+  delete db;
+  db = nullptr;
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_OK(DestroyDB(dbname, options));
+}
+
+TEST(TransactionPartitionedWalTest,
+     SwitchWalQuiesceSkippedWhilePrepareRetainsOldestWal) {
+  // GC31 Q1 (A1): at N=8 a prepare pins the DB's oldest WAL. The first
+  // switch past max_total_wal_size acts (it flushes and sets
+  // unable_to_release_oldest_log_); while the prepare is outstanding every
+  // later SwitchWAL would return at once, so 200 more writes stop no
+  // partition. Once the prepare commits, the next switch acts once, and the
+  // WAL retires.
+  // Neuter: drop the pre-check; every write group quiesces.
+  constexpr size_t kPartitions = 8;
+  const std::string dbname =
+      test::PerThreadDBPath("transaction_partitioned_wal_quiesce");
+  Options options;
+  options.create_if_missing = true;
+  options.wal_partitions = kPartitions;
+  options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  options.track_and_verify_wals_in_manifest = true;
+  ASSERT_OK(DestroyDB(dbname, options));
+  TransactionDB* db = nullptr;
+  std::vector<ColumnFamilyHandle*> handles;
+  Transaction* txn = nullptr;
+  std::atomic<int> quiesces{0};
+  Defer release([&] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    delete txn;
+    if (db != nullptr) {
+      for (ColumnFamilyHandle* handle : handles) {
+        db->DestroyColumnFamilyHandle(handle).PermitUncheckedError();
+      }
+      delete db;
+    }
+  });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::ValidateOptions:AllowWalPartitions",
+      [](void* arg) { *static_cast<bool*>(arg) = true; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_OK(TransactionDB::Open(options, TransactionDBOptions(), dbname, &db));
+  DBImpl* db_impl = static_cast_with_check<DBImpl>(db->GetRootDB());
+  ASSERT_EQ(kPartitions, db_impl->TEST_NumWalPartitions());
+  // Two families, on partitions 0 and 1.
+  std::vector<ColumnFamilyHandle*> cf_for_partition(2, nullptr);
+  while (cf_for_partition[0] == nullptr || cf_for_partition[1] == nullptr) {
+    ColumnFamilyHandle* handle = nullptr;
+    ASSERT_OK(db->CreateColumnFamily(ColumnFamilyOptions(options),
+                                     "cf" + std::to_string(handles.size() + 1),
+                                     &handle));
+    handles.push_back(handle);
+    WriteBatch batch;
+    ASSERT_OK(WriteBatchInternal::Put(&batch, handle->GetID(), "key", "value"));
+    size_t partition = kPartitions;
+    ASSERT_OK(
+        DBImpl::TEST_WalPartitionForWrite(batch, kPartitions, &partition));
+    if (partition < 2 && cf_for_partition[partition] == nullptr) {
+      cf_for_partition[partition] = handle;
+    }
+  }
+  auto flush_all = [&] {
+    ASSERT_OK(db->Flush(FlushOptions()));
+    for (ColumnFamilyHandle* handle : handles) {
+      ASSERT_OK(db->Flush(FlushOptions(), handle));
+    }
+  };
+
+  txn = db->BeginTransaction(WriteOptions());
+  ASSERT_OK(txn->SetName("xid"));
+  ASSERT_OK(txn->Put(cf_for_partition[1], "prepared", "value"));
+  ASSERT_OK(txn->Prepare());
+  const uint64_t prep_log = txn->GetLogNumber();
+  for (int round = 0; round < 2; ++round) {
+    for (size_t p = 0; p < 2; ++p) {
+      ASSERT_OK(db->Put(WriteOptions(), cf_for_partition[p],
+                        "k" + std::to_string(round), "v"));
+    }
+    flush_all();
+  }
+  ASSERT_EQ(prep_log, db_impl->TEST_AliveWalFiles(1).front().first);
+  ASSERT_FALSE(db_impl->TEST_UnableToReleaseOldestLog());
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WaitForPendingWrites:BeforeBlock",
+      [&](void*) { quiesces.fetch_add(1); });
+  SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_OK(db->SetDBOptions({{"max_total_wal_size", "1"}}));
+  ASSERT_OK(db->Put(WriteOptions(), cf_for_partition[0], "trigger", "v"));
+  ASSERT_TRUE(db_impl->TEST_UnableToReleaseOldestLog());
+  quiesces.store(0);
+  std::vector<port::Thread> threads;
+  for (int t = 0; t < 8; ++t) {
+    threads.emplace_back([&, t] {
+      for (int i = 0; i < 25; ++i) {
+        ASSERT_OK(db->Put(WriteOptions(), cf_for_partition[t % 2],
+                          "t" + std::to_string(t) + "_" + std::to_string(i),
+                          "v"));
+      }
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  EXPECT_EQ(0, quiesces.load());
+  ASSERT_TRUE(db_impl->TEST_UnableToReleaseOldestLog());
+  ASSERT_EQ(prep_log, db_impl->TEST_AliveWalFiles(1).front().first);
+
+  ASSERT_OK(txn->Commit());
+  delete txn;
+  txn = nullptr;
+  quiesces.store(0);
+  ASSERT_OK(db->Put(WriteOptions(), cf_for_partition[0], "after", "v"));
+  EXPECT_EQ(1, quiesces.load());
+  EXPECT_FALSE(db_impl->TEST_UnableToReleaseOldestLog());
+  ASSERT_OK(db_impl->TEST_WaitForBackgroundWork());
+  EXPECT_GT(db_impl->TEST_AliveWalFiles(1).front().first, prep_log);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  for (ColumnFamilyHandle* handle : handles) {
+    ASSERT_OK(db->DestroyColumnFamilyHandle(handle));
+  }
+  handles.clear();
+  delete db;
+  db = nullptr;
+  ASSERT_OK(DestroyDB(dbname, options));
 }
 
 // CDR-F017 with a WriteCommitted prepare: the prepare keeps a WAL written
