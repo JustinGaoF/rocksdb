@@ -124,6 +124,55 @@ TEST_F(DBWalIteratorTest, IndexedWALsInArchiveAndLive) {
   }
 }
 
+// A flush leaves the new current WAL holding only its WAL index marker. Like a
+// WAL with no record, it is skipped as empty: it must neither be listed ahead
+// of the older WAL that holds the requested sequence nor keep a start sequence
+// that goes stale once it takes writes.
+// Neuter: give such a WAL start sequence 1 in WalManager::ReadFirstLine (as for
+// a compression-only WAL); GetSortedWalFiles lists the current WAL, start 3
+// yields no batch, and the later reads start at kBatches / 2 + 1.
+TEST_F(DBWalIteratorTest, IndexedDataLessCurrentWalKeepsOlderWal) {
+  Options options = OptionsForLogIterTest();
+  options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  DestroyAndReopen(options);
+  constexpr int kBatches = 8;
+  for (int i = 0; i < kBatches / 2; ++i) {
+    ASSERT_OK(Put("key" + std::to_string(i), DummyString(16)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForPurge());
+  ASSERT_GT(test::CountIndexedWALFiles(env_, ArchivalDirectory(dbname_)), 0);
+
+  auto expect_batches = [&](SequenceNumber start, SequenceNumber end) {
+    SCOPED_TRACE(start);
+    std::unique_ptr<WalIterator> iter = OpenWalIter(start);
+    SequenceNumber expected = start;
+    for (; iter->Valid(); iter->Next()) {
+      ASSERT_EQ(expected, iter->GetBatch().sequence);
+      ++expected;
+    }
+    ASSERT_OK(iter->status());
+    ASSERT_EQ(end, expected);
+  };
+  // The current WAL has no data record yet.
+  for (const SequenceNumber start : {SequenceNumber{1}, SequenceNumber{3}}) {
+    expect_batches(start, SequenceNumber{kBatches / 2 + 1});
+  }
+  VectorWalPtr wal_files;
+  ASSERT_OK(db_->GetSortedWalFiles(wal_files));
+  for (const auto& wal : wal_files) {
+    ASSERT_NE(dbfull()->TEST_LogfileNumber(), wal->LogNumber());
+  }
+
+  for (int i = kBatches / 2; i < kBatches; ++i) {
+    ASSERT_OK(Put("key" + std::to_string(i), DummyString(16)));
+  }
+  for (const SequenceNumber start : {SequenceNumber{1}, SequenceNumber{3},
+                                     SequenceNumber{kBatches / 2 + 2}}) {
+    expect_batches(start, SequenceNumber{kBatches + 1});
+  }
+}
+
 #ifndef NDEBUG  // sync point is not included with DNDEBUG build
 TEST_F(DBWalIteratorTest, Race) {
   static const int LOG_ITERATOR_RACE_TEST_COUNT = 2;

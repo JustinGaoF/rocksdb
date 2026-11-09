@@ -137,6 +137,17 @@ DBOptions SanitizeOptions(const std::string& dbname, const DBOptions& src,
                    "recycle_log_file_num is non-zero");
   }
 
+  if (result.async_wal_precreate &&
+      log::WALIndexEnabled(result.partition_wal_usage)) {
+    // The precreated WAL sits on disk, empty, until a rotation consumes it. A
+    // secondary instance cannot tell it from a partition WAL whose head is not
+    // written yet, so beside an indexed WAL it would refuse every catch-up.
+    result.async_wal_precreate = false;
+    ROCKS_LOG_WARN(result.info_log,
+                   "async_wal_precreate is disabled since "
+                   "partition_wal_usage indexes the WAL");
+  }
+
   if (result.db_paths.size() == 0) {
     result.db_paths.emplace_back(dbname, std::numeric_limits<uint64_t>::max());
   } else if (result.wal_dir.empty()) {
@@ -1012,7 +1023,11 @@ Status DBImpl::Recover(
         s = versions_->GetWalSet().CheckWals(env_, wal_files);
       }  // else since best effort recovery does not recover from WALs, no need
          // to check WALs.
-    } else if (!versions_->GetWalSet().GetWals().empty()) {
+    } else if (!read_only && !versions_->GetWalSet().GetWals().empty()) {
+      // A read-only open writes no MANIFEST edit (it has no recovery context),
+      // and a DB written with wal_partitions > 1 always tracks its WALs, so a
+      // read-only open with tracking off leaves them as they are.
+      //
       // Tracking is disabled, clear previously tracked WALs from MANIFEST,
       // otherwise, in the future, if WAL tracking is enabled again,
       // since the WALs deleted when WAL tracking is disabled are not persisted

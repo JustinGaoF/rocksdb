@@ -70,6 +70,13 @@ class WalFilter : public Customizable {
   //    (by returning kStop replay) - please note that this implies
   //    discarding the logs from current record onwards.
   //
+  // Records arrive in the order recovery replays them. WALs written without
+  // a WAL index replay one file at a time in file-number order. When the
+  // recovered WALs carry a WAL index (see partition_wal_usage), in particular
+  // when they were written with wal_partitions > 1, records arrive in
+  // wal_index order, hence sequence order, interleaved across files, and
+  // log_number is the file the current record came from.
+  //
   // @params log_number     log_number of the current log.
   //                        Filter might use this to determine if the log
   //                        record is applicable to a certain column family.
