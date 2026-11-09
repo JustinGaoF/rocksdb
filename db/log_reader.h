@@ -133,6 +133,12 @@ class Reader {
     return !first_record_read_ && compression_type_record_read_;
   }
 
+  // Returns true when ReadRecord stopped at bytes that were not a clean EOF,
+  // such as a truncated record or a stale recycled-file tail.
+  bool WALRecoveryStoppedBeforeEndOfFile() const {
+    return wal_recovery_stopped_before_end_of_file_;
+  }
+
   // WAL index (LSN) accessors. See db/log_writer.h for the format.
   //
   // wal_index extracted from the most recently returned logical record. Zero
@@ -198,6 +204,7 @@ class Reader {
 
   // Whether the first record has been read or not.
   bool first_record_read_;
+  bool wal_recovery_stopped_before_end_of_file_ = false;
   // Type of compression used
   CompressionType compression_type_;
   // Track whether the compression type record has been read or not.
