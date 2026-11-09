@@ -244,10 +244,6 @@ TEST_F(LdbCmdTest, DumpWalOnPartitionedWals) {
   EXPECT_EQ(std::string::npos, output.find("WAL partition"));
   ASSERT_OK(DestroyDB(dbname, opts));
 
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
   constexpr size_t kPartitions = 8;
   opts.wal_partitions = kPartitions;
   std::vector<uint64_t> current_wals(kPartitions);
@@ -281,8 +277,6 @@ TEST_F(LdbCmdTest, DumpWalOnPartitionedWals) {
       ASSERT_OK(db->DestroyColumnFamilyHandle(handle.release()));
     }
   }
-  SyncPoint::GetInstance()->DisableProcessing();
-  SyncPoint::GetInstance()->ClearAllCallBacks();
 
   ASSERT_EQ(0, dump(LogFileName(dbname, current_wals[3]), nullptr, &output));
   EXPECT_NE(std::string::npos, output.find("WAL partition: 3")) << output;
@@ -312,7 +306,7 @@ INSTANTIATE_TEST_CASE_P(WalPartitions8, LdbCmdWalPartitionsTest,
 // records, and an indexed DB refuses at N=1 too (the MANIFEST guard), where
 // older WALs may come from an N>1 open. A DB that does not index its WALs
 // gap-checks its WAL as upstream does. `dump_live_files`, which opens the
-// DB, lists the WAL at one partition and is refused at more. Ported from
+// DB, lists every partition's current WAL. Ported from
 // D127115188's DumpWalShowsPartitionAndRefusesGapsAtN8.
 // Neuter (GC34 Q4): drop the single-file refusal in DumpWalFiles; partition
 // 0's gap check exits 0 at N=8 with false "Prev batch" gaps.
@@ -404,12 +398,14 @@ TEST_P(LdbCmdWalPartitionsTest, DumpWalAtWalPartitions) {
               output.find(LogFileName("", current_wals[0]).substr(1)))
         << output;
   } else {
-    // ldb opens the DB with its OPTIONS file, which does not keep the testing
-    // opt-in, so the open is refused like any production open.
-    EXPECT_NE(0, live_files) << output;
-    EXPECT_NE(std::string::npos,
-              output.find("wal_partitions > 1 is not supported yet"))
-        << output;
+    // ldb opens the DB with its OPTIONS file, which keeps wal_partitions and
+    // the indexing partition_wal_usage, so the open succeeds and every
+    // partition's current WAL is live.
+    ASSERT_EQ(0, live_files) << output;
+    for (const uint64_t wal : current_wals) {
+      EXPECT_NE(std::string::npos, output.find(LogFileName("", wal).substr(1)))
+          << output;
+    }
   }
   ASSERT_OK(DestroyDB(dbname, opts));
 
@@ -459,10 +455,6 @@ TEST_F(LdbCmdTest, DumpWalRefusesDamagedHeadOfPartitionedWal) {
   opts.wal_partitions = kPartitions;
   const std::string dbname = test::PerThreadDBPath(env, "ldb_cmd_test");
   ASSERT_OK(DestroyDB(dbname, opts));
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
   std::vector<uint64_t> current_wals(kPartitions);
   {
     std::unique_ptr<DB> db;
@@ -515,10 +507,6 @@ TEST_F(LdbCmdTest, DumpWalRefusesDamagedHeadOfPartitionedWal) {
   EXPECT_NE(std::string::npos, output.find("head damaged")) << output;
   EXPECT_EQ(std::string::npos, output.find("Checking wal file")) << output;
   ASSERT_OK(DestroyDB(dbname, opts));
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
 }
 
 // GC30 Q9: an indexed DB written with wal_partitions = 2 whose partition-1
@@ -540,10 +528,6 @@ TEST_F(LdbCmdTest, LdbDumpWalRefusesDamagedHeadWithoutOptions) {
   opts.wal_partitions = kPartitions;
   const std::string dbname = test::PerThreadDBPath(env, "ldb_cmd_test");
   ASSERT_OK(DestroyDB(dbname, opts));
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
   uint64_t p1_wal = 0;
   {
     std::unique_ptr<DB> db;
@@ -601,10 +585,6 @@ TEST_F(LdbCmdTest, LdbDumpWalRefusesDamagedHeadWithoutOptions) {
   EXPECT_NE(std::string::npos, output.find(fname)) << output;
   EXPECT_EQ(std::string::npos, output.find("Checking wal file")) << output;
   ASSERT_OK(DestroyDB(dbname, opts));
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
 }
 
 class FileChecksumTestHelper {

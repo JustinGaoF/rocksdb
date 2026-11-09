@@ -444,7 +444,6 @@ TEST_F(OptionsSettableTest, DBOptionsAllFieldsSettable) {
       "WAL_size_limit_MB=4295036161;"
       "max_write_batch_group_size_bytes=1048576;"
       "wal_partitions=1;"
-      "experimental_allow_wal_partitions_for_testing=false;"
       "wal_dir=path/to/wal_dir;"
       "db_write_buffer_size=2587;"
       "max_subcompactions=64330;"
