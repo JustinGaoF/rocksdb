@@ -40,6 +40,34 @@ namespace log {
 // rather than continuing on a broken invariant.
 constexpr uint64_t kWALIndexStartNumber = 1;
 
+// The predecessor span a new WAL attests in its head; see
+// MakeWALIndexPredecessorSpan. A zero wal_number attests none.
+struct WALIndexPredecessorSpan {
+  uint64_t wal_number = 0;
+  uint64_t first = 0;
+  uint64_t last = 0;
+};
+
+// The span a new WAL attests for its partition's previous WAL `wal_number`.
+// `last` is `high`, the highest wal_index allocated before the new WAL was
+// created: every index the previous WAL, or any WAL before it, bears is at or
+// below it, and every index the new WAL bears is above it. `first` is the
+// first index the previous WAL bears, or `high` when it bears none, so the
+// span still anchors recovery's lower bound; both are zero only when nothing
+// was allocated yet. No span when `first` is above `high`: recovery cut the
+// previous WAL's records and the new WAL reissues them.
+inline WALIndexPredecessorSpan MakeWALIndexPredecessorSpan(uint64_t wal_number,
+                                                           uint64_t first,
+                                                           uint64_t high) {
+  WALIndexPredecessorSpan span;
+  if (first <= high) {
+    span.wal_number = wal_number;
+    span.first = first != 0 ? first : high;
+    span.last = high;
+  }
+  return span;
+}
+
 // True when `usage` prefixes each WAL record with a wal_index.
 //
 // Deliberately an allowlist rather than `!= kNone`. The enum names a WAL
@@ -143,8 +171,9 @@ class Writer {
       const UnorderedMap<uint32_t, size_t>& cf_to_ts_sz);
 
   // When WAL index is enabled, emits the leading marker record that identifies
-  // this file as carrying per-record ordering numbers (wal_index / LSN). The
-  // marker does not consume a wal_index. No-op when WAL index is disabled.
+  // this file as carrying per-record ordering numbers (wal_index / LSN), and
+  // the WAL partition when it is not 0. The marker does not consume a
+  // wal_index. No-op when WAL index is disabled.
   IOStatus MaybeAddWALIndexMarkerRecord(const WriteOptions& write_options);
 
   // Records that the closed range [lo, hi] of wal_index values is not part of
@@ -187,6 +216,12 @@ class Writer {
     return log::WALIndexEnabled(partition_wal_usage_);
   }
 
+  // The WAL partition this file belongs to, recorded in the marker. Must be
+  // called before the marker is written.
+  void SetWALPartition(uint32_t wal_partition) {
+    wal_partition_ = wal_partition;
+  }
+
   WritableFileWriter* file() { return dest_.get(); }
   const WritableFileWriter* file() const { return dest_.get(); }
 
@@ -209,6 +244,10 @@ class Writer {
 
   // wal_index of the last data record AddRecord completed, or zero.
   uint64_t last_wal_index_recorded() const { return last_wal_index_recorded_; }
+  // wal_index of the first data record AddRecord completed, or zero.
+  uint64_t first_wal_index_recorded() const {
+    return first_wal_index_recorded_;
+  }
 
   // The highest sequence a DBImpl append to this file has consumed. Not part
   // of the file format: DBImpl keeps it only to assert that sequence order
@@ -275,6 +314,8 @@ class Writer {
 
   // See `DBOptions::partition_wal_usage`.
   PartitionWALUsage partition_wal_usage_ = PartitionWALUsage::kNone;
+  uint32_t wal_partition_ = 0;
+  uint64_t first_wal_index_recorded_ = 0;
   uint64_t last_wal_index_recorded_ = 0;
   uint64_t last_progress_bound_recorded_ = 0;
 };
