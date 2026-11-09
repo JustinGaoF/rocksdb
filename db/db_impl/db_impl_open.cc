@@ -3228,6 +3228,9 @@ Status DBImpl::RestoreAliveLogFiles(const std::vector<uint64_t>& wal_numbers) {
   // Mark these as alive so they'll be considered for deletion later by
   // FindObsoleteFiles()
   wals_total_size_.StoreRelaxed(0);
+  for (auto& size : wal_partition_sizes_) {
+    size.obj_.StoreRelaxed(0);
+  }
   wal_empty_ = false;
   uint64_t min_wal_with_unflushed_data =
       versions_->MinLogNumberWithUnflushedData();
@@ -3250,7 +3253,7 @@ Status DBImpl::RestoreAliveLogFiles(const std::vector<uint64_t>& wal_numbers) {
       break;
     }
     wals_total_size_.FetchAddRelaxed(log.size);
-    alive_wal_files_.push_back(log);
+    AliveWalFiles(0).push_back(log);
   }
   return s;
 }
@@ -3941,12 +3944,12 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
       InstrumentedMutexLock wl(&impl->wal_write_mutex_);
       impl->cur_wal_number_ = new_log_number;
       assert(new_log != nullptr);
-      assert(impl->logs_.empty());
-      impl->logs_.emplace_back(new_log_number, new_log);
+      assert(impl->WalLogs(0).empty());
+      impl->WalLogs(0).emplace_back(new_log_number, new_log);
     }
 
     if (s.ok()) {
-      impl->alive_wal_files_.emplace_back(impl->cur_wal_number_);
+      impl->AliveWalFiles(0).emplace_back(impl->cur_wal_number_);
       s = impl->WriteWALIndexSupersessions(
           write_options, new_log, recovery_ctx.wal_index_supersessions_);
     }
