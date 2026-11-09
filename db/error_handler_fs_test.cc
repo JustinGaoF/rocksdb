@@ -9,8 +9,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <future>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <utility>
 
 #include "db/db_test_util.h"
@@ -4749,6 +4752,99 @@ TEST_F(DBErrorHandlingFSTest, AtomicFlushErrorRecoveryTwoCFs) {
   ASSERT_EQ("v0", Get(0, Key(0)));
   ASSERT_EQ("v0b", Get(0, Key(1)));
   ASSERT_EQ("v1", Get(1, Key(0)));
+  Close();
+}
+
+// ClearBGError restores shutdown readiness only after it has notified the
+// listeners, which runs with the DB mutex released, so a Close() can start
+// waiting for readiness in between. A soft error that needs no flush is
+// cleared by RecoverFromBGError calling ClearBGError directly, without
+// ResumeImpl's final signal: only ClearBGError's own signal wakes the Close().
+// Neuter: drop the bg_cv_ signal in ClearBGError; Close() never returns until
+// the test wakes it.
+TEST_F(DBErrorHandlingFSTest, CloseWaitingOnDirectErrorClearReturns) {
+  struct BlockingRecoveryEndListener : public EventListener {
+    void OnBackgroundError(BackgroundErrorReason, Status* bg_error) override {
+      std::lock_guard<std::mutex> lock(mu);
+      severity = bg_error->severity();
+    }
+    void OnErrorRecoveryBegin(BackgroundErrorReason, Status bg_error,
+                              bool* /*auto_recovery*/) override {
+      // Only the recovery end matters here.
+      bg_error.PermitUncheckedError();
+    }
+    void OnErrorRecoveryEnd(const BackgroundErrorRecoveryInfo&) override {
+      std::unique_lock<std::mutex> lock(mu);
+      entered = true;
+      cv.notify_all();
+      cv.wait_for(lock, std::chrono::seconds(30),
+                  [&] { return close_waiting; });
+    }
+    std::mutex mu;
+    std::condition_variable cv;
+    bool entered = false;
+    bool close_waiting = false;
+    Status::Severity severity = Status::Severity::kNoError;
+  };
+  auto listener = std::make_shared<BlockingRecoveryEndListener>();
+  Options options = GetDefaultOptions();
+  options.env = fault_env_.get();
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+  options.listeners.emplace_back(listener);
+  DestroyAndReopen(options);
+  ASSERT_OK(Put(Key(0), "val"));
+
+  // SanitizeOptions installs a default SstFileManager, whose recovery thread
+  // clears this soft error through RecoverFromBGError's direct ClearBGError
+  // (Resume() finds background work running and returns OK). It may do so at
+  // once, so the severity checked is the one the listener saw when it was set.
+  dbfull()->TEST_SetBGError(IOStatus::NoSpace("injected"),
+                            BackgroundErrorReason::kCompaction);
+  {
+    std::lock_guard<std::mutex> lock(listener->mu);
+    ASSERT_EQ(Status::Severity::kSoftError, listener->severity);
+  }
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::CloseHelper:WaitForRecovery", [&](void*) {
+        std::lock_guard<std::mutex> lock(listener->mu);
+        listener->close_waiting = true;
+        listener->cv.notify_all();
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  Status resume_status;
+  port::Thread resumer([&] { resume_status = dbfull()->Resume(); });
+  bool entered = false;
+  {
+    std::unique_lock<std::mutex> lock(listener->mu);
+    entered = listener->cv.wait_for(lock, std::chrono::seconds(30),
+                                    [&] { return listener->entered; });
+  }
+  EXPECT_TRUE(entered);
+  Status close_status;
+  std::atomic<bool> closed{false};
+  port::Thread closer([&] {
+    close_status = db_->Close();
+    closed.store(true);
+  });
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (!closed.load() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  const bool returned = closed.load();
+  EXPECT_TRUE(returned) << "Close() was not woken by ClearBGError";
+  if (!returned) {
+    // Wake it, so the test ends.
+    dbfull()->TEST_SignalAllBgCv();
+  }
+  closer.join();
+  resumer.join();
+  EXPECT_OK(resume_status);
+  EXPECT_OK(close_status);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
   Close();
 }
 

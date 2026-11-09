@@ -4870,6 +4870,97 @@ class WritePreparedPartitionedWalTest : public testing::Test {
   std::mutex prepare_mu_;
 };
 
+TEST_F(WritePreparedPartitionedWalTest,
+       FailedSyncCommitAndPrepareNeverVisible) {
+  // GC25 Q2 (D-9, G3-E-1): above one partition a sync 2PC write's
+  // pre-release callbacks run only once it is fsynced. A WritePrepared or
+  // WriteUnprepared commit with sync=true whose gate sync fails returns an
+  // IOError and is never visible: before Resume(), after it, and after a
+  // reopen; Rollback() then succeeds. A sync Prepare whose gate sync fails
+  // leaves no prepared-heap entry: once Resume() publishes past it, a new
+  // snapshot's min_uncommitted lies above it.
+  // Neuters: run the sync writers' callbacks in the group, before the gate
+  // (as at the base): the failed commit reads back after Resume() (and
+  // Rollback() asserts in debug), and the failed Prepare's sequence stays
+  // the snapshot's min_uncommitted.
+  options_.paranoid_checks = true;
+  options_.max_bgerror_resume_count = 0;
+  for (const TxnDBWritePolicy policy : {WRITE_PREPARED, WRITE_UNPREPARED}) {
+    for (const size_t partitions : {size_t{2}, size_t{8}}) {
+      SCOPED_TRACE("policy=" + std::to_string(policy) +
+                   " partitions=" + std::to_string(partitions));
+      Close();
+      cf_names_.clear();
+      ASSERT_OK(DestroyDB(dbname_, options_));
+      txn_db_options_.write_policy = policy;
+      Open(partitions);
+      ColumnFamilyHandle* cf = CfOnPartition(0);
+      auto read = [&](const std::string& key) {
+        std::string value;
+        // CfOnPartition again: Reopen() replaces the handles.
+        Status s = db_->Get(ReadOptions(), CfOnPartition(0), key, &value);
+        if (s.IsNotFound()) {
+          return std::string("NOT_FOUND");
+        }
+        EXPECT_OK(s);
+        return value;
+      };
+      std::atomic<int> fail_syncs{0};
+      SyncPoint::GetInstance()->SetCallBack(
+          "DBImpl::SyncWalsFromCompletionGate:AfterGateSync", [&](void* arg) {
+            if (fail_syncs.load() > 0) {
+              --fail_syncs;
+              IOStatus error = IOStatus::IOError("injected gate sync error");
+              error.SetRetryable(true);
+              *static_cast<IOStatus*>(arg) = error;
+            }
+          });
+      WriteOptions sync_wo;
+      sync_wo.sync = true;
+
+      std::unique_ptr<Transaction> committing(db_->BeginTransaction(sync_wo));
+      ASSERT_OK(committing->SetName("committing"));
+      ASSERT_OK(committing->Put(cf, "committed", "v"));
+      ASSERT_OK(committing->Prepare());
+      fail_syncs = 1;
+      const Status commit_status = committing->Commit();
+      ASSERT_TRUE(commit_status.IsIOError()) << commit_status.ToString();
+      ASSERT_EQ(0, fail_syncs.load());
+      EXPECT_EQ("NOT_FOUND", read("committed"));
+      ASSERT_OK(db_->Resume());
+      EXPECT_EQ("NOT_FOUND", read("committed"));
+      ASSERT_OK(committing->Rollback());
+      EXPECT_EQ("NOT_FOUND", read("committed"));
+      committing.reset();
+
+      std::unique_ptr<Transaction> preparing(db_->BeginTransaction(sync_wo));
+      ASSERT_OK(preparing->SetName("preparing"));
+      ASSERT_OK(preparing->Put(cf, "prepared", "v"));
+      const SequenceNumber before = db_->GetLatestSequenceNumber();
+      fail_syncs = 1;
+      const Status prepare_status = preparing->Prepare();
+      ASSERT_TRUE(prepare_status.IsIOError()) << prepare_status.ToString();
+      ASSERT_EQ(0, fail_syncs.load());
+      ASSERT_OK(db_->Resume());
+      ASSERT_GT(db_->GetLatestSequenceNumber(), before);
+      const Snapshot* snapshot = db_->GetSnapshot();
+      EXPECT_GT(static_cast_with_check<const SnapshotImpl>(snapshot)
+                    ->min_uncommitted_,
+                before + 1);
+      db_->ReleaseSnapshot(snapshot);
+      EXPECT_EQ("NOT_FOUND", read("prepared"));
+      preparing.reset();
+      SyncPoint::GetInstance()->ClearCallBack(
+          "DBImpl::SyncWalsFromCompletionGate:AfterGateSync");
+
+      Reopen();
+      EXPECT_EQ("NOT_FOUND", read("committed"));
+      EXPECT_EQ("NOT_FOUND", read("prepared"));
+      EXPECT_EQ(nullptr, db_->GetTransactionByName("committing"));
+    }
+  }
+}
+
 TEST_F(WritePreparedPartitionedWalTest, ConcurrentRecoverableStateCaching) {
   // G-18: leaders of all four partitions cache the recoverable state at the
   // same moment, with flushes draining it in between. A barrier at the cache
@@ -5513,6 +5604,180 @@ static std::string TxnNameOnPartition(const std::string& prefix,
     EXPECT_OK(DBImpl::TEST_WalPartitionForWrite(batch, num_partitions, &route));
     if (route == partition) {
       return name;
+    }
+  }
+}
+
+// GC30 Q2 (D-GC30c (i)): a sync commit's pre-release callbacks (AddCommitted)
+// run only once its group can no longer fail: after its own append and
+// fsync, and once every range below it is published, so no fence can reach
+// it. (a) A lower write A on partition 0 is held after its insert, before
+// it publishes; sync commit C on partition 1 allocates above it and its gate
+// sync completes, yet C's AddCommitted does not run while A is held.
+// Released, C commits and reads back. (b) A lower sync write S on partition
+// 0 is held before its gate sync; C's gate sync covers S's records and
+// succeeds first, and C does not run AddCommitted. Released, S then fails
+// (its own pre-release callback returns a retryable I/O error, after its
+// fsync): S's range is fenced with everything above it, so C returns the
+// error, never ran AddCommitted, and is not visible before or after
+// Resume(), after Rollback() or after a reopen. With GC28's coalescer C's
+// fsync covers every record below it, so a lower group can fail after C's
+// fsync only through such a non-fsync failure.
+// Neuter: run the sync writers' callbacks right after their fsync, without
+// the wait (D-GC30c (ii), the base); C runs AddCommitted while A or S is
+// held, and in (b) C is visible after Resume().
+TEST_F(WritePreparedPartitionedWalTest,
+       SyncCommitCallbacksWaitUntilGroupCannotFail) {
+  class FailingPreReleaseCallback : public PreReleaseCallback {
+   public:
+    Status Callback(SequenceNumber, bool, uint64_t, size_t, size_t) override {
+      IOStatus error = IOStatus::IOError("injected pre-release callback error");
+      error.SetRetryable(true);
+      return error;
+    }
+  };
+  options_.paranoid_checks = true;
+  options_.max_bgerror_resume_count = 0;
+  for (const TxnDBWritePolicy policy : {WRITE_PREPARED, WRITE_UNPREPARED}) {
+    for (const size_t partitions : {size_t{2}, size_t{8}}) {
+      for (const bool lower_fails : {false, true}) {
+        SCOPED_TRACE("policy=" + std::to_string(policy) +
+                     " partitions=" + std::to_string(partitions) +
+                     " lower_fails=" + std::to_string(lower_fails));
+        Close();
+        cf_names_.clear();
+        ASSERT_OK(DestroyDB(dbname_, options_));
+        txn_db_options_.write_policy = policy;
+        SyncPoint::GetInstance()->SetCallBack(
+            "DBImpl::ValidateOptions:AllowWalPartitions",
+            [](void* arg) { *static_cast<bool*>(arg) = true; });
+        SyncPoint::GetInstance()->EnableProcessing();
+        Open(partitions);
+        DBImpl* db_impl = static_cast_with_check<DBImpl>(db_->GetRootDB());
+        auto read = [&](const std::string& key) {
+          std::string value;
+          Status s = db_->Get(ReadOptions(), CfOnPartition(1), key, &value);
+          return s.IsNotFound() ? std::string("NOT_FOUND")
+                 : s.ok()       ? value
+                                : s.ToString();
+        };
+        WriteOptions sync_wo;
+        sync_wo.sync = true;
+        // C's commit routes to partition 1, away from the lower write's.
+        const std::string name = TxnNameOnPartition("c", 1, partitions);
+        std::unique_ptr<Transaction> txn(db_->BeginTransaction(sync_wo));
+        ASSERT_OK(txn->SetName(name));
+        ASSERT_OK(txn->Put(CfOnPartition(1), "committed", "v"));
+        ASSERT_OK(txn->Prepare());
+
+        std::mutex mu;
+        std::condition_variable cv;
+        bool lower_held = false;
+        bool release_lower = false;
+        int committed_while_held = 0;
+        std::atomic<int> gate_syncs{0};
+        auto hold_lower = [&](void*) {
+          std::unique_lock<std::mutex> lock(mu);
+          if (lower_held) {
+            return;
+          }
+          lower_held = true;
+          cv.notify_all();
+          cv.wait(lock, [&] { return release_lower; });
+        };
+        // (a) holds A after its insert, before it publishes; (b) holds S
+        // before its gate sync.
+        SyncPoint::GetInstance()->SetCallBack(
+            lower_fails ? "DBImpl::CompletionGate:BeforeCoalescedSync"
+                        : "DBImpl::WriteImpl:"
+                          "AfterWBWIIngestBeforeSetLastSequence:pause",
+            hold_lower);
+        SyncPoint::GetInstance()->SetCallBack(
+            "WritePreparedTxnDB::AddCommitted:end", [&](void*) {
+              std::lock_guard<std::mutex> lock(mu);
+              if (lower_held && !release_lower) {
+                ++committed_while_held;
+              }
+            });
+        SyncPoint::GetInstance()->SetCallBack(
+            "DBImpl::SyncWalsFromCompletionGate:AfterGateSync",
+            [&](void*) { gate_syncs.fetch_add(1); });
+        SyncPoint::GetInstance()->EnableProcessing();
+
+        Status lower_status;
+        FailingPreReleaseCallback failing_callback;
+        port::Thread lower([&] {
+          if (!lower_fails) {
+            lower_status = db_->Put(WriteOptions(), CfOnPartition(0), "a", "v");
+            return;
+          }
+          WriteBatch batch;
+          EXPECT_OK(batch.Put(CfOnPartition(0), "s", "v"));
+          // As WritePreparedTxnDB::WriteInternal: one sub-batch, ended by a
+          // Noop in the absence of a Prepare marker.
+          EXPECT_OK(WriteBatchInternal::InsertNoop(&batch));
+          lower_status = db_impl->WriteImpl(
+              sync_wo, &batch, /*callback=*/nullptr, /*user_write_cb=*/nullptr,
+              /*wal_used=*/nullptr, /*log_ref=*/0, /*disable_memtable=*/false,
+              /*seq_used=*/nullptr, /*batch_cnt=*/1, &failing_callback);
+        });
+        JoinThreadsOnExit join_lower({&lower}, [&] {
+          std::lock_guard<std::mutex> lock(mu);
+          release_lower = true;
+          cv.notify_all();
+        });
+        {
+          std::unique_lock<std::mutex> lock(mu);
+          ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(30),
+                                  [&] { return lower_held; }));
+        }
+        Status commit_status;
+        port::Thread committer([&] { commit_status = txn->Commit(); });
+        // C parks once its gate sync is done: before its callbacks here, or
+        // after them in its final wait under the neuter.
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while ((gate_syncs.load() == 0 ||
+                db_impl->TEST_WalDurabilityWaiters() == 0) &&
+               std::chrono::steady_clock::now() < deadline) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        EXPECT_GE(gate_syncs.load(), 1);
+        EXPECT_EQ(1U, db_impl->TEST_WalDurabilityWaiters());
+        {
+          std::lock_guard<std::mutex> lock(mu);
+          EXPECT_EQ(0, committed_while_held);
+          release_lower = true;
+          cv.notify_all();
+        }
+        lower.join();
+        committer.join();
+        SyncPoint::GetInstance()->DisableProcessing();
+        SyncPoint::GetInstance()->ClearAllCallBacks();
+        if (!lower_fails) {
+          ASSERT_OK(lower_status);
+          ASSERT_OK(commit_status);
+          EXPECT_EQ("v", read("committed"));
+          txn.reset();
+          continue;
+        }
+        EXPECT_TRUE(lower_status.IsIOError()) << lower_status.ToString();
+        EXPECT_NOK(commit_status);
+        EXPECT_NOK(db_impl->TEST_GetBGError());
+        EXPECT_EQ("NOT_FOUND", read("committed"));
+        ASSERT_OK(db_->Resume());
+        EXPECT_EQ("NOT_FOUND", read("committed"));
+        ASSERT_OK(txn->Rollback());
+        EXPECT_EQ("NOT_FOUND", read("committed"));
+        txn.reset();
+        SyncPoint::GetInstance()->SetCallBack(
+            "DBImpl::ValidateOptions:AllowWalPartitions",
+            [](void* arg) { *static_cast<bool*>(arg) = true; });
+        SyncPoint::GetInstance()->EnableProcessing();
+        Reopen();
+        EXPECT_EQ("NOT_FOUND", read("committed"));
+        EXPECT_EQ(nullptr, db_->GetTransactionByName(name));
+      }
     }
   }
 }

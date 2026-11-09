@@ -702,6 +702,18 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
   if (s.ok()) {
     recovering_from_wal_write_error_ = context.IsWALWriteErrorRecovery();
     recover_wal_through_number_ = context.failed_wal_number;
+    // The retry path rotates no WALs and switches no memtables: with a
+    // burned index pending, the explanation would find partition 0's WAL
+    // below the burning one and fail closed. Take the full path instead,
+    // whose switches rotate. Above one partition only; at one partition
+    // burns are never explained and the retry path is unchanged. The reason
+    // is normalized too: the waits below treat only kErrorRecovery as
+    // resuming (WaitForFlushMemTables), and the work is a full recovery
+    // flush.
+    if (context.flush_reason == FlushReason::kErrorRecoveryRetryFlush &&
+        NumWalPartitions() > 1 && BurnedWalIndicesPending()) {
+      context.flush_reason = FlushReason::kErrorRecovery;
+    }
     if (context.flush_reason == FlushReason::kErrorRecoveryRetryFlush) {
       s = RetryFlushesForErrorRecovery(FlushReason::kErrorRecoveryRetryFlush,
                                        true /* wait */);
@@ -818,6 +830,17 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
       }
     }
     mutex_.Lock();
+    TEST_SYNC_POINT("DBImpl::ResumeImpl:AfterRetire");
+  }
+
+  if (s.ok() && NumWalPartitions() > 1) {
+    // Before ClearBGError admits writes above a burned index. A file-scoped
+    // recovery's flush retired every WAL below the minimum to keep, the
+    // failed one included: no recovery reads them again.
+    s = ExplainBurnedWALIndices(write_options,
+                                context.IsWALWriteErrorRecovery()
+                                    ? versions_->min_log_number_to_keep()
+                                    : 0);
   }
 
   JobContext job_context(0);
@@ -1261,6 +1284,7 @@ Status DBImpl::CloseHelper() {
   bg_cv_.SignalAll();
   error_handler_.CancelErrorRecoveryForShutDown();
   while (!error_handler_.ReadyForShutdown()) {
+    TEST_SYNC_POINT("DBImpl::CloseHelper:WaitForRecovery");
     bg_cv_.Wait();
   }
   mutex_.Unlock();
