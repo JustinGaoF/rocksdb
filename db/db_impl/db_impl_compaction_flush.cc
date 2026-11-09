@@ -2737,16 +2737,15 @@ void DBImpl::MaybeSyncLastSequenceWithAllocatedForRecovery(
 }
 
 Status DBImpl::EnterWriteThreadForNonBlockingFlush(
-    WriteThread::Writer* w, WriteThread::Writer* nonmem_w) {
+    AllPartitionsWriter* w, AllPartitionsWriter* nonmem_w) {
   mutex_.AssertHeld();
-  if (!write_thread_.EnterUnbatchedNonBlocking(w, &mutex_)) {
+  if (!w->EnterUnbatchedNonBlocking()) {
     return Status::Incomplete(
         "Write stall in progress, unable to join the write thread to switch "
         "memtables");
   }
-  if (two_write_queues_ &&
-      !nonmem_write_thread_.EnterUnbatchedNonBlocking(nonmem_w, &mutex_)) {
-    write_thread_.ExitUnbatched(w);
+  if (two_write_queues_ && !nonmem_w->EnterUnbatchedNonBlocking()) {
+    w->ExitUnbatched();
     return Status::Incomplete(
         "Write stall in progress, unable to join the write thread to switch "
         "memtables");
@@ -2755,9 +2754,9 @@ Status DBImpl::EnterWriteThreadForNonBlockingFlush(
       !WouldBlockJoiningWriteThread()) {
     return Status::OK();
   }
-  write_thread_.ExitUnbatched(w);
+  w->ExitUnbatched();
   if (two_write_queues_) {
-    nonmem_write_thread_.ExitUnbatched(nonmem_w);
+    nonmem_w->ExitUnbatched();
   }
   return Status::Incomplete(
       "Write stop started while joining the write thread to switch memtables");
@@ -2814,8 +2813,8 @@ Status DBImpl::FlushMemTableImpl(ColumnFamilyData* cfd,
     WriteContext context;
     InstrumentedMutexLock guard_lock(&mutex_);
 
-    WriteThread::Writer w;
-    WriteThread::Writer nonmem_w;
+    AllPartitionsWriter w(this, /*nonmem=*/false);
+    AllPartitionsWriter nonmem_w(this, /*nonmem=*/true);
     if (needs_to_join_write_thread) {
       if (join_mode == WriteThreadJoinMode::kNonBlocking) {
         s = EnterWriteThreadForNonBlockingFlush(&w, &nonmem_w);
@@ -2823,18 +2822,18 @@ Status DBImpl::FlushMemTableImpl(ColumnFamilyData* cfd,
           return s;
         }
       } else {
-        write_thread_.EnterUnbatched(&w, &mutex_);
+        w.EnterUnbatched();
         if (two_write_queues_) {
-          nonmem_write_thread_.EnterUnbatched(&nonmem_w, &mutex_);
+          nonmem_w.EnterUnbatched();
         }
       }
     }
     if (join_mode == WriteThreadJoinMode::kNonBlocking && cfd->IsDropped()) {
       TEST_SYNC_POINT("DBImpl::FlushMemTableImpl:Dropped");
       if (needs_to_join_write_thread) {
-        write_thread_.ExitUnbatched(&w);
+        w.ExitUnbatched();
         if (two_write_queues_) {
-          nonmem_write_thread_.ExitUnbatched(&nonmem_w);
+          nonmem_w.ExitUnbatched();
         }
       }
       s.PermitUncheckedOk();
@@ -2847,9 +2846,9 @@ Status DBImpl::FlushMemTableImpl(ColumnFamilyData* cfd,
         cfd->imm()->IsFlushPendingOrRunning()) {
       TEST_SYNC_POINT("DBImpl::FlushMemTableImpl:AlreadyFlushing");
       if (needs_to_join_write_thread) {
-        write_thread_.ExitUnbatched(&w);
+        w.ExitUnbatched();
         if (two_write_queues_) {
-          nonmem_write_thread_.ExitUnbatched(&nonmem_w);
+          nonmem_w.ExitUnbatched();
         }
       }
       return Status::Incomplete(
@@ -2952,9 +2951,9 @@ Status DBImpl::FlushMemTableImpl(ColumnFamilyData* cfd,
     }
 
     if (needs_to_join_write_thread) {
-      write_thread_.ExitUnbatched(&w);
+      w.ExitUnbatched();
       if (two_write_queues_) {
-        nonmem_write_thread_.ExitUnbatched(&nonmem_w);
+        nonmem_w.ExitUnbatched();
       }
     }
   }
@@ -3072,8 +3071,8 @@ Status DBImpl::AtomicFlushMemTablesImpl(
     WriteContext context;
     InstrumentedMutexLock guard_lock(&mutex_);
 
-    WriteThread::Writer w;
-    WriteThread::Writer nonmem_w;
+    AllPartitionsWriter w(this, /*nonmem=*/false);
+    AllPartitionsWriter nonmem_w(this, /*nonmem=*/true);
     if (needs_to_join_write_thread) {
       if (join_mode == WriteThreadJoinMode::kNonBlocking) {
         s = EnterWriteThreadForNonBlockingFlush(&w, &nonmem_w);
@@ -3082,9 +3081,9 @@ Status DBImpl::AtomicFlushMemTablesImpl(
           return s;
         }
       } else {
-        write_thread_.EnterUnbatched(&w, &mutex_);
+        w.EnterUnbatched();
         if (two_write_queues_) {
-          nonmem_write_thread_.EnterUnbatched(&nonmem_w, &mutex_);
+          nonmem_w.EnterUnbatched();
         }
       }
     }
@@ -3146,9 +3145,9 @@ Status DBImpl::AtomicFlushMemTablesImpl(
     }
 
     if (needs_to_join_write_thread) {
-      write_thread_.ExitUnbatched(&w);
+      w.ExitUnbatched();
       if (two_write_queues_) {
-        nonmem_write_thread_.ExitUnbatched(&nonmem_w);
+        nonmem_w.ExitUnbatched();
       }
     }
   }
