@@ -23,6 +23,7 @@
 #include "rocksdb/file_system.h"
 #include "rocksdb/utilities/checkpoint.h"
 #include "rocksdb/utilities/ldb_cmd.h"
+#include "rocksdb/utilities/transaction_db.h"
 #include "rocksdb/wal_filter.h"
 #include "test_util/sync_point.h"
 #include "util/crc32c.h"
@@ -7898,6 +7899,317 @@ TEST_F(DBWALIndexTest, RollbackProcedureLeavesNoIndexedWAL) {
       ASSERT_OK(DestroyDB(checkpoint_after, CurrentOptions()));
       Destroy(none);
     }
+  }
+}
+
+// The rollback procedure in PartitionWALUsage's comment, from N partitions
+// (FU4): step 1 sets wal_partitions = 1 with kNone. The parameter is N.
+class DBWALIndexRollbackTest : public DBWALIndexTest,
+                               public testing::WithParamInterface<uint32_t> {
+ protected:
+  // Options writing indexed WALs at `partitions` partitions.
+  Options IndexedOptions(uint32_t partitions) {
+    Options options =
+        WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+    test::SetWalPartitions(&options, partitions);
+    return options;
+  }
+
+  // Writes key "<prefix><cf>" with value "<prefix>" to every column family,
+  // synced, and records it in written_.
+  void WriteEveryColumnFamily(const std::string& prefix) {
+    WriteOptions sync;
+    sync.sync = true;
+    for (int cf = 0; cf < static_cast<int>(handles_.size()); ++cf) {
+      const std::string key = prefix + std::to_string(cf);
+      ASSERT_OK(db_->Put(sync, handles_[cf], key, prefix));
+      written_.emplace_back(cf, key);
+    }
+  }
+
+  void VerifyWritten() {
+    for (const auto& [cf, key] : written_) {
+      EXPECT_EQ(key.substr(0, 1), Get(cf, key)) << key;
+    }
+  }
+
+  std::vector<std::pair<int, std::string>> written_;
+};
+
+INSTANTIATE_TEST_CASE_P(DBWALIndexRollbackTest, DBWALIndexRollbackTest,
+                        testing::Values(1u, 4u));
+
+// R2-R4: the documented steps one by one, from a history with an unflushed,
+// indexed tail on every partition. With an archive (WAL_ttl_seconds) the
+// check names the archived indexed WALs until step 4 purges them; with a
+// crash that drops unsynced data after step 1's reopen, before the guard
+// clears, the DB reopens with kNone at one partition with every key, and
+// the procedure repeated from step 1 completes. At N > 1, step 1 without
+// wal_partitions = 1 is refused and changes nothing.
+TEST_P(DBWALIndexRollbackTest,
+       RollbackProcedureLeavesNoIndexedWALAtAnyPartitionCount) {
+  const uint32_t partitions = GetParam();
+  const std::vector<std::string> names = ColumnFamilyNamesThrough(
+      ColumnFamilyIdsCoveringWalPartitions(partitions));
+  const std::vector<std::string> cfs(names.begin() + 1, names.end());
+  for (const bool archive : {false, true}) {
+    for (const bool crash : {false, true}) {
+      SCOPED_TRACE("archive=" + std::to_string(archive) +
+                   " crash=" + std::to_string(crash));
+      Options indexed = IndexedOptions(partitions);
+      indexed.WAL_ttl_seconds = archive ? 1000 : 0;
+      ASSERT_NO_FATAL_FAILURE(DestroyAndReopen(indexed));
+      ASSERT_NO_FATAL_FAILURE(CreateAndReopenWithCF(cfs, indexed));
+      written_.clear();
+      ASSERT_NO_FATAL_FAILURE(WriteEveryColumnFamily("a"));
+      // Every partition holds records, none of them flushed.
+      if (partitions > 1) {
+        EXPECT_EQ(partitions, WalPartitionsAppendedTo(db_.get()));
+      }
+      Close();
+      const std::vector<uint64_t> indexed_wals = ListWalNumbers();
+      ASSERT_GE(indexed_wals.size(), partitions);
+      std::string output;
+      EXPECT_NE(0, RunCheckWALIndex(dbname_, indexed, &output));
+      EXPECT_NE(std::string::npos, output.find("WAL index guard: set"))
+          << output;
+
+      Options none = indexed;
+      none.partition_wal_usage = PartitionWALUsage::kNone;
+      if (partitions > 1) {
+        // Step 1 without wal_partitions = 1 is refused.
+        SyncPoint::GetInstance()->SetCallBack(
+            "DBImpl::ValidateOptions:AllowWalPartitions",
+            [](void* arg) { *static_cast<bool*>(arg) = true; });
+        SyncPoint::GetInstance()->EnableProcessing();
+        const Status s = TryReopenWithColumnFamilies(names, none);
+        ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+        EXPECT_NE(std::string::npos,
+                  s.ToString().find("wal_partitions > 1 requires "
+                                    "partition_wal_usage other than kNone"))
+            << s.ToString();
+        EXPECT_EQ(indexed_wals, ListWalNumbers());
+      }
+      none.wal_partitions = 1;
+
+      // 1. Reopen with kNone at one partition. The crash leg tracks what
+      // this instance writes, to drop what it left unsynced.
+      std::unique_ptr<FaultInjectionTestEnv> fault_env(
+          new FaultInjectionTestEnv(env_));
+      // On any exit, the DB, which may be on fault_env, closes first.
+      Defer close_before_env([&] { Close(); });
+      if (crash) {
+        none.env = fault_env.get();
+      }
+      ASSERT_NO_FATAL_FAILURE(ReopenWithColumnFamilies(names, none));
+      ASSERT_EQ(1u, dbfull()->TEST_NumWalPartitions());
+      VerifyWritten();
+      ASSERT_NO_FATAL_FAILURE(WriteEveryColumnFamily("b"));
+      // With one partition the indexed WALs stay live until step 2's flush
+      // (avoid_flush_during_recovery), and so does the guard. A kNone open
+      // of a partitioned set flushes it at open, so the guard clears there
+      // (step 5's "may already be step 1's").
+      const bool guard_at_step_1 = partitions == 1;
+      EXPECT_EQ(guard_at_step_1, ManifestWALIndexGuard(env_, dbname_) != 0);
+      if (crash) {
+        // Lose everything unsynced before the guard clears, then start over
+        // from step 1.
+        fault_env->SetFilesystemActive(false);
+        Close();
+        ASSERT_OK(fault_env->DropUnsyncedFileData());
+        none.env = env_;
+        ASSERT_NO_FATAL_FAILURE(ReopenWithColumnFamilies(names, none));
+        VerifyWritten();
+        EXPECT_EQ(guard_at_step_1, ManifestWALIndexGuard(env_, dbname_) != 0);
+      }
+
+      // 2. Flush every column family.
+      for (int cf = 0; cf < static_cast<int>(handles_.size()); ++cf) {
+        ASSERT_OK(Flush(cf));
+      }
+      // 3. No prepared transaction here; the WALs written before step 1 are
+      // deleted, or moved to the archive.
+      Close();
+      for (const uint64_t wal_number : indexed_wals) {
+        EXPECT_TRUE(env_->FileExists(WALPath(wal_number)).IsNotFound())
+            << wal_number;
+        EXPECT_EQ(
+            archive,
+            env_->FileExists(ArchivedLogFileName(dbname_, wal_number)).ok())
+            << wal_number;
+      }
+      output.clear();
+      EXPECT_EQ(guard_at_step_1 || archive,
+                RunCheckWALIndex(dbname_, none, &output) != 0)
+          << output;
+      // 4. Purge the archive. Until then the check names every archived
+      // indexed WAL.
+      for (const uint64_t wal_number : indexed_wals) {
+        const std::string archived = ArchivedLogFileName(dbname_, wal_number);
+        if (archive) {
+          EXPECT_NE(std::string::npos,
+                    output.find("archived WAL " + archived + ": indexed"))
+              << output;
+        }
+      }
+      if (archive) {
+        const std::string archive_dir = ArchivalDirectory(dbname_);
+        std::vector<std::string> files;
+        ASSERT_OK(env_->GetChildren(archive_dir, &files));
+        for (const std::string& file : files) {
+          if (file != "." && file != "..") {
+            ASSERT_OK(env_->DeleteFile(archive_dir + "/" + file));
+          }
+        }
+      }
+
+      // 5. Reopen once more with kNone, and close: the guard clears.
+      ASSERT_NO_FATAL_FAILURE(ReopenWithColumnFamilies(names, none));
+      Close();
+      // 6, 7. The check finds no indexed WAL and the guard clear.
+      output.clear();
+      EXPECT_EQ(0, RunCheckWALIndex(dbname_, none, &output)) << output;
+      EXPECT_NE(std::string::npos,
+                output.find("No WAL index records and no WAL index guard"))
+          << output;
+      EXPECT_EQ(0u, ManifestWALIndexGuard(env_, dbname_));
+
+      // An open with kNone at one partition accepts the DB, with every key.
+      ASSERT_NO_FATAL_FAILURE(ReopenWithColumnFamilies(names, none));
+      VerifyWritten();
+      Close();
+      Destroy(none);
+    }
+  }
+}
+
+// R5: a prepared transaction outstanding at step 1 keeps the WALs written
+// before step 1 live, and with them the guard, until it commits or rolls
+// back; then steps 3-7 complete and the transaction's outcome stands.
+// Re-enabling partitioning before the rollback completes, with the prepare
+// still outstanding, is GC26TrueAlternationFailsClosed (db_write_test.cc).
+TEST_P(DBWALIndexRollbackTest, RollbackProcedureWaitsForPreparedTransaction) {
+  const uint32_t partitions = GetParam();
+  const std::vector<std::string> names = ColumnFamilyNamesThrough(
+      ColumnFamilyIdsCoveringWalPartitions(partitions));
+  const std::vector<std::string> cfs(names.begin() + 1, names.end());
+  const int prepared_cf = static_cast<int>(names.size()) - 1;
+  for (const bool commit : {true, false}) {
+    SCOPED_TRACE("commit=" + std::to_string(commit));
+    Options indexed = IndexedOptions(partitions);
+    ASSERT_NO_FATAL_FAILURE(DestroyAndReopen(indexed));
+    ASSERT_NO_FATAL_FAILURE(CreateAndReopenWithCF(cfs, indexed));
+    Close();
+
+    std::vector<ColumnFamilyHandle*> handles;
+    std::unique_ptr<TransactionDB> txn_db;
+    // On any exit, every handle is destroyed before the DB closes.
+    Defer close_on_exit([&] {
+      for (ColumnFamilyHandle* handle : handles) {
+        EXPECT_OK(txn_db->DestroyColumnFamilyHandle(handle));
+      }
+      handles.clear();
+      txn_db.reset();
+    });
+    auto open = [&](const Options& options) {
+      std::vector<ColumnFamilyDescriptor> column_families;
+      for (const std::string& name : names) {
+        column_families.emplace_back(name, options);
+      }
+      TransactionDB* opened = nullptr;
+      ASSERT_OK(TransactionDB::Open(options, TransactionDBOptions(), dbname_,
+                                    column_families, &handles, &opened));
+      txn_db.reset(opened);
+    };
+    auto close = [&]() {
+      // Each handle leaves `handles` once destroyed, so that close_on_exit
+      // destroys only what is left.
+      while (!handles.empty()) {
+        ASSERT_OK(txn_db->DestroyColumnFamilyHandle(handles.back()));
+        handles.pop_back();
+      }
+      txn_db.reset();
+    };
+    auto get = [&](int cf, const std::string& key) {
+      std::string value;
+      const Status s = txn_db->Get(ReadOptions(), handles[cf], key, &value);
+      EXPECT_TRUE(s.ok() || s.IsNotFound()) << s.ToString();
+      return s.ok() ? value : "NOT_FOUND";
+    };
+    auto flush_all = [&]() {
+      ASSERT_OK(txn_db->Flush(FlushOptions(), handles));
+      // The WALs recovered from the previous instance leave only by a full
+      // scan, which re-enabling deletions forces.
+      ASSERT_OK(txn_db->DisableFileDeletions());
+      ASSERT_OK(txn_db->EnableFileDeletions());
+    };
+    WriteOptions sync;
+    sync.sync = true;
+
+    ASSERT_NO_FATAL_FAILURE(open(indexed));
+    for (int cf = 0; cf < static_cast<int>(handles.size()); ++cf) {
+      ASSERT_OK(txn_db->Put(sync, handles[cf], "a" + std::to_string(cf), "a"));
+    }
+    {
+      std::unique_ptr<Transaction> txn(txn_db->BeginTransaction(sync));
+      ASSERT_OK(txn->SetName("xid"));
+      ASSERT_OK(txn->Put(handles[prepared_cf], "prepared", "v"));
+      ASSERT_OK(txn->Prepare());
+    }
+    ASSERT_NO_FATAL_FAILURE(close());
+    const std::vector<uint64_t> indexed_wals = ListWalNumbers();
+
+    // 1. kNone at one partition; 2. flush every column family. 3. cannot
+    // complete: the prepare keeps the indexed WALs live.
+    Options none = indexed;
+    none.partition_wal_usage = PartitionWALUsage::kNone;
+    none.wal_partitions = 1;
+    ASSERT_NO_FATAL_FAILURE(open(none));
+    ASSERT_NE(nullptr, txn_db->GetTransactionByName("xid"));
+    ASSERT_NO_FATAL_FAILURE(flush_all());
+    ASSERT_NO_FATAL_FAILURE(close());
+    EXPECT_OK(env_->FileExists(WALPath(indexed_wals.front())));
+    std::string output;
+    EXPECT_NE(0, RunCheckWALIndex(dbname_, none, &output));
+    EXPECT_NE(
+        std::string::npos,
+        output.find("live WAL " + WALPath(indexed_wals.front()) + ": indexed"))
+        << output;
+    EXPECT_NE(0u, ManifestWALIndexGuard(env_, dbname_));
+
+    // 3. Resolve the prepare, flush again; the WALs written before step 1
+    // are deleted.
+    ASSERT_NO_FATAL_FAILURE(open(none));
+    {
+      std::unique_ptr<Transaction> recovered(
+          txn_db->GetTransactionByName("xid"));
+      ASSERT_NE(nullptr, recovered);
+      ASSERT_OK(commit ? recovered->Commit() : recovered->Rollback());
+    }
+    // A rollback leaves every memtable empty, and a flush with nothing to
+    // write records nothing, so one write gives the flush its edit.
+    ASSERT_OK(txn_db->Put(sync, handles[0], "c", "c"));
+    ASSERT_NO_FATAL_FAILURE(flush_all());
+    ASSERT_NO_FATAL_FAILURE(close());
+    for (const uint64_t wal_number : indexed_wals) {
+      EXPECT_TRUE(env_->FileExists(WALPath(wal_number)).IsNotFound())
+          << wal_number;
+    }
+    // 5. Reopen once more and close. 6, 7. The check passes.
+    ASSERT_NO_FATAL_FAILURE(open(none));
+    ASSERT_NO_FATAL_FAILURE(close());
+    output.clear();
+    EXPECT_EQ(0, RunCheckWALIndex(dbname_, none, &output)) << output;
+    EXPECT_EQ(0u, ManifestWALIndexGuard(env_, dbname_));
+
+    ASSERT_NO_FATAL_FAILURE(open(none));
+    EXPECT_EQ(nullptr, txn_db->GetTransactionByName("xid"));
+    EXPECT_EQ(commit ? "v" : "NOT_FOUND", get(prepared_cf, "prepared"));
+    for (int cf = 0; cf < static_cast<int>(handles.size()); ++cf) {
+      EXPECT_EQ("a", get(cf, "a" + std::to_string(cf))) << cf;
+    }
+    ASSERT_NO_FATAL_FAILURE(close());
+    Destroy(none);
   }
 }
 
