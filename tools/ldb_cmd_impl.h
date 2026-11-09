@@ -396,6 +396,26 @@ class WALDumperCommand : public LDBCommand {
   static const std::string ARG_ONLY_PRINT_SEQNO_GAPS;
 };
 
+class CheckWALIndexCommand : public LDBCommand {
+ public:
+  static std::string Name() { return "check_wal_index"; }
+
+  CheckWALIndexCommand(const std::vector<std::string>& params,
+                       const std::map<std::string, std::string>& options,
+                       const std::vector<std::string>& flags);
+
+  bool NoDBOpen() override { return true; }
+
+  static void Help(std::string& ret);
+
+  void DoCommand() override;
+
+ private:
+  std::string wal_dir_;
+
+  static const std::string ARG_WAL_DIR;
+};
+
 class GetCommand : public LDBCommand {
  public:
   static std::string Name() { return "get"; }
