@@ -1,0 +1,1 @@
+With `wal_partitions` > 1, a sync write syncs only the WAL partitions holding records ordered before it, once and concurrently, without holding WAL write locks across the sync, which raises the throughput of workloads mixing sync and async writes.

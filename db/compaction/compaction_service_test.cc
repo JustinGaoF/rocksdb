@@ -10824,10 +10824,6 @@ TEST_F(CompactionServiceTest, OpenAndCompactAtPartitionedPrimary) {
     options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
     options.wal_partitions = 2;
     options.track_and_verify_wals_in_manifest = true;
-    SyncPoint::GetInstance()->SetCallBack(
-        "DBImpl::ValidateOptions:AllowWalPartitions",
-        [](void* arg) { *static_cast<bool*>(arg) = true; });
-    SyncPoint::GetInstance()->EnableProcessing();
     ReopenWithCompactionService(&options);
     ASSERT_EQ(2U, dbfull()->TEST_NumWalPartitions());
     MyTestCompactionService* my_cs = GetCompactionService();
