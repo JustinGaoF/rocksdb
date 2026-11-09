@@ -58,15 +58,17 @@ Status WalManager::DeleteFile(const std::string& fname, uint64_t number) {
   }
   return s;
 }
-Status WalManager::GetSortedWalFiles(VectorWalPtr& files, bool need_seqnos,
-                                     bool include_archived) {
+Status WalManager::GetSortedWalFiles(
+    VectorWalPtr& files, bool need_seqnos, bool include_archived,
+    const std::vector<uint64_t>* tracked_wals) {
   // First get sorted files in db dir, then get sorted files from archived
   // dir, to avoid a race condition where a log file is moved to archived
   // dir in between.
   Status s;
   // list wal files in main db dir.
   VectorWalPtr logs;
-  s = GetSortedWalsOfType(wal_dir_, logs, kAliveLogFile, need_seqnos);
+  s = GetSortedWalsOfType(wal_dir_, logs, kAliveLogFile, need_seqnos,
+                          tracked_wals);
 
   if (!include_archived || !s.ok()) {
     return s;
@@ -83,7 +85,8 @@ Status WalManager::GetSortedWalFiles(VectorWalPtr& files, bool need_seqnos,
   std::string archivedir = ArchivalDirectory(wal_dir_);
   Status exists = env_->FileExists(archivedir);
   if (exists.ok()) {
-    s = GetSortedWalsOfType(archivedir, files, kArchivedLogFile, need_seqnos);
+    s = GetSortedWalsOfType(archivedir, files, kArchivedLogFile, need_seqnos,
+                            tracked_wals);
     if (!s.ok()) {
       return s;
     }
@@ -116,6 +119,41 @@ Status WalManager::GetSortedWalFiles(VectorWalPtr& files, bool need_seqnos,
   return s;
 }
 
+Status WalManager::CheckWalsReadableAndUnpartitioned(
+    const VectorWalPtr& wal_files, VersionSet* version_set) {
+  // WALs an earlier instance wrote with wal_partitions > 1 interleave their
+  // sequences across files, so reading them in file order would report gaps
+  // that are not there.
+  for (const auto& wal : wal_files) {
+    const std::string fname =
+        wal->Type() == kAliveLogFile
+            ? LogFileName(wal_dir_, wal->LogNumber())
+            : ArchivedLogFileName(wal_dir_, wal->LogNumber());
+    uint32_t wal_partition = 0;
+    const Status head = log::ReadWALPartition(
+        fs_.get(), fname, fs_->OptimizeForLogRead(file_options_),
+        wal->LogNumber(), &wal_partition);
+    if (!head.ok() && !head.IsNotFound() &&
+        (db_options_.wal_partitions > 1 ||
+         (version_set != nullptr && version_set->wal_index_guard() != 0))) {
+      // An indexed DB: which partition wrote it is unknown.
+      return Status::NotSupported(
+          "GetUpdatesSince: WAL " + std::to_string(wal->LogNumber()) + ": " +
+          head.ToString() +
+          "; it may be a partitioned WAL, whose sequences interleave across "
+          "files");
+    }
+    if (head.ok() && wal_partition != 0) {
+      return Status::NotSupported(
+          "GetUpdatesSince: WAL " + std::to_string(wal->LogNumber()) +
+          " was written by partition " + std::to_string(wal_partition) +
+          " of a DB with wal_partitions > 1, whose sequences interleave "
+          "across files");
+    }
+  }
+  return Status::OK();
+}
+
 Status WalManager::GetUpdatesSince(SequenceNumber seq,
                                    std::unique_ptr<WalIterator>* iter,
                                    const WalIterator::ReadOptions& read_options,
@@ -134,10 +172,26 @@ Status WalManager::GetUpdatesSince(SequenceNumber seq,
   std::unique_ptr<VectorWalPtr> wal_files(new VectorWalPtr);
   Status s = GetSortedWalFiles(*wal_files);
   if (!s.ok()) {
+    // A damaged head fails the seqno pass above; in an indexed DB that is a
+    // refusal naming the WAL, not a Corruption. Re-list without seqnos to
+    // find it. Any other listing failure returns as before.
+    VectorWalPtr unscanned;
+    if (GetSortedWalFiles(unscanned, /*need_seqnos=*/false).ok()) {
+      const Status check =
+          CheckWalsReadableAndUnpartitioned(unscanned, version_set);
+      if (!check.ok()) {
+        s.PermitUncheckedError();
+        return check;
+      }
+    }
     return s;
   }
 
   s = RetainProbableWalFiles(*wal_files, seq);
+  if (!s.ok()) {
+    return s;
+  }
+  s = CheckWalsReadableAndUnpartitioned(*wal_files, version_set);
   if (!s.ok()) {
     return s;
   }
@@ -332,9 +386,9 @@ void WalManager::ArchiveWALFile(const std::string& fname, uint64_t number) {
                  s.ToString().c_str());
 }
 
-Status WalManager::GetSortedWalsOfType(const std::string& path,
-                                       VectorWalPtr& log_files,
-                                       WalFileType log_type, bool need_seqnos) {
+Status WalManager::GetSortedWalsOfType(
+    const std::string& path, VectorWalPtr& log_files, WalFileType log_type,
+    bool need_seqnos, const std::vector<uint64_t>* tracked_wals) {
   std::vector<std::string> all_files;
   const Status status = env_->GetChildren(path, &all_files);
   if (!status.ok()) {
@@ -347,13 +401,23 @@ Status WalManager::GetSortedWalsOfType(const std::string& path,
     if (ParseFileName(f, &number, &type) && type == kWalFile) {
       SequenceNumber sequence;
       if (need_seqnos) {
-        Status s = ReadFirstRecord(log_type, number, &sequence);
+        bool metadata_only = false;
+        Status s = ReadFirstRecord(log_type, number, &sequence, &metadata_only);
         if (!s.ok()) {
           return s;
         }
         if (sequence == 0) {
-          // empty file
-          continue;
+          if (!metadata_only || tracked_wals == nullptr ||
+              !std::binary_search(tracked_wals->begin(), tracked_wals->end(),
+                                  number)) {
+            // empty file
+            continue;
+          }
+          // The MANIFEST tracks this WAL, which holds only WAL index metadata
+          // (an idle partition's WAL that coupled rotation retired), so a copy
+          // of the listed WALs needs it. List it as a compression-only WAL is
+          // listed; ReadFirstRecord does not cache this start sequence.
+          sequence = 1;
         }
       } else {
         sequence = 0;
@@ -425,8 +489,12 @@ Status WalManager::RetainProbableWalFiles(VectorWalPtr& all_logs,
 
 Status WalManager::ReadFirstRecord(const WalFileType type,
                                    const uint64_t number,
-                                   SequenceNumber* sequence) {
+                                   SequenceNumber* sequence,
+                                   bool* metadata_only) {
   *sequence = 0;
+  if (metadata_only != nullptr) {
+    *metadata_only = false;
+  }
   if (type != kAliveLogFile && type != kArchivedLogFile) {
     ROCKS_LOG_ERROR(db_options_.info_log, "[WalManger] Unknown file type %s",
                     std::to_string(type).c_str());
@@ -443,7 +511,7 @@ Status WalManager::ReadFirstRecord(const WalFileType type,
   Status s;
   if (type == kAliveLogFile) {
     std::string fname = LogFileName(wal_dir_, number);
-    s = ReadFirstLine(fname, number, sequence);
+    s = ReadFirstLine(fname, number, sequence, metadata_only);
     if (!s.ok() && env_->FileExists(fname).ok()) {
       // return any error that is not caused by non-existing file
       return s;
@@ -453,7 +521,7 @@ Status WalManager::ReadFirstRecord(const WalFileType type,
   if (type == kArchivedLogFile || !s.ok()) {
     //  check if the file got moved to archive.
     std::string archived_file = ArchivedLogFileName(wal_dir_, number);
-    s = ReadFirstLine(archived_file, number, sequence);
+    s = ReadFirstLine(archived_file, number, sequence, metadata_only);
     // maybe the file was deleted from archive dir. If that's the case, return
     // Status::OK(). The caller with identify this as empty file because
     // *sequence == 0
@@ -499,7 +567,11 @@ Status WalManager::GetLiveWalFile(uint64_t number,
 // empty
 Status WalManager::ReadFirstLine(const std::string& fname,
                                  const uint64_t number,
-                                 SequenceNumber* sequence) {
+                                 SequenceNumber* sequence,
+                                 bool* metadata_only) {
+  if (metadata_only != nullptr) {
+    *metadata_only = false;
+  }
   struct LogReporter : public log::Reader::Reporter {
     Env* env;
     Logger* info_log;
@@ -571,6 +643,13 @@ Status WalManager::ReadFirstLine(const std::string& fname,
     // file is empty. Or, a failure may have occurred while processing the first
     // entry. In any case, return status and set sequence number to 0.
     *sequence = 0;
+    // An indexed WAL with no data record, such as a partition's WAL that took
+    // no write before coupled rotation retired it, holds only WAL index
+    // metadata, and the MANIFEST may track it, whatever wal_partitions this
+    // instance opened with.
+    if (status.ok() && reader.SawWALIndexMarker() && metadata_only != nullptr) {
+      *metadata_only = true;
+    }
   }
   return status;
 }
