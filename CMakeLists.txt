@@ -835,6 +835,7 @@ set(SOURCES
         db/import_column_family_job.cc
         db/internal_stats.cc
         db/logs_with_prep_tracker.cc
+        db/log_merge.cc
         db/log_reader.cc
         db/log_writer.cc
         db/malloc_stats.cc
@@ -1558,6 +1559,7 @@ if(WITH_TESTS)
         db/db_follower_test.cc
         db/import_column_family_test.cc
         db/listener_test.cc
+        db/log_merge_test.cc
         db/log_test.cc
         db/manual_compaction_test.cc
         db/memtable_list_test.cc
