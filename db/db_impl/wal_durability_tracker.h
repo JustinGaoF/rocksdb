@@ -37,7 +37,9 @@ namespace ROCKSDB_NAMESPACE {
 // single DBImpl accessor. It deliberately shares no field with
 // last_published_sequence_, which ingestion and recovery legitimately jump
 // forward; the watermark is a lower bound whose worth is that it cannot be
-// overstated. Nothing gates on it yet; a later diff consumes it.
+// overstated. DBImpl's completion gate waits on it. DBImpl also keeps a second
+// instance whose ranges complete after the memtable insert instead; that
+// instance's safe point bounds what N>1 publishes (see PublishAppliedPrefix).
 //
 // Threading: each partition's in-flight ranges are guarded by that
 // partition's own mutex, so its Register/Complete/Release calls may come
