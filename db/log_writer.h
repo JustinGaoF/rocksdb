@@ -161,6 +161,21 @@ class Writer {
                                          uint64_t superseded_wal_number,
                                          uint64_t first_superseded_wal_index);
 
+  // Asserts that no record with a wal_index below `bound` is still coming
+  // from this file, so a merge waiting on this member can advance. Bounds
+  // are nondecreasing within a file; a backward bound fails the write.
+  // Consumes no wal_index. No-op when WAL index is disabled.
+  IOStatus AddWALIndexProgressRecord(const WriteOptions& write_options,
+                                     uint64_t bound);
+
+  // Attests the wal_index span borne by this file's numeric predecessor:
+  // `first` and `last` are its first and last indices, or both zero when it
+  // bears none. Consumes no wal_index. No-op when WAL index is disabled.
+  IOStatus AddWALIndexPredecessorSpanRecord(const WriteOptions& write_options,
+                                            uint64_t predecessor_wal_number,
+                                            uint64_t first_wal_index,
+                                            uint64_t last_wal_index);
+
   // Enables WAL indexing for this writer.
   // Must be called before the first record is written and never changed
   // afterwards. A file's records are either all indexed or none are.
@@ -250,6 +265,7 @@ class Writer {
   // See `DBOptions::partition_wal_usage`.
   PartitionWALUsage partition_wal_usage_ = PartitionWALUsage::kNone;
   uint64_t last_wal_index_recorded_ = 0;
+  uint64_t last_progress_bound_recorded_ = 0;
 };
 
 }  // namespace log
