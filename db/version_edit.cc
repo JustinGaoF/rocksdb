@@ -359,6 +359,13 @@ bool VersionEdit::EncodeTo(std::string* dst,
     PutLengthPrefixedSlice(dst, encoded);
   }
 
+  if (has_wal_index_guard_) {
+    PutVarint32(dst, kWALIndexGuard);
+    std::string encoded;
+    PutVarint64(&encoded, wal_index_guard_);
+    PutLengthPrefixedSlice(dst, encoded);
+  }
+
   return true;
 }
 
@@ -1054,6 +1061,17 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
         break;
       }
 
+      case kWALIndexGuard: {
+        Slice encoded;
+        if (GetLengthPrefixedSlice(&input, &encoded) &&
+            GetVarint64(&encoded, &wal_index_guard_) && encoded.empty()) {
+          has_wal_index_guard_ = true;
+        } else {
+          msg = "WAL index guard";
+        }
+        break;
+      }
+
       default:
         if (tag & kTagSafeIgnoreMask) {
           // Tag from future which can be safely ignored.
@@ -1245,6 +1263,10 @@ std::string VersionEdit::DebugString(bool hex_key) const {
     r.append("\n  CommittedOptionsFileNumber: ");
     AppendNumberTo(&r, committed_options_file_number_);
   }
+  if (has_wal_index_guard_) {
+    r.append("\n  WALIndexGuard: ");
+    AppendNumberTo(&r, wal_index_guard_);
+  }
   r.append("\n}\n");
   return r;
 }
@@ -1415,6 +1437,10 @@ std::string VersionEdit::DebugJSON(int edit_num, bool hex_key) const {
 
   if (has_committed_options_file_number_) {
     jw << "CommittedOptionsFileNumber" << committed_options_file_number_;
+  }
+
+  if (has_wal_index_guard_) {
+    jw << "WALIndexGuard" << wal_index_guard_;
   }
 
   jw.EndObject();
