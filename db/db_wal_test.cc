@@ -8223,10 +8223,6 @@ TEST_P(DBWALIndexRollbackTest,
       none.partition_wal_usage = PartitionWALUsage::kNone;
       if (partitions > 1) {
         // Step 1 without wal_partitions = 1 is refused.
-        SyncPoint::GetInstance()->SetCallBack(
-            "DBImpl::ValidateOptions:AllowWalPartitions",
-            [](void* arg) { *static_cast<bool*>(arg) = true; });
-        SyncPoint::GetInstance()->EnableProcessing();
         const Status s = TryReopenWithColumnFamilies(names, none);
         ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
         EXPECT_NE(std::string::npos,
