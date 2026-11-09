@@ -2138,10 +2138,10 @@ TEST_F(DBWriteTestUnparameterized, WalPartitionHistogramsSilentAtN1) {
   }
 }
 
-TEST_F(DBWriteTestUnparameterized, WalPartitionsTestingOptIn) {
-  // Uses no sync point, so it also runs in release builds: there the
-  // testing-only opt-in is the only way to open wal_partitions > 1, and it
-  // admits indexed WALs only.
+TEST_F(DBWriteTestUnparameterized, IndexedWalPartitionsOpenFromOptionsFile) {
+  // Uses no sync point: indexed wal_partitions > 1 opens on its own, and so
+  // does a reopen from the OPTIONS file it writes, which is how tools such as
+  // ldb open a DB.
   constexpr uint32_t kPartitions = 4;
   Options options = CurrentOptions();
   options.wal_partitions = kPartitions;
@@ -2150,19 +2150,6 @@ TEST_F(DBWriteTestUnparameterized, WalPartitionsTestingOptIn) {
   options.avoid_flush_during_shutdown = true;
   options.avoid_flush_during_recovery = true;
   DestroyDB(dbname_, options).PermitUncheckedError();
-  Status s = TryReopen(options);
-  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
-  ASSERT_NE(nullptr, std::strstr(s.getState(),
-                                 "wal_partitions > 1 is not supported yet"));
-
-  options.experimental_allow_wal_partitions_for_testing = true;
-  options.partition_wal_usage = PartitionWALUsage::kNone;
-  s = TryReopen(options);
-  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
-  ASSERT_NE(nullptr, std::strstr(s.getState(),
-                                 "wal_partitions > 1 is not supported yet"));
-
-  options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
   ASSERT_OK(TryReopen(options));
   std::vector<std::string> children;
   ASSERT_OK(env_->GetChildren(dbname_, &children));
@@ -2183,8 +2170,6 @@ TEST_F(DBWriteTestUnparameterized, WalPartitionsTestingOptIn) {
   ASSERT_EQ("v1", Get("k1"));
   ASSERT_EQ("v2", Get("k2"));
 
-  // The OPTIONS file keeps wal_partitions but not the opt-in, so reopening
-  // from it is rejected.
   DBOptions loaded_db_options;
   std::vector<ColumnFamilyDescriptor> loaded_cfs;
   ConfigOptions config_options;
@@ -2192,34 +2177,29 @@ TEST_F(DBWriteTestUnparameterized, WalPartitionsTestingOptIn) {
   ASSERT_OK(LoadLatestOptions(config_options, dbname_, &loaded_db_options,
                               &loaded_cfs));
   ASSERT_EQ(kPartitions, loaded_db_options.wal_partitions);
-  ASSERT_FALSE(loaded_db_options.experimental_allow_wal_partitions_for_testing);
+  ASSERT_EQ(PartitionWALUsage::kPartitionByColumnFamily,
+            loaded_db_options.partition_wal_usage);
   Close();
-  s = TryReopen(Options(loaded_db_options, loaded_cfs[0].options));
-  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+  ASSERT_OK(TryReopen(Options(loaded_db_options, loaded_cfs[0].options)));
+  ASSERT_EQ(kPartitions, dbfull()->TEST_NumWalPartitions());
+  ASSERT_EQ("v1", Get("k1"));
+  ASSERT_EQ("v2", Get("k2"));
 }
 
-// Unindexed WALs cannot be merged at recovery, so kNone with N > 1 is rejected
-// with and without the test hook, naming both options.
+// Unindexed WALs cannot be merged at recovery, so kNone with N > 1 is rejected,
+// naming both options, while an indexing usage opens.
 TEST_F(DBWriteTestUnparameterized, UnindexedWalPartitionsAlwaysRejected) {
-  for (const bool hook : {false, true}) {
-    if (hook) {
-      SyncPoint::GetInstance()->SetCallBack(
-          "DBImpl::ValidateOptions:AllowWalPartitions",
-          [](void* arg) { *static_cast<bool*>(arg) = true; });
-      SyncPoint::GetInstance()->EnableProcessing();
-    }
-    for (const uint32_t partitions : {2U, 4U}) {
-      SCOPED_TRACE("hook=" + std::to_string(hook) +
-                   " partitions=" + std::to_string(partitions));
-      Options options = CurrentOptions();
-      options.wal_partitions = partitions;
-      options.partition_wal_usage = PartitionWALUsage::kNone;
-      Destroy(options);
-      const Status s = TryReopen(options);
-      ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
-      EXPECT_NE(nullptr, std::strstr(s.getState(), "wal_partitions"));
-      EXPECT_NE(nullptr, std::strstr(s.getState(), "partition_wal_usage"));
-    }
+  for (const uint32_t partitions : {2U, 4U}) {
+    SCOPED_TRACE("partitions=" + std::to_string(partitions));
+    Options options = CurrentOptions();
+    options.wal_partitions = partitions;
+    options.partition_wal_usage = PartitionWALUsage::kNone;
+    options.track_and_verify_wals_in_manifest = true;
+    Destroy(options);
+    const Status s = TryReopen(options);
+    ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+    EXPECT_NE(nullptr, std::strstr(s.getState(), "wal_partitions"));
+    EXPECT_NE(nullptr, std::strstr(s.getState(), "partition_wal_usage"));
   }
   Options options = CurrentOptions();
   options.wal_partitions = 4;
@@ -2233,8 +2213,8 @@ TEST_F(DBWriteTestUnparameterized, UnindexedWalPartitionsAlwaysRejected) {
   ASSERT_EQ("value", Get("key"));
 }
 
-// wal_partitions above kMaxWalPartitions is rejected with and without the
-// test hook; kMaxWalPartitions itself opens with the hook.
+// wal_partitions above kMaxWalPartitions is rejected; kMaxWalPartitions itself
+// opens.
 TEST_F(DBWriteTestUnparameterized, WalPartitionsUpperBound) {
   Options options = CurrentOptions();
   options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
@@ -2242,21 +2222,12 @@ TEST_F(DBWriteTestUnparameterized, WalPartitionsUpperBound) {
   options.wal_partitions = DBImpl::kMaxWalPartitions + 1;
   options.track_and_verify_wals_in_manifest = true;
   Destroy(options);
-  for (const bool hook : {false, true}) {
-    SCOPED_TRACE("hook=" + std::to_string(hook));
-    if (hook) {
-      SyncPoint::GetInstance()->SetCallBack(
-          "DBImpl::ValidateOptions:AllowWalPartitions",
-          [](void* arg) { *static_cast<bool*>(arg) = true; });
-      SyncPoint::GetInstance()->EnableProcessing();
-    }
-    const Status s = TryReopen(options);
-    ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
-    EXPECT_NE(nullptr, std::strstr(s.getState(), "wal_partitions"));
-    EXPECT_NE(nullptr,
-              std::strstr(s.getState(),
-                          std::to_string(DBImpl::kMaxWalPartitions).c_str()));
-  }
+  const Status s = TryReopen(options);
+  ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+  EXPECT_NE(nullptr, std::strstr(s.getState(), "wal_partitions"));
+  EXPECT_NE(nullptr,
+            std::strstr(s.getState(),
+                        std::to_string(DBImpl::kMaxWalPartitions).c_str()));
   options.wal_partitions = DBImpl::kMaxWalPartitions;
   ASSERT_OK(TryReopen(options));
   ASSERT_EQ(DBImpl::kMaxWalPartitions, dbfull()->TEST_NumWalPartitions());
@@ -2264,15 +2235,11 @@ TEST_F(DBWriteTestUnparameterized, WalPartitionsUpperBound) {
   ASSERT_EQ("value", Get("key"));
 }
 
-// Every rejection of wal_partitions > 1, with the test hook on: each names
+// Every rejection of wal_partitions > 1: each names
 // wal_partitions and its conflicting option, and the two M1.5 cells (kNone,
 // and two_write_queues, which rejects indexing) also name partition_wal_usage.
 // The runtime rejections follow on a DB that opens.
 TEST_F(DBWriteTestUnparameterized, WalPartitionsRejectionsNameTheirOptions) {
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
   struct Case {
     const char* name;
     std::function<void(Options*)> tweak;
@@ -2415,9 +2382,6 @@ class DBWritePartitionTest : public DBTestBase,
       : DBTestBase("db_write_partition_test", /*env_do_fsync=*/false) {}
 
   void OpenWithPartitions(size_t num_partitions, Options options) {
-    SyncPoint::GetInstance()->SetCallBack(
-        "DBImpl::ValidateOptions:AllowWalPartitions",
-        [](void* arg) { *static_cast<bool*>(arg) = true; });
     SyncPoint::GetInstance()->EnableProcessing();
 
     // Column family ids are assigned in creation order, so cf_id is also the
@@ -2608,9 +2572,6 @@ class DBWritePartitionTest : public DBTestBase,
   // Reopens the column families OpenWithPartitions created, with
   // `num_partitions` WAL partitions, and recomputes cf_for_partition_ for it.
   void ReopenWithPartitions(size_t num_partitions, Options options) {
-    SyncPoint::GetInstance()->SetCallBack(
-        "DBImpl::ValidateOptions:AllowWalPartitions",
-        [](void* arg) { *static_cast<bool*>(arg) = true; });
     SyncPoint::GetInstance()->EnableProcessing();
     // Listed in id order, which is also handle order.
     std::vector<std::string> cf_names;
@@ -2929,10 +2890,6 @@ TEST_P(DBWritePartitionTest, MemtableDecisionEnforcedAtOpen) {
         "rejects");
     return;
   }
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
   Options options = CurrentOptions();
   options.wal_partitions = 4;
   options.track_and_verify_wals_in_manifest = true;
@@ -3510,10 +3467,6 @@ TEST_P(DBWritePartitionTest, ConcurrentUnsafeConfigsRejectedAtOpen) {
   // allow_concurrent_memtable_write on); the merge-counting and non-SkipList
   // rejections are new. Reverting either new guard opens successfully and
   // fails its case below; the last case is the allowed-config control.
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
 
   auto try_open =
       [](const std::string& name,
@@ -3631,10 +3584,6 @@ TEST_F(DBWriteTestUnparameterized, RejectsSeqPerBatchTwoQueues) {
   // (WriteUnprepared shares seq_per_batch=true, so the same gate covers it.)
   // Two queues are rejected at N > 1 with or without seq_per_batch, ahead of
   // the seq_per_batch check, since they reject the WAL indexing N > 1 needs.
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
 
   auto try_open = [](const std::string& name, bool seq_per_batch,
                      bool two_write_queues) {
@@ -4782,10 +4731,6 @@ TEST_P(DBWritePartitionTest, RejectsPipelinedWalPartitions) {
         "rejects");
     return;
   }
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
   Options options = CurrentOptions();
   options.wal_partitions = 4;
   options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
@@ -11895,10 +11840,6 @@ TEST_P(DBWritePartitionTest, WalPartitionsOptionRefusalsUnchanged) {
     EXPECT_NE(std::string::npos, s.ToString().find(refusal.fragment))
         << s.ToString();
   };
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
   for (const size_t partitions : {size_t{2}, size_t{8}}) {
     SCOPED_TRACE("partitions=" + std::to_string(partitions));
     Options base = CurrentOptions();
@@ -12947,10 +12888,6 @@ TEST_P(DBWritePartitionTest, GateSyncDoesNotWaitBehindParkedMarker) {
   options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
   options.track_and_verify_wals_in_manifest = true;
   options.avoid_flush_during_shutdown = true;
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
   DestroyAndReopen(options);
   ASSERT_EQ(kPartitions, dbfull()->TEST_NumWalPartitions());
   SyncPoint::GetInstance()->EnableProcessing();
@@ -13250,10 +13187,6 @@ TEST_P(DBWritePartitionTest, NGreaterThan1FollowerExitHandsFailureToLeader) {
     SCOPED_TRACE("partitions=" + std::to_string(partitions));
     Status leader_status;
     Status follower_status;
-    SyncPoint::GetInstance()->SetCallBack(
-        "DBImpl::ValidateOptions:AllowWalPartitions",
-        [](void* arg) { *static_cast<bool*>(arg) = true; });
-    SyncPoint::GetInstance()->EnableProcessing();
     GC31FollowerExitGroup(this, partitions, &leader_status, &follower_status);
     EXPECT_TRUE(leader_status.IsInvalidArgument()) << leader_status.ToString();
     EXPECT_TRUE(follower_status.IsInvalidArgument())
@@ -15127,10 +15060,6 @@ TEST_P(DBWritePartitionTest, FirstSessionBottomLossIsDetected) {
     return;
   }
   constexpr size_t kPartitions = 2;
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
   Options options = IndexedWalOptions(CurrentOptions());
   options.wal_partitions = kPartitions;
   options.create_missing_column_families = true;
@@ -15720,10 +15649,6 @@ TEST_P(DBWritePartitionTest, ReadOnlyAndSecondaryApplyPartitionChecks) {
     ROCKSDB_GTEST_BYPASS("N > 1 rejects two_write_queues");
     return;
   }
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
   Options base = CurrentOptions();
   DestroyAndReopen(base);
   Close();
@@ -15787,10 +15712,6 @@ TEST_P(DBWritePartitionTest, ReadOnlyCompactedOpenAppliesPartitionChecks) {
     ROCKSDB_GTEST_BYPASS("N > 1 rejects two_write_queues");
     return;
   }
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
   Options options = CurrentOptions();
   options.max_open_files = -1;
   DestroyAndReopen(options);
@@ -17409,8 +17330,8 @@ class DBWalAppendFailureTest : public DBWritePartitionTest {
 
 TEST_F(DBWriteTestUnparameterized, WalPartitionsRequireParanoidChecks) {
   // Q1 (G-12, G-22 N>1 half): a failed append must stop an N>1 DB, so Open
-  // refuses paranoid_checks=false there and names both options. Without the
-  // test hook N>1 is still refused first; N=1 is unaffected.
+  // refuses paranoid_checks=false there and names both options; N=1 is
+  // unaffected.
   Options options = CurrentOptions();
   options.wal_partitions = 2;
   options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
@@ -17418,15 +17339,6 @@ TEST_F(DBWriteTestUnparameterized, WalPartitionsRequireParanoidChecks) {
   options.paranoid_checks = false;
   Destroy(options);
   Status s = TryReopen(options);
-  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
-  EXPECT_NE(nullptr, std::strstr(s.getState(), "not supported yet"))
-      << s.ToString();
-
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
-  s = TryReopen(options);
   ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
   EXPECT_NE(nullptr, std::strstr(s.getState(), "wal_partitions"))
       << s.ToString();
@@ -17438,8 +17350,6 @@ TEST_F(DBWriteTestUnparameterized, WalPartitionsRequireParanoidChecks) {
   options.wal_partitions = 1;
   options.paranoid_checks = false;
   ASSERT_OK(TryReopen(options));
-  SyncPoint::GetInstance()->DisableProcessing();
-  SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
 TEST_P(DBWalAppendFailureTest, EveryAppendFailureStopsTheDb) {
@@ -22098,10 +22008,6 @@ class DBWalPartitionCoverageTest : public DBWritePartitionTest {
     options.create_missing_column_families = true;
     options.wal_partitions = static_cast<uint32_t>(num_partitions);
     options.two_write_queues = GetParam();
-    SyncPoint::GetInstance()->SetCallBack(
-        "DBImpl::ValidateOptions:AllowWalPartitions",
-        [](void* arg) { *static_cast<bool*>(arg) = true; });
-    SyncPoint::GetInstance()->EnableProcessing();
     ASSERT_OK(TryReopenWithColumnFamilies(cf_names, options));
     ASSERT_EQ(num_partitions, dbfull()->TEST_NumWalPartitions());
     ASSERT_EQ(0U, dbfull()->GetVersionSet()->LastSequence());
@@ -23399,9 +23305,6 @@ TEST_P(DBWalPartitionCoverageTest, FU14H6TornFirstRecordInBrandNewNTwoDb) {
   Options options = IndexedWalOptions(CurrentOptions());
   Close();
   ASSERT_OK(DestroyDB(dbname_, options));
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
   SyncPoint::GetInstance()->EnableProcessing();
   std::vector<std::string> cf_names = {kDefaultColumnFamilyName};
   cf_for_partition_.assign(kPartitions, -1);
@@ -23470,9 +23373,6 @@ TEST_P(DBWalPartitionCoverageTest,
     Options options = IndexedWalOptions(CurrentOptions());
     Close();
     ASSERT_OK(DestroyDB(dbname_, options));
-    SyncPoint::GetInstance()->SetCallBack(
-        "DBImpl::ValidateOptions:AllowWalPartitions",
-        [](void* arg) { *static_cast<bool*>(arg) = true; });
     SyncPoint::GetInstance()->EnableProcessing();
     std::vector<std::string> cf_names = {kDefaultColumnFamilyName};
     cf_for_partition_.assign(kPartitions, -1);
@@ -23830,10 +23730,6 @@ TEST_P(DBWalPartitionCoverageTest, GC19TornFirstRecordInBrandNewNTwoDbModes) {
   options.create_if_missing = true;
   options.create_missing_column_families = true;
   options.wal_partitions = kPartitions;
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
   ASSERT_OK(TryReopenWithColumnFamilies(cf_names, options));
   ASSERT_EQ(0U, dbfull()->GetVersionSet()->LastSequence());
   writes_.clear();
@@ -24144,10 +24040,6 @@ TEST_P(DBWalPartitionCoverageTest, GC23FloorOffForLaterGenerationHeads) {
     Close();
     CorruptImageRecord(image, b1);
     SCOPED_TRACE("damaged second-generation WAL " + std::to_string(b1.wal));
-    SyncPoint::GetInstance()->SetCallBack(
-        "DBImpl::ValidateOptions:AllowWalPartitions",
-        [](void* arg) { *static_cast<bool*>(arg) = true; });
-    SyncPoint::GetInstance()->EnableProcessing();
     const std::string copy = image + "_open";
     for (const WALRecoveryMode mode :
          {kTolerate, kAbsolute, kPointInTime, kSkip}) {
@@ -26575,10 +26467,6 @@ TEST_F(DBWriteTestUnparameterized, WalPartitionsSetOptionsRuntimeConflicts) {
   options.track_and_verify_wals_in_manifest = true;
   options.avoid_flush_during_shutdown = true;
   Destroy(options);
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::ValidateOptions:AllowWalPartitions",
-      [](void* arg) { *static_cast<bool*>(arg) = true; });
-  SyncPoint::GetInstance()->EnableProcessing();
   ASSERT_OK(TryReopen(options));
   ColumnFamilyHandle* cf = db_->DefaultColumnFamily();
   const Status merges = db_->SetOptions(cf, {{"max_successive_merges", "10"}});
@@ -27340,10 +27228,6 @@ TEST_P(DBWalPartitionCoverageTest, GC24HistoryFloorScopeOnUpgrade) {
     n2.create_missing_column_families = true;
     n2.wal_partitions = 2;
     n2.two_write_queues = false;
-    SyncPoint::GetInstance()->SetCallBack(
-        "DBImpl::ValidateOptions:AllowWalPartitions",
-        [](void* arg) { *static_cast<bool*>(arg) = true; });
-    SyncPoint::GetInstance()->EnableProcessing();
     ASSERT_OK(TryReopenWithColumnFamilies(cf_names, n2));
     ASSERT_EQ(2U, dbfull()->TEST_NumWalPartitions());
     WriteBatch marker;
@@ -27378,10 +27262,6 @@ TEST_P(DBWalPartitionCoverageTest, GC24HistoryFloorScopeOnUpgrade) {
     // every mode but absolute (a byte flip instead would leave a hole,
     // which tolerate refuses too).
     TruncateImageWal(image, wal, (begin + end) / 2);
-    SyncPoint::GetInstance()->SetCallBack(
-        "DBImpl::ValidateOptions:AllowWalPartitions",
-        [](void* arg) { *static_cast<bool*>(arg) = true; });
-    SyncPoint::GetInstance()->EnableProcessing();
     const std::string copy = image + "_open";
     for (const WALRecoveryMode mode :
          {kTolerate, kAbsolute, kPointInTime, kSkip}) {
