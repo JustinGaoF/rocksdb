@@ -1560,6 +1560,12 @@ class DBImpl : public DB
     return logs_.back().number;
   }
 
+  // Acquisitions of sequence_wal_index_mutex_ so far. Tests use it to prove
+  // only the issuing of sequences and WAL indices takes it.
+  uint64_t TEST_SequenceWalIndexMutexTakes() const {
+    return sequence_wal_index_mutex_takes_.load(std::memory_order_relaxed);
+  }
+
   void TEST_DeleteObsoleteFiles();
 
   const std::unordered_set<uint64_t>& TEST_GetFilesGrabbedForPurge() const {
@@ -1570,6 +1576,19 @@ class DBImpl : public DB
 
   static Status TEST_ValidateOptions(const DBOptions& db_options) {
     return ValidateOptions(db_options);
+  }
+
+  // Exposes sequence and optional WAL-index allocation for concurrency tests.
+  IOStatus TEST_AllocateSequenceAndWALIndex(
+      size_t sequence_count, bool write_wal,
+      SequenceNumber* last_sequence_before, uint64_t* wal_index) {
+    return AllocateSequenceAndWALIndex(sequence_count, write_wal,
+                                       last_sequence_before, wal_index);
+  }
+
+  void TEST_SetNextWALIndex(uint64_t next_wal_index) {
+    SequenceWalIndexLock lock(this);
+    next_wal_index_ = next_wal_index;
   }
 #endif  // NDEBUG
 
@@ -3049,17 +3068,25 @@ class DBImpl : public DB
                     WriteBatch* tmp_batch, WriteBatch** merged_batch,
                     size_t* write_with_wal, WriteBatch** to_be_cached_state);
 
+  // Reserves a sequence block and, when a WAL record will be written, its
+  // wal_index in one DB-wide critical section. The mutex is released before
+  // batch merging, WAL append, or any other I/O. The future durability
+  // watermark's RegisterPending operation belongs in this same section.
+  IOStatus AllocateSequenceAndWALIndex(size_t sequence_count, bool write_wal,
+                                       SequenceNumber* last_sequence_before,
+                                       uint64_t* wal_index);
+
   IOStatus WriteToWAL(const WriteBatch& merged_batch,
                       const WriteOptions& write_options,
                       log::Writer* log_writer, uint64_t* wal_used,
                       uint64_t* log_size,
                       WalFileNumberSize& wal_file_number_size,
-                      SequenceNumber sequence);
+                      SequenceNumber sequence, uint64_t wal_index);
 
   IOStatus WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
                            log::Writer* log_writer, uint64_t* wal_used,
                            bool need_wal_sync, bool need_wal_dir_sync,
-                           SequenceNumber sequence,
+                           SequenceNumber sequence, uint64_t wal_index,
                            WalFileNumberSize& wal_file_number_size);
 
   IOStatus ConcurrentWriteGroupToWAL(const WriteThread::WriteGroup& write_group,
@@ -3742,6 +3769,20 @@ class DBImpl : public DB
   // mutex_, the order should be first mutex_ and then wal_write_mutex_.
   InstrumentedMutex wal_write_mutex_;
 
+  // Serializes sequence-block and WAL-index allocation across all WAL
+  // partitions: held only to issue a sequence block with its WAL index,
+  // register the block in both trackers (so no frontier scan can miss it),
+  // and read or seed next_wal_index_. It is never held across batch
+  // merging or I/O, and nothing is taken under it but a tracker
+  // partition's mutex. On its own cache line with next_wal_index_, the
+  // state it guards.
+  ALIGN_AS(CACHE_LINE_SIZE) InstrumentedMutex sequence_wal_index_mutex_;
+  uint64_t next_wal_index_ = log::kWALIndexStartNumber;
+#ifndef NDEBUG
+  // Every acquisition of sequence_wal_index_mutex_ (SequenceWalIndexLock).
+  std::atomic<uint64_t> sequence_wal_index_mutex_takes_{0};
+#endif  // NDEBUG
+
   // If zero, manual compactions are allowed to proceed. If non-zero, manual
   // compactions may still be running, but will quickly fail with
   // `Status::Incomplete`. The value indicates how many threads have paused
@@ -3907,6 +3948,24 @@ class DBImpl : public DB
   //  - it follows that the items with getting_synced=true can be safely read
   //  from the same thread that has set getting_synced=true
   std::deque<LogWriterNumber> logs_;
+
+  // Takes sequence_wal_index_mutex_, counting the acquisition in debug
+  // builds (TEST_SequenceWalIndexMutexTakes).
+  class SequenceWalIndexLock {
+   public:
+    explicit SequenceWalIndexLock(DBImpl* db)
+        : lock_(&db->sequence_wal_index_mutex_) {
+#ifndef NDEBUG
+      db->sequence_wal_index_mutex_takes_.fetch_add(1,
+                                                    std::memory_order_relaxed);
+#endif  // NDEBUG
+    }
+    SequenceWalIndexLock(const SequenceWalIndexLock&) = delete;
+    SequenceWalIndexLock& operator=(const SequenceWalIndexLock&) = delete;
+
+   private:
+    InstrumentedMutexLock lock_;
+  };
 
   // Signaled when getting_synced becomes false for some of the logs_.
   InstrumentedCondVar wal_sync_cv_;
