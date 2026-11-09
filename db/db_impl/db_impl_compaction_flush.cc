@@ -309,6 +309,7 @@ Status DBImpl::FlushMemTableToOutputFile(
   }
 
   if (s.ok()) {
+    flush_job.DropEntriesAtOrAbove(UnreleasedWalGateFenceLow());
     flush_job.PickMemTable();
     need_cancel = true;
   }
@@ -682,7 +683,9 @@ Status DBImpl::AtomicFlushMemTablesToOutputFiles(
   }
 
   if (s.ok()) {
+    const SequenceNumber drop_floor = UnreleasedWalGateFenceLow();
     for (int i = 0; i != num_cfs; ++i) {
+      jobs[i]->DropEntriesAtOrAbove(drop_floor);
       jobs[i]->PickMemTable();
       pick_status[i] = true;
     }
