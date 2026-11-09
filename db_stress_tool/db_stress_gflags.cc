@@ -1572,9 +1572,8 @@ DEFINE_string(partition_wal_usage, "none",
               "sets how many WAL files writes spread across.");
 
 DEFINE_uint32(wal_partitions, ROCKSDB_NAMESPACE::Options().wal_partitions,
-              "DBOptions::wal_partitions. Values above 1 also set the "
-              "testing-only experimental_allow_wal_partitions_for_testing, "
-              "and need --partition_wal_usage other than none.");
+              "DBOptions::wal_partitions. Values above 1 need "
+              "--partition_wal_usage other than none.");
 
 DEFINE_bool(inject_wal_latency, false,
             "Put a LatencyInjectionFileSystem above the DB's FileSystem (and "
