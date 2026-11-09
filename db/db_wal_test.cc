@@ -8,6 +8,8 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #include <algorithm>
+#include <map>
+#include <mutex>
 #include <numeric>
 
 #include "db/db_test_util.h"
@@ -4265,6 +4267,71 @@ class FailWALOpenFileSystem : public FileSystemWrapper {
   const std::string blocked_path_;
 };
 
+// Counts recovery opens of one WAL without changing the underlying I/O.
+class CountingWALOpenFileSystem : public FileSystemWrapper {
+ public:
+  CountingWALOpenFileSystem(const std::shared_ptr<FileSystem>& base,
+                            std::string counted_path)
+      : FileSystemWrapper(base), counted_path_(std::move(counted_path)) {}
+
+  static const char* kClassName() { return "CountingWALOpenFileSystem"; }
+  const char* Name() const override { return kClassName(); }
+
+  IOStatus NewSequentialFile(const std::string& fname,
+                             const FileOptions& file_opts,
+                             std::unique_ptr<FSSequentialFile>* result,
+                             IODebugContext* dbg) override {
+    if (fname == counted_path_) {
+      ++open_count_;
+    }
+    return FileSystemWrapper::NewSequentialFile(fname, file_opts, result, dbg);
+  }
+
+  int open_count() const { return open_count_; }
+
+ private:
+  const std::string counted_path_;
+  int open_count_ = 0;
+};
+
+// Captures every recovery log line with the level it was emitted at, so a
+// test can assert both that a message appeared at the intended level and that
+// it did not also appear at a different one. Recording the level alongside
+// the text is what lets one helper serve the routing assertions as well as
+// the operator-facing warnings.
+class RecordingLogger : public Logger {
+ public:
+  using Logger::Logv;
+  void Logv(InfoLogLevel log_level, const char* format, va_list ap) override {
+    char buf[4096];
+    vsnprintf(buf, sizeof(buf), format, ap);
+    std::lock_guard<std::mutex> lock(mutex_);
+    entries_.push_back({log_level, buf});
+  }
+
+  int count(InfoLogLevel level, const std::string& substr) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return static_cast<int>(
+        std::count_if(entries_.begin(), entries_.end(), [&](const Entry& e) {
+          return e.level == level &&
+                 e.message.find(substr) != std::string::npos;
+        }));
+  }
+
+  bool saw(InfoLogLevel level, const std::string& substr) const {
+    return count(level, substr) > 0;
+  }
+
+ private:
+  struct Entry {
+    InfoLogLevel level;
+    std::string message;
+  };
+
+  mutable std::mutex mutex_;
+  std::vector<Entry> entries_;
+};
+
 TEST_F(DBWALIndexTest, TwoWriteQueuesIsRejected) {
   Options options =
       WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
@@ -6396,6 +6463,138 @@ TEST_F(DBWALIndexTest, RecycledOldRecordStopsOnlyAtTheStreamEnd) {
   }
 }
 
+// Every truncating merged recovery leaves one warning naming the cut and each
+// superseded WAL with its first obsolete index, and every corruption warning
+// names the WAL it came from. A recovery that discards nothing adds neither.
+TEST_F(DBWALIndexTest, TruncatingRecoveryLogsWALAndCut) {
+  const std::string truncated = "Merged WAL recovery truncated";
+  Options options =
+      WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+  options.wal_recovery_mode = WALRecoveryMode::kPointInTimeRecovery;
+
+  // A pristine hole: index 3 moved to 30 stops point-in-time at index 3.
+  DestroyAndReopen(options);
+  WriteKeyRange(0, 4);
+  const uint64_t wal_number = LatestWALNumber();
+  Close();
+  OverwriteDataRecordWALIndexAt(WALPath(wal_number), 2, 30);
+  std::shared_ptr<RecordingLogger> logger = std::make_shared<RecordingLogger>();
+  options.info_log = logger;
+  Reopen(options);
+  EXPECT_EQ(1, logger->count(InfoLogLevel::WARN_LEVEL, truncated));
+  EXPECT_TRUE(logger->saw(InfoLogLevel::WARN_LEVEL, "cut at wal_index 3 "));
+  EXPECT_TRUE(logger->saw(InfoLogLevel::WARN_LEVEL,
+                          "superseded WALs: #" + std::to_string(wal_number) +
+                              " from wal_index 3;"));
+
+  // A destroyed record mid-file: the reader's warning names its WAL, and the
+  // cut supersedes both WALs.
+  options.info_log = nullptr;
+  DestroyAndReopen(options);
+  WriteKeyRange(0, 6);
+  const uint64_t first_wal = LatestWALNumber();
+  Reopen(options);
+  WriteKeyRange(6, 4);
+  const uint64_t second_wal = LatestWALNumber();
+  Close();
+  CorruptDataRecordPayloadAt(WALPath(first_wal), 2);
+  logger = std::make_shared<RecordingLogger>();
+  options.info_log = logger;
+  Reopen(options);
+  EXPECT_TRUE(
+      logger->saw(InfoLogLevel::WARN_LEVEL, WALPath(first_wal) + ": dropping"));
+  EXPECT_EQ(1, logger->count(InfoLogLevel::WARN_LEVEL, truncated));
+  EXPECT_TRUE(logger->saw(
+      InfoLogLevel::WARN_LEVEL,
+      "superseded WALs: #" + std::to_string(first_wal) + " from wal_index 3 #" +
+          std::to_string(second_wal) + " from wal_index 7;"));
+  Close();
+
+  // A recovery that discards nothing warns about nothing.
+  options.info_log = nullptr;
+  DestroyAndReopen(options);
+  WriteKeyRange(0, 4);
+  Close();
+  logger = std::make_shared<RecordingLogger>();
+  options.info_log = logger;
+  Reopen(options);
+  EXPECT_EQ(0, logger->count(InfoLogLevel::WARN_LEVEL, truncated));
+  EXPECT_EQ(0, logger->count(InfoLogLevel::WARN_LEVEL, "dropping"));
+  Destroy(options);
+}
+
+// The truncation summary's counts and its scope over several WALs: a
+// skip-mode tail gap and a WAL-filter stop each warn once, with the tail-gap
+// count and the discarded lower bound, and a clean recovery warns nothing and
+// logs one completion line rather than one per WAL.
+TEST_F(DBWALIndexTest, TruncationSummaryCountsAndCleanCompletion) {
+  const std::string truncated = "Merged WAL recovery truncated";
+  Options options =
+      WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+  uint64_t first_wal = 0;
+  uint64_t second_wal = 0;
+  // Keys 0-3 at indices 1-4 in the first WAL, keys 4-7 at 5-8 in the second.
+  auto write_two_wals = [&]() {
+    options.info_log = nullptr;
+    DestroyAndReopen(options);
+    WriteKeyRange(0, 4);
+    first_wal = LatestWALNumber();
+    Reopen(options);
+    WriteKeyRange(4, 4);
+    second_wal = LatestWALNumber();
+    Close();
+  };
+  std::shared_ptr<RecordingLogger> logger;
+  auto reopen_logged = [&]() {
+    logger = std::make_shared<RecordingLogger>();
+    options.info_log = logger;
+    Reopen(options);
+  };
+
+  options.wal_recovery_mode = WALRecoveryMode::kPointInTimeRecovery;
+  write_two_wals();
+  reopen_logged();
+  EXPECT_EQ(0, logger->count(InfoLogLevel::WARN_LEVEL, truncated));
+  EXPECT_EQ(1,
+            logger->count(InfoLogLevel::INFO_LEVEL, "Recovered merged logs"));
+  EXPECT_TRUE(logger->saw(InfoLogLevel::INFO_LEVEL,
+                          "Recovered merged logs #" +
+                              std::to_string(first_wal) + " to #" +
+                              std::to_string(second_wal) + " next seq #9"));
+  EXPECT_EQ(0, logger->count(InfoLogLevel::INFO_LEVEL, "Recovered to log #"));
+  Close();
+
+  // The first WAL's last record, index 4, is torn.
+  options.wal_recovery_mode = WALRecoveryMode::kSkipAnyCorruptedRecords;
+  write_two_wals();
+  TruncateLastDataRecord(WALPath(first_wal));
+  reopen_logged();
+  EXPECT_EQ(1, logger->count(InfoLogLevel::WARN_LEVEL, truncated));
+  EXPECT_TRUE(logger->saw(InfoLogLevel::WARN_LEVEL,
+                          "1 tail-gap indices from wal_index 4,"));
+  EXPECT_TRUE(
+      logger->saw(InfoLogLevel::WARN_LEVEL, "discarded at least 1 records"));
+  Close();
+
+  // The filter stops at key 6, index 7, which it drops.
+  StopReplayAfterRecordsWalFilter filter(/*stop_after=*/6);
+  options.wal_recovery_mode = WALRecoveryMode::kPointInTimeRecovery;
+  write_two_wals();
+  options.wal_filter = &filter;
+  reopen_logged();
+  options.wal_filter = nullptr;
+  EXPECT_EQ(1, logger->count(InfoLogLevel::WARN_LEVEL, truncated));
+  EXPECT_TRUE(logger->saw(InfoLogLevel::WARN_LEVEL,
+                          "cut at wal_index 7 (0: no cut), 0 tail-gap"));
+  EXPECT_TRUE(logger->saw(InfoLogLevel::WARN_LEVEL,
+                          "superseded WALs: #" + std::to_string(second_wal) +
+                              " from wal_index 7;"));
+  EXPECT_TRUE(
+      logger->saw(InfoLogLevel::WARN_LEVEL, "discarded at least 1 records"));
+  Close();
+  Destroy(options);
+}
+
 // One drive exercising both directions: a burn cover skipped mid-stream and
 // a pristine hole stopping it. Point-in-time opens at the cut; tolerate and
 // absolute fail; skip skips the hole too and opens with every key (GC26 Q4,
@@ -7037,6 +7236,165 @@ TEST_F(DBWALIndexTest, CheckWALIndexFailsWithoutTheOptionsFile) {
         env_->RenameFile(dbname_ + "/hidden_" + file, dbname_ + "/" + file));
   }
   Destroy(none);
+}
+
+// kNone must take the established sequential recovery path directly. Counting
+// the actual WAL open makes an accidentally enabled classification pass add a
+// second open and fail this test.
+TEST_F(DBWALIndexTest, KNoneOpensEachWALOnceDuringRecovery) {
+  Options options = WALIndexOptions(PartitionWALUsage::kNone);
+  DestroyAndReopen(options);
+  WriteKeyRange(0, 4);
+  const uint64_t wal_number = LatestWALNumber();
+  const std::string wal_path = WALPath(wal_number);
+  Close();
+
+  auto counting_fs = std::make_shared<CountingWALOpenFileSystem>(
+      env_->GetFileSystem(), wal_path);
+  std::unique_ptr<Env> counting_env(NewCompositeEnv(counting_fs));
+  options.env = counting_env.get();
+  Reopen(options);
+  EXPECT_EQ(1, counting_fs->open_count());
+  for (int i = 0; i <= 3; ++i) {
+    EXPECT_EQ("value" + std::to_string(i), Get(Key(i))) << "key " << i;
+  }
+  Destroy(options);
+}
+
+// Pins the shape of the classification pass: every live WAL is visited
+// exactly once. A second visit to the same file would make recovery cost
+// super-linear in the WAL count, and would also break the single-pull premise
+// the head-integrity reads depend on. Keyed by WAL number so a repeat visit
+// is distinguishable from an extra file being drawn into the pass.
+//
+// Scope: the hook fires once per loop iteration, so this pins visits, not
+// reads. That one visit pulls exactly one record is a property of the loop
+// body itself, not something this test can observe.
+TEST_F(DBWALIndexTest, PrePassExaminesEachLiveWALOnce) {
+  Options options =
+      WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+  DestroyAndReopen(options);
+  WriteKeyRange(0, 4);
+  const uint64_t wal_number = LatestWALNumber();
+  Close();
+
+  std::map<uint64_t, int> fires;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::CheckWALFilesCarryWALIndex:PerFile",
+      [&](void* arg) { ++fires[*static_cast<uint64_t*>(arg)]; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  Defer cleanup_sync_point([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+
+  Reopen(options);
+
+  ASSERT_EQ(1U, fires.size());
+  EXPECT_EQ(1, fires[wal_number]);
+  for (int i = 0; i <= 3; ++i) {
+    EXPECT_EQ("value" + std::to_string(i), Get(Key(i))) << "key " << i;
+  }
+  Destroy(options);
+}
+
+// Simulate the exact condition the merge-side gate backstops: classification
+// sees an indexed file, but the merge receives an unindexed member. This uses
+// a real DB recovery and must fail before that member can be replayed.
+//
+// Ordering dependency: the swap is driven from the :AfterClassification hook,
+// which fires once every file has been classified but before the merge opens
+// any of them. That window is what makes the substitution invisible to
+// classification and visible only to the merge. If the hook were ever moved
+// inside the classification loop, the pre-pass would see the legacy contents
+// itself and reject them, and this test would still pass -- but it would be
+// exercising the classification path, not the merge backstop it is named for.
+TEST_F(DBWALIndexTest, MergeBackstopRejectsUnindexedWALAfterClassification) {
+  Options none = WALIndexOptions(PartitionWALUsage::kNone);
+  DestroyAndReopen(none);
+  WriteKeyRange(0, 4);
+  const uint64_t legacy_wal = LatestWALNumber();
+  Close();
+  const std::string legacy_contents = ReadWALContents(WALPath(legacy_wal));
+  Destroy(none);
+
+  Options indexed =
+      WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+  DestroyAndReopen(indexed);
+  WriteKeyRange(0, 4);
+  const uint64_t indexed_wal = LatestWALNumber();
+  const std::string indexed_path = WALPath(indexed_wal);
+  Close();
+
+  bool replaced_after_classification = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::CheckWALFilesCarryWALIndex:AfterClassification",
+      [&](void* /*arg*/) {
+        WriteWALContents(indexed_path, legacy_contents);
+        replaced_after_classification = true;
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  Defer cleanup_sync_point([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+
+  const Status status = TryReopen(indexed);
+  ASSERT_TRUE(replaced_after_classification);
+  ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+  EXPECT_NE(std::string::npos,
+            status.ToString().find(std::to_string(indexed_wal)));
+  EXPECT_NE(std::string::npos,
+            status.ToString().find(
+                "an unindexed file cannot be ordered in the merge"));
+  Destroy(indexed);
+}
+
+// A damaged marker-less head with unindexed data is undecidable from the WAL:
+// recovery fails open, but operators need a warning when investigating loss.
+TEST_F(DBWALIndexTest, DamagedUnindexedHeadLogsWarning) {
+  Options none = WALIndexOptions(PartitionWALUsage::kNone);
+  DestroyAndReopen(none);
+  WriteKeyRange(0, 4);
+  const uint64_t wal_number = LatestWALNumber();
+  const std::string wal_path = WALPath(wal_number);
+  Close();
+
+  std::string contents = ReadWALContents(wal_path);
+  const std::vector<PhysicalRecord> records = ScanPhysicalRecords(contents);
+  const auto first_data = std::find_if(
+      records.begin(), records.end(), [](const PhysicalRecord& record) {
+        return record.type == log::kFullType ||
+               record.type == log::kRecyclableFullType;
+      });
+  ASSERT_NE(records.end(), first_data);
+  contents[first_data->header_offset + 6] = static_cast<char>(50);
+  FixRecordChecksum(*first_data, &contents);
+  WriteWALContents(wal_path, contents);
+
+  auto logger = std::make_shared<RecordingLogger>();
+  Options indexed =
+      WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+  indexed.wal_recovery_mode = WALRecoveryMode::kSkipAnyCorruptedRecords;
+  indexed.info_log = logger;
+  Reopen(indexed);
+
+  const std::string undecidable =
+      "cannot distinguish a pre-option WAL from a lost marker";
+  EXPECT_EQ(1, logger->count(InfoLogLevel::WARN_LEVEL, undecidable));
+  EXPECT_EQ(0, logger->count(InfoLogLevel::INFO_LEVEL, undecidable));
+  EXPECT_TRUE(
+      logger->saw(InfoLogLevel::WARN_LEVEL, std::to_string(wal_number)));
+  // The warning only matters if the file actually took the path it warns
+  // about, so pin the routing decision itself rather than trusting that the
+  // warning implies it.
+  EXPECT_TRUE(
+      logger->saw(InfoLogLevel::INFO_LEVEL, "Recovering WALs sequentially"));
+  EXPECT_EQ("NOT_FOUND", Get(Key(0)));
+  for (int i = 1; i <= 3; ++i) {
+    EXPECT_EQ("value" + std::to_string(i), Get(Key(i))) << "key " << i;
+  }
+  Destroy(indexed);
 }
 
 // A marker prepended to a legacy WAL promises indices the file never
