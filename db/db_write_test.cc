@@ -2464,14 +2464,17 @@ class DBWritePartitionTest : public DBTestBase,
   std::vector<port::Thread> FillAndSwitchMemtable(
       int cf, const std::function<bool()>& switching) {
     std::vector<port::Thread> puts;
+    const size_t parked_before = dbfull()->TEST_WalDurabilityWaiters();
     puts.emplace_back([this, cf] {
       ASSERT_OK(DisableWalPut(cf, "fill", std::string(128 << 10, 'x')));
     });
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(30);
     for (int i = 0; i < 3; ++i) {
-      // Gives the last put time to insert and park in its completion gate.
-      const auto deadline =
-          std::chrono::steady_clock::now() + std::chrono::seconds(1);
-      while (!switching() && std::chrono::steady_clock::now() < deadline) {
+      while (!switching() &&
+             dbfull()->TEST_WalDurabilityWaiters() <
+                 parked_before + puts.size() &&
+             std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
       }
       if (switching()) {
@@ -2555,6 +2558,21 @@ class DBWritePartitionTest : public DBTestBase,
     SyncPoint::GetInstance()->ClearCallBack(
         "DBImpl::WriteToWAL:AfterAddRecord");
     return max_in_append;
+  }
+
+  // Waits until exactly `expected` groups park in their completion
+  // gates. Returns false on timeout instead of failing, so callers can
+  // ASSERT_TRUE it next to the injection the parked state gates.
+  bool WaitForDurabilityWaiters(size_t expected) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (dbfull()->TEST_WalDurabilityWaiters() != expected) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        return false;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return true;
   }
 
   // Options for tests that reopen with N > 1: only indexed WALs recover as
@@ -3445,6 +3463,66 @@ TEST_P(DBWritePartitionTest, LeadershipSyncFinishesMarksPastHorizon) {
   ASSERT_OK(db_->SyncWAL());
 }
 
+TEST_P(DBWritePartitionTest, DurabilityWaitAndCompletionHistograms) {
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS("single-queue path only");
+    return;
+  }
+  constexpr size_t kPartitions = 2;
+  constexpr uint64_t kHeldMicros = 20000;
+  Options options = CurrentOptions();
+  options.statistics = CreateDBStatistics();
+  options.avoid_flush_during_shutdown = true;
+  OpenWithPartitions(kPartitions, options);
+  ASSERT_OK(options.statistics->Reset());
+
+  // A's append is held; B appends behind it on the other partition and
+  // parks in its gate until A is released at least kHeldMicros later.
+  std::mutex mu;
+  std::condition_variable cv;
+  bool first_append = true;
+  bool a_in_append = false;
+  bool release_a = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WriteToWAL:log_entry", [&](void*) {
+        std::unique_lock<std::mutex> lock(mu);
+        if (first_append) {
+          first_append = false;
+          a_in_append = true;
+          cv.notify_all();
+          cv.wait(lock, [&] { return release_a; });
+        }
+      });
+  port::Thread a_thread(
+      [&] { ASSERT_OK(Put(cf_for_partition_[0], "key_a", "value_a")); });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    cv.wait(lock, [&] { return a_in_append; });
+  }
+  port::Thread b_thread(
+      [&] { ASSERT_OK(Put(cf_for_partition_[1], "key_b", "value_b")); });
+  EXPECT_TRUE(WaitForDurabilityWaiters(1));
+  env_->SleepForMicroseconds(static_cast<int>(kHeldMicros));
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    release_a = true;
+    cv.notify_all();
+  }
+  a_thread.join();
+  b_thread.join();
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:log_entry");
+
+  HistogramData wait;
+  options.statistics->histogramData(WAL_DURABILITY_WAIT_MICROS, &wait);
+  EXPECT_GE(wait.count, 1U);
+  EXPECT_GE(wait.max, static_cast<double>(kHeldMicros));
+  HistogramData completion;
+  options.statistics->histogramData(WAL_PARTITION_COMPLETION_MICROS,
+                                    &completion);
+  EXPECT_EQ(2U, completion.count);
+  EXPECT_GE(completion.max, static_cast<double>(kHeldMicros));
+}
+
 TEST_P(DBWritePartitionTest, SyncFanoutAndMutexHistograms) {
   if (GetParam()) {
     ROCKSDB_GTEST_BYPASS("single-queue path only");
@@ -3552,6 +3630,84 @@ TEST_P(DBWritePartitionTest, ImportStallHistogram) {
   std::string value;
   ASSERT_OK(db_->Get(ReadOptions(), imported, "key", &value));
   ASSERT_EQ("value", value);
+}
+
+TEST_P(DBWritePartitionTest, DisableWalWritesWaitOnlyForLowerRanges) {
+  // Sequences that never produce a WAL record never wait for durability, but
+  // are published only above an applied prefix. With nothing in flight below
+  // it, a disableWAL write is visible as soon as it returns; above a held WAL
+  // write it parks until that write is released.
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS(
+        "N > 1 needs indexed WALs, which two_write_queues "
+        "rejects");
+    return;
+  }
+  constexpr size_t kPartitions = 2;
+  Options options = CurrentOptions();
+  options.avoid_flush_during_shutdown = true;
+  OpenWithPartitions(kPartitions, options);
+  const int cf_a = cf_for_partition_[0];
+  const int cf_b = cf_for_partition_[1];
+  WriteOptions no_wal;
+  no_wal.disableWAL = true;
+
+  // Idle: a naive min with the durability safe point (the highest durable
+  // sequence when every partition is idle) would hide this write.
+  ASSERT_OK(Put(cf_a, "key_wal", "value_wal"));
+  const SequenceNumber before_idle = db_->GetLatestSequenceNumber();
+  ASSERT_OK(Put(cf_b, "key_idle", "value_idle", no_wal));
+  EXPECT_EQ(before_idle + 1, db_->GetLatestSequenceNumber());
+  ASSERT_EQ("value_idle", Get(cf_b, "key_idle"));
+
+  std::mutex mu;
+  std::condition_variable cv;
+  bool first_append = true;
+  bool a_in_append = false;
+  bool release_a = false;
+  std::atomic<bool> b_returned{false};
+  Status b_status;
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WriteToWAL:log_entry", [&](void*) {
+        std::unique_lock<std::mutex> lock(mu);
+        if (first_append) {
+          first_append = false;
+          a_in_append = true;
+          cv.notify_all();
+          cv.wait(lock, [&] { return release_a; });
+        }
+      });
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  port::Thread a_thread([&] { ASSERT_OK(Put(cf_a, "key_a", "value_a")); });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    EXPECT_TRUE(cv.wait_until(lock, deadline, [&] { return a_in_append; }));
+  }
+  const SequenceNumber before_held = db_->GetLatestSequenceNumber();
+  port::Thread b_thread([&] {
+    b_status = Put(cf_b, "key_nowal", "value_nowal", no_wal);
+    b_returned.store(true);
+  });
+  // Inserted but parked behind A, and not visible while A is held.
+  EXPECT_TRUE(WaitForDurabilityWaiters(1));
+  EXPECT_FALSE(b_returned.load());
+  EXPECT_EQ(before_held, db_->GetLatestSequenceNumber());
+  EXPECT_EQ("NOT_FOUND", Get(cf_b, "key_nowal"));
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    release_a = true;
+    cv.notify_all();
+  }
+  a_thread.join();
+  b_thread.join();
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:log_entry");
+
+  ASSERT_OK(b_status);
+  ASSERT_EQ("value_nowal", Get(cf_b, "key_nowal"));
+  ASSERT_EQ("value_a", Get(cf_a, "key_a"));
 }
 
 TEST_P(DBWritePartitionTest, BackgroundErrorFailsWaitingWrite) {
@@ -3938,6 +4094,1338 @@ TEST_P(DBWritePartitionTest, N2WritePathTakesPartitionLocks) {
       "DBImpl::SyncWalImpl:TakesSyncMarkMutex");
 }
 
+TEST_P(DBWritePartitionTest, SlowPartitionParksInGateWithoutError) {
+  // R3 neuter: a slow partition parks the waiter in its completion gate
+  // without any error. B appends on partition 1 while A is held open on
+  // partition 0: B must reach the parked state (one waiter), stay blocked
+  // over a bounded observation interval, and complete OK once A lands.
+  // (CompletionWaitsForPriorPartitionAppend proves the same wait without
+  // observing the parked state; this one pins the mechanism.)
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS(
+        "N > 1 needs indexed WALs, which two_write_queues "
+        "rejects");
+    return;
+  }
+  constexpr size_t kPartitions = 2;
+  Options options = CurrentOptions();
+  options.avoid_flush_during_shutdown = true;
+  OpenWithPartitions(kPartitions, options);
+  const int cf_a = cf_for_partition_[0];
+  const int cf_b = cf_for_partition_[1];
+
+  std::mutex mu;
+  std::condition_variable cv;
+  bool first_append = true;
+  bool a_in_append = false;
+  bool release_a = false;
+  bool b_appended = false;
+  std::atomic<bool> b_returned{false};
+  Status b_status;
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WriteToWAL:log_entry", [&](void*) {
+        std::unique_lock<std::mutex> lock(mu);
+        if (first_append) {
+          first_append = false;
+          a_in_append = true;
+          cv.notify_all();
+          cv.wait(lock, [&] { return release_a; });
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack("DBImpl::WriteToWAL:AfterAddRecord",
+                                        [&](void*) {
+                                          std::lock_guard<std::mutex> lock(mu);
+                                          if (!release_a) {
+                                            b_appended = true;
+                                            cv.notify_all();
+                                          }
+                                        });
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  port::Thread a_thread([&] { ASSERT_OK(Put(cf_a, "key_a", "value_a")); });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    EXPECT_TRUE(cv.wait_until(lock, deadline, [&] { return a_in_append; }));
+  }
+  port::Thread b_thread([&] {
+    b_status = Put(cf_b, "key_b", "value_b");
+    b_returned.store(true);
+  });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    EXPECT_TRUE(cv.wait_until(lock, deadline, [&] { return b_appended; }));
+  }
+  // B's append landed while A was held: B must now be parked in its gate,
+  // with no background error anywhere.
+  EXPECT_TRUE(WaitForDurabilityWaiters(1));
+  EXPECT_TRUE(dbfull()->TEST_GetBGError().ok());
+  EXPECT_FALSE(dbfull()->TEST_WalDurabilityBGError());
+  // Bounded observation only: B must still be blocked, by policy, not by
+  // error. (Correctness never depends on this interval.)
+  const auto return_deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+  while (!b_returned.load() &&
+         std::chrono::steady_clock::now() < return_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  EXPECT_FALSE(b_returned.load());
+  EXPECT_EQ(1U, dbfull()->TEST_WalDurabilityWaiters());
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    release_a = true;
+    cv.notify_all();
+  }
+  a_thread.join();
+  b_thread.join();
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:log_entry");
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:AfterAddRecord");
+
+  ASSERT_OK(b_status);
+  EXPECT_EQ(0U, dbfull()->TEST_WalDurabilityWaiters());
+  ASSERT_EQ("value_a", Get(cf_a, "key_a"));
+  ASSERT_EQ("value_b", Get(cf_b, "key_b"));
+}
+
+TEST_P(DBWritePartitionTest, BackgroundErrorWakesParkedGateWithFollowers) {
+  // R1/R2/R6: a real WAL I/O failure on partition 0 fails every group
+  // parked behind it, leader and followers alike. A is held open; B1 and
+  // B2 are forced into one group on partition 1 and park in its gate (one
+  // waiter); A's append then fails. A returns promptly without ever
+  // waiting; B1 and B2 wake promptly with the background error. The DB
+  // enters the same read-only state as a single-WAL failure, the failed
+  // append ran exactly once on its own partition, and no acknowledged
+  // sequence lies above the failed hole.
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS(
+        "N > 1 needs indexed WALs, which two_write_queues "
+        "rejects");
+    return;
+  }
+  constexpr size_t kPartitions = 2;
+  Options options = CurrentOptions();
+  options.avoid_flush_during_shutdown = true;
+  options.paranoid_checks = true;
+  OpenWithPartitions(kPartitions, options);
+  const int cf_a = cf_for_partition_[0];
+  const int cf_b = cf_for_partition_[1];
+
+  std::mutex mu;
+  std::condition_variable cv;
+  bool first_append = true;
+  bool a_in_append = false;
+  bool release_a = false;
+  bool fail_a_append = false;
+  bool b1_in_wait = false;
+  bool b2_linked = false;
+  std::atomic<bool> b1_returned{false};
+  std::atomic<bool> b2_returned{false};
+  Status a_status;
+  Status b1_status;
+  Status b2_status;
+  std::atomic<int> gate_installs{0};
+  std::atomic<int> bg_error_wakes{0};
+  std::atomic<int> resume_syncs{0};
+  std::atomic<int> resume_fences{0};
+  std::vector<DBImpl::WalAppendOutcome> append_outcomes;
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WriteToWAL:log_entry", [&](void*) {
+        std::unique_lock<std::mutex> lock(mu);
+        if (first_append) {
+          first_append = false;
+          a_in_append = true;
+          cv.notify_all();
+          cv.wait(lock, [&] { return release_a; });
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WriteToWAL:AfterAddRecord", [&](void* arg) {
+        std::lock_guard<std::mutex> lock(mu);
+        if (fail_a_append) {
+          fail_a_append = false;
+          *static_cast<IOStatus*>(arg) =
+              IOStatus::IOError("injected WAL append error");
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WriteToWAL:AppendOutcome", [&](void* arg) {
+        std::lock_guard<std::mutex> lock(mu);
+        append_outcomes.push_back(*static_cast<DBImpl::WalAppendOutcome*>(arg));
+      });
+  // Force B1 and B2 into one group: B1 (partition 1's leader) waits here
+  // until B2 has linked behind it, so group formation observes both.
+  const size_t b_partition = 1;
+  SyncPoint::GetInstance()->SetCallBack(
+      "WriteThread::JoinBatchGroup:Wait", [&](void* arg) {
+        auto* w = static_cast<WriteThread::Writer*>(arg);
+        if (w->wal_partition != b_partition) {
+          return;
+        }
+        std::unique_lock<std::mutex> lock(mu);
+        if (!b1_in_wait) {
+          b1_in_wait = true;
+          cv.notify_all();
+          cv.wait(lock, [&] { return b2_linked; });
+        } else {
+          b2_linked = true;
+          cv.notify_all();
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack("DBImpl::InstallCompletionGate",
+                                        [&](void*) { ++gate_installs; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SignalWalDurabilityWaitersOnBGError",
+      [&](void*) { ++bg_error_wakes; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::ResumeImpl:SyncLastSequenceWithAllocated",
+      [&](void*) { ++resume_syncs; });
+  SyncPoint::GetInstance()->SetCallBack("DBImpl::ResumeImpl:AfterSyncSeq",
+                                        [&](void*) { ++resume_fences; });
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  port::Thread a_thread([&] { a_status = Put(cf_a, "key_a", "value_a"); });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    EXPECT_TRUE(cv.wait_until(lock, deadline, [&] { return a_in_append; }));
+  }
+  port::Thread b1_thread([&] {
+    b1_status = Put(cf_b, "key_b1", "value_b1");
+    b1_returned.store(true);
+  });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    EXPECT_TRUE(cv.wait_until(lock, deadline, [&] { return b1_in_wait; }));
+  }
+  port::Thread b2_thread([&] {
+    b2_status = Put(cf_b, "key_b2", "value_b2");
+    b2_returned.store(true);
+  });
+  // One group, one waiter: both B writes park behind the same gate.
+  EXPECT_TRUE(WaitForDurabilityWaiters(1));
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    fail_a_append = true;
+    release_a = true;
+    cv.notify_all();
+  }
+  a_thread.join();
+  b1_thread.join();
+  b2_thread.join();
+
+  EXPECT_TRUE(b1_returned.load());
+  EXPECT_TRUE(b2_returned.load());
+  ASSERT_NOK(a_status);
+  EXPECT_TRUE(a_status.IsIOError());
+  ASSERT_NOK(b1_status);
+  ASSERT_NOK(b2_status);
+  EXPECT_TRUE(b1_status.IsIOError());
+  EXPECT_TRUE(b2_status.IsIOError());
+  // Three writes, one gate install: B1 and B2 shared a group, so one of
+  // the two failing statuses belongs to a follower.
+  EXPECT_EQ(1, gate_installs.load());
+  // Direct notification fired; nothing was left to the poll.
+  EXPECT_EQ(1, bg_error_wakes.load());
+  EXPECT_EQ(0U, dbfull()->TEST_WalDurabilityWaiters());
+  // Same background error and read-only state as a single-WAL failure: a
+  // later write fails fast with the published error.
+  Status bg_error = dbfull()->TEST_GetBGError();
+  EXPECT_FALSE(bg_error.ok());
+  EXPECT_TRUE(bg_error.IsIOError());
+  Status read_only_status = Put(cf_b, "key_after", "value_after");
+  EXPECT_FALSE(read_only_status.ok());
+  EXPECT_TRUE(read_only_status.IsIOError());
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    // Each write attempted its append exactly once, on its own partition:
+    // A on 0 (failed), the B group on 1 (landed but never acknowledged).
+    ASSERT_EQ(2U, append_outcomes.size());
+    const DBImpl::WalAppendOutcome* a_outcome = nullptr;
+    const DBImpl::WalAppendOutcome* b_outcome = nullptr;
+    const size_t a_partition = 0;
+    for (const auto& outcome : append_outcomes) {
+      if (outcome.wal_partition == a_partition) {
+        a_outcome = &outcome;
+      } else {
+        b_outcome = &outcome;
+      }
+    }
+    ASSERT_NE(nullptr, a_outcome);
+    ASSERT_NE(nullptr, b_outcome);
+    EXPECT_FALSE(a_outcome->ok);
+    EXPECT_EQ(1U, a_outcome->sequence_count);
+    EXPECT_TRUE(b_outcome->ok);
+    EXPECT_EQ(2U, b_outcome->sequence_count);
+    EXPECT_LT(a_outcome->first_sequence, b_outcome->first_sequence);
+  }
+
+  // Reconciliation still uses the existing path exactly once per Resume:
+  // the two-queues Resume fence runs it, the standard path never needs it.
+  dbfull()->Resume().PermitUncheckedError();
+  EXPECT_EQ(1, resume_fences.load());
+  EXPECT_EQ(GetParam() ? 1 : 0, resume_syncs.load());
+
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:log_entry");
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:AfterAddRecord");
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:AppendOutcome");
+  SyncPoint::GetInstance()->ClearCallBack("WriteThread::JoinBatchGroup:Wait");
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::InstallCompletionGate");
+  SyncPoint::GetInstance()->ClearCallBack(
+      "DBImpl::SignalWalDurabilityWaitersOnBGError");
+  SyncPoint::GetInstance()->ClearCallBack(
+      "DBImpl::ResumeImpl:SyncLastSequenceWithAllocated");
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::ResumeImpl:AfterSyncSeq");
+}
+
+TEST_P(DBWritePartitionTest, GatePostWaitSyncFailureWakesParkedGate) {
+  // M2.7 (second half of R2): the completion gate's own post-wait sync
+  // establishes the same background error as a leadership sync failure and
+  // wakes every other parked gate. A (async, partition 0) is held open; B
+  // (sync, partition 1) appends and parks; M (async, partition 2)
+  // allocates then holds its append open; W (async, partition 0) appends
+  // after A is released and parks behind M's still-open range. Releasing
+  // A lets B reach its post-wait sync, which fails: W wakes and, being above
+  // B's failed range, fails with the background error while M is still held
+  // (D-9; at GC24, before D-9, it parked again as D-N71 (b) had it). M's
+  // append then fails too.
+  // Neuter: no fence for a failed sync (FailUnpublishedSyncRange always
+  // publishing the range as a hole): W is not failed while M is held.
+  // Standard path only (as in PostWaitSyncErrorFailsSyncWrite): with two
+  // write queues the leadership sync itself goes through SyncWAL, so the
+  // failure cannot be aimed at the post-wait sync alone.
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS("N > 1 rejects two_write_queues");
+    return;
+  }
+  constexpr size_t kPartitions = 3;
+  Options options = CurrentOptions();
+  options.avoid_flush_during_shutdown = true;
+  options.paranoid_checks = true;
+  OpenWithPartitions(kPartitions, options);
+  const int cf_a = cf_for_partition_[0];
+  const int cf_b = cf_for_partition_[1];
+  const int cf_m = cf_for_partition_[2];
+
+  std::mutex mu;
+  std::condition_variable cv;
+  bool first_append = true;
+  bool a_in_append = false;
+  bool release_a = false;
+  bool m_in_append = false;
+  bool release_m = false;
+  bool fail_m_append = false;
+  bool b_appended = false;
+  std::atomic<bool> w_returned{false};
+  std::atomic<bool> m_returned{false};
+  Status a_status;
+  Status b_status;
+  Status w_status;
+  Status m_status;
+  std::atomic<int> gate_installs{0};
+  std::atomic<int> bg_error_wakes{0};
+  std::atomic<int> resume_syncs{0};
+  std::atomic<int> resume_fences{0};
+  std::atomic<int> sync_wal_begins{0};
+  std::vector<DBImpl::WalAppendOutcome> append_outcomes;
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WriteToWAL:log_entry", [&](void* arg) {
+        std::unique_lock<std::mutex> lock(mu);
+        if (first_append) {
+          first_append = false;
+          a_in_append = true;
+          cv.notify_all();
+          cv.wait(lock, [&] { return release_a; });
+        } else if (static_cast<Slice*>(arg)->ends_with("value_m")) {
+          m_in_append = true;
+          cv.notify_all();
+          cv.wait(lock, [&] { return release_m; });
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WriteToWAL:AfterAddRecord", [&](void* arg) {
+        std::lock_guard<std::mutex> lock(mu);
+        if (!release_a && !m_in_append) {
+          b_appended = true;
+          cv.notify_all();
+        }
+        if (fail_m_append) {
+          fail_m_append = false;
+          *static_cast<IOStatus*>(arg) =
+              IOStatus::IOError("injected WAL append error");
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WriteToWAL:AppendOutcome", [&](void* arg) {
+        std::lock_guard<std::mutex> lock(mu);
+        append_outcomes.push_back(*static_cast<DBImpl::WalAppendOutcome*>(arg));
+      });
+  SyncPoint::GetInstance()->SetCallBack("DBImpl::InstallCompletionGate",
+                                        [&](void*) {
+                                          ++gate_installs;
+                                          std::lock_guard<std::mutex> lock(mu);
+                                          cv.notify_all();
+                                        });
+  // No leadership-time SyncWAL exists on this path, so the only SyncWAL is
+  // B's post-wait one. Hold it until W installed its gate and parked, so
+  // W is provably parked when B's sync fails.
+  SyncPoint::GetInstance()->SetCallBack("DBImpl::SyncWAL:Begin", [&](void*) {
+    ++sync_wal_begins;
+    {
+      std::unique_lock<std::mutex> lock(mu);
+      cv.wait_until(lock, deadline, [&] { return gate_installs.load() >= 3; });
+    }
+    const auto park_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (dbfull()->TEST_WalDurabilityWaiters() != 1 &&
+           std::chrono::steady_clock::now() < park_deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SyncWalImpl:AfterSyncWAL", [&](void* arg) {
+        auto* wal_and_status =
+            static_cast<std::pair<log::Writer*, IOStatus*>*>(arg);
+        *wal_and_status->second = IOStatus::IOError("injected sync error");
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SignalWalDurabilityWaitersOnBGError",
+      [&](void*) { ++bg_error_wakes; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::ResumeImpl:SyncLastSequenceWithAllocated",
+      [&](void*) { ++resume_syncs; });
+  SyncPoint::GetInstance()->SetCallBack("DBImpl::ResumeImpl:AfterSyncSeq",
+                                        [&](void*) { ++resume_fences; });
+  std::atomic<std::thread::id> w_thread_id{std::thread::id()};
+  std::atomic<int> w_parks{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WaitForWalDurability:BeforePark", [&](void*) {
+        if (std::this_thread::get_id() == w_thread_id.load()) {
+          ++w_parks;
+        }
+      });
+
+  WriteOptions sync_wo;
+  sync_wo.sync = true;
+  port::Thread a_thread([&] { a_status = Put(cf_a, "key_a", "value_a"); });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    EXPECT_TRUE(cv.wait_until(lock, deadline, [&] { return a_in_append; }));
+  }
+  port::Thread b_thread(
+      [&] { b_status = Put(cf_b, "key_b", "value_b", sync_wo); });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    EXPECT_TRUE(cv.wait_until(lock, deadline, [&] { return b_appended; }));
+  }
+  EXPECT_TRUE(WaitForDurabilityWaiters(1));
+  port::Thread m_thread([&] {
+    m_status = Put(cf_m, "key_m", "value_m");
+    m_returned.store(true);
+  });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    EXPECT_TRUE(cv.wait_until(lock, deadline, [&] { return m_in_append; }));
+  }
+  // W shares partition 0 with A, so it queues behind A and appends only
+  // after A is released, allocating after M.
+  port::Thread w_thread([&] {
+    w_thread_id.store(std::this_thread::get_id());
+    w_status = Put(cf_a, "key_w", "value_w");
+    w_returned.store(true);
+  });
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    release_a = true;
+    cv.notify_all();
+  }
+  // B's sync failure wakes W, which fails without parking again while M is
+  // held.
+  const auto w_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while ((bg_error_wakes.load() < 1 || !w_returned.load()) &&
+         std::chrono::steady_clock::now() < w_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  b_thread.join();
+  EXPECT_EQ(1, bg_error_wakes.load());
+  EXPECT_GE(w_parks.load(), 1);
+  EXPECT_EQ(0U, dbfull()->TEST_WalDurabilityWaiters());
+  EXPECT_TRUE(w_returned.load());
+  EXPECT_FALSE(m_returned.load());
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    fail_m_append = true;
+    release_m = true;
+    cv.notify_all();
+  }
+  a_thread.join();
+  w_thread.join();
+  m_thread.join();
+
+  ASSERT_OK(a_status);
+  ASSERT_NOK(b_status);
+  EXPECT_TRUE(b_status.IsIOError());
+  ASSERT_NOK(w_status);
+  EXPECT_TRUE(w_status.IsIOError());
+  ASSERT_NOK(m_status);
+  EXPECT_TRUE(m_status.IsIOError());
+  // A, B, and W installed gates; M's append failed, so it installed none.
+  EXPECT_EQ(3, gate_installs.load());
+  // Exactly one SyncWAL ran: B's post-wait one. One notification per
+  // failure: B's post-wait sync (classified inside SyncWalImpl), then M's
+  // append.
+  EXPECT_EQ(1, sync_wal_begins.load());
+  EXPECT_EQ(2, bg_error_wakes.load());
+  EXPECT_EQ(0U, dbfull()->TEST_WalDurabilityWaiters());
+  Status bg_error = dbfull()->TEST_GetBGError();
+  EXPECT_FALSE(bg_error.ok());
+  EXPECT_TRUE(bg_error.IsIOError());
+  Status read_only_status = Put(cf_b, "key_after", "value_after");
+  EXPECT_FALSE(read_only_status.ok());
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    ASSERT_EQ(4U, append_outcomes.size());
+    const DBImpl::WalAppendOutcome* a_outcome = nullptr;
+    const DBImpl::WalAppendOutcome* b_outcome = nullptr;
+    const DBImpl::WalAppendOutcome* m_outcome = nullptr;
+    const DBImpl::WalAppendOutcome* w_outcome = nullptr;
+    const size_t p1 = 1;
+    const size_t p2 = 2;
+    for (const auto& outcome : append_outcomes) {
+      if (outcome.wal_partition == p1) {
+        b_outcome = &outcome;
+      } else if (outcome.wal_partition == p2) {
+        m_outcome = &outcome;
+      } else if (a_outcome == nullptr ||
+                 outcome.first_sequence < a_outcome->first_sequence) {
+        // Partition 0 holds A and W; A allocated first.
+        w_outcome = a_outcome;
+        a_outcome = &outcome;
+      } else {
+        w_outcome = &outcome;
+      }
+    }
+    ASSERT_NE(nullptr, a_outcome);
+    ASSERT_NE(nullptr, b_outcome);
+    ASSERT_NE(nullptr, m_outcome);
+    ASSERT_NE(nullptr, w_outcome);
+    EXPECT_TRUE(a_outcome->ok);
+    EXPECT_TRUE(b_outcome->ok);
+    EXPECT_TRUE(w_outcome->ok);
+    EXPECT_FALSE(m_outcome->ok);
+    EXPECT_EQ(1U, a_outcome->sequence_count);
+    EXPECT_EQ(1U, b_outcome->sequence_count);
+    EXPECT_EQ(1U, m_outcome->sequence_count);
+    EXPECT_EQ(1U, w_outcome->sequence_count);
+    EXPECT_LT(a_outcome->first_sequence, b_outcome->first_sequence);
+    EXPECT_LT(b_outcome->first_sequence, m_outcome->first_sequence);
+    EXPECT_LT(m_outcome->first_sequence, w_outcome->first_sequence);
+  }
+
+  dbfull()->Resume().PermitUncheckedError();
+  EXPECT_EQ(1, resume_fences.load());
+  EXPECT_EQ(0, resume_syncs.load());
+
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:log_entry");
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:AfterAddRecord");
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:AppendOutcome");
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::InstallCompletionGate");
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::SyncWAL:Begin");
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::SyncWalImpl:AfterSyncWAL");
+  SyncPoint::GetInstance()->ClearCallBack(
+      "DBImpl::SignalWalDurabilityWaitersOnBGError");
+  SyncPoint::GetInstance()->ClearCallBack(
+      "DBImpl::ResumeImpl:SyncLastSequenceWithAllocated");
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::ResumeImpl:AfterSyncSeq");
+  SyncPoint::GetInstance()->ClearCallBack(
+      "DBImpl::WaitForWalDurability:BeforePark");
+}
+
+TEST_P(DBWritePartitionTest, DurabilityWaitErrorBeforeAdvanceFailsWaiter) {
+  // Invariant 4, error-first order: W parks behind held A and held F; F's
+  // append, below W, fails while A is still held. W must wake promptly with
+  // the error rather than waiting for A, with no lost wake and no leaked
+  // waiter-count. A, released afterwards, still completes OK: its own
+  // range is below F's, and coverage never depended on the error.
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS(
+        "N > 1 needs indexed WALs, which two_write_queues "
+        "rejects");
+    return;
+  }
+  constexpr size_t kPartitions = 3;
+  Options options = CurrentOptions();
+  options.avoid_flush_during_shutdown = true;
+  options.paranoid_checks = true;
+  OpenWithPartitions(kPartitions, options);
+  const int cf_a = cf_for_partition_[0];
+  const int cf_w = cf_for_partition_[1];
+  const int cf_f = cf_for_partition_[2];
+
+  std::mutex mu;
+  std::condition_variable cv;
+  int appends = 0;
+  bool a_in_append = false;
+  bool f_in_append = false;
+  bool release_a = false;
+  bool release_f = false;
+  bool fail_next_append = false;
+  bool w_appended = false;
+  std::atomic<bool> w_returned{false};
+  Status a_status;
+  Status f_status;
+  Status w_status;
+  std::atomic<int> bg_error_wakes{0};
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WriteToWAL:log_entry", [&](void*) {
+        std::unique_lock<std::mutex> lock(mu);
+        const int append = appends++;
+        if (append == 0) {
+          a_in_append = true;
+          cv.notify_all();
+          cv.wait(lock, [&] { return release_a; });
+        } else if (append == 1) {
+          f_in_append = true;
+          cv.notify_all();
+          cv.wait(lock, [&] { return release_f; });
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WriteToWAL:AfterAddRecord", [&](void* arg) {
+        std::lock_guard<std::mutex> lock(mu);
+        if (fail_next_append) {
+          fail_next_append = false;
+          *static_cast<IOStatus*>(arg) =
+              IOStatus::IOError("injected WAL append error");
+        } else if (!release_f) {
+          w_appended = true;
+          cv.notify_all();
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SignalWalDurabilityWaitersOnBGError",
+      [&](void*) { ++bg_error_wakes; });
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  port::Thread a_thread([&] { a_status = Put(cf_a, "key_a", "value_a"); });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    EXPECT_TRUE(cv.wait_until(lock, deadline, [&] { return a_in_append; }));
+  }
+  port::Thread f_thread([&] { f_status = Put(cf_f, "key_f", "value_f"); });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    EXPECT_TRUE(cv.wait_until(lock, deadline, [&] { return f_in_append; }));
+  }
+  port::Thread w_thread([&] {
+    w_status = Put(cf_w, "key_w", "value_w");
+    w_returned.store(true);
+  });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    EXPECT_TRUE(cv.wait_until(lock, deadline, [&] { return w_appended; }));
+  }
+  EXPECT_TRUE(WaitForDurabilityWaiters(1));
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    fail_next_append = true;
+    release_f = true;
+    cv.notify_all();
+  }
+  f_thread.join();
+  const auto w_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while (!w_returned.load() && std::chrono::steady_clock::now() < w_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_TRUE(w_returned.load());
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    release_a = true;
+    cv.notify_all();
+  }
+  a_thread.join();
+  w_thread.join();
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:log_entry");
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:AfterAddRecord");
+  SyncPoint::GetInstance()->ClearCallBack(
+      "DBImpl::SignalWalDurabilityWaitersOnBGError");
+
+  ASSERT_NOK(f_status);
+  ASSERT_NOK(w_status);
+  EXPECT_TRUE(w_status.IsIOError());
+  EXPECT_EQ(dbfull()->TEST_GetBGError().ToString(), w_status.ToString());
+  ASSERT_OK(a_status);
+  EXPECT_EQ(1, bg_error_wakes.load());
+  EXPECT_TRUE(dbfull()->TEST_WalDurabilityBGError());
+  EXPECT_EQ(0U, dbfull()->TEST_WalDurabilityWaiters());
+  dbfull()->Resume().PermitUncheckedError();
+}
+
+TEST_P(DBWritePartitionTest, DurabilityWaitAdvanceBeforeErrorCompletesWaiter) {
+  // Invariant 4, advance-first order: W parks behind held A; A lands and
+  // both complete OK. Publishing a background error afterwards, with no
+  // waiters, must be safe and set the predicate flag for future waiters.
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS(
+        "N > 1 needs indexed WALs, which two_write_queues "
+        "rejects");
+    return;
+  }
+  constexpr size_t kPartitions = 2;
+  Options options = CurrentOptions();
+  options.avoid_flush_during_shutdown = true;
+  options.paranoid_checks = true;
+  OpenWithPartitions(kPartitions, options);
+  const int cf_a = cf_for_partition_[0];
+  const int cf_w = cf_for_partition_[1];
+
+  std::mutex mu;
+  std::condition_variable cv;
+  bool first_append = true;
+  bool a_in_append = false;
+  bool release_a = false;
+  bool w_appended = false;
+  std::atomic<bool> w_returned{false};
+  Status a_status;
+  Status w_status;
+  std::atomic<int> bg_error_wakes{0};
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WriteToWAL:log_entry", [&](void*) {
+        std::unique_lock<std::mutex> lock(mu);
+        if (first_append) {
+          first_append = false;
+          a_in_append = true;
+          cv.notify_all();
+          cv.wait(lock, [&] { return release_a; });
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack("DBImpl::WriteToWAL:AfterAddRecord",
+                                        [&](void*) {
+                                          std::lock_guard<std::mutex> lock(mu);
+                                          if (!release_a) {
+                                            w_appended = true;
+                                            cv.notify_all();
+                                          }
+                                        });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SignalWalDurabilityWaitersOnBGError",
+      [&](void*) { ++bg_error_wakes; });
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  port::Thread a_thread([&] { a_status = Put(cf_a, "key_a", "value_a"); });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    EXPECT_TRUE(cv.wait_until(lock, deadline, [&] { return a_in_append; }));
+  }
+  port::Thread w_thread([&] {
+    w_status = Put(cf_w, "key_w", "value_w");
+    w_returned.store(true);
+  });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    EXPECT_TRUE(cv.wait_until(lock, deadline, [&] { return w_appended; }));
+  }
+  EXPECT_TRUE(WaitForDurabilityWaiters(1));
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    release_a = true;
+    cv.notify_all();
+  }
+  a_thread.join();
+  w_thread.join();
+
+  ASSERT_OK(a_status);
+  ASSERT_OK(w_status);
+  EXPECT_EQ(0U, dbfull()->TEST_WalDurabilityWaiters());
+  EXPECT_EQ(0, bg_error_wakes.load());
+
+  dbfull()->TEST_SetBGError(IOStatus::IOError("injected race error"),
+                            BackgroundErrorReason::kWriteCallback);
+  EXPECT_EQ(1, bg_error_wakes.load());
+  EXPECT_TRUE(dbfull()->TEST_WalDurabilityBGError());
+  EXPECT_FALSE(dbfull()->TEST_GetBGError().ok());
+  Status read_only_status = Put(cf_w, "key_after", "value_after");
+  EXPECT_FALSE(read_only_status.ok());
+
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:log_entry");
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:AfterAddRecord");
+  SyncPoint::GetInstance()->ClearCallBack(
+      "DBImpl::SignalWalDurabilityWaitersOnBGError");
+  dbfull()->Resume().PermitUncheckedError();
+}
+
+TEST_P(DBWritePartitionTest, DurabilityWaitAdvanceRacesError) {
+  // Invariant 4, true race: W parks behind held A; releasing A (the final
+  // frontier advance covering W) races with background-error publication
+  // from a barrier start. Either order must lose no wake, invent no stale
+  // OK, deadlock nothing, and leak no waiter-count. W's append succeeded and
+  // a background error that is not a fence only wakes a parked gate to
+  // recheck, so W returns OK once A completes, below a covering frontier.
+  // The last iteration is deterministic: the error is published, and its
+  // wake delivered, before A is released.
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS(
+        "N > 1 needs indexed WALs, which two_write_queues "
+        "rejects");
+    return;
+  }
+  constexpr size_t kPartitions = 2;
+  constexpr int kIterations = 10;
+  Options options = CurrentOptions();
+  options.avoid_flush_during_shutdown = true;
+  options.paranoid_checks = true;
+
+  for (int iter = 0; iter <= kIterations; ++iter) {
+    const bool error_first = iter == kIterations;
+    if (iter > 0) {
+      // Fresh database per iteration: the previous one holds a background
+      // error, and its WALs must not reopen.
+      Destroy(options);
+      Reopen(options);
+    }
+    OpenWithPartitions(kPartitions, options);
+    const int cf_a = cf_for_partition_[0];
+    const int cf_w = cf_for_partition_[1];
+
+    std::mutex mu;
+    std::condition_variable cv;
+    bool first_append = true;
+    bool a_in_append = false;
+    bool release_a = false;
+    bool w_appended = false;
+    Status a_status;
+    Status w_status;
+    SequenceNumber w_target = 0;
+    std::atomic<int> bg_error_wakes{0};
+
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::WriteToWAL:log_entry", [&](void*) {
+          std::unique_lock<std::mutex> lock(mu);
+          if (first_append) {
+            first_append = false;
+            a_in_append = true;
+            cv.notify_all();
+            cv.wait(lock, [&] { return release_a; });
+          }
+        });
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::WriteToWAL:AfterAddRecord", [&](void*) {
+          std::lock_guard<std::mutex> lock(mu);
+          if (!release_a) {
+            w_appended = true;
+            cv.notify_all();
+          }
+        });
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::InstallCompletionGate", [&](void* arg) {
+          std::lock_guard<std::mutex> lock(mu);
+          // A installs below W; the maximum install is W's target.
+          w_target = std::max(w_target, *static_cast<SequenceNumber*>(arg));
+        });
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::SignalWalDurabilityWaitersOnBGError", [&](void*) {
+          std::lock_guard<std::mutex> lock(mu);
+          ++bg_error_wakes;
+          cv.notify_all();
+        });
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    port::Thread a_thread([&] { a_status = Put(cf_a, "key_a", "value_a"); });
+    {
+      std::unique_lock<std::mutex> lock(mu);
+      EXPECT_TRUE(cv.wait_until(lock, deadline, [&] { return a_in_append; }));
+    }
+    port::Thread w_thread([&] { w_status = Put(cf_w, "key_w", "value_w"); });
+    {
+      std::unique_lock<std::mutex> lock(mu);
+      EXPECT_TRUE(cv.wait_until(lock, deadline, [&] { return w_appended; }));
+    }
+    EXPECT_TRUE(WaitForDurabilityWaiters(1));
+
+    std::mutex latch_mu;
+    std::condition_variable latch_cv;
+    bool start_race = false;
+    port::Thread advance_thread([&] {
+      {
+        std::unique_lock<std::mutex> lock(latch_mu);
+        latch_cv.wait(lock, [&] { return start_race; });
+      }
+      std::unique_lock<std::mutex> lock(mu);
+      if (error_first) {
+        EXPECT_TRUE(cv.wait_until(lock, deadline,
+                                  [&] { return bg_error_wakes.load() == 1; }));
+      }
+      release_a = true;
+      cv.notify_all();
+    });
+    port::Thread error_thread([&] {
+      {
+        std::unique_lock<std::mutex> lock(latch_mu);
+        latch_cv.wait(lock, [&] { return start_race; });
+      }
+      dbfull()->TEST_SetBGError(IOStatus::IOError("injected race error"),
+                                BackgroundErrorReason::kWriteCallback);
+    });
+    {
+      std::lock_guard<std::mutex> lock(latch_mu);
+      start_race = true;
+      latch_cv.notify_all();
+    }
+    advance_thread.join();
+    error_thread.join();
+    a_thread.join();
+    w_thread.join();
+
+    ASSERT_OK(a_status);
+    ASSERT_OK(w_status);
+    {
+      // No stale OK: an acknowledged write sits below a covering frontier.
+      std::lock_guard<std::mutex> lock(mu);
+      EXPECT_NE(0U, w_target);
+      EXPECT_LE(w_target, dbfull()->WalDurabilitySafePoint());
+    }
+    EXPECT_EQ(1, bg_error_wakes.load());
+    EXPECT_EQ(0U, dbfull()->TEST_WalDurabilityWaiters());
+
+    SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:log_entry");
+    SyncPoint::GetInstance()->ClearCallBack(
+        "DBImpl::WriteToWAL:AfterAddRecord");
+    SyncPoint::GetInstance()->ClearCallBack("DBImpl::InstallCompletionGate");
+    SyncPoint::GetInstance()->ClearCallBack(
+        "DBImpl::SignalWalDurabilityWaitersOnBGError");
+    dbfull()->Resume().PermitUncheckedError();
+  }
+}
+
+TEST_P(DBWritePartitionTest, WalFailureMatchesSingleWALBehavior) {
+  // R1: a WAL I/O failure on one partition produces the same DB-level
+  // behaviour as a single-WAL failure. Run the identical injection at N=1
+  // and N=2 and compare every observable: the failing write's status, the
+  // published background error, and the read-only behaviour after it.
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS(
+        "N > 1 needs indexed WALs, which two_write_queues "
+        "rejects");
+    return;
+  }
+  Options options = CurrentOptions();
+  options.avoid_flush_during_shutdown = true;
+  options.paranoid_checks = true;
+  options.two_write_queues = GetParam();
+
+  auto run_single_write_failure = [&](size_t num_partitions,
+                                      Status* append_status, Status* bg_error,
+                                      Status* followup_status) {
+    if (num_partitions == 1) {
+      options.wal_partitions = 1;
+      DestroyAndReopen(options);
+      ASSERT_EQ(1U, dbfull()->TEST_NumWalPartitions());
+    } else {
+      OpenWithPartitions(num_partitions, options);
+    }
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::WriteToWAL:AfterAddRecord", [&](void* arg) {
+          *static_cast<IOStatus*>(arg) =
+              IOStatus::IOError("injected WAL append error");
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+    if (num_partitions == 1) {
+      // Plain reopen leaves no column family handles behind.
+      *append_status = Put("key_fail", "value_fail");
+      *bg_error = dbfull()->TEST_GetBGError();
+      *followup_status = Put("key_after", "value_after");
+    } else {
+      const int cf = cf_for_partition_[0];
+      *append_status = Put(cf, "key_fail", "value_fail");
+      *bg_error = dbfull()->TEST_GetBGError();
+      *followup_status = Put(cf, "key_after", "value_after");
+    }
+    SyncPoint::GetInstance()->ClearCallBack(
+        "DBImpl::WriteToWAL:AfterAddRecord");
+    dbfull()->Resume().PermitUncheckedError();
+  };
+
+  Status append_1, bg_1, followup_1;
+  run_single_write_failure(1, &append_1, &bg_1, &followup_1);
+  Status append_n, bg_n, followup_n;
+  run_single_write_failure(2, &append_n, &bg_n, &followup_n);
+
+  ASSERT_NOK(append_1);
+  EXPECT_TRUE(append_1.IsIOError());
+  ASSERT_NOK(bg_1);
+  ASSERT_NOK(followup_1);
+  for (const auto& pair :
+       {std::make_pair(&append_1, &append_n), std::make_pair(&bg_1, &bg_n),
+        std::make_pair(&followup_1, &followup_n)}) {
+    EXPECT_EQ(pair.first->code(), pair.second->code());
+    EXPECT_EQ(pair.first->subcode(), pair.second->subcode());
+    EXPECT_EQ(pair.first->severity(), pair.second->severity());
+    EXPECT_EQ(pair.first->ToString(), pair.second->ToString());
+  }
+}
+
+TEST_P(DBWritePartitionTest, DurabilityBGErrorFlagClearsWithBackgroundError) {
+  // The park predicate's error leg mirrors the background error: set on
+  // publication (with no waiters, safely lock-free) and cleared only when
+  // the background error itself clears. Uses a soft error recovered
+  // through TEST_ResumeImpl, which runs the clearing path directly:
+  // Resume() itself reports a soft error as nothing to do.
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS(
+        "N > 1 needs indexed WALs, which two_write_queues "
+        "rejects");
+    return;
+  }
+  Options options = CurrentOptions();
+  options.avoid_flush_during_shutdown = true;
+  options.paranoid_checks = true;
+  OpenWithPartitions(2, options);
+
+  std::atomic<int> bg_error_wakes{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SignalWalDurabilityWaitersOnBGError",
+      [&](void*) { ++bg_error_wakes; });
+
+  EXPECT_FALSE(dbfull()->TEST_WalDurabilityBGError());
+  dbfull()->TEST_SetBGError(IOStatus::IOError("injected soft error"),
+                            BackgroundErrorReason::kAsyncFileOpen);
+  Status bg = dbfull()->TEST_GetBGError();
+  EXPECT_FALSE(bg.ok());
+  EXPECT_TRUE(bg.IsIOError());
+  EXPECT_EQ(Status::Severity::kSoftError, bg.severity());
+  EXPECT_TRUE(dbfull()->TEST_WalDurabilityBGError());
+  EXPECT_EQ(1, bg_error_wakes.load());
+
+  ASSERT_OK(dbfull()->TEST_ResumeImpl(DBRecoverContext()));
+  EXPECT_TRUE(dbfull()->TEST_GetBGError().ok());
+  EXPECT_FALSE(dbfull()->TEST_WalDurabilityBGError());
+
+  SyncPoint::GetInstance()->ClearCallBack(
+      "DBImpl::SignalWalDurabilityWaitersOnBGError");
+}
+
+// A listener that clears the next background error it sees, modelling a
+// suppression: the error reaches no stored state and must wake nothing.
+class SuppressNextBgErrorListener : public EventListener {
+ public:
+  void OnBackgroundError(BackgroundErrorReason /*reason*/,
+                         Status* bg_error) override {
+    if (suppress_next_) {
+      suppress_next_ = false;
+      *bg_error = Status::OK();
+    }
+  }
+
+  void SuppressNext() { suppress_next_ = true; }
+
+ private:
+  bool suppress_next_ = false;
+};
+
+TEST_P(DBWritePartitionTest, CompactionErrorWakesParkedGate) {
+  // Q1, non-WAL source: a real compaction failure wakes a parked gate
+  // through the same transition hook as a WAL error. A is held open on
+  // partition 0; W appends on partition 1 and parks in its gate; a file
+  // compaction then fails at output verification. W wakes on the
+  // publication while A is still held, but the error fences no range, so W
+  // parks again, once, instead of failing or spinning (D-N71 (b)): once A
+  // is released W is acknowledged, as one WAL acknowledges a write whose
+  // append landed before an unrelated background error, while a new write
+  // fails with the error. CompactFiles is used because CompactRange and Flush
+  // seal the memtable first, and the switch waits for the held append.
+  // Standard path only: even CompactFiles runs obsolete-file cleanup
+  // (all N WAL mutexes) around its error publication, so with two write
+  // queues it cannot publish while A's append holds its partition mutex.
+  // The compaction-to-SetBGError wiring is queue-independent code, and
+  // the two-queue wake mechanics are covered by the WAL run below.
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS("N > 1 rejects two_write_queues");
+    return;
+  }
+  constexpr size_t kPartitions = 2;
+  Options options = CurrentOptions();
+  options.avoid_flush_during_shutdown = true;
+  options.paranoid_checks = true;
+  OpenWithPartitions(kPartitions, options);
+  const int cf_a = cf_for_partition_[0];
+  const int cf_w = cf_for_partition_[1];
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_OK(Put(cf_a, "pre_key" + std::to_string(i), "value"));
+  }
+  ASSERT_OK(Flush(cf_a));
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_OK(Put(cf_a, "pre_key2_" + std::to_string(i), "value"));
+  }
+  ASSERT_OK(Flush(cf_a));
+  ColumnFamilyMetaData meta;
+  db_->GetColumnFamilyMetaData(handles_[cf_a], &meta);
+  std::vector<std::string> l0_files;
+  for (const auto& f : meta.levels[0].files) {
+    l0_files.push_back(f.name);
+  }
+  ASSERT_GE(l0_files.size(), 2U);
+
+  std::mutex mu;
+  std::condition_variable cv;
+  bool first_append = true;
+  bool a_in_append = false;
+  bool release_a = false;
+  bool w_appended = false;
+  bool fail_compaction = false;
+  int compaction_verifies = 0;
+  std::atomic<bool> w_returned{false};
+  Status compact_status;
+  Status a_status;
+  Status w_status;
+  std::atomic<int> bg_error_wakes{0};
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WriteToWAL:log_entry", [&](void*) {
+        std::unique_lock<std::mutex> lock(mu);
+        if (first_append) {
+          first_append = false;
+          a_in_append = true;
+          cv.notify_all();
+          cv.wait(lock, [&] { return release_a; });
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack("DBImpl::WriteToWAL:AfterAddRecord",
+                                        [&](void*) {
+                                          std::lock_guard<std::mutex> lock(mu);
+                                          if (!release_a) {
+                                            w_appended = true;
+                                            cv.notify_all();
+                                          }
+                                        });
+  SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::Run():AfterVerifyOutputFiles", [&](void* arg) {
+        std::lock_guard<std::mutex> lock(mu);
+        if (fail_compaction) {
+          fail_compaction = false;
+          ++compaction_verifies;
+          *static_cast<Status*>(arg) =
+              IOStatus::IOError("injected compaction error");
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SignalWalDurabilityWaitersOnBGError",
+      [&](void*) { ++bg_error_wakes; });
+  std::atomic<std::thread::id> w_thread_id{std::thread::id()};
+  std::atomic<int> w_parks{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WaitForWalDurability:BeforePark", [&](void*) {
+        if (std::this_thread::get_id() == w_thread_id.load()) {
+          ++w_parks;
+        }
+      });
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  port::Thread a_thread([&] { a_status = Put(cf_a, "key_a", "value_a"); });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    EXPECT_TRUE(cv.wait_until(lock, deadline, [&] { return a_in_append; }));
+  }
+  port::Thread w_thread([&] {
+    w_thread_id.store(std::this_thread::get_id());
+    w_status = Put(cf_w, "key_w", "value_w");
+    w_returned.store(true);
+  });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    EXPECT_TRUE(cv.wait_until(lock, deadline, [&] { return w_appended; }));
+  }
+  EXPECT_TRUE(WaitForDurabilityWaiters(1));
+  // Armed before the compaction starts, so it cannot finish uninjected.
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    fail_compaction = true;
+  }
+  port::Thread compact_thread([&] {
+    compact_status = db_->CompactFiles(CompactionOptions(), handles_[cf_a],
+                                       l0_files, /*output_level=*/1);
+  });
+  // The compaction error wakes W while A is still held, and W parks again.
+  compact_thread.join();
+  const auto w_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while (w_parks.load() < 2 && std::chrono::steady_clock::now() < w_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_EQ(1, bg_error_wakes.load());
+  EXPECT_EQ(2, w_parks.load());
+  EXPECT_EQ(1U, dbfull()->TEST_WalDurabilityWaiters());
+  EXPECT_FALSE(w_returned.load());
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    EXPECT_FALSE(release_a);
+    release_a = true;
+    cv.notify_all();
+  }
+  a_thread.join();
+  w_thread.join();
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:log_entry");
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:AfterAddRecord");
+  SyncPoint::GetInstance()->ClearCallBack(
+      "CompactionJob::Run():AfterVerifyOutputFiles");
+  SyncPoint::GetInstance()->ClearCallBack(
+      "DBImpl::SignalWalDurabilityWaitersOnBGError");
+  SyncPoint::GetInstance()->ClearCallBack(
+      "DBImpl::WaitForWalDurability:BeforePark");
+
+  ASSERT_NOK(compact_status);
+  ASSERT_OK(w_status);
+  ASSERT_OK(a_status);
+  EXPECT_EQ(1, compaction_verifies);
+  EXPECT_EQ(1, bg_error_wakes.load());
+  EXPECT_TRUE(dbfull()->TEST_WalDurabilityBGError());
+  const Status bg_error = dbfull()->TEST_GetBGError();
+  ASSERT_NOK(bg_error);
+  EXPECT_EQ(bg_error.ToString(), Put(cf_w, "key_new", "value_new").ToString());
+  EXPECT_EQ("value_w", Get(cf_w, "key_w"));
+  EXPECT_EQ(0U, dbfull()->TEST_WalDurabilityWaiters());
+  dbfull()->Resume().PermitUncheckedError();
+}
+
+TEST_P(DBWritePartitionTest, GateSyncFailureWakesParkedGate) {
+  // Q1, gate sync failure: A is held open on partition 0; W appends on
+  // partition 1 and parks in its gate; C (sync) then fails exactly its gate
+  // fsync, which runs from its completion gate before the gate waits. The
+  // failure fences C's range, which lies above W's, so the wake leaves W
+  // parked (D-N71 (b)): once A is released W is acknowledged, as one WAL
+  // acknowledges an async write whose append landed before a later sync
+  // failed. Standard path only: with two write queues a sync write takes all
+  // N WAL mutexes in PreprocessWrite, so C would block on A's held append
+  // before ever reaching its sync. The two-queue write-path sync still
+  // funnels through the same SetBGError transition the two-queue
+  // append-failure run already covers; only the funnel (WriteStatusCheck)
+  // differs, and it is pre-existing code.
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS("N > 1 rejects two_write_queues");
+    return;
+  }
+  constexpr size_t kPartitions = 2;
+  Options options = CurrentOptions();
+  options.avoid_flush_during_shutdown = true;
+  options.paranoid_checks = true;
+  OpenWithPartitions(kPartitions, options);
+  const int cf_a = cf_for_partition_[0];
+  const int cf_w = cf_for_partition_[1];
+
+  std::mutex mu;
+  std::condition_variable cv;
+  bool first_append = true;
+  bool a_in_append = false;
+  bool release_a = false;
+  bool w_appended = false;
+  bool fail_gate_sync = false;
+  int gate_syncs = 0;
+  std::atomic<bool> w_returned{false};
+  Status c_status;
+  Status a_status;
+  Status w_status;
+  std::atomic<int> bg_error_wakes{0};
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WriteToWAL:log_entry", [&](void*) {
+        std::unique_lock<std::mutex> lock(mu);
+        if (first_append) {
+          first_append = false;
+          a_in_append = true;
+          cv.notify_all();
+          cv.wait(lock, [&] { return release_a; });
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack("DBImpl::WriteToWAL:AfterAddRecord",
+                                        [&](void*) {
+                                          std::lock_guard<std::mutex> lock(mu);
+                                          if (!release_a && !w_appended) {
+                                            w_appended = true;
+                                            cv.notify_all();
+                                          }
+                                        });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SyncWalsFromCompletionGate:AfterGateSync", [&](void* arg) {
+        std::lock_guard<std::mutex> lock(mu);
+        if (fail_gate_sync) {
+          fail_gate_sync = false;
+          ++gate_syncs;
+          *static_cast<IOStatus*>(arg) =
+              IOStatus::IOError("injected gate sync error");
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SignalWalDurabilityWaitersOnBGError",
+      [&](void*) { ++bg_error_wakes; });
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  port::Thread a_thread([&] { a_status = Put(cf_a, "key_a", "value_a"); });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    EXPECT_TRUE(cv.wait_until(lock, deadline, [&] { return a_in_append; }));
+  }
+  port::Thread w_thread([&] {
+    w_status = Put(cf_w, "key_w", "value_w");
+    w_returned.store(true);
+  });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    EXPECT_TRUE(cv.wait_until(lock, deadline, [&] { return w_appended; }));
+  }
+  EXPECT_TRUE(WaitForDurabilityWaiters(1));
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    fail_gate_sync = true;
+  }
+  WriteOptions sync_options;
+  sync_options.sync = true;
+  port::Thread c_thread([&] {
+    c_status = db_->Put(sync_options, handles_[cf_w], "key_c", "value_c");
+  });
+  c_thread.join();
+  // C's failure is published, and W is still parked behind held A.
+  EXPECT_EQ(1, bg_error_wakes.load());
+  EXPECT_TRUE(WaitForDurabilityWaiters(1));
+  EXPECT_FALSE(w_returned.load());
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    EXPECT_FALSE(release_a);
+    release_a = true;
+    cv.notify_all();
+  }
+  a_thread.join();
+  w_thread.join();
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:log_entry");
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:AfterAddRecord");
+  SyncPoint::GetInstance()->ClearCallBack(
+      "DBImpl::SyncWalsFromCompletionGate:AfterGateSync");
+  SyncPoint::GetInstance()->ClearCallBack(
+      "DBImpl::SignalWalDurabilityWaitersOnBGError");
+
+  ASSERT_NOK(c_status);
+  EXPECT_TRUE(c_status.IsIOError());
+  ASSERT_OK(w_status);
+  ASSERT_OK(a_status);
+  EXPECT_EQ(1, gate_syncs);
+  EXPECT_EQ(1, bg_error_wakes.load());
+  EXPECT_TRUE(dbfull()->TEST_WalDurabilityBGError());
+  EXPECT_EQ(c_status.ToString(), dbfull()->TEST_GetBGError().ToString());
+  EXPECT_EQ(0U, dbfull()->TEST_WalDurabilityWaiters());
+  dbfull()->Resume().PermitUncheckedError();
+}
+
 TEST_P(DBWritePartitionTest, SyncLedGroupAsyncWritersReturnBeforeFsync) {
   // GC25 Q2 (D-9): in a group led by a sync write, the async writers take
   // the group's lower sequences and return, visible, without waiting for
@@ -4070,6 +5558,429 @@ TEST_P(DBWritePartitionTest, SyncLedGroupAsyncWritersReturnBeforeFsync) {
     EXPECT_EQ("v", Get(cf, "l"));
     Close();
   }
+}
+
+TEST_P(DBWritePartitionTest, SuppressedErrorLeavesGateUndisturbed) {
+  // Q1: errors that never become the background error wake nothing, stick
+  // nothing, and leave a parked gate undisturbed. W parks behind held A;
+  // a compaction retryable (soft, never stored) and a listener-suppressed
+  // error are published; neither fires the wake nor sets the flag, and W
+  // stays parked. Repeating the suppressed error without the listener
+  // then lands it, proving the listener did the suppressing; it fences no
+  // range, so W still waits for A and is acknowledged (D-N71 (b)).
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS(
+        "N > 1 needs indexed WALs, which two_write_queues "
+        "rejects");
+    return;
+  }
+  constexpr size_t kPartitions = 2;
+  auto listener = std::make_shared<SuppressNextBgErrorListener>();
+  Options options = CurrentOptions();
+  options.avoid_flush_during_shutdown = true;
+  options.paranoid_checks = true;
+  options.listeners.push_back(listener);
+  OpenWithPartitions(kPartitions, options);
+  const int cf_a = cf_for_partition_[0];
+  const int cf_w = cf_for_partition_[1];
+
+  std::mutex mu;
+  std::condition_variable cv;
+  bool first_append = true;
+  bool a_in_append = false;
+  bool release_a = false;
+  bool w_appended = false;
+  std::atomic<bool> w_returned{false};
+  Status a_status;
+  Status w_status;
+  std::atomic<int> bg_error_wakes{0};
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WriteToWAL:log_entry", [&](void*) {
+        std::unique_lock<std::mutex> lock(mu);
+        if (first_append) {
+          first_append = false;
+          a_in_append = true;
+          cv.notify_all();
+          cv.wait(lock, [&] { return release_a; });
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack("DBImpl::WriteToWAL:AfterAddRecord",
+                                        [&](void*) {
+                                          std::lock_guard<std::mutex> lock(mu);
+                                          if (!release_a) {
+                                            w_appended = true;
+                                            cv.notify_all();
+                                          }
+                                        });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SignalWalDurabilityWaitersOnBGError",
+      [&](void*) { ++bg_error_wakes; });
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  port::Thread a_thread([&] { a_status = Put(cf_a, "key_a", "value_a"); });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    EXPECT_TRUE(cv.wait_until(lock, deadline, [&] { return a_in_append; }));
+  }
+  port::Thread w_thread([&] {
+    w_status = Put(cf_w, "key_w", "value_w");
+    w_returned.store(true);
+  });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    EXPECT_TRUE(cv.wait_until(lock, deadline, [&] { return w_appended; }));
+  }
+  EXPECT_TRUE(WaitForDurabilityWaiters(1));
+
+  // A compaction retryable maps to soft and is never stored.
+  IOStatus retryable = IOStatus::IOError("injected compaction retryable");
+  retryable.SetRetryable(true);
+  dbfull()->TEST_SetBGError(retryable, BackgroundErrorReason::kCompaction);
+  EXPECT_EQ(0, bg_error_wakes.load());
+  EXPECT_FALSE(dbfull()->TEST_WalDurabilityBGError());
+  EXPECT_TRUE(dbfull()->TEST_GetBGError().ok());
+  EXPECT_EQ(1U, dbfull()->TEST_WalDurabilityWaiters());
+
+  // A listener suppression clears the error before it is stored.
+  listener->SuppressNext();
+  dbfull()->TEST_SetBGError(IOStatus::IOError("suppressed error"),
+                            BackgroundErrorReason::kWriteCallback);
+  EXPECT_EQ(0, bg_error_wakes.load());
+  EXPECT_FALSE(dbfull()->TEST_WalDurabilityBGError());
+  EXPECT_TRUE(dbfull()->TEST_GetBGError().ok());
+  EXPECT_EQ(1U, dbfull()->TEST_WalDurabilityWaiters());
+  EXPECT_FALSE(w_returned.load());
+
+  // The same error without suppression lands and wakes the parked gate:
+  // the listener, not the classification, suppressed it above.
+  dbfull()->TEST_SetBGError(IOStatus::IOError("suppressed error"),
+                            BackgroundErrorReason::kWriteCallback);
+  EXPECT_EQ(1, bg_error_wakes.load());
+  EXPECT_TRUE(dbfull()->TEST_WalDurabilityBGError());
+  EXPECT_FALSE(dbfull()->TEST_GetBGError().ok());
+  EXPECT_FALSE(w_returned.load());
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    EXPECT_FALSE(release_a);
+    release_a = true;
+    cv.notify_all();
+  }
+  a_thread.join();
+  w_thread.join();
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:log_entry");
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:AfterAddRecord");
+  SyncPoint::GetInstance()->ClearCallBack(
+      "DBImpl::SignalWalDurabilityWaitersOnBGError");
+
+  ASSERT_OK(a_status);
+  ASSERT_OK(w_status);
+  EXPECT_EQ(1, bg_error_wakes.load());
+  EXPECT_EQ(0U, dbfull()->TEST_WalDurabilityWaiters());
+  dbfull()->Resume().PermitUncheckedError();
+}
+
+TEST_P(DBWritePartitionTest, CheckThenParkRaceWakesWaiter) {
+  // Q1, the check-then-park window: a failure published between the
+  // waiter's predicate check and its park is never missed. W parks behind
+  // held A and held F; the BeforePark hook holds W after its check with the
+  // park mutex held; F's append, below W, then fails while W is held there
+  // (its wake and fence block on the mutex W holds); W is then released and
+  // must fail with the error instead of sleeping past it. There is no timer
+  // to save a missed wake, so a lost signal would hang this test.
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS(
+        "N > 1 needs indexed WALs, which two_write_queues "
+        "rejects");
+    return;
+  }
+  constexpr size_t kPartitions = 3;
+  Options options = CurrentOptions();
+  options.avoid_flush_during_shutdown = true;
+  options.paranoid_checks = true;
+  OpenWithPartitions(kPartitions, options);
+  const int cf_a = cf_for_partition_[0];
+  const int cf_w = cf_for_partition_[1];
+  const int cf_f = cf_for_partition_[2];
+
+  std::mutex mu;
+  std::condition_variable cv;
+  int appends = 0;
+  bool a_in_append = false;
+  bool f_in_append = false;
+  bool release_a = false;
+  bool release_f = false;
+  bool fail_next_append = false;
+  bool w_appended = false;
+  bool w_at_park = false;
+  bool release_w = false;
+  std::atomic<bool> w_returned{false};
+  Status a_status;
+  Status f_status;
+  Status w_status;
+  std::atomic<int> bg_error_wakes{0};
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WriteToWAL:log_entry", [&](void*) {
+        std::unique_lock<std::mutex> lock(mu);
+        const int append = appends++;
+        if (append == 0) {
+          a_in_append = true;
+          cv.notify_all();
+          cv.wait(lock, [&] { return release_a; });
+        } else if (append == 1) {
+          f_in_append = true;
+          cv.notify_all();
+          cv.wait(lock, [&] { return release_f; });
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WriteToWAL:AfterAddRecord", [&](void* arg) {
+        std::lock_guard<std::mutex> lock(mu);
+        if (fail_next_append) {
+          fail_next_append = false;
+          *static_cast<IOStatus*>(arg) = IOStatus::IOError("park-window error");
+        } else if (!release_f) {
+          w_appended = true;
+          cv.notify_all();
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WaitForWalDurability:BeforePark", [&](void*) {
+        std::unique_lock<std::mutex> lock(mu);
+        if (!w_at_park) {
+          w_at_park = true;
+          cv.notify_all();
+          cv.wait(lock, [&] { return release_w; });
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SignalWalDurabilityWaitersOnBGError",
+      [&](void*) { ++bg_error_wakes; });
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  port::Thread a_thread([&] { a_status = Put(cf_a, "key_a", "value_a"); });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    EXPECT_TRUE(cv.wait_until(lock, deadline, [&] { return a_in_append; }));
+  }
+  port::Thread f_thread([&] { f_status = Put(cf_f, "key_f", "value_f"); });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    EXPECT_TRUE(cv.wait_until(lock, deadline, [&] { return f_in_append; }));
+  }
+  port::Thread w_thread([&] {
+    w_status = Put(cf_w, "key_w", "value_w");
+    w_returned.store(true);
+  });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    EXPECT_TRUE(cv.wait_until(lock, deadline, [&] { return w_appended; }));
+  }
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    EXPECT_TRUE(cv.wait_until(lock, deadline, [&] { return w_at_park; }));
+  }
+  // W has checked (no fence then) and is held before its park with the park
+  // mutex held. Fail F: its wake and its fence block on that mutex until W
+  // is released.
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    fail_next_append = true;
+    release_f = true;
+    cv.notify_all();
+  }
+  // Release W only once the error is published: the blocked wake and fence
+  // are then all that is left to wake W, and they must still reach W. The
+  // bound only turns a flag that never appears into a reported failure; W
+  // is released either way so the test can finish.
+  const auto flag_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while (!dbfull()->TEST_WalDurabilityBGError() &&
+         std::chrono::steady_clock::now() < flag_deadline) {
+    std::this_thread::yield();
+  }
+  EXPECT_TRUE(dbfull()->TEST_WalDurabilityBGError());
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    release_w = true;
+    cv.notify_all();
+  }
+  f_thread.join();
+  const auto w_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while (!w_returned.load() && std::chrono::steady_clock::now() < w_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_TRUE(w_returned.load());
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    EXPECT_FALSE(release_a);
+    release_a = true;
+    cv.notify_all();
+  }
+  a_thread.join();
+  w_thread.join();
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:log_entry");
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:AfterAddRecord");
+  SyncPoint::GetInstance()->ClearCallBack(
+      "DBImpl::WaitForWalDurability:BeforePark");
+  SyncPoint::GetInstance()->ClearCallBack(
+      "DBImpl::SignalWalDurabilityWaitersOnBGError");
+
+  ASSERT_NOK(f_status);
+  ASSERT_NOK(w_status);
+  EXPECT_TRUE(w_status.IsIOError());
+  ASSERT_OK(a_status);
+  EXPECT_EQ(1, bg_error_wakes.load());
+  EXPECT_TRUE(dbfull()->TEST_WalDurabilityBGError());
+  EXPECT_EQ(w_status.ToString(), dbfull()->TEST_GetBGError().ToString());
+  EXPECT_EQ(0U, dbfull()->TEST_WalDurabilityWaiters());
+  dbfull()->Resume().PermitUncheckedError();
+}
+
+TEST_P(DBWritePartitionTest, WalErrorFailsGatedGroupWithFollowers) {
+  // Q1 (WAL source) and Q10 (follower receipt): a real WAL I/O failure
+  // fails a parked multi-writer group, and every member receives the
+  // identical published error. A is held open on partition 0; B1 and B2
+  // are forced into one group on partition 1 and park in its single
+  // gate; A's append then fails. Both members must return the same
+  // status string as the stored background error: the follower's error
+  // is the gate's outcome, not a generic failure.
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS(
+        "N > 1 needs indexed WALs, which two_write_queues "
+        "rejects");
+    return;
+  }
+  constexpr size_t kPartitions = 2;
+  Options options = CurrentOptions();
+  options.avoid_flush_during_shutdown = true;
+  options.paranoid_checks = true;
+  OpenWithPartitions(kPartitions, options);
+  const int cf_a = cf_for_partition_[0];
+  constexpr size_t b_partition = 1;
+  const int cf_b = cf_for_partition_[b_partition];
+
+  std::mutex mu;
+  std::condition_variable cv;
+  bool first_append = true;
+  bool a_in_append = false;
+  bool release_a = false;
+  bool fail_a_append = false;
+  bool b1_in_wait = false;
+  bool b2_linked = false;
+  std::atomic<bool> b1_returned{false};
+  std::atomic<bool> b2_returned{false};
+  Status a_status;
+  Status b1_status;
+  Status b2_status;
+  std::atomic<int> bg_error_wakes{0};
+  std::atomic<int> gate_installs{0};
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WriteToWAL:log_entry", [&](void*) {
+        std::unique_lock<std::mutex> lock(mu);
+        if (first_append) {
+          first_append = false;
+          a_in_append = true;
+          cv.notify_all();
+          cv.wait(lock, [&] { return release_a; });
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WriteToWAL:AfterAddRecord", [&](void* arg) {
+        std::lock_guard<std::mutex> lock(mu);
+        if (fail_a_append) {
+          *static_cast<IOStatus*>(arg) =
+              IOStatus::IOError("injected WAL append error");
+        }
+      });
+  // Force B1 and B2 into one group: B1 (partition 1's first writer) waits
+  // here until B2 has linked behind it, so group formation observes both.
+  SyncPoint::GetInstance()->SetCallBack(
+      "WriteThread::JoinBatchGroup:Wait", [&](void* arg) {
+        auto* w = static_cast<WriteThread::Writer*>(arg);
+        if (w->wal_partition != b_partition) {
+          return;
+        }
+        std::unique_lock<std::mutex> lock(mu);
+        if (!b1_in_wait) {
+          b1_in_wait = true;
+          cv.notify_all();
+          cv.wait(lock, [&] { return b2_linked; });
+        } else {
+          b2_linked = true;
+          cv.notify_all();
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack("DBImpl::InstallCompletionGate",
+                                        [&](void*) { ++gate_installs; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SignalWalDurabilityWaitersOnBGError",
+      [&](void*) { ++bg_error_wakes; });
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  port::Thread a_thread([&] { a_status = Put(cf_a, "key_a", "value_a"); });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    EXPECT_TRUE(cv.wait_until(lock, deadline, [&] { return a_in_append; }));
+  }
+  port::Thread b1_thread([&] {
+    b1_status = Put(cf_b, "key_b1", "value_b1");
+    b1_returned.store(true);
+  });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    EXPECT_TRUE(cv.wait_until(lock, deadline, [&] { return b1_in_wait; }));
+  }
+  port::Thread b2_thread([&] {
+    b2_status = Put(cf_b, "key_b2", "value_b2");
+    b2_returned.store(true);
+  });
+  EXPECT_TRUE(WaitForDurabilityWaiters(1));
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    fail_a_append = true;
+    release_a = true;
+    cv.notify_all();
+  }
+  const auto b_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while ((!b1_returned.load() || !b2_returned.load()) &&
+         std::chrono::steady_clock::now() < b_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_TRUE(b1_returned.load());
+  EXPECT_TRUE(b2_returned.load());
+  a_thread.join();
+  b1_thread.join();
+  b2_thread.join();
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:log_entry");
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:AfterAddRecord");
+  SyncPoint::GetInstance()->ClearCallBack("WriteThread::JoinBatchGroup:Wait");
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::InstallCompletionGate");
+  SyncPoint::GetInstance()->ClearCallBack(
+      "DBImpl::SignalWalDurabilityWaitersOnBGError");
+
+  ASSERT_NOK(a_status);
+  ASSERT_NOK(b1_status);
+  ASSERT_NOK(b2_status);
+  EXPECT_TRUE(b1_status.IsIOError());
+  EXPECT_TRUE(b2_status.IsIOError());
+  // One group parked one gate; both members received its outcome, which
+  // is the published background error verbatim.
+  EXPECT_EQ(1, gate_installs.load());
+  EXPECT_EQ(b1_status.ToString(), b2_status.ToString());
+  EXPECT_EQ(b1_status.ToString(), dbfull()->TEST_GetBGError().ToString());
+  EXPECT_EQ(b2_status.ToString(), dbfull()->TEST_GetBGError().ToString());
+  EXPECT_EQ(1, bg_error_wakes.load());
+  EXPECT_TRUE(dbfull()->TEST_WalDurabilityBGError());
+  EXPECT_EQ(0U, dbfull()->TEST_WalDurabilityWaiters());
+  dbfull()->Resume().PermitUncheckedError();
 }
 
 TEST_P(DBWritePartitionTest, MalformedBatchFailsAsAtN1) {
@@ -4225,7 +6136,137 @@ TEST_P(DBWritePartitionTest, JoinWaitTimerOffAtDefaultStatsLevel) {
   }
   EXPECT_EQ(3U, join_wait_count());
 }
+
+TEST_P(DBWritePartitionTest, FrontierLockTakenOnlyForAllocation) {
+  // GC28 Q8 (R6): at N=8, non-sync writes from 16 threads take
+  // sequence_wal_index_mutex_ exactly once per write group, to allocate;
+  // completion, publication and waiting take it never.
+  // Neuter: take it again in PublishAppliedPrefix; the count exceeds the
+  // number of groups.
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS("N > 1 rejects two_write_queues");
+    return;
+  }
+  constexpr size_t kPartitions = 8;
+  Options options = CurrentOptions();
+  options.statistics = CreateDBStatistics();
+  options.avoid_flush_during_shutdown = true;
+  OpenWithPartitions(kPartitions, options);
+  ASSERT_OK(options.statistics->Reset());
+  const uint64_t takes_before = dbfull()->TEST_SequenceWalIndexMutexTakes();
+  std::vector<port::Thread> threads;
+  for (int t = 0; t < 16; ++t) {
+    threads.emplace_back([&, t] {
+      for (int i = 0; i < 50; ++i) {
+        ASSERT_OK(Put(cf_for_partition_[(t + i) % kPartitions],
+                      "k" + std::to_string(t) + "_" + std::to_string(i), "v"));
+      }
+    });
+  }
+  for (auto& t : threads) {
+    t.join();
+  }
+  HistogramData groups;
+  options.statistics->histogramData(WRITERS_PER_WRITE_GROUP, &groups);
+  EXPECT_EQ(16U * 50U, groups.sum);
+  EXPECT_EQ(groups.count,
+            dbfull()->TEST_SequenceWalIndexMutexTakes() - takes_before);
+}
+
+TEST_P(DBWritePartitionTest, FrontierNeverPassesAllocatedRange) {
+  // GC28 Q8 ordering: X (partition 1) is held right after its allocation
+  // section, before its append; Y1..Y3 (partition 2) allocate above it,
+  // append, publish their ranges and park. Neither GetLatestSequenceNumber()
+  // nor the WAL safe point passes X's range until X lands.
+  // Neuter: register X's range after releasing the allocation lock; the Ys'
+  // completions move both frontiers past it.
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS("N > 1 rejects two_write_queues");
+    return;
+  }
+  constexpr size_t kPartitions = 3;
+  Options options = CurrentOptions();
+  options.avoid_flush_during_shutdown = true;
+  OpenWithPartitions(kPartitions, options);
+  ASSERT_OK(Put(cf_for_partition_[0], "base", "v"));
+  const SequenceNumber x_low = db_->GetLatestSequenceNumber() + 1;
+
+  std::atomic<std::thread::id> x_thread_id{std::thread::id()};
+  GC28Hold hold_x;
+  hold_x.Arm("DBImpl::AllocateSequenceAndWALIndex:Allocated",
+             GC28OnThread(&x_thread_id));
+  Status x_status;
+  port::Thread x([&] {
+    x_thread_id.store(std::this_thread::get_id());
+    x_status = Put(cf_for_partition_[1], "x", "v");
+  });
+  EXPECT_TRUE(hold_x.WaitHeld());
+  std::vector<Status> y_statuses(3);
+  std::vector<port::Thread> ys;
+  for (int i = 0; i < 3; ++i) {
+    ys.emplace_back([&, i] {
+      y_statuses[i] = Put(cf_for_partition_[2], "y" + std::to_string(i), "v");
+    });
+  }
+  // Releases X and joins every writer on every exit.
+  Defer join_writers([&] {
+    hold_x.Release();
+    if (x.joinable()) {
+      x.join();
+    }
+    for (auto& y : ys) {
+      if (y.joinable()) {
+        y.join();
+      }
+    }
+  });
+  // A Y group parks only after its append completed and it published.
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while (dbfull()->TEST_WalDurabilityWaiters() == 0 &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_GT(dbfull()->TEST_WalDurabilityWaiters(), 0U);
+  // Every Y's append completed on partition 2 (they take x_low + 1 through
+  // x_low + 3), so nothing but X's range can hold either frontier.
+  while (dbfull()->TEST_WalDurabilityDurableUpto(2) < x_low + 3 ||
+         dbfull()->TEST_WalDurabilityPendingLow(2) !=
+             WalDurabilityTracker::kIdle) {
+    ASSERT_LT(std::chrono::steady_clock::now(), deadline)
+        << "partition 2 appends never completed";
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_LT(db_->GetLatestSequenceNumber(), x_low);
+  EXPECT_LT(dbfull()->WalDurabilitySafePoint(), x_low);
+  hold_x.Release();
+  x.join();
+  for (auto& y : ys) {
+    y.join();
+  }
+  ASSERT_OK(x_status);
+  for (const Status& s : y_statuses) {
+    ASSERT_OK(s);
+  }
+  EXPECT_EQ("v", Get(cf_for_partition_[1], "x"));
+  EXPECT_EQ("v", Get(cf_for_partition_[2], "y2"));
+}
+// GC30 tests. Helpers shared by this block only.
 namespace {
+// Matches MemTable::Add:BeforeReturn:Encoded for an entry whose user key is
+// one of `keys`.
+std::function<bool(void*)> GC30AddOf(const std::vector<std::string>& keys) {
+  return [keys](void* arg) {
+    Slice encoded = *static_cast<Slice*>(arg);
+    Slice internal_key;
+    if (!GetLengthPrefixedSlice(&encoded, &internal_key) ||
+        internal_key.size() < 8) {
+      return false;
+    }
+    const std::string user_key = ExtractUserKey(internal_key).ToString();
+    return std::find(keys.begin(), keys.end(), user_key) != keys.end();
+  };
+}
 
 // A write on its own thread. Joined when it goes out of scope, so declare it
 // before every hold that may block it: the holds release first.
@@ -4267,7 +6308,765 @@ class GC30Write {
   Status status_;
   port::Thread thread_;
 };
+
+// Runs writes as one write group: the first is held before it leads
+// (DBImpl::WriteImpl:BeforeLeaderEnters) until the others have queued behind
+// it on its partition. Declare it before every hold that may block a write.
+// (A hold clears its sync point only once no sync point callback runs, so
+// declare the holds that hold last, or release them all first.)
+class GC30Group {
+ public:
+  GC30Group() = default;
+  GC30Group(const GC30Group&) = delete;
+  GC30Group& operator=(const GC30Group&) = delete;
+  ~GC30Group() {
+    leader_.Release();
+    writes_.clear();
+  }
+  // Returns true once the group formed: the first write is held and the
+  // others wait behind it.
+  bool Start(const std::vector<std::function<Status()>>& writes) {
+    leader_.Arm("DBImpl::WriteImpl:BeforeLeaderEnters");
+    queued_.Arm("WriteThread::JoinBatchGroup:BeganWaiting", nullptr,
+                /*hold=*/false);
+    for (size_t i = 0; i < writes.size(); ++i) {
+      writes_.emplace_back(new GC30Write());
+      writes_.back()->Start(writes[i]);
+      if (i == 0 && !leader_.WaitHeld()) {
+        return false;
+      }
+    }
+    return queued_.WaitHits(static_cast<int>(writes.size()) - 1);
+  }
+  // Lets the first write lead the group.
+  void Lead() { leader_.Release(); }
+  int Returned() {
+    int returned = 0;
+    for (auto& write : writes_) {
+      returned += write->Done() ? 1 : 0;
+    }
+    return returned;
+  }
+  std::vector<Status> Join() {
+    Lead();
+    std::vector<Status> statuses;
+    for (auto& write : writes_) {
+      statuses.push_back(write->Join());
+    }
+    return statuses;
+  }
+
+ private:
+  GC28Hold leader_;
+  GC28Hold queued_;
+  std::vector<std::unique_ptr<GC30Write>> writes_;
+};
+
+std::vector<std::function<Status()>> GC30Puts(
+    DBTestBase* test, int cf, const std::vector<std::string>& keys,
+    const WriteOptions& write_options = WriteOptions()) {
+  std::vector<std::function<Status()>> writes;
+  for (const std::string& key : keys) {
+    writes.push_back([test, cf, key, write_options] {
+      return test->Put(cf, key, "v", write_options);
+    });
+  }
+  return writes;
+}
+
+// Every read path of `cf` misses each of `keys`: Get, MultiGet, an iterator
+// and a tailing iterator.
+void GC30ExpectInvisible(DB* db, ColumnFamilyHandle* cf,
+                         const std::vector<std::string>& keys) {
+  for (const std::string& key : keys) {
+    std::string value;
+    const Status s = db->Get(ReadOptions(), cf, key, &value);
+    EXPECT_TRUE(s.IsNotFound()) << key << ": " << s.ToString();
+  }
+  std::vector<ColumnFamilyHandle*> cfs(keys.size(), cf);
+  std::vector<Slice> slices(keys.begin(), keys.end());
+  std::vector<std::string> values;
+  for (const Status& s : db->MultiGet(ReadOptions(), cfs, slices, &values)) {
+    EXPECT_TRUE(s.IsNotFound()) << s.ToString();
+  }
+  for (const bool tailing : {false, true}) {
+    ReadOptions ro;
+    ro.tailing = tailing;
+    std::unique_ptr<Iterator> it(db->NewIterator(ro, cf));
+    for (it->SeekToFirst(); it->Valid(); it->Next()) {
+      EXPECT_EQ(keys.end(),
+                std::find(keys.begin(), keys.end(), it->key().ToString()))
+          << "tailing=" << tailing << " " << it->key().ToString();
+    }
+    EXPECT_OK(it->status());
+  }
+}
+
+// Every read path of `cf` returns "v" for each of `keys`.
+void GC30ExpectVisible(DB* db, ColumnFamilyHandle* cf,
+                       const std::vector<std::string>& keys) {
+  for (const std::string& key : keys) {
+    std::string value;
+    EXPECT_OK(db->Get(ReadOptions(), cf, key, &value)) << key;
+    EXPECT_EQ("v", value) << key;
+  }
+  for (const bool tailing : {false, true}) {
+    ReadOptions ro;
+    ro.tailing = tailing;
+    std::unique_ptr<Iterator> it(db->NewIterator(ro, cf));
+    for (const std::string& key : keys) {
+      it->Seek(key);
+      ASSERT_TRUE(it->Valid()) << "tailing=" << tailing << " " << key;
+      EXPECT_EQ(key, it->key().ToString());
+    }
+    EXPECT_OK(it->status());
+  }
+}
+
+IOStatus GC30RetryableError(const std::string& msg) {
+  IOStatus s = IOStatus::IOError(msg);
+  s.SetRetryable(true);
+  return s;
+}
+
+// Fails the next WAL append on this DB before its record is added (so
+// nothing of it lands), with a retryable error, once armed.
+class GC30AppendFailure {
+ public:
+  GC30AppendFailure() {
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::WriteToWAL:AfterMaybeAddUserDefinedTimestampSizeRecord",
+        [this](void* arg) {
+          if (armed_.exchange(false)) {
+            *static_cast<IOStatus*>(arg) =
+                GC30RetryableError("injected append error");
+          }
+        });
+  }
+  ~GC30AppendFailure() {
+    SyncPoint::GetInstance()->ClearCallBack(
+        "DBImpl::WriteToWAL:AfterMaybeAddUserDefinedTimestampSizeRecord");
+  }
+  void Arm() { armed_.store(true); }
+
+ private:
+  std::atomic<bool> armed_{false};
+};
+
+// Counts background errors raised on the DB it listens to.
+class GC30BgErrorCounter : public EventListener {
+ public:
+  void OnBackgroundError(BackgroundErrorReason /*reason*/,
+                         Status* /*bg_error*/) override {
+    ++count_;
+  }
+  int Count() const { return count_.load(); }
+
+ private:
+  std::atomic<int> count_{0};
+};
 }  // namespace
+
+TEST_P(DBWritePartitionTest, AsyncGroupInsertOverlapsHeldAppend) {
+  // GC30 Q1 (ruling 4d, D-GC30b (i)): above one partition a group's memtable
+  // inserts do not wait for its WAL append. Four async writes form one group
+  // on one partition and the leader's append is held: the three followers'
+  // inserts finish meanwhile, yet no key is visible on any read path, the
+  // published sequence does not move and no write returns. Released, every
+  // write returns OK and reads back.
+  // Neuter: launch the parallel memtable writers after the append (the base
+  // order); no follower inserts while the append is held.
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS("N > 1 rejects two_write_queues");
+    return;
+  }
+  for (const size_t partitions : {size_t{2}, size_t{8}}) {
+    SCOPED_TRACE("partitions=" + std::to_string(partitions));
+    Options options = CurrentOptions();
+    DestroyAndReopen(options);
+    OpenWithPartitions(partitions, options);
+    const int cf = cf_for_partition_[1];
+    const std::vector<std::string> keys = {"k0", "k1", "k2", "k3"};
+    const SequenceNumber published = db_->GetLatestSequenceNumber();
+    GC30Group group;
+    GC28Hold inserted;
+    inserted.Arm("MemTable::Add:BeforeReturn:Encoded",
+                 GC30AddOf({"k1", "k2", "k3"}), /*hold=*/false);
+    GC28Hold append;
+    append.Arm("DBImpl::WriteToWAL:TakesWalMutex");
+    ASSERT_TRUE(group.Start(GC30Puts(this, cf, keys)));
+    group.Lead();
+    ASSERT_TRUE(append.WaitHeld());
+    EXPECT_TRUE(inserted.WaitHits(3, std::chrono::seconds(10)))
+        << "followers inserted while the append was held: " << inserted.Hits();
+    GC30ExpectInvisible(db_.get(), handles_[cf], keys);
+    EXPECT_EQ(published, db_->GetLatestSequenceNumber());
+    EXPECT_EQ(0, group.Returned());
+    append.Release();
+    for (const Status& s : group.Join()) {
+      ASSERT_OK(s);
+    }
+    GC30ExpectVisible(db_.get(), handles_[cf], keys);
+  }
+}
+
+TEST_P(DBWritePartitionTest, GroupPublishesOnlyAfterAppendAndInserts) {
+  // GC30 Q1: a group publishes only once its append and every insert are
+  // done. (a) The append is done and one follower's insert is held: nothing
+  // is published. (b) Every follower's insert is done and the append is
+  // held: nothing is published. Released, all writes return OK and read back.
+  // Neuter: let the last inserter exit without waiting for the append (the
+  // leader's unit completed before its append); in (b) the last follower
+  // publishes, and in debug PublishAppliedFrontier's assertion fires.
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS("N > 1 rejects two_write_queues");
+    return;
+  }
+  constexpr size_t kPartitions = 4;
+  Options options = CurrentOptions();
+  OpenWithPartitions(kPartitions, options);
+  const int cf = cf_for_partition_[2];
+  {
+    SCOPED_TRACE("(a) an insert held after the append");
+    const std::vector<std::string> keys = {"a0", "a1", "a2"};
+    const SequenceNumber published = db_->GetLatestSequenceNumber();
+    GC30Group group;
+    GC28Hold appended;
+    appended.Arm("DBImpl::WriteToWAL:AfterAddRecord", nullptr,
+                 /*hold=*/false);
+    GC28Hold insert;
+    insert.Arm("MemTable::Add:BeforeReturn:Encoded", GC30AddOf({"a2"}));
+    ASSERT_TRUE(group.Start(GC30Puts(this, cf, keys)));
+    group.Lead();
+    ASSERT_TRUE(insert.WaitHeld());
+    ASSERT_TRUE(appended.WaitHits(1));
+    GC30ExpectInvisible(db_.get(), handles_[cf], keys);
+    EXPECT_EQ(published, db_->GetLatestSequenceNumber());
+    EXPECT_EQ(0, group.Returned());
+    insert.Release();
+    for (const Status& s : group.Join()) {
+      ASSERT_OK(s);
+    }
+    GC30ExpectVisible(db_.get(), handles_[cf], keys);
+  }
+  {
+    SCOPED_TRACE("(b) the append held after the inserts");
+    const std::vector<std::string> keys = {"b0", "b1", "b2"};
+    const SequenceNumber published = db_->GetLatestSequenceNumber();
+    GC30Group group;
+    GC28Hold inserted;
+    inserted.Arm("MemTable::Add:BeforeReturn:Encoded", GC30AddOf({"b1", "b2"}),
+                 /*hold=*/false);
+    GC28Hold append;
+    append.Arm("DBImpl::WriteToWAL:TakesWalMutex");
+    ASSERT_TRUE(group.Start(GC30Puts(this, cf, keys)));
+    group.Lead();
+    ASSERT_TRUE(append.WaitHeld());
+    ASSERT_TRUE(inserted.WaitHits(2, std::chrono::seconds(10)))
+        << "followers inserted while the append was held: " << inserted.Hits();
+    GC30ExpectInvisible(db_.get(), handles_[cf], keys);
+    EXPECT_EQ(published, db_->GetLatestSequenceNumber());
+    EXPECT_EQ(0, group.Returned());
+    append.Release();
+    for (const Status& s : group.Join()) {
+      ASSERT_OK(s);
+    }
+    GC30ExpectVisible(db_.get(), handles_[cf], keys);
+  }
+}
+
+TEST_P(DBWritePartitionTest, AppendAndInsertBothFailClassifiedOnce) {
+  // GC30 Q1 (D-1): in one group a follower's insert fails (its batch names a
+  // column family that does not exist, ignore_missing_column_families is
+  // off) while the leader's append is held, and then the append fails. The
+  // group is classified once, as the WAL failure: one background error, the
+  // WAL's IOError, which every writer returns (the failed follower
+  // included); debug builds do not assert (HandleMemTableInsertFailure never
+  // runs). No write is visible before or after Resume(), which succeeds.
+  // Neuter: classify the insert failure too (HandleMemTableInsertFailure at
+  // the exit whatever the append status); debug builds assert, release
+  // builds record a second background error.
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS("N > 1 rejects two_write_queues");
+    return;
+  }
+  constexpr size_t kPartitions = 2;
+  auto counter = std::make_shared<GC30BgErrorCounter>();
+  Options options = IndexedWalOptions(CurrentOptions());
+  options.paranoid_checks = true;
+  options.max_bgerror_resume_count = 0;
+  options.listeners.push_back(counter);
+  OpenWithPartitions(kPartitions, options);
+  const int cf = cf_for_partition_[1];
+  uint32_t missing_cf = static_cast<uint32_t>(handles_.size()) + 100;
+  while (true) {
+    WriteBatch batch;
+    ASSERT_OK(WriteBatchInternal::Put(&batch, missing_cf, "key", "value"));
+    size_t partition = kPartitions;
+    ASSERT_OK(
+        DBImpl::TEST_WalPartitionForWrite(batch, kPartitions, &partition));
+    if (partition == 1) {
+      break;
+    }
+    ++missing_cf;
+  }
+  WriteOptions sync_wo;
+  sync_wo.sync = true;
+  ASSERT_OK(Put(cf, "acked", "v", sync_wo));
+  std::vector<std::function<Status()>> writes =
+      GC30Puts(this, cf, {"k0", "k1"});
+  writes.insert(writes.begin() + 1, [this, missing_cf] {
+    WriteBatch batch;
+    EXPECT_OK(WriteBatchInternal::Put(&batch, missing_cf, "missing", "v"));
+    return db_->Write(WriteOptions(), &batch);
+  });
+  std::vector<Status> statuses;
+  {
+    GC30Group group;
+    GC28Hold followers_done;
+    followers_done.Arm("DBImpl::WriteImpl:FollowerMemTableInserted", nullptr,
+                       /*hold=*/false);
+    GC30AppendFailure failure;
+    GC28Hold append;
+    append.Arm("DBImpl::WriteToWAL:TakesWalMutex");
+    ASSERT_TRUE(group.Start(writes));
+    group.Lead();
+    ASSERT_TRUE(append.WaitHeld());
+    ASSERT_TRUE(followers_done.WaitHits(2, std::chrono::seconds(10)))
+        << "followers inserted while the append was held: "
+        << followers_done.Hits();
+    failure.Arm();
+    append.Release();
+    statuses = group.Join();
+  }
+  ASSERT_EQ(3U, statuses.size());
+  for (const Status& s : statuses) {
+    EXPECT_TRUE(s.IsIOError()) << s.ToString();
+  }
+  const Status bg = dbfull()->TEST_GetBGError();
+  EXPECT_TRUE(bg.IsIOError()) << bg.ToString();
+  EXPECT_EQ(1, counter->Count());
+  GC30ExpectInvisible(db_.get(), handles_[cf], {"k0", "k1"});
+  ASSERT_OK(dbfull()->Resume());
+  GC30ExpectInvisible(db_.get(), handles_[cf], {"k0", "k1"});
+  ASSERT_OK(Put(cf, "after", "v"));
+  GC30ExpectVisible(db_.get(), handles_[cf], {"after"});
+}
+
+TEST_P(DBWritePartitionTest,
+       SyncWriterInsertedBeforeFsyncInvisibleUntilDurable) {
+  // GC30 Q2 (ruling 4b, D-GC30e (i)): a sync write's batch is in the
+  // memtable while its gate sync is held, yet invisible to Get, MultiGet, an
+  // iterator, a tailing iterator created before the write and one created
+  // during the hold, a snapshot taken during the hold, and
+  // GetLatestSequenceNumber(). Released, the write returns OK and is visible
+  // everywhere but to that snapshot.
+  // Neuter: insert the sync writers' batches after the fsync (the base
+  // order); the key is not in the memtable while the gate sync is held. The
+  // tailing legs rest on GC27 Q4's bound (neuter: tailing at
+  // kMaxSequenceNumber; the tailing iterators then show the key).
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS("N > 1 rejects two_write_queues");
+    return;
+  }
+  for (const size_t partitions : {size_t{2}, size_t{8}}) {
+    SCOPED_TRACE("partitions=" + std::to_string(partitions));
+    Options options = CurrentOptions();
+    DestroyAndReopen(options);
+    OpenWithPartitions(partitions, options);
+    const int cf = cf_for_partition_[1];
+    ASSERT_OK(Put(cf, "before", "v"));
+    ReadOptions tailing_ro;
+    tailing_ro.tailing = true;
+    std::unique_ptr<Iterator> tailing_before(
+        db_->NewIterator(tailing_ro, handles_[cf]));
+    tailing_before->Seek("s");
+    EXPECT_FALSE(tailing_before->Valid());
+    const SequenceNumber published = db_->GetLatestSequenceNumber();
+    const Snapshot* during = nullptr;
+    std::unique_ptr<Iterator> tailing_during;
+    WriteOptions sync_wo;
+    sync_wo.sync = true;
+    {
+      GC30Write s;
+      GC28Hold inserted;
+      inserted.Arm("MemTable::Add:BeforeReturn:Encoded", GC30AddOf({"s"}),
+                   /*hold=*/false);
+      GC28Hold gate;
+      gate.Arm("DBImpl::CompletionGate:BeforeCoalescedSync");
+      s.Start([&] { return Put(cf, "s", "v", sync_wo); });
+      ASSERT_TRUE(gate.WaitHeld());
+      EXPECT_EQ(1, inserted.Hits()) << "inserted before its fsync";
+      GC30ExpectInvisible(db_.get(), handles_[cf], {"s"});
+      tailing_before->Seek("s");
+      EXPECT_FALSE(tailing_before->Valid());
+      tailing_during.reset(db_->NewIterator(tailing_ro, handles_[cf]));
+      tailing_during->Seek("s");
+      EXPECT_FALSE(tailing_during->Valid());
+      during = db_->GetSnapshot();
+      EXPECT_EQ(published, db_->GetLatestSequenceNumber());
+      EXPECT_FALSE(s.Done());
+      gate.Release();
+      ASSERT_OK(s.Join());
+    }
+    GC30ExpectVisible(db_.get(), handles_[cf], {"s"});
+    for (Iterator* it : {tailing_before.get(), tailing_during.get()}) {
+      it->Seek("s");
+      ASSERT_TRUE(it->Valid());
+      EXPECT_EQ("s", it->key().ToString());
+      EXPECT_OK(it->status());
+    }
+    ReadOptions at_snapshot;
+    at_snapshot.snapshot = during;
+    std::string value;
+    EXPECT_TRUE(db_->Get(at_snapshot, handles_[cf], "s", &value).IsNotFound());
+    db_->ReleaseSnapshot(during);
+    tailing_before.reset();
+    tailing_during.reset();
+  }
+}
+
+TEST_P(DBWritePartitionTest, SyncLedGroupAsyncMembersInsertDuringAppend) {
+  // GC30 Q3 (D-GC30e (i)): in a group led by a sync write, the async
+  // members' inserts finish while the leader's append is held, and they
+  // return, visible, before the group's gate sync starts; the sync writer
+  // returns only after it.
+  // Neuter: launch the memtable writers after the append (the base order);
+  // no member inserts while the append is held.
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS("N > 1 rejects two_write_queues");
+    return;
+  }
+  constexpr size_t kPartitions = 4;
+  Options options = CurrentOptions();
+  OpenWithPartitions(kPartitions, options);
+  const int cf = cf_for_partition_[3];
+  WriteOptions sync_wo;
+  sync_wo.sync = true;
+  std::vector<std::function<Status()>> writes =
+      GC30Puts(this, cf, {"leader"}, sync_wo);
+  for (const auto& write : GC30Puts(this, cf, {"m1", "m2"})) {
+    writes.push_back(write);
+  }
+  GC30Group group;
+  GC28Hold inserted;
+  inserted.Arm("MemTable::Add:BeforeReturn:Encoded", GC30AddOf({"m1", "m2"}),
+               /*hold=*/false);
+  GC28Hold gate;
+  gate.Arm("DBImpl::CompletionGate:BeforeCoalescedSync");
+  GC28Hold append;
+  append.Arm("DBImpl::WriteToWAL:TakesWalMutex");
+  // A hold clears its sync point only once no callback runs: release both
+  // before either clears.
+  Defer release_holds([&] {
+    gate.Release();
+    append.Release();
+  });
+  ASSERT_TRUE(group.Start(writes));
+  group.Lead();
+  ASSERT_TRUE(append.WaitHeld());
+  EXPECT_TRUE(inserted.WaitHits(2, std::chrono::seconds(10)))
+      << "members inserted while the append was held: " << inserted.Hits();
+  EXPECT_EQ(0, group.Returned());
+  append.Release();
+  ASSERT_TRUE(gate.WaitHeld());
+  // Both async members return before the gate sync is released.
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while (group.Returned() < 2 && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_EQ(2, group.Returned());
+  GC30ExpectVisible(db_.get(), handles_[cf], {"m1", "m2"});
+  GC30ExpectInvisible(db_.get(), handles_[cf], {"leader"});
+  gate.Release();
+  for (const Status& s : group.Join()) {
+    ASSERT_OK(s);
+  }
+  GC30ExpectVisible(db_.get(), handles_[cf], {"leader", "m1", "m2"});
+}
+
+TEST_P(DBWritePartitionTest, WalPartitionsOptionRefusalsUnchanged) {
+  // GC30 Q7 guard (it passes at the base): at N in {2, 8} every write-path
+  // option that N>1 refuses is still refused with the same status, naming
+  // wal_partitions and the option: through DB::Open and, for the column
+  // family options, CreateColumnFamily and (where mutable) SetOptions. The
+  // timestamp-stripping refusal is GC29a's and is not pinned here.
+  // Neuter: drop one refusal; its case opens.
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS("N > 1 rejects two_write_queues");
+    return;
+  }
+  struct Refusal {
+    const char* option;
+    std::function<void(Options*)> set;
+    bool invalid_argument;
+    const char* fragment;
+  };
+  const std::vector<Refusal> db_refusals = {
+      {"allow_concurrent_memtable_write",
+       [](Options* o) { o->allow_concurrent_memtable_write = false; }, false,
+       "allow_concurrent_memtable_write"},
+      {"enable_pipelined_write",
+       [](Options* o) { o->enable_pipelined_write = true; }, false,
+       "enable_pipelined_write"},
+      {"unordered_write", [](Options* o) { o->unordered_write = true; }, false,
+       "unordered_write"},
+      {"two_write_queues", [](Options* o) { o->two_write_queues = true; },
+       false, "two_write_queues"},
+      {"track_and_verify_wals",
+       [](Options* o) { o->track_and_verify_wals = true; }, false,
+       "track_and_verify_wals"},
+      {"recycle_log_file_num", [](Options* o) { o->recycle_log_file_num = 1; },
+       false, "recycle_log_file_num"},
+      {"partition_wal_usage",
+       [](Options* o) { o->partition_wal_usage = PartitionWALUsage::kNone; },
+       false, "partition_wal_usage"},
+      {"track_and_verify_wals_in_manifest",
+       [](Options* o) { o->track_and_verify_wals_in_manifest = false; }, false,
+       "track_and_verify_wals_in_manifest"},
+      {"paranoid_checks", [](Options* o) { o->paranoid_checks = false; }, false,
+       "paranoid_checks"},
+  };
+  const std::vector<Refusal> cf_refusals = {
+      {"inplace_update_support",
+       [](Options* o) { o->inplace_update_support = true; }, false,
+       "inplace_update_support"},
+      {"enable_blob_direct_write",
+       [](Options* o) { o->enable_blob_direct_write = true; }, false,
+       "enable_blob_direct_write"},
+      {"max_successive_merges",
+       [](Options* o) { o->max_successive_merges = 1; }, true,
+       "max_successive_merges"},
+      {"memtable_factory",
+       [](Options* o) {
+         o->memtable_factory.reset(test::NewSpecialSkipListFactory(1000));
+       },
+       false, "SkipList memtable"},
+  };
+  auto expect_refused = [](const Status& s, const Refusal& refusal,
+                           const std::string& via) {
+    SCOPED_TRACE(std::string(refusal.option) + " via " + via);
+    if (refusal.invalid_argument) {
+      EXPECT_TRUE(s.IsInvalidArgument()) << s.ToString();
+    } else {
+      EXPECT_TRUE(s.IsNotSupported()) << s.ToString();
+    }
+    EXPECT_NE(std::string::npos, s.ToString().find("wal_partitions"))
+        << s.ToString();
+    EXPECT_NE(std::string::npos, s.ToString().find(refusal.fragment))
+        << s.ToString();
+  };
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::ValidateOptions:AllowWalPartitions",
+      [](void* arg) { *static_cast<bool*>(arg) = true; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  for (const size_t partitions : {size_t{2}, size_t{8}}) {
+    SCOPED_TRACE("partitions=" + std::to_string(partitions));
+    Options base = CurrentOptions();
+    base.create_if_missing = true;
+    base.wal_partitions = static_cast<uint32_t>(partitions);
+    base.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+    base.track_and_verify_wals_in_manifest = true;
+    for (const std::vector<Refusal>* refusals : {&db_refusals, &cf_refusals}) {
+      for (const Refusal& refusal : *refusals) {
+        Options options = base;
+        refusal.set(&options);
+        Close();
+        ASSERT_OK(DestroyDB(dbname_, base));
+        expect_refused(TryReopen(options), refusal, "DB::Open");
+      }
+    }
+    DestroyAndReopen(base);
+    for (const Refusal& refusal : cf_refusals) {
+      Options options = base;
+      refusal.set(&options);
+      ColumnFamilyHandle* handle = nullptr;
+      expect_refused(db_->CreateColumnFamily(ColumnFamilyOptions(options),
+                                             "refused", &handle),
+                     refusal, "CreateColumnFamily");
+      EXPECT_EQ(nullptr, handle);
+    }
+    // The only mutable one.
+    expect_refused(db_->SetOptions(db_->DefaultColumnFamily(),
+                                   {{"max_successive_merges", "1"}}),
+                   cf_refusals[2], "SetOptions");
+    ASSERT_OK(Put("after", "v"));
+  }
+}
+
+TEST_P(DBWritePartitionTest, DroppedColumnFamilyInsertFailsOnceUnderOverlap) {
+  // GC30 Q7: with ignore_missing_column_families=false, a follower's batch
+  // for a dropped column family fails its insert while the leader's append
+  // is held. The group fails once, as upstream: every write of the group
+  // returns the insert's InvalidArgument, one background error is set
+  // (kMemTable, which fences the group's range), and nothing of the group
+  // becomes visible.
+  // Neuter: drop the insert failure's classification on the group exit (or
+  // run it twice); the background error count is not 1.
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS("N > 1 rejects two_write_queues");
+    return;
+  }
+  Options options = CurrentOptions();
+  auto listener = std::make_shared<GC30BgErrorCounter>();
+  options.listeners.push_back(listener);
+  constexpr size_t kPartitions = 2;
+  OpenWithPartitions(kPartitions, options);
+  const int cf = cf_for_partition_[1];
+  // A column family routed to partition 1, dropped.
+  ColumnFamilyHandle* dropped = nullptr;
+  for (int i = 0; dropped == nullptr; ++i) {
+    ColumnFamilyHandle* handle = nullptr;
+    ASSERT_OK(db_->CreateColumnFamily(ColumnFamilyOptions(options),
+                                      "candidate" + std::to_string(i),
+                                      &handle));
+    WriteBatch probe;
+    ASSERT_OK(WriteBatchInternal::Put(&probe, handle->GetID(), "k", "v"));
+    size_t partition = kPartitions;
+    ASSERT_OK(
+        DBImpl::TEST_WalPartitionForWrite(probe, kPartitions, &partition));
+    if (partition == 1) {
+      dropped = handle;
+    } else {
+      ASSERT_OK(db_->DestroyColumnFamilyHandle(handle));
+    }
+  }
+  const uint32_t dropped_id = dropped->GetID();
+  ASSERT_OK(db_->DropColumnFamily(dropped));
+  ASSERT_OK(db_->DestroyColumnFamilyHandle(dropped));
+  ASSERT_GT(dropped_id, static_cast<uint32_t>(cf));
+
+  const std::vector<std::string> keys = {"k0", "k1"};
+  std::vector<std::function<Status()>> writes = GC30Puts(this, cf, keys);
+  writes.push_back([&] {
+    WriteBatch batch;
+    EXPECT_OK(WriteBatchInternal::Put(&batch, dropped_id, "lost", "v"));
+    WriteOptions wo;
+    wo.ignore_missing_column_families = false;
+    return db_->Write(wo, &batch);
+  });
+  std::vector<Status> statuses;
+  {
+    GC30Group group;
+    GC28Hold failed_insert_done;
+    failed_insert_done.Arm(
+        "DBImpl::WriteImpl:FollowerMemTableInserted",
+        [](void* arg) {
+          return !static_cast<WriteThread::Writer*>(arg)->status.ok();
+        },
+        /*hold=*/false);
+    GC28Hold append;
+    append.Arm("DBImpl::WriteToWAL:TakesWalMutex");
+    ASSERT_TRUE(group.Start(writes));
+    group.Lead();
+    ASSERT_TRUE(append.WaitHeld());
+    ASSERT_TRUE(failed_insert_done.WaitHits(1, std::chrono::seconds(10)))
+        << "the dropped column family's insert failed during the append";
+    EXPECT_EQ(0, group.Returned());
+    EXPECT_EQ(0, listener->Count());
+    append.Release();
+    statuses = group.Join();
+  }
+  ASSERT_EQ(writes.size(), statuses.size());
+  for (const Status& s : statuses) {
+    EXPECT_TRUE(s.IsInvalidArgument()) << s.ToString();
+  }
+  EXPECT_EQ(1, listener->Count());
+  ASSERT_NOK(dbfull()->TEST_GetBGError());
+  GC30ExpectInvisible(db_.get(), handles_[cf], keys);
+}
+
+TEST_P(DBWritePartitionTest, LoneWriterGroupStillPublishesInOrder) {
+  // GC30 Q7 (D-GC30b (i)): at N=8, one writer thread per partition, so every
+  // group is a lone writer, whose leader appends and inserts on its own
+  // thread. Every write is acknowledged only once published: when Put
+  // returns, LastSequence() covers its sequence and it reads back. And
+  // publication stays in sequence order: at every snapshot an observer
+  // takes, the visible writes are exactly those at or below its sequence.
+  // Neuter: publish a lone group's range at its insert, before its append
+  // returns; a snapshot sees a write above one not yet inserted, or a Put
+  // returns before LastSequence() covers it.
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS("N > 1 rejects two_write_queues");
+    return;
+  }
+  constexpr size_t kPartitions = 8;
+  constexpr int kWrites = 300;
+  Options options = CurrentOptions();
+  OpenWithPartitions(kPartitions, options);
+  std::atomic<int> waited{0};
+  thread_local SequenceNumber gate_last_sequence = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "WriteThread::JoinBatchGroup:BeganWaiting",
+      [&](void*) { waited.fetch_add(1); });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::InstallCompletionGate", [&](void* arg) {
+        gate_last_sequence = *static_cast<SequenceNumber*>(arg);
+      });
+  std::mutex mu;
+  // key -> (partition, sequence)
+  std::map<std::string, std::pair<size_t, SequenceNumber>> written;
+  std::atomic<bool> done{false};
+  std::vector<std::pair<const Snapshot*, std::vector<std::set<std::string>>>>
+      observed;
+  port::Thread observer([&] {
+    while (!done.load()) {
+      const Snapshot* snapshot = db_->GetSnapshot();
+      ReadOptions ro;
+      ro.snapshot = snapshot;
+      std::vector<std::set<std::string>> visible(kPartitions);
+      for (size_t p = 0; p < kPartitions; ++p) {
+        std::unique_ptr<Iterator> it(
+            db_->NewIterator(ro, handles_[cf_for_partition_[p]]));
+        for (it->SeekToFirst(); it->Valid(); it->Next()) {
+          visible[p].insert(it->key().ToString());
+        }
+        EXPECT_OK(it->status());
+      }
+      observed.emplace_back(snapshot, std::move(visible));
+    }
+  });
+  std::vector<port::Thread> writers;
+  for (size_t p = 0; p < kPartitions; ++p) {
+    writers.emplace_back([&, p] {
+      for (int i = 0; i < kWrites; ++i) {
+        const std::string key =
+            "p" + std::to_string(p) + "_" + std::to_string(1000 + i);
+        gate_last_sequence = 0;
+        ASSERT_OK(Put(cf_for_partition_[p], key, "v"));
+        const SequenceNumber sequence = gate_last_sequence;
+        ASSERT_NE(0U, sequence);
+        EXPECT_GE(db_->GetLatestSequenceNumber(), sequence) << key;
+        EXPECT_EQ("v", Get(cf_for_partition_[p], key)) << key;
+        std::lock_guard<std::mutex> lock(mu);
+        written[key] = {p, sequence};
+      }
+    });
+  }
+  for (auto& writer : writers) {
+    writer.join();
+  }
+  done.store(true);
+  observer.join();
+  SyncPoint::GetInstance()->ClearCallBack(
+      "WriteThread::JoinBatchGroup:BeganWaiting");
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::InstallCompletionGate");
+  // One writer per partition: no write ever queued behind another.
+  EXPECT_EQ(0, waited.load());
+  ASSERT_EQ(kPartitions * kWrites, written.size());
+  EXPECT_FALSE(observed.empty());
+  for (auto& [snapshot, visible] : observed) {
+    const SequenceNumber at = snapshot->GetSequenceNumber();
+    for (const auto& [key, where] : written) {
+      const bool expected = where.second <= at;
+      EXPECT_EQ(expected, visible[where.first].count(key) == 1)
+          << key << " sequence " << where.second << " snapshot " << at;
+    }
+    db_->ReleaseSnapshot(snapshot);
+  }
+}
+
 // GC31 tests: the write-path locks and shared writes at N > 1 outside the
 // two allowed cross-partition sync points.
 namespace {
@@ -4423,6 +7222,252 @@ TEST_P(DBWritePartitionTest, EndSyncGroupWithoutWaiterTakesNoDbMutex) {
   EXPECT_EQ(0, signals.Get());
   EXPECT_EQ(0U, dbfull()->TEST_UnpublishedSyncGroups());
 }
+
+namespace {
+// A FileSystem whose WAL appends block, while armed, on data containing
+// "blockme", until Unblock(). Works without sync points (release builds).
+class GC31BlockingAppendFS : public FileSystemWrapper {
+ public:
+  explicit GC31BlockingAppendFS(const std::shared_ptr<FileSystem>& target)
+      : FileSystemWrapper(target) {}
+  static const char* kClassName() { return "GC31BlockingAppendFS"; }
+  const char* Name() const override { return kClassName(); }
+  IOStatus NewWritableFile(const std::string& fname,
+                           const FileOptions& file_opts,
+                           std::unique_ptr<FSWritableFile>* result,
+                           IODebugContext* dbg) override {
+    IOStatus s = target()->NewWritableFile(fname, file_opts, result, dbg);
+    if (s.ok() && fname.size() > 4 &&
+        fname.compare(fname.size() - 4, 4, ".log") == 0) {
+      result->reset(new File(std::move(*result), this));
+    }
+    return s;
+  }
+  bool WaitBlocked() {
+    std::unique_lock<std::mutex> lock(mu_);
+    return cv_.wait_for(lock, std::chrono::seconds(30),
+                        [this] { return blocked_; });
+  }
+  void Unblock() {
+    std::lock_guard<std::mutex> lock(mu_);
+    released_ = true;
+    cv_.notify_all();
+  }
+
+ private:
+  class File : public FSWritableFileOwnerWrapper {
+   public:
+    File(std::unique_ptr<FSWritableFile>&& t, GC31BlockingAppendFS* fs)
+        : FSWritableFileOwnerWrapper(std::move(t)), fs_(fs) {}
+    IOStatus Append(const Slice& data, const IOOptions& options,
+                    IODebugContext* dbg) override {
+      fs_->MaybeBlock(data);
+      return FSWritableFileOwnerWrapper::Append(data, options, dbg);
+    }
+    IOStatus Append(const Slice& data, const IOOptions& options,
+                    const DataVerificationInfo& info,
+                    IODebugContext* dbg) override {
+      fs_->MaybeBlock(data);
+      return FSWritableFileOwnerWrapper::Append(data, options, info, dbg);
+    }
+
+   private:
+    GC31BlockingAppendFS* const fs_;
+  };
+  void MaybeBlock(const Slice& data) {
+    if (data.ToString().find("blockme") == std::string::npos) {
+      return;
+    }
+    std::unique_lock<std::mutex> lock(mu_);
+    blocked_ = true;
+    cv_.notify_all();
+    cv_.wait(lock, [this] { return released_; });
+  }
+  std::mutex mu_;
+  std::condition_variable cv_;
+  bool blocked_ = false;
+  bool released_ = false;
+};
+
+// Runs, at `num_partitions`, a write group {leader, follower} on the default
+// column family whose follower's batch (a few thousand puts, then one for a
+// dropped column family) fails its insert last, so the follower runs the
+// group's exit. The group forms behind a write whose WAL append blocks.
+// Returns the leader's and the follower's statuses.
+void GC31FollowerExitGroup(DBTestBase* test, size_t num_partitions,
+                           Status* leader_status, Status* follower_status) {
+  auto fs = std::make_shared<GC31BlockingAppendFS>(test->env_->GetFileSystem());
+  std::unique_ptr<Env> env(NewCompositeEnv(fs));
+  Defer close_before_env([test] { test->Close(); });
+  Options options = test->CurrentOptions();
+  options.env = env.get();
+  options.wal_partitions = static_cast<uint32_t>(num_partitions);
+  if (num_partitions > 1) {
+    options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+    options.track_and_verify_wals_in_manifest = true;
+  }
+  options.allow_concurrent_memtable_write = true;
+  test->DestroyAndReopen(options);
+  DB* db = test->db_.get();
+  ColumnFamilyHandle* dropped = nullptr;
+  ASSERT_OK(db->CreateColumnFamily(options, "dropped", &dropped));
+  const uint32_t dropped_id = dropped->GetID();
+  ASSERT_OK(db->DropColumnFamily(dropped));
+  ASSERT_OK(db->DestroyColumnFamilyHandle(dropped));
+
+  GC30Write blocker;
+  GC30Write leader;
+  GC30Write follower;
+  Defer unblock([&] { fs->Unblock(); });
+  blocker.Start([&] { return db->Put(WriteOptions(), "a", "blockme"); });
+  ASSERT_TRUE(fs->WaitBlocked());
+  leader.Start([&] { return db->Put(WriteOptions(), "leader", "v"); });
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  follower.Start([&] {
+    WriteBatch batch;
+    for (int i = 0; i < 4000; ++i) {
+      EXPECT_OK(batch.Put("f" + std::to_string(i), "v"));
+    }
+    EXPECT_OK(WriteBatchInternal::Put(&batch, dropped_id, "lost", "v"));
+    return db->Write(WriteOptions(), &batch);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  fs->Unblock();
+  ASSERT_OK(blocker.Join());
+  *leader_status = leader.Join();
+  *follower_status = follower.Join();
+  test->Close();
+}
+
+}  // namespace
+
+TEST_P(DBWritePartitionTest, N1FollowerExitMatchesUpstream) {
+  // GC31 Q11: at one WAL partition the follower exit is upstream's. A
+  // follower's insert fails (a dropped column family) and the follower runs
+  // the group's exit: upstream's assertion that the group succeeded fires in
+  // debug builds, and in release builds the leader returns OK while the
+  // follower returns the failure.
+  // Neuter: GC30's unconditional hand-off of a failed group status to the
+  // leader; no assertion fires (debug), the leader returns InvalidArgument
+  // (release).
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS("single-queue path only");
+    return;
+  }
+#ifdef NDEBUG
+  Status leader_status;
+  Status follower_status;
+  GC31FollowerExitGroup(this, 1, &leader_status, &follower_status);
+  EXPECT_OK(leader_status);
+  EXPECT_TRUE(follower_status.IsInvalidArgument())
+      << follower_status.ToString();
+#else
+#ifdef GTEST_FLAG_SET
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+#else
+  ::testing::GTEST_FLAG(death_test_style) = "threadsafe";
+#endif
+  EXPECT_DEATH(
+      {
+        Status leader_status;
+        Status follower_status;
+        GC31FollowerExitGroup(this, 1, &leader_status, &follower_status);
+      },
+      "write_group->status\\.ok\\(\\)");
+#endif  // NDEBUG
+}
+
+TEST_P(DBWritePartitionTest, NGreaterThan1FollowerExitHandsFailureToLeader) {
+  // GC31 Q11: above one partition GC30's follower exit stays: the same group,
+  // whose follower's insert fails and whose exit the follower runs, fails as
+  // one, the leader included.
+  // Neuter: upstream's follower exit at every N; the leader returns OK (and
+  // debug builds assert).
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS("N > 1 rejects two_write_queues");
+    return;
+  }
+  for (const size_t partitions : {size_t{2}, size_t{8}}) {
+    SCOPED_TRACE("partitions=" + std::to_string(partitions));
+    Status leader_status;
+    Status follower_status;
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::ValidateOptions:AllowWalPartitions",
+        [](void* arg) { *static_cast<bool*>(arg) = true; });
+    SyncPoint::GetInstance()->EnableProcessing();
+    GC31FollowerExitGroup(this, partitions, &leader_status, &follower_status);
+    EXPECT_TRUE(leader_status.IsInvalidArgument()) << leader_status.ToString();
+    EXPECT_TRUE(follower_status.IsInvalidArgument())
+        << follower_status.ToString();
+  }
+}
+TEST_P(DBWritePartitionTest, ZeroCountMarkerNeverPublishesInFlightSequence) {
+  // GC20 Q3 (K1): a WAL record that consumes no sequence (here LogData
+  // only) completes while every other partition is idle. It must not move
+  // the applied safe point past the last allocated sequence L: X then
+  // allocates L + 1 on partition 1 and is held before its append, and Y
+  // allocates L + 2 on partition 2, completes, publishes and parks in its
+  // gate. LastSequence() stays at L until X completes.
+  // Neuter: the tracker treats the marker's empty range [L + 1, L] as
+  // [L + 1, L + 1]; Y's completion publishes L + 1, X's in-flight sequence
+  // (in debug, PublishAppliedFrontierLocked's pending-low assertion fires).
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS("N > 1 rejects two_write_queues");
+    return;
+  }
+  constexpr size_t kPartitions = 3;
+  Options options = CurrentOptions();
+  options.avoid_flush_during_shutdown = true;
+  OpenWithPartitions(kPartitions, options);
+  ASSERT_OK(Put(cf_for_partition_[0], "base", "value"));
+  WriteBatch marker;
+  ASSERT_OK(marker.PutLogData("marker"));
+  ASSERT_OK(db_->Write(WriteOptions(), &marker));
+  const SequenceNumber last = db_->GetLatestSequenceNumber();
+
+  std::mutex mu;
+  std::condition_variable cv;
+  bool x_in_append = false;
+  bool release_x = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WriteToWAL:log_entry", [&](void* arg) {
+        if (!static_cast<Slice*>(arg)->ends_with("value_x")) {
+          return;
+        }
+        std::unique_lock<std::mutex> lock(mu);
+        x_in_append = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return release_x; });
+      });
+  Status x_status;
+  port::Thread x_thread(
+      [&] { x_status = Put(cf_for_partition_[1], "key_x", "value_x"); });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    EXPECT_TRUE(cv.wait_for(lock, std::chrono::seconds(30),
+                            [&] { return x_in_append; }));
+  }
+  Status y_status;
+  port::Thread y_thread(
+      [&] { y_status = Put(cf_for_partition_[2], "key_y", "value_y"); });
+  EXPECT_TRUE(WaitForDurabilityWaiters(1));
+  EXPECT_EQ(last, db_->GetLatestSequenceNumber());
+  EXPECT_EQ("NOT_FOUND", Get(cf_for_partition_[2], "key_y"));
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    release_x = true;
+    cv.notify_all();
+  }
+  x_thread.join();
+  y_thread.join();
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:log_entry");
+  ASSERT_OK(x_status);
+  ASSERT_OK(y_status);
+  EXPECT_EQ(last + 2, db_->GetLatestSequenceNumber());
+  EXPECT_EQ("value_x", Get(cf_for_partition_[1], "key_x"));
+  EXPECT_EQ("value_y", Get(cf_for_partition_[2], "key_y"));
+}
+
 TEST_P(DBWritePartitionTest, CoverAppendSerializedWithFlushWAL) {
   // GC20 Q4 (K3): with manual_wal_flush at N=2, a protected batch whose log
   // entry is corrupted fails WriteBatch::VerifyChecksum inside WriteToWAL,
@@ -5321,6 +8366,111 @@ TEST_P(DBWritePartitionTest, ReadOnlyCompactedOpenAppliesPartitionChecks) {
       << s.ToString();
 }
 
+// G-10 and N-2-1 (F011): A on partition 0 allocates the lower sequence and
+// is held either inside its WAL append or between its append and its memtable
+// insert; B on partition 1 (the higher sequence) finishes its insert. Nothing
+// at or above A's sequence is visible until A is released: not B through
+// GetLatestSequenceNumber(), a new snapshot, a plain Get or an iterator, and
+// B's Put does not return. A snapshot taken while A is held reads the same
+// before and after A lands.
+TEST_P(DBWritePartitionTest, PublicationStopsBelowHeldLowerWrite) {
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS("single-queue path only");
+    return;
+  }
+  constexpr size_t kPartitions = 2;
+  Options options = CurrentOptions();
+  options.avoid_flush_during_shutdown = true;
+  for (const bool hold_in_append : {true, false}) {
+    SCOPED_TRACE(hold_in_append ? "held in append" : "held before insert");
+    if (!hold_in_append) {
+      Destroy(options);
+      Reopen(options);
+    }
+    OpenWithPartitions(kPartitions, options);
+    const int cf_a = cf_for_partition_[0];
+    const int cf_b = cf_for_partition_[1];
+    ASSERT_OK(Put(cf_a, "seed", "v"));
+    const SequenceNumber base = db_->GetLatestSequenceNumber();
+    const SequenceNumber seq_a = base + 1;
+    const SequenceNumber seq_b = base + 2;
+
+    std::mutex mu;
+    std::condition_variable cv;
+    bool a_held = false;
+    bool release_a = false;
+    std::atomic<bool> b_returned{false};
+    Status a_status;
+    Status b_status;
+    // A is the next WAL write, so it is the first to reach either point.
+    SyncPoint::GetInstance()->SetCallBack(
+        hold_in_append ? "DBImpl::WriteToWAL:log_entry"
+                       : "DBImpl::InstallCompletionGate",
+        [&](void*) {
+          std::unique_lock<std::mutex> lock(mu);
+          if (a_held) {
+            return;
+          }
+          a_held = true;
+          cv.notify_all();
+          cv.wait(lock, [&] { return release_a; });
+        });
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    port::Thread a_thread([&] { a_status = Put(cf_a, "key_a", "value_a"); });
+    {
+      std::unique_lock<std::mutex> lock(mu);
+      EXPECT_TRUE(cv.wait_until(lock, deadline, [&] { return a_held; }));
+    }
+    port::Thread b_thread([&] {
+      b_status = Put(cf_b, "key_b", "value_b");
+      b_returned.store(true);
+    });
+    // B parks in its completion gate only after its memtable insert.
+    EXPECT_TRUE(WaitForDurabilityWaiters(1));
+    if (!hold_in_append) {
+      // A's record landed, so the durability safe point alone would admit
+      // B; only the applied bound keeps it hidden.
+      EXPECT_GE(dbfull()->WalDurabilitySafePoint(), seq_b);
+    }
+
+    EXPECT_LT(db_->GetLatestSequenceNumber(), seq_a);
+    const Snapshot* snapshot = db_->GetSnapshot();
+    EXPECT_LT(snapshot->GetSequenceNumber(), seq_a);
+    EXPECT_EQ("NOT_FOUND", Get(cf_b, "key_b"));
+    EXPECT_EQ("NOT_FOUND", Get(cf_b, "key_b", snapshot));
+    EXPECT_EQ("NOT_FOUND", Get(cf_a, "key_a", snapshot));
+    {
+      std::unique_ptr<Iterator> it(
+          db_->NewIterator(ReadOptions(), handles_[cf_b]));
+      it->SeekToFirst();
+      EXPECT_FALSE(it->Valid());
+      EXPECT_OK(it->status());
+    }
+    EXPECT_FALSE(b_returned.load());
+
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      release_a = true;
+      cv.notify_all();
+    }
+    a_thread.join();
+    b_thread.join();
+    SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:log_entry");
+    SyncPoint::GetInstance()->ClearCallBack("DBImpl::InstallCompletionGate");
+    ASSERT_OK(a_status);
+    ASSERT_OK(b_status);
+
+    // The snapshot reads exactly what it read while A was held.
+    EXPECT_EQ("NOT_FOUND", Get(cf_b, "key_b", snapshot));
+    EXPECT_EQ("NOT_FOUND", Get(cf_a, "key_a", snapshot));
+    db_->ReleaseSnapshot(snapshot);
+    EXPECT_EQ(seq_b, db_->GetLatestSequenceNumber());
+    EXPECT_EQ("value_a", Get(cf_a, "key_a"));
+    EXPECT_EQ("value_b", Get(cf_b, "key_b"));
+  }
+}
+
 // N-2-2: with more than one WAL partition, publishing above the allocated
 // sequence fails the debug assertion even without two_write_queues.
 TEST_P(DBWritePartitionTest, PublishAboveAllocatedAsserts) {
@@ -5490,6 +8640,41 @@ TEST_P(DBWritePartitionTest, IngestionFailsCleanlyOverPinnedFailedAppend) {
     EXPECT_EQ("v", Get(cf, "key"));
     Close();
   }
+}
+
+TEST_F(DBWriteTestUnparameterized, WalPartitionsRequireParanoidChecks) {
+  // Q1 (G-12, G-22 N>1 half): a failed append must stop an N>1 DB, so Open
+  // refuses paranoid_checks=false there and names both options. Without the
+  // test hook N>1 is still refused first; N=1 is unaffected.
+  Options options = CurrentOptions();
+  options.wal_partitions = 2;
+  options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  options.track_and_verify_wals_in_manifest = true;
+  options.paranoid_checks = false;
+  Destroy(options);
+  Status s = TryReopen(options);
+  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+  EXPECT_NE(nullptr, std::strstr(s.getState(), "not supported yet"))
+      << s.ToString();
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::ValidateOptions:AllowWalPartitions",
+      [](void* arg) { *static_cast<bool*>(arg) = true; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  s = TryReopen(options);
+  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+  EXPECT_NE(nullptr, std::strstr(s.getState(), "wal_partitions"))
+      << s.ToString();
+  EXPECT_NE(nullptr, std::strstr(s.getState(), "paranoid_checks"))
+      << s.ToString();
+
+  options.paranoid_checks = true;
+  ASSERT_OK(TryReopen(options));
+  options.wal_partitions = 1;
+  options.paranoid_checks = false;
+  ASSERT_OK(TryReopen(options));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
 namespace {
@@ -5674,6 +8859,124 @@ TEST_P(DBWritePartitionTest, WbmFlushDecidedAgainAfterGateCloses) {
   options.write_buffer_manager->FreeMem(4 * kBufferSize);
 }
 
+TEST_P(DBWritePartitionTest, PublicationBoundedForParallelGroup) {
+  // G-10 on the parallel-memtable path (ported from D126813582): B1 and B2
+  // are forced into one group on partition 1, above A held in its append on
+  // partition 0. B2, the follower, is made the last writer out, so the
+  // group publishes from the follower's exit; it publishes nothing above A's
+  // sequence and parks until A lands.
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS(
+        "N > 1 needs indexed WALs, which two_write_queues "
+        "rejects");
+    return;
+  }
+  Options options = CurrentOptions();
+  options.avoid_flush_during_shutdown = true;
+  OpenWithPartitions(2, options);
+  const int cf_a = cf_for_partition_[0];
+  const int cf_b = cf_for_partition_[1];
+  ASSERT_OK(Put(cf_a, "warmup", "value"));
+  const SequenceNumber seq_a = db_->GetLatestSequenceNumber() + 1;
+
+  std::mutex mu;
+  std::condition_variable cv;
+  bool a_held = false;
+  bool release_a = false;
+  bool b1_waiting = false;
+  bool b2_linked = false;
+  WriteThread::Writer* b1 = nullptr;
+  bool b1_blocked = false;
+  int follower_exits = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WriteToWAL:log_entry", [&](void*) {
+        std::unique_lock<std::mutex> lock(mu);
+        if (!a_held) {
+          a_held = true;
+          cv.notify_all();
+          cv.wait(lock, [&] { return release_a; });
+        }
+      });
+  port::Thread a_thread([&] { ASSERT_OK(Put(cf_a, "a", "value")); });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    EXPECT_TRUE(
+        cv.wait_for(lock, std::chrono::seconds(30), [&] { return a_held; }));
+  }
+  // B1 waits at group formation until B2 has queued behind it.
+  SyncPoint::GetInstance()->SetCallBack(
+      "WriteThread::JoinBatchGroup:Wait", [&](void* arg) {
+        if (static_cast<WriteThread::Writer*>(arg)->wal_partition != 1) {
+          return;
+        }
+        std::unique_lock<std::mutex> lock(mu);
+        if (!b1_waiting) {
+          b1 = static_cast<WriteThread::Writer*>(arg);
+          b1_waiting = true;
+          cv.notify_all();
+          cv.wait(lock, [&] { return b2_linked; });
+        } else {
+          b2_linked = true;
+          cv.notify_all();
+        }
+      });
+  // B1 inserts and blocks waiting for B2 before B2 inserts, so B2 exits the
+  // group.
+  SyncPoint::GetInstance()->SetCallBack(
+      "WriteThread::AwaitState:BlockingWaiting", [&](void* arg) {
+        std::lock_guard<std::mutex> lock(mu);
+        if (arg == b1) {
+          b1_blocked = true;
+          cv.notify_all();
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "WriteThread::JoinBatchGroup:DoneWaiting", [&](void* arg) {
+        auto* w = static_cast<WriteThread::Writer*>(arg);
+        if (w->wal_partition != 1 ||
+            w->state != WriteThread::STATE_PARALLEL_MEMTABLE_WRITER) {
+          return;
+        }
+        std::unique_lock<std::mutex> lock(mu);
+        cv.wait(lock, [&] { return b1_blocked; });
+        ++follower_exits;
+      });
+  port::Thread b1_thread([&] { ASSERT_OK(Put(cf_b, "b1", "value")); });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    EXPECT_TRUE(cv.wait_for(lock, std::chrono::seconds(30),
+                            [&] { return b1_waiting; }));
+  }
+  port::Thread b2_thread([&] { ASSERT_OK(Put(cf_b, "b2", "value")); });
+  EXPECT_TRUE(WaitForDurabilityWaiters(1));
+
+  EXPECT_LT(db_->GetLatestSequenceNumber(), seq_a);
+  const Snapshot* snapshot = db_->GetSnapshot();
+  EXPECT_EQ("NOT_FOUND", Get(cf_b, "b1"));
+  EXPECT_EQ("NOT_FOUND", Get(cf_b, "b2"));
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    release_a = true;
+    cv.notify_all();
+  }
+  a_thread.join();
+  b1_thread.join();
+  b2_thread.join();
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::WriteToWAL:log_entry");
+  SyncPoint::GetInstance()->ClearCallBack("WriteThread::JoinBatchGroup:Wait");
+  SyncPoint::GetInstance()->ClearCallBack(
+      "WriteThread::AwaitState:BlockingWaiting");
+  SyncPoint::GetInstance()->ClearCallBack(
+      "WriteThread::JoinBatchGroup:DoneWaiting");
+
+  EXPECT_EQ(1, follower_exits);
+  EXPECT_EQ(seq_a + 2, db_->GetLatestSequenceNumber());
+  EXPECT_EQ("value", Get(cf_b, "b1"));
+  EXPECT_EQ("value", Get(cf_b, "b2"));
+  EXPECT_EQ("NOT_FOUND", Get(cf_b, "b1", snapshot));
+  db_->ReleaseSnapshot(snapshot);
+}
+
 // GC27 Q2 (former M4-F1.1, GC25 carry-over; AMB-M4-23): above one partition
 // a sync group leaves its write queue before its sync writers are fsynced,
 // inserted and published (D-9). LockWAL() enters every queue and then waits
@@ -5768,6 +9071,229 @@ TEST_P(DBWritePartitionTest, LockWalWaitsForPendingSyncGroup) {
     SyncPoint::GetInstance()->DisableProcessing();
     SyncPoint::GetInstance()->ClearAllCallBacks();
   }
+}
+
+// Keys a tailing iterator shows from the first, after a fresh seek.
+static std::vector<std::string> TailingKeys(Iterator* it) {
+  std::vector<std::string> keys;
+  for (it->SeekToFirst(); it->Valid(); it->Next()) {
+    keys.push_back(it->key().ToString());
+  }
+  EXPECT_OK(it->status());
+  return keys;
+}
+
+// GC27 Q4 (D-GC27a): above one partition an async write in its own group
+// above a pending sync write inserts into the memtable before its completion
+// gate waits for the sync write, and fails when that write's fsync fails. A
+// tailing iterator reads the memtables at kMaxSequenceNumber; it is now
+// bounded by the published sequence on every visibility check, so it never
+// shows the failed write: not while it is inserted and parked, not after the
+// failure, before or after Resume(), whether created before the failure, new,
+// or opened through NewIterators() (a tailing iterator does not support
+// Refresh()). It still shows writes as they publish. Neuter: tail at
+// kMaxSequenceNumber with no read callback (as before); "zebra" shows while
+// parked and before Resume.
+TEST_P(DBWritePartitionTest,
+       TailingIteratorNeverShowsFailedWriteAboveFailedSync) {
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS("N > 1 rejects two_write_queues");
+    return;
+  }
+  for (const size_t partitions : {size_t{2}, size_t{8}}) {
+    SCOPED_TRACE("N=" + std::to_string(partitions));
+    Options options = CurrentOptions();
+    options.paranoid_checks = true;
+    options.max_bgerror_resume_count = 0;
+    options.disable_auto_compactions = true;
+    DestroyAndReopen(options);
+    OpenWithPartitions(partitions, options);
+    const int cf = cf_for_partition_[0];
+    ASSERT_OK(Put(cf, "f", "value_f"));
+    ReadOptions tailing;
+    tailing.tailing = true;
+    std::unique_ptr<Iterator> early(db_->NewIterator(tailing, handles_[cf]));
+    const std::vector<std::string> kOnlyF = {"f"};
+    ASSERT_EQ(kOnlyF, TailingKeys(early.get()));
+
+    std::mutex mu;
+    std::condition_variable cv;
+    bool held = false;
+    bool release = false;
+    std::atomic<bool> fail_sync{false};
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::CompletionGate:BeforeCoalescedSync", [&](void*) {
+          std::unique_lock<std::mutex> lock(mu);
+          if (held) {
+            return;
+          }
+          held = true;
+          cv.notify_all();
+          cv.wait_for(lock, std::chrono::seconds(30), [&] { return release; });
+        });
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::SyncWalsFromCompletionGate:AfterGateSync", [&](void* arg) {
+          if (fail_sync.exchange(false)) {
+            IOStatus error = IOStatus::IOError("injected gate sync error");
+            error.SetRetryable(true);
+            *static_cast<IOStatus*>(arg) = error;
+          }
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+    Status s_status;
+    port::Thread s_thread([&] {
+      WriteOptions sync_wo;
+      sync_wo.sync = true;
+      s_status = db_->Put(sync_wo, handles_[cf], "s", "value_s");
+    });
+    {
+      std::unique_lock<std::mutex> lock(mu);
+      EXPECT_TRUE(
+          cv.wait_for(lock, std::chrono::seconds(30), [&] { return held; }));
+    }
+    Status c_status;
+    port::Thread c_thread([&] { c_status = Put(cf, "zebra", "value_zebra"); });
+    EXPECT_TRUE(WaitForDurabilityWaiters(1));
+    // Inserted, parked, not published.
+    {
+      std::unique_ptr<Iterator> fresh(db_->NewIterator(tailing, handles_[cf]));
+      EXPECT_EQ(kOnlyF, TailingKeys(fresh.get()));
+      EXPECT_EQ(kOnlyF, TailingKeys(early.get()));
+    }
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      fail_sync = true;
+      release = true;
+      cv.notify_all();
+    }
+    s_thread.join();
+    c_thread.join();
+    ASSERT_TRUE(s_status.IsIOError()) << s_status.ToString();
+    ASSERT_TRUE(c_status.IsIOError()) << c_status.ToString();
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+
+    auto check = [&](const std::string& phase) {
+      SCOPED_TRACE(phase);
+      EXPECT_EQ(kOnlyF, TailingKeys(early.get()));
+      std::unique_ptr<Iterator> fresh(db_->NewIterator(tailing, handles_[cf]));
+      EXPECT_EQ(kOnlyF, TailingKeys(fresh.get()));
+      std::vector<Iterator*> iterators;
+      ASSERT_OK(db_->NewIterators(tailing, {handles_[cf]}, &iterators));
+      ASSERT_EQ(1U, iterators.size());
+      EXPECT_EQ(kOnlyF, TailingKeys(iterators[0]));
+      delete iterators[0];
+    };
+    check("before resume");
+    ASSERT_OK(dbfull()->Resume());
+    check("after resume");
+    // Published writes show without a refresh.
+    ASSERT_OK(Put(cf, "after", "value_after"));
+    const std::vector<std::string> kWithAfter = {"after", "f"};
+    EXPECT_EQ(kWithAfter, TailingKeys(early.get()));
+    early.reset();
+  }
+}
+
+// GC27 Q4: the corrected sibling of
+// FailedSyncRangeDeletionHiddenUntilResumeDropsIt without its tailing
+// allowance. That test lets a tailing iterator show "zebra", the async write
+// that parked behind the failed sync range deletion, before Resume(); a
+// tailing iterator is now bounded by the published sequence, so it shows
+// neither "point" nor "zebra", and the range deletion never hides "f",
+// before Resume() (an iterator created before the failure and a fresh one)
+// and after it.
+// Neuter: the tailing DBIter at kMaxSequenceNumber (no
+// PublishedSequenceReadCallback): "zebra" shows before Resume().
+TEST_P(DBWritePartitionTest,
+       FailedSyncRangeDeletionHiddenFromTailingIteratorBeforeResume) {
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS("N > 1 rejects two_write_queues");
+    return;
+  }
+  Options options = CurrentOptions();
+  options.paranoid_checks = true;
+  options.max_bgerror_resume_count = 0;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  OpenWithPartitions(2, options);
+  const int cf = cf_for_partition_[0];
+  ASSERT_OK(Put(cf, "f", "value_f"));
+  ReadOptions tailing_ro;
+  tailing_ro.tailing = true;
+  std::unique_ptr<Iterator> early(db_->NewIterator(tailing_ro, handles_[cf]));
+  ASSERT_EQ(std::vector<std::string>{"f"}, TailingKeys(early.get()));
+
+  std::mutex mu;
+  std::condition_variable cv;
+  int fail_syncs = 0;
+  bool f_in_sync = false;
+  bool release_f = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SyncWalsFromCompletionGate:AfterGateSync", [&](void* arg) {
+        std::lock_guard<std::mutex> lock(mu);
+        if (fail_syncs > 0) {
+          --fail_syncs;
+          IOStatus error = IOStatus::IOError("injected gate sync error");
+          error.SetRetryable(true);
+          *static_cast<IOStatus*>(arg) = error;
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SyncEveryWalPartition:TakesPartitionSyncMutex", [&](void*) {
+        std::unique_lock<std::mutex> lock(mu);
+        if (!f_in_sync) {
+          f_in_sync = true;
+          cv.notify_all();
+          cv.wait(lock, [&] { return release_f; });
+        }
+      });
+  WriteOptions sync_wo;
+  sync_wo.sync = true;
+  Status w_status;
+  port::Thread f_thread([&] {
+    WriteBatch batch;
+    EXPECT_OK(batch.DeleteRange(handles_[cf], "a", "m"));
+    EXPECT_OK(batch.Put(handles_[cf], "point", "value_point"));
+    w_status = db_->Write(sync_wo, &batch);
+  });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    EXPECT_TRUE(
+        cv.wait_for(lock, std::chrono::seconds(30), [&] { return f_in_sync; }));
+  }
+  Status zebra_status;
+  port::Thread zebra_thread(
+      [&] { zebra_status = Put(cf, "zebra", "value_zebra"); });
+  EXPECT_TRUE(WaitForDurabilityWaiters(1));
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    fail_syncs = 1;
+    release_f = true;
+    cv.notify_all();
+  }
+  f_thread.join();
+  zebra_thread.join();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_TRUE(w_status.IsIOError()) << w_status.ToString();
+  ASSERT_TRUE(zebra_status.IsIOError()) << zebra_status.ToString();
+
+  const std::vector<std::string> kOnlyF = {"f"};
+  {
+    SCOPED_TRACE("before resume");
+    std::unique_ptr<Iterator> fresh(db_->NewIterator(tailing_ro, handles_[cf]));
+    EXPECT_EQ(kOnlyF, TailingKeys(fresh.get()));
+    EXPECT_EQ(kOnlyF, TailingKeys(early.get()));
+  }
+  early.reset();
+  ASSERT_OK(dbfull()->Resume());
+  ASSERT_OK(Flush(cf));
+  {
+    SCOPED_TRACE("after resume");
+    std::unique_ptr<Iterator> fresh(db_->NewIterator(tailing_ro, handles_[cf]));
+    EXPECT_EQ(kOnlyF, TailingKeys(fresh.get()));
+  }
+  Close();
 }
 
 // GC27 Q7: ported from GC26's losing candidate (Muse, babe10dd6620), with
