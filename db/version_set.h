@@ -1591,9 +1591,26 @@ class VersionSet {
   // Set the last sequence number to s.
   void SetLastSequence(uint64_t s) {
     assert(s >= last_sequence_);
-    // Last visible sequence must always be less than last written seq
-    assert(!db_options_->two_write_queues || s <= last_allocated_sequence_);
+    // Last visible sequence must always be less than last written seq. Every
+    // publisher with two write queues or more than one WAL partition
+    // allocates before it publishes.
+    assert(
+        (!db_options_->two_write_queues && db_options_->wal_partitions <= 1) ||
+        s <= last_allocated_sequence_);
     last_sequence_.store(s, std::memory_order_release);
+  }
+
+  // Like SetLastSequence(), but for concurrent publishers: raises the last
+  // sequence to `s` and leaves it alone if it is already at or past `s`.
+  void SetLastSequenceAtLeast(uint64_t s) {
+    assert(
+        (!db_options_->two_write_queues && db_options_->wal_partitions <= 1) ||
+        s <= last_allocated_sequence_);
+    uint64_t current = last_sequence_.load(std::memory_order_acquire);
+    while (current < s && !last_sequence_.compare_exchange_weak(
+                              current, s, std::memory_order_release,
+                              std::memory_order_acquire)) {
+    }
   }
 
   // Note: memory_order_release must be sufficient
