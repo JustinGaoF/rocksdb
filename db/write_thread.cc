@@ -742,8 +742,20 @@ bool WriteThread::CompleteParallelMemTableWriter(Writer* w) {
     write_group->status = w->status;
   }
 
+  // Read before this writer's decrement, which may let the group exit.
+  const bool leader_exits = write_group->leader_exits;
+  Writer* const leader = write_group->leader;
   if (write_group->running-- > 1) {
     // we're not the last one
+    if (!leader_exits || w != leader) {
+      AwaitState(w, STATE_COMPLETED, &cpmtw_ctx);
+      return false;
+    }
+    // The last of the others hands this leader the exit.
+    AwaitState(w, STATE_PARALLEL_GROUP_EXIT, &cpmtw_ctx);
+  } else if (leader_exits && w != leader) {
+    // The leader, waiting above, performs the exit duties.
+    SetState(leader, STATE_PARALLEL_GROUP_EXIT);
     AwaitState(w, STATE_COMPLETED, &cpmtw_ctx);
     return false;
   }
@@ -759,18 +771,30 @@ void WriteThread::ExitAsBatchGroupFollower(Writer* w) {
 
   assert(w->state == STATE_PARALLEL_MEMTABLE_WRITER);
   assert(w != write_group->leader);
-  assert(write_group->status.ok());
-  ExitAsBatchGroupLeader(*write_group, write_group->status);
+  if (!write_group->multi_partition) {
+    // One WAL partition: exactly upstream's exit.
+    assert(write_group->status.ok());
+    ExitAsBatchGroupLeader(*write_group, write_group->status);
+    assert(w->status.ok());
+    assert(w->state == STATE_COMPLETED);
+    SetState(write_group->leader, STATE_COMPLETED);
+    return;
+  }
+  // Above one partition the group may have failed (an insert, or the
+  // leader's WAL append, see WriteGroup::wal_status), and every writer, the
+  // leader included, gets that outcome.
+  Status status = write_group->status;
+  ExitAsBatchGroupLeader(*write_group, status);
   // The exit hands every non-leader member the group outcome, so the exiting
   // follower's status now equals the group status, including a completion-gate
   // outcome that did not exist when the exit started.
-  assert(w->status.ToString() == write_group->status.ToString());
+  assert(w->status.ToString() == status.ToString());
   assert(w->state == STATE_COMPLETED);
-  // The leader's own status is untouched by the loop above; hand it the gate
-  // outcome (only that: other group errors keep their existing routing).
-  // Before the state change, which lets the leader thread read its status.
-  if (write_group->leader->status.ok() && !write_group->gate_status.ok()) {
-    write_group->leader->status = write_group->gate_status;
+  // The leader's own status is untouched by the loop above; hand it the
+  // group outcome. Before the state change, which lets the leader thread
+  // read its status.
+  if (write_group->leader->status.ok() && !status.ok()) {
+    write_group->leader->status = status;
   }
   SetState(write_group->leader, STATE_COMPLETED);
 }
@@ -914,8 +938,8 @@ void WriteThread::ExitAsBatchGroupLeader(WriteGroup& write_group,
       // already failed; followers are failing either way, and a failed append
       // stays pinned, so waiting on it could never succeed.
       if (write_group.async_writers_gate) {
-        // The leader, a sync writer, inserts every batch of such a group
-        // itself and so runs this exit: only sync writers wait for the
+        // The leader, a sync writer, runs the exit of such a group
+        // (WriteGroup::leader_exits): only sync writers wait for the
         // completion gate below.
         assert(leader->sync);
         Status async_status = write_group.async_writers_gate();
