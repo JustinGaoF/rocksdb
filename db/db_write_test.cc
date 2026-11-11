@@ -928,6 +928,34 @@ TEST_P(DBWriteTest, LockWALConcurrentRecursive) {
   ASSERT_EQ(Get("k3"), "val");
 }
 
+TEST_F(DBWriteTestUnparameterized, WalWriteMutexConfigurationMatrix) {
+  for (const bool two_write_queues : {false, true}) {
+    for (const bool manual_wal_flush : {false, true}) {
+      Options options = CurrentOptions();
+      options.two_write_queues = two_write_queues;
+      options.manual_wal_flush = manual_wal_flush;
+      Reopen(options);
+
+      ASSERT_OK(Put("before_lock", "value"));
+      ASSERT_EQ(!manual_wal_flush, dbfull()->WALBufferIsEmpty());
+      ASSERT_OK(db_->LockWAL());
+      ASSERT_TRUE(dbfull()->WALBufferIsEmpty());
+
+      port::Thread concurrent_writer([&]() {
+        WriteOptions write_options;
+        write_options.no_slowdown = true;
+        ASSERT_TRUE(
+            db_->Put(write_options, "while_locked", "value").IsIncomplete());
+      });
+      concurrent_writer.join();
+
+      ASSERT_OK(db_->UnlockWAL());
+      ASSERT_OK(Put("after_unlock", "value"));
+      ASSERT_EQ("value", Get("after_unlock"));
+    }
+  }
+}
+
 TEST_P(DBWriteTest, ConcurrentlyDisabledWAL) {
   Options options = GetOptions();
   options.statistics = ROCKSDB_NAMESPACE::CreateDBStatistics();
