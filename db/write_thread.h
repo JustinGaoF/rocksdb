@@ -80,13 +80,21 @@ class WriteThread {
     // by calling SetMemWritersEachStride. After doing
     // this, it will also write to memtable.
     STATE_PARALLEL_MEMTABLE_CALLER = 64,
+
+    // The state used to hand the exit of a parallel group whose exit must run
+    // on its leader's thread (WriteGroup::leader_exits) to that leader, once
+    // every other writer of the group has finished its memtable write.
+    STATE_PARALLEL_GROUP_EXIT = 128,
   };
 
   struct Writer;
 
   struct WriteGroup {
     // Set and read only above one WAL partition.
-    WriteGroup() { gate_status.PermitUncheckedError(); }
+    WriteGroup() {
+      gate_status.PermitUncheckedError();
+      wal_status.PermitUncheckedError();
+    }
     Writer* leader = nullptr;
     Writer* last_writer = nullptr;
     // The group's sequences are [first_sequence, last_sequence], set by the
@@ -125,6 +133,23 @@ class WriteThread {
     // the gate. Lets ExitAsBatchGroupFollower hand the gate outcome to the
     // leader, whose own status is otherwise untouched by the exit.
     Status gate_status;
+    // Above one WAL partition the leader appends the group's WAL record
+    // while the parallel memtable writers insert. Outcome of that append and
+    // of the leader's steps after it, set by the leader before it completes
+    // its own memtable write, so whichever thread exits the group reads it.
+    // Non-OK: the leader classified the failure, and the exit publishes
+    // nothing of the group.
+    Status wal_status;
+    // Set by DBImpl on a group whose exit must run on its leader's thread
+    // (above one WAL partition, a group led by a sync write, whose exit runs
+    // the fsync): the last other writer to finish its memtable write hands
+    // the exit to the leader (STATE_PARALLEL_GROUP_EXIT) instead of running
+    // it.
+    bool leader_exits = false;
+    // Set by DBImpl on every group above one WAL partition. A follower that
+    // exits such a group hands the leader any failed group status; at one
+    // partition the follower exit is upstream's.
+    bool multi_partition = false;
 
     struct Iterator {
       Writer* writer;
