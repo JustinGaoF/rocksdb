@@ -39,6 +39,54 @@ inline bool IsInCombination(size_t i, size_t comb) {
   return comb & (size_t(1) << i);
 }
 
+// For a test that can exit early, on a failed ASSERT, while a thread it
+// started still runs: declared after those threads, and after whatever
+// closes the DB, it runs before either, so no thread is destroyed joinable
+// (std::terminate) and none outlives the DB. If any is still joinable it
+// disables SyncPoint processing, which wakes a thread waiting on a
+// dependency, runs `release`, which must unblock any test hook a thread can
+// be parked in, and joins them. On the normal path every thread is already
+// joined and it does nothing.
+class JoinThreadsOnExit {
+ public:
+  JoinThreadsOnExit(std::initializer_list<port::Thread*> threads,
+                    std::function<void()> release)
+      : threads_(threads), release_(std::move(release)) {}
+  JoinThreadsOnExit(std::vector<port::Thread>* threads,
+                    std::function<void()> release)
+      : thread_vector_(threads), release_(std::move(release)) {}
+  ~JoinThreadsOnExit() {
+    std::vector<port::Thread*> joinable;
+    for (port::Thread* thread : threads_) {
+      if (thread->joinable()) {
+        joinable.push_back(thread);
+      }
+    }
+    if (thread_vector_ != nullptr) {
+      for (port::Thread& thread : *thread_vector_) {
+        if (thread.joinable()) {
+          joinable.push_back(&thread);
+        }
+      }
+    }
+    if (joinable.empty()) {
+      return;
+    }
+    SyncPoint::GetInstance()->DisableProcessing();
+    release_();
+    for (port::Thread* thread : joinable) {
+      thread->join();
+    }
+  }
+  JoinThreadsOnExit(const JoinThreadsOnExit&) = delete;
+  JoinThreadsOnExit& operator=(const JoinThreadsOnExit&) = delete;
+
+ private:
+  std::vector<port::Thread*> threads_;
+  std::vector<port::Thread>* thread_vector_ = nullptr;
+  std::function<void()> release_;
+};
+
 enum WriteOrdering : bool { kOrderedWrite, kUnorderedWrite };
 
 class TransactionTestBase : public ::testing::Test {
