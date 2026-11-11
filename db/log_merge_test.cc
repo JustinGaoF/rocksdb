@@ -170,6 +170,14 @@ class LogMergeTest : public ::testing::TestWithParam<std::tuple<int, bool>> {
       const auto it = sups.find(bearer);
       return it != sups.end() && index >= it->second;
     }
+    bool SwallowedCovers(uint64_t index) const override {
+      for (const auto& [lo, hi] : swallowed) {
+        if (index > lo && index < hi) {
+          return true;
+        }
+      }
+      return false;
+    }
     bool AttestedSpan(PredecessorSpan* out) const override {
       if (!has_span) {
         return false;
@@ -177,11 +185,18 @@ class LogMergeTest : public ::testing::TestWithParam<std::tuple<int, bool>> {
       *out = span;
       return true;
     }
+    bool TailImpure() const override {
+      return done_ && first_indexed_ != 0 && tail_impure;
+    }
+    bool TailReported() const override { return done_ && tail_reported; }
 
     bool head_intact = true;
+    bool tail_impure = false;
+    bool tail_reported = false;
     uint64_t progress_bound = 0;
     int progress_after_pulls = 0;
     std::vector<std::pair<uint64_t, uint64_t>> voids;
+    std::vector<std::pair<uint64_t, uint64_t>> swallowed;
     std::map<uint64_t, uint64_t> sups;
     bool has_span = false;
     PredecessorSpan span;
@@ -210,10 +225,17 @@ class LogMergeTest : public ::testing::TestWithParam<std::tuple<int, bool>> {
     step.kind = WALIndexMerger::Member::Pull::kIdle;
     return step;
   }
+  static ScriptMember::Step Stop() {
+    ScriptMember::Step step;
+    step.kind = WALIndexMerger::Member::Pull::kFinishedStop;
+    return step;
+  }
 
-  std::unique_ptr<WALIndexMerger::Member> MakeMember(const MemberFile& file,
-                                                     const std::string& bytes,
-                                                     int fail_on_read = 0) {
+  std::unique_ptr<WALIndexMerger::Member> MakeMember(
+      const MemberFile& file, const std::string& bytes, int fail_on_read = 0,
+      bool stop_on_report = false,
+      WALRecoveryMode wal_recovery_mode =
+          WALRecoveryMode::kTolerateCorruptedTailRecords) {
     std::unique_ptr<FSSequentialFile> source(
         new InMemorySource(bytes, fail_on_read));
     std::unique_ptr<SequentialFileReader> file_reader(
@@ -222,6 +244,8 @@ class LogMergeTest : public ::testing::TestWithParam<std::tuple<int, bool>> {
     options.wal_number = file.log_number();
     options.file = std::move(file_reader);
     options.fragment_buffered = fragment_buffered();
+    options.wal_recovery_mode = wal_recovery_mode;
+    options.stop_on_report = stop_on_report;
     return std::unique_ptr<WALIndexMerger::Member>(
         new WALIndexMerger::ReaderMember(std::move(options)));
   }
@@ -236,9 +260,11 @@ class LogMergeTest : public ::testing::TestWithParam<std::tuple<int, bool>> {
 
   std::unique_ptr<WALIndexMerger> MakeMerger(
       std::vector<std::unique_ptr<WALIndexMerger::Member>> members,
-      std::vector<uint64_t> expected_wals) {
-    return std::unique_ptr<WALIndexMerger>(new WALIndexMerger(
-        std::move(members), std::move(expected_wals), TestSequenceOf));
+      std::vector<uint64_t> expected_wals,
+      bool continue_past_discarded_holes = false) {
+    return std::unique_ptr<WALIndexMerger>(
+        new WALIndexMerger(std::move(members), std::move(expected_wals),
+                           TestSequenceOf, continue_past_discarded_holes));
   }
 
   struct DrivenRecord {
@@ -248,6 +274,7 @@ class LogMergeTest : public ::testing::TestWithParam<std::tuple<int, bool>> {
   struct DriveResult {
     WALIndexMerger::Result outcome = WALIndexMerger::Result::kWaiting;
     std::vector<DrivenRecord> records;
+    std::vector<WALIndexMerger::TailGap> gaps;
     int waiting_rounds = 0;
   };
 
@@ -259,6 +286,8 @@ class LogMergeTest : public ::testing::TestWithParam<std::tuple<int, bool>> {
       if (r == WALIndexMerger::Result::kRecord) {
         out.records.push_back(
             {merger->GetLastEmittedWALIndex(), record.ToString()});
+      } else if (r == WALIndexMerger::Result::kTailGap) {
+        out.gaps.push_back(merger->GetTailGap());
       } else if (r == WALIndexMerger::Result::kWaiting) {
         if (++out.waiting_rounds > max_waits) {
           ADD_FAILURE() << "merge stuck waiting";
@@ -534,7 +563,12 @@ TEST_P(LogMergeTest, VoidCoverPlusDataFails) {
   ASSERT_EQ(std::vector<uint64_t>({1}), DrivenIndices(driven));
 }
 
-TEST_P(LogMergeTest, VoidCoverPlusSupersededDataFails) {
+// GC31 Q12 (D-2, owner ruling 2026-11-02): a declaration supersedes a void
+// by its first_obsolete alone, so 121's declaration, which attests no start,
+// obsoletes 120's void over 4..6 with its records there: nothing contradicts,
+// the void explains the indices, and the merge ends clean after 1..3. (Before
+// the ruling it reached records only, and the void failed the merge.)
+TEST_P(LogMergeTest, VoidCoverPlusSupersededDataMerges) {
   MemberFile a(120, recyclable());
   MemberFile b(121, recyclable());
   ASSERT_OK(a.Marker());
@@ -553,10 +587,10 @@ TEST_P(LogMergeTest, VoidCoverPlusSupersededDataFails) {
   members.push_back(MakeMember(b, b.Bytes()));
   auto merger = MakeMerger(std::move(members), {120, 121});
   DriveResult driven = Drive(merger.get());
-  ASSERT_EQ(WALIndexMerger::Result::kError, driven.outcome);
-  ASSERT_NE(std::string::npos,
-            merger->GetError().ToString().find("void cover"));
+  ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome)
+      << merger->GetError().ToString();
   ASSERT_EQ(std::vector<uint64_t>({1, 2, 3}), DrivenIndices(driven));
+  EXPECT_EQ(7U, merger->GetFrontier());
 }
 
 // A merge over a set including one idle member advances past that member's
@@ -804,8 +838,10 @@ TEST_P(LogMergeTest, SequenceWitnessRejectsReorder) {
 }
 
 // A supersession explains the copies it names, not the absence of a live
-// copy: when the live copy of 14 is lost while superseded and live copies
-// survive around it, the merge stops rather than skipping.
+// copy: when the live copy of 14 is lost and the member stops instead of
+// reading past the loss, the merge stops rather than skipping. (Without the
+// stop the loss is a bounded swallowed span and the merge skips it; see
+// SwallowedHoleSkipsSilently.)
 TEST_P(LogMergeTest, SupersededOnlyWithLiveAboveStops) {
   const int hs = header_size();
   MemberFile old(120, recyclable());
@@ -832,7 +868,8 @@ TEST_P(LogMergeTest, SupersededOnlyWithLiveAboveStops) {
 
   std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
   members.push_back(MakeMember(old, old.Bytes()));
-  members.push_back(MakeMember(young, young_bytes));
+  members.push_back(MakeMember(young, young_bytes, /*fail_on_read=*/0,
+                               /*stop_on_report=*/true));
   auto merger = MakeMerger(std::move(members), {120, 121});
   DriveResult driven = Drive(merger.get());
   ASSERT_EQ(WALIndexMerger::Result::kFrontier, driven.outcome);
@@ -977,6 +1014,53 @@ TEST_P(LogMergeTest, DataLessIdleMemberWithProgressDoesNotPinStream) {
   ASSERT_LT(idle_ptr->idle_pulls_, 100);
 }
 
+// An attested predecessor at or above the retirement bound that the merge
+// does not hold is lost: the merge stops at the frontier at its first index,
+// even where another member's torn tail would explain the hole as a tail gap.
+// Below the bound the same span is a retirement: it anchors the bound past
+// its end, and the torn tail explains the gap as usual (recyclable and
+// fragment-buffered readers end a torn record differently, so only the plain
+// reader shows that).
+TEST_P(LogMergeTest, LostPredecessorStopsAtItsFirstIndex) {
+  for (const bool lost : {false, true}) {
+    SCOPED_TRACE(lost ? "lost" : "retired");
+    MemberFile b(121, recyclable());
+    MemberFile c(122, recyclable());
+    ASSERT_OK(b.Marker());
+    ASSERT_OK(b.Span(120, 5, 6));
+    for (uint64_t i = 7; i <= 9; ++i) {
+      ASSERT_OK(b.Data("b" + std::to_string(i), i, i));
+    }
+    ASSERT_OK(c.Marker());
+    ASSERT_OK(c.Span(119, 1, 3));
+    ASSERT_OK(c.Data("c4", 4, 4));
+    ASSERT_OK(c.Data("c6", 6, 6));
+    // Tear c's last record: its tail covers everything above 4.
+    std::string torn = c.Bytes();
+    torn.resize(torn.size() - 3);
+    std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+    members.push_back(MakeMember(b, b.Bytes()));
+    members.push_back(MakeMember(c, torn));
+    auto merger = MakeMerger(std::move(members), {121, 122});
+    merger->SetRetirementBound(lost ? 120 : 121);
+    DriveResult driven = Drive(merger.get());
+    if (lost) {
+      ASSERT_EQ(WALIndexMerger::Result::kFrontier, driven.outcome);
+      ASSERT_EQ(5U, merger->GetFrontier());
+      ASSERT_EQ(120U, merger->GetLostPredecessor());
+      ASSERT_EQ(std::vector<uint64_t>({4}), DrivenIndices(driven));
+      ASSERT_TRUE(driven.gaps.empty());
+    } else {
+      ASSERT_EQ(0U, merger->GetLostPredecessor());
+      if (!recyclable() && !fragment_buffered()) {
+        ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome);
+        ASSERT_EQ(std::vector<uint64_t>({4, 7, 8, 9}), DrivenIndices(driven));
+        ASSERT_EQ(2U, driven.gaps.size());
+      }
+    }
+  }
+}
+
 // A damaged head on a file numbered above a member whose span anchors the
 // bound (here a retired predecessor's) is bounded: the indices it lost
 // surface as a hole instead of failing the merge as unattested. Without the
@@ -1095,6 +1179,1181 @@ TEST_P(LogMergeTest, UnreadableMemberFails) {
   ASSERT_EQ(WALIndexMerger::Result::kError, driven.outcome);
   ASSERT_TRUE(merger->GetError().IsIOError());
   ASSERT_EQ(std::vector<uint64_t>({1, 2, 3}), DrivenIndices(driven));
+}
+
+// A finished member's reported torn tail explains a mid-stream gap: the merge
+// surfaces it for the recovery-mode mapping and continues past it.
+TEST_P(LogMergeTest, ReportedTailGapSkipsAndContinues) {
+  std::vector<ScriptMember::Step> torn_script;
+  for (uint64_t i = 1; i <= 5; ++i) {
+    torn_script.push_back(Rec(i, i));
+  }
+  torn_script.push_back(Stop());
+  auto torn = std::unique_ptr<WALIndexMerger::Member>(
+      new ScriptMember(120, std::move(torn_script)));
+  static_cast<ScriptMember*>(torn.get())->tail_impure = true;
+  static_cast<ScriptMember*>(torn.get())->tail_reported = true;
+  std::vector<ScriptMember::Step> live_script;
+  for (uint64_t i = 7; i <= 10; ++i) {
+    live_script.push_back(Rec(i, i));
+  }
+  auto live = std::unique_ptr<WALIndexMerger::Member>(
+      new ScriptMember(121, std::move(live_script)));
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(std::move(torn));
+  members.push_back(std::move(live));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome);
+  ASSERT_EQ(std::vector<uint64_t>({1, 2, 3, 4, 5, 7, 8, 9, 10}),
+            DrivenIndices(driven));
+  ASSERT_EQ(1U, driven.gaps.size());
+  EXPECT_EQ(6U, driven.gaps[0].index);
+  EXPECT_EQ(std::vector<uint64_t>({120}), driven.gaps[0].members);
+  EXPECT_TRUE(driven.gaps[0].reported);
+  EXPECT_EQ(11U, merger->GetFrontier());
+}
+
+// A real torn tail mid-stream: the plain reader stops and the gap surfaces
+// silently. The fragment-buffered reader treats the torn tail as growable,
+// so it idles, resolves clean, and accounts for nothing: the same hole is a
+// pristine frontier there. Recovery uses plain readers, so only the plain
+// shape reaches it.
+TEST_P(LogMergeTest, TornTailMidStreamSurfacesGapOrFrontier) {
+  MemberFile old(120, recyclable());
+  MemberFile young(121, recyclable());
+  ASSERT_OK(old.Marker());
+  for (uint64_t i = 1; i <= 10; ++i) {
+    ASSERT_OK(old.Data("o" + std::to_string(i), i, i));
+  }
+  ASSERT_OK(old.Data("torn", 11, 11));
+  ASSERT_OK(young.Marker());
+  for (uint64_t i = 12; i <= 15; ++i) {
+    ASSERT_OK(young.Data("n" + std::to_string(i), i, i));
+  }
+  std::string old_bytes = old.Bytes();
+  old_bytes.resize(old_bytes.size() - 1);
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(old, old_bytes));
+  members.push_back(MakeMember(young, young.Bytes()));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  if (fragment_buffered()) {
+    ASSERT_EQ(WALIndexMerger::Result::kFrontier, driven.outcome);
+    ASSERT_EQ(11U, merger->GetFrontier());
+    ASSERT_TRUE(driven.gaps.empty());
+    ASSERT_EQ(std::vector<uint64_t>({1, 2, 3, 4, 5, 6, 7, 8, 9, 10}),
+              DrivenIndices(driven));
+    return;
+  }
+  ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome);
+  ASSERT_EQ(
+      std::vector<uint64_t>({1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15}),
+      DrivenIndices(driven));
+  ASSERT_EQ(1U, driven.gaps.size());
+  EXPECT_EQ(11U, driven.gaps[0].index);
+  EXPECT_EQ(std::vector<uint64_t>({120}), driven.gaps[0].members);
+  EXPECT_FALSE(driven.gaps[0].reported);
+  EXPECT_EQ(16U, merger->GetFrontier());
+}
+
+// A member that stops early leaves its whole unread tail to the gap: every
+// index between its last pull and the next live record surfaces.
+TEST_P(LogMergeTest, StoppedMemberSkipsUnreadTail) {
+  auto torn = std::unique_ptr<WALIndexMerger::Member>(
+      new ScriptMember(120, {Rec(1, 1), Rec(2, 2), Rec(3, 3), Stop()}));
+  static_cast<ScriptMember*>(torn.get())->tail_impure = true;
+  static_cast<ScriptMember*>(torn.get())->tail_reported = true;
+  auto live = std::unique_ptr<WALIndexMerger::Member>(
+      new ScriptMember(121, {Rec(6, 6), Rec(7, 7)}));
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(std::move(torn));
+  members.push_back(std::move(live));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome);
+  ASSERT_EQ(std::vector<uint64_t>({1, 2, 3, 6, 7}), DrivenIndices(driven));
+  ASSERT_EQ(2U, driven.gaps.size());
+  EXPECT_EQ(4U, driven.gaps[0].index);
+  EXPECT_EQ(5U, driven.gaps[1].index);
+  EXPECT_TRUE(driven.gaps[0].reported);
+}
+
+// An empty record occupies its index but carries no witness: it emits
+// without advancing the sequence check, wherever it sits.
+TEST_P(LogMergeTest, EmptySequenceSkipsWitness) {
+  MemberFile a(120, recyclable());
+  ASSERT_OK(a.Marker());
+  ASSERT_OK(a.Data("e1", 1, 0));
+  ASSERT_OK(a.Data("a2", 2, 2));
+  ASSERT_OK(a.Data("e3", 3, 0));
+  ASSERT_OK(a.Data("a4", 4, 4));
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(a, a.Bytes()));
+  auto merger = MakeMerger(std::move(members), {120});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome);
+  ASSERT_EQ(std::vector<uint64_t>({1, 2, 3, 4}), DrivenIndices(driven));
+}
+
+// Every emission names its source member, indexed or unindexed, and plain
+// members attach the record checksum the protection-info update consumes.
+TEST_P(LogMergeTest, EmittedRecordsCarrySourceAndChecksum) {
+  const int hs = header_size();
+  MemberFile a(120, recyclable());
+  MemberFile b(121, recyclable());
+  ASSERT_OK(a.Marker());
+  ASSERT_OK(b.Marker());
+  ASSERT_OK(a.Data("u0", 1, 1));
+  ASSERT_OK(a.Data("a2", 2, 2));
+  ASSERT_OK(a.Data("a3", 3, 3));
+  ASSERT_OK(b.Data("b1", 1, 1));
+  std::string a_bytes = a.Bytes();
+  SetByte(&a_bytes, hs + 6,
+          static_cast<char>(recyclable() ? kRecyclableFullType : kFullType));
+  FixChecksumAt(&a_bytes, hs, 2 * kWALIndexSize + 2, recyclable());
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(a, a_bytes));
+  members.push_back(MakeMember(b, b.Bytes()));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  Slice record;
+  // The merge emits the unindexed u0 after a read on to a2, so the checksum
+  // it reports for u0 is the one captured when u0 was pulled (GC12 Q9).
+  uint64_t u0_checksum = 0;
+  {
+    std::unique_ptr<FSSequentialFile> source(new InMemorySource(a_bytes, 0));
+    Reader reader(/*info_log=*/nullptr,
+                  std::make_unique<SequentialFileReader>(std::move(source), ""),
+                  /*reporter=*/nullptr, /*checksum=*/true, a.log_number());
+    std::string scratch;
+    Slice first;
+    ASSERT_TRUE(reader.ReadRecord(
+        &first, &scratch, WALRecoveryMode::kTolerateCorruptedTailRecords,
+        &u0_checksum));
+  }
+  ASSERT_EQ(WALIndexMerger::Result::kRecord, merger->Next(&record));
+  EXPECT_EQ(0U, merger->GetLastEmittedWALIndex());
+  ASSERT_NE(nullptr, merger->GetLastEmittedMember());
+  EXPECT_EQ(120U, merger->GetLastEmittedMember()->wal_number());
+  if (!fragment_buffered()) {
+    EXPECT_NE(0U, u0_checksum);
+    EXPECT_EQ(u0_checksum, merger->GetLastEmittedChecksum());
+  }
+  ASSERT_EQ(WALIndexMerger::Result::kRecord, merger->Next(&record));
+  EXPECT_EQ(1U, merger->GetLastEmittedWALIndex());
+  ASSERT_NE(nullptr, merger->GetLastEmittedMember());
+  EXPECT_EQ(121U, merger->GetLastEmittedMember()->wal_number());
+  if (fragment_buffered()) {
+    // Fragment-buffered readers do not compute record checksums.
+    EXPECT_EQ(0U, merger->GetLastEmittedMember()->LastRecordChecksum());
+  } else {
+    EXPECT_NE(0U, merger->GetLastEmittedMember()->LastRecordChecksum());
+  }
+  ASSERT_EQ(WALIndexMerger::Result::kRecord, merger->Next(&record));
+  EXPECT_EQ(2U, merger->GetLastEmittedWALIndex());
+  ASSERT_NE(nullptr, merger->GetLastEmittedMember());
+  EXPECT_EQ(120U, merger->GetLastEmittedMember()->wal_number());
+  if (!fragment_buffered()) {
+    EXPECT_NE(u0_checksum, merger->GetLastEmittedChecksum());
+  }
+  ASSERT_EQ(WALIndexMerger::Result::kRecord, merger->Next(&record));
+  EXPECT_EQ(3U, merger->GetLastEmittedWALIndex());
+  ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, merger->Next(&record));
+}
+
+// Driving past the type limit fails closed instead of re-deciding index
+// zero. Only physically crafted indices reach here.
+TEST_P(LogMergeTest, IndexOverflowFailsClosed) {
+  const int hs = header_size();
+  MemberFile a(120, recyclable());
+  ASSERT_OK(a.Marker());
+  ASSERT_OK(a.Data("m", 1, 1));
+  std::string bytes = a.Bytes();
+  SetFixed64At(&bytes, hs + hs, std::numeric_limits<uint64_t>::max());
+  FixChecksumAt(&bytes, hs, 2 * kWALIndexSize + 1, recyclable());
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(a, bytes));
+  auto merger = MakeMerger(std::move(members), {120});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kError, driven.outcome);
+  ASSERT_NE(std::string::npos,
+            merger->GetError().ToString().find("overflowed"));
+  ASSERT_EQ(std::vector<uint64_t>({std::numeric_limits<uint64_t>::max()}),
+            DrivenIndices(driven));
+}
+
+// A member that finished clean with an intact tail explains nothing above
+// it: the hole above stays a pristine frontier. (The scripted equivalent of
+// mid-file corruption swallowed before clean records, which likewise leaves
+// the tail intact.)
+TEST_P(LogMergeTest, CleanFinishedMemberDoesNotExplainGap) {
+  std::vector<ScriptMember::Step> a_script;
+  for (uint64_t i = 1; i <= 5; ++i) {
+    a_script.push_back(Rec(i, i));
+  }
+  auto a = std::unique_ptr<WALIndexMerger::Member>(
+      new ScriptMember(120, std::move(a_script)));
+  auto b = std::unique_ptr<WALIndexMerger::Member>(
+      new ScriptMember(121, {Rec(7, 7)}));
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(std::move(a));
+  members.push_back(std::move(b));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kFrontier, driven.outcome);
+  ASSERT_EQ(6U, merger->GetFrontier());
+  ASSERT_EQ(std::vector<uint64_t>({1, 2, 3, 4, 5}), DrivenIndices(driven));
+  ASSERT_TRUE(driven.gaps.empty());
+}
+
+// The neuter pair of SupersededOnlyWithLiveAboveStops: the same destroyed
+// record, but the member reads past it instead of stopping. The loss is a
+// bounded swallowed span, so the merge skips it silently and continues.
+TEST_P(LogMergeTest, SwallowedHoleSkipsSilently) {
+  const int hs = header_size();
+  MemberFile a(120, recyclable());
+  MemberFile b(121, recyclable());
+  ASSERT_OK(a.Marker());
+  ASSERT_OK(a.Data("a1", 1, 1));
+  ASSERT_OK(a.Data("a2", 2, 2));
+  ASSERT_OK(a.Data("a3", 3, 3));
+  ASSERT_OK(a.Data("a4", 4, 4));
+  ASSERT_OK(a.Data("a5", 5, 5));
+  ASSERT_OK(b.Marker());
+  ASSERT_OK(b.Data("b6", 6, 6));
+  ASSERT_OK(b.Data("b7", 7, 7));
+  // Corrupt record 3's type (with a fixed checksum) so the reader reports
+  // exactly that record and continues.
+  std::string a_bytes = a.Bytes();
+  const size_t payload = 2 * kWALIndexSize + 2;
+  const size_t rec3 = static_cast<size_t>(hs) + 2 * (hs + payload);
+  SetByte(&a_bytes, rec3 + 6, static_cast<char>(50));
+  // The reader verifies an unknown type with the non-recyclable framing, so
+  // the checksum is fixed that way even in a recyclable file.
+  FixChecksumAt(&a_bytes, rec3, payload, /*recyclable=*/false);
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(a, a_bytes));
+  members.push_back(MakeMember(b, b.Bytes()));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  if (recyclable()) {
+    // In a recyclable file the unknown type's shorter framing desyncs the
+    // stream (the skip comes up four bytes short of the next header), so the
+    // reader stops its tail there instead of skipping past it, and each lost
+    // index surfaces as a tail gap. Recovery WALs are not recycled, so only
+    // the plain shape below reaches it.
+    ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome);
+    ASSERT_EQ(std::vector<uint64_t>({1, 2, 6, 7}), DrivenIndices(driven));
+    ASSERT_EQ(3U, driven.gaps.size());
+    EXPECT_EQ(3U, driven.gaps[0].index);
+    EXPECT_EQ(4U, driven.gaps[1].index);
+    EXPECT_EQ(5U, driven.gaps[2].index);
+    EXPECT_EQ(std::vector<uint64_t>({120}), driven.gaps[0].members);
+    ASSERT_EQ(8U, merger->GetFrontier());
+    return;
+  }
+  ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome);
+  ASSERT_EQ(std::vector<uint64_t>({1, 2, 4, 5, 6, 7}), DrivenIndices(driven));
+  ASSERT_TRUE(driven.gaps.empty());
+  ASSERT_EQ(8U, merger->GetFrontier());
+}
+
+// The sequence witness is non-decreasing: an empty batch consumes an index
+// but no sequence, so the next record legitimately repeats it.
+TEST_P(LogMergeTest, EqualSequenceEmitsInOrder) {
+  MemberFile a(120, recyclable());
+  MemberFile b(121, recyclable());
+  ASSERT_OK(a.Marker());
+  ASSERT_OK(b.Marker());
+  ASSERT_OK(a.Data("a1", 1, 5));
+  ASSERT_OK(a.Data("a2", 2, 6));
+  ASSERT_OK(b.Data("b3", 3, 6));
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(a, a.Bytes()));
+  members.push_back(MakeMember(b, b.Bytes()));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome);
+  ASSERT_EQ(std::vector<uint64_t>({1, 2, 3}), DrivenIndices(driven));
+}
+
+// Superseded-only holes with no torn tail covering them and no live record
+// above them were never reissued after the cut: the merge re-trusts the
+// declaration and moves on. Here the writes after the cut reached index 4
+// only, so index 5 was never reissued.
+TEST_P(LogMergeTest, DiscardedHoleWithoutTornTailSkips) {
+  MemberFile old(120, recyclable());
+  MemberFile young(121, recyclable());
+  ASSERT_OK(old.Marker());
+  for (uint64_t i = 1; i <= 5; ++i) {
+    ASSERT_OK(old.Data("o" + std::to_string(i), i, i));
+  }
+  ASSERT_OK(young.Marker());
+  ASSERT_OK(young.Sup(120, 4));
+  ASSERT_OK(young.Data("n4", 4, 4));
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(old, old.Bytes()));
+  members.push_back(MakeMember(young, young.Bytes()));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome);
+  ASSERT_EQ(std::vector<uint64_t>({1, 2, 3, 4}), DrivenIndices(driven));
+  ASSERT_TRUE(driven.gaps.empty());
+  ASSERT_EQ(6U, merger->GetFrontier());
+}
+
+// FU14 H4: writes after a cut reissue indices in order, so a live record
+// above a superseded-only index means its reissued copy was lost: the index
+// is the frontier. A void in a WAL older than the declaration predates the
+// cut, and an open at N=1 seeds past it, so the indices below it were never
+// reissued; a void the declaring WAL holds was burned after the cut and
+// explains nothing below it. Neuter: skip superseded-only indices
+// unconditionally; the first and third cases drive 6 and 7 to a clean end.
+TEST_P(LogMergeTest, DiscardedHoleWithLiveAboveIsAFrontier) {
+  struct Case {
+    const char* name;
+    bool old_void;
+    bool young_void;
+    WALIndexMerger::Result outcome;
+    std::vector<uint64_t> driven;
+  };
+  for (const Case& c : {Case{"no void",
+                             false,
+                             false,
+                             WALIndexMerger::Result::kFrontier,
+                             {1, 2, 3}},
+                        Case{"pre-cut void",
+                             true,
+                             false,
+                             WALIndexMerger::Result::kCleanEnd,
+                             {1, 2, 3, 7}},
+                        Case{"post-cut void",
+                             false,
+                             true,
+                             WALIndexMerger::Result::kFrontier,
+                             {1, 2, 3}}}) {
+    SCOPED_TRACE(c.name);
+    MemberFile old(120, recyclable());
+    MemberFile young(121, recyclable());
+    ASSERT_OK(old.Marker());
+    for (uint64_t i = 1; i <= 5; ++i) {
+      ASSERT_OK(old.Data("o" + std::to_string(i), i, i));
+    }
+    if (c.old_void) {
+      ASSERT_OK(old.Void(6, 6));
+    }
+    ASSERT_OK(young.Marker());
+    ASSERT_OK(young.Sup(120, 4));
+    if (c.young_void) {
+      ASSERT_OK(young.Void(6, 6));
+    }
+    ASSERT_OK(young.Data("n7", 7, 7));
+
+    std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+    members.push_back(MakeMember(old, old.Bytes()));
+    members.push_back(MakeMember(young, young.Bytes()));
+    auto merger = MakeMerger(std::move(members), {120, 121});
+    DriveResult driven = Drive(merger.get());
+    ASSERT_EQ(c.outcome, driven.outcome);
+    ASSERT_EQ(c.driven, DrivenIndices(driven));
+    if (c.outcome == WALIndexMerger::Result::kFrontier) {
+      ASSERT_EQ(4U, merger->GetFrontier());
+    }
+  }
+}
+
+// GC23 Q5, ported from GC19's Muse candidate. A superseded-only hole inside
+// a live stream: the cut discarded old's copy of 5, but young already emitted
+// 4 above the cut, and young still holds live 6 above the hole. The reissued
+// copy of 5 was lost, so the strict merge stops at the frontier instead of
+// re-trusting the discard; the forgiving merge (skip-mode recovery) skips it.
+// Neuter: GC19's Q2 neuter (skip superseded-only indices unconditionally);
+// the strict merge emits 6 and ends clean.
+TEST_P(LogMergeTest, SupersededOnlyHoleInsideLiveStreamStops) {
+  auto old = std::unique_ptr<WALIndexMerger::Member>(
+      new ScriptMember(120, {Rec(1, 1), Rec(2, 2), Rec(3, 3), Rec(5, 5)}));
+  auto young = std::unique_ptr<WALIndexMerger::Member>(
+      new ScriptMember(121, {Rec(4, 4), Rec(6, 6)}));
+  static_cast<ScriptMember*>(young.get())->sups[120] = 4;
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(std::move(old));
+  members.push_back(std::move(young));
+  auto strict = MakeMerger(std::move(members), {120, 121});
+  DriveResult strict_driven = Drive(strict.get());
+  ASSERT_EQ(WALIndexMerger::Result::kFrontier, strict_driven.outcome);
+  ASSERT_EQ(5U, strict->GetFrontier());
+  ASSERT_EQ(std::vector<uint64_t>({1, 2, 3, 4}), DrivenIndices(strict_driven));
+  ASSERT_TRUE(strict_driven.gaps.empty());
+
+  auto old2 = std::unique_ptr<WALIndexMerger::Member>(
+      new ScriptMember(120, {Rec(1, 1), Rec(2, 2), Rec(3, 3), Rec(5, 5)}));
+  auto young2 = std::unique_ptr<WALIndexMerger::Member>(
+      new ScriptMember(121, {Rec(4, 4), Rec(6, 6)}));
+  static_cast<ScriptMember*>(young2.get())->sups[120] = 4;
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members2;
+  members2.push_back(std::move(old2));
+  members2.push_back(std::move(young2));
+  auto forgiving = MakeMerger(std::move(members2), {120, 121},
+                              /*continue_past_discarded_holes=*/true);
+  DriveResult forgiving_driven = Drive(forgiving.get());
+  ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, forgiving_driven.outcome);
+  ASSERT_EQ(std::vector<uint64_t>({1, 2, 3, 4, 6}),
+            DrivenIndices(forgiving_driven));
+  ASSERT_TRUE(forgiving_driven.gaps.empty());
+  ASSERT_EQ(7U, forgiving->GetFrontier());
+}
+
+// GC23 Q5, ported from GC19's Muse candidate. A superseded-only hole with
+// live records below it but none above: the trailing discards were never
+// reissued, so the merge re-trusts the cut and moves on. Neuter: stop at
+// every superseded-only index without deferring (the frontier at 5).
+TEST_P(LogMergeTest, TrailingSupersededHoleWithoutLiveAboveSkips) {
+  auto old = std::unique_ptr<WALIndexMerger::Member>(
+      new ScriptMember(120, {Rec(1, 1), Rec(2, 2), Rec(5, 5)}));
+  auto young = std::unique_ptr<WALIndexMerger::Member>(
+      new ScriptMember(121, {Rec(3, 3), Rec(4, 4)}));
+  static_cast<ScriptMember*>(young.get())->sups[120] = 3;
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(std::move(old));
+  members.push_back(std::move(young));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome);
+  ASSERT_EQ(std::vector<uint64_t>({1, 2, 3, 4}), DrivenIndices(driven));
+  ASSERT_TRUE(driven.gaps.empty());
+  ASSERT_EQ(6U, merger->GetFrontier());
+}
+
+// A torn tail over a superseded-only hole keeps the strict merge at the
+// frontier; the forgiving merge (skip-mode recovery) skips it.
+TEST_P(LogMergeTest, DiscardedHoleSkipsWhenForgiving) {
+  auto torn = std::unique_ptr<WALIndexMerger::Member>(
+      new ScriptMember(120, {Rec(1, 1), Rec(2, 2), Rec(3, 3), Stop()}));
+  static_cast<ScriptMember*>(torn.get())->tail_impure = true;
+  auto live = std::unique_ptr<WALIndexMerger::Member>(
+      new ScriptMember(121, {Rec(6, 6), Rec(7, 7)}));
+  static_cast<ScriptMember*>(live.get())->sups[122] = 4;
+  auto discarded = std::unique_ptr<WALIndexMerger::Member>(
+      new ScriptMember(122, {Rec(4, 4), Rec(5, 5)}));
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(std::move(torn));
+  members.push_back(std::move(live));
+  members.push_back(std::move(discarded));
+  auto strict = MakeMerger(std::move(members), {120, 121, 122});
+  DriveResult strict_driven = Drive(strict.get());
+  ASSERT_EQ(WALIndexMerger::Result::kFrontier, strict_driven.outcome);
+  ASSERT_EQ(4U, strict->GetFrontier());
+  ASSERT_EQ(std::vector<uint64_t>({1, 2, 3}), DrivenIndices(strict_driven));
+
+  auto torn2 = std::unique_ptr<WALIndexMerger::Member>(
+      new ScriptMember(120, {Rec(1, 1), Rec(2, 2), Rec(3, 3), Stop()}));
+  static_cast<ScriptMember*>(torn2.get())->tail_impure = true;
+  auto live2 = std::unique_ptr<WALIndexMerger::Member>(
+      new ScriptMember(121, {Rec(6, 6), Rec(7, 7)}));
+  static_cast<ScriptMember*>(live2.get())->sups[122] = 4;
+  auto discarded2 = std::unique_ptr<WALIndexMerger::Member>(
+      new ScriptMember(122, {Rec(4, 4), Rec(5, 5)}));
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members2;
+  members2.push_back(std::move(torn2));
+  members2.push_back(std::move(live2));
+  members2.push_back(std::move(discarded2));
+  auto forgiving = MakeMerger(std::move(members2), {120, 121, 122},
+                              /*continue_past_discarded_holes=*/true);
+  DriveResult forgiving_driven = Drive(forgiving.get());
+  ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, forgiving_driven.outcome);
+  ASSERT_EQ(std::vector<uint64_t>({1, 2, 3, 6, 7}),
+            DrivenIndices(forgiving_driven));
+  ASSERT_EQ(8U, forgiving->GetFrontier());
+}
+
+// A member whose file holds its marker and then a header cut short at end of
+// file holds no data record, so nothing in it sits above where it stopped:
+// the merge treats it as a lost tail rather than a damaged head. Point-in-time
+// mode, as recovery reads by default, reports the truncation after the stop.
+TEST_P(LogMergeTest, DataLessTornMemberIsATail) {
+  if (fragment_buffered()) {
+    return;  // Recovery reads with plain readers; this one waits out the tail.
+  }
+  MemberFile a(120, recyclable());
+  MemberFile b(121, recyclable());
+  ASSERT_OK(a.Marker());
+  for (uint64_t i = 1; i <= 3; ++i) {
+    ASSERT_OK(a.Data("a" + std::to_string(i), i, i));
+  }
+  ASSERT_OK(b.Marker());
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(a, a.Bytes()));
+  members.push_back(MakeMember(b, b.Bytes() + std::string(3, '\x01'),
+                               /*fail_on_read=*/0, /*stop_on_report=*/true,
+                               WALRecoveryMode::kPointInTimeRecovery));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome);
+  ASSERT_EQ(std::vector<uint64_t>({1, 2, 3}), DrivenIndices(driven));
+  ASSERT_TRUE(driven.gaps.empty());
+}
+
+// The normal crash state under recycling: the file's new marker, then a record
+// from its previous use. The reader stops at the old record before any new
+// data, which is a lost tail too.
+TEST_P(LogMergeTest, RecycledDataLessMemberIsATail) {
+  if (!recyclable() || fragment_buffered()) {
+    // Only recyclable records name the log they were written for, and only
+    // the plain reader, which recovery uses, reports an old record.
+    return;
+  }
+  MemberFile a(120, recyclable());
+  MemberFile previous(100, recyclable());
+  MemberFile b(121, recyclable());
+  ASSERT_OK(a.Marker());
+  for (uint64_t i = 1; i <= 3; ++i) {
+    ASSERT_OK(a.Data("a" + std::to_string(i), i, i));
+  }
+  ASSERT_OK(previous.Marker());
+  ASSERT_OK(previous.Data("old", 7, 7));
+  ASSERT_OK(b.Marker());
+  // The new marker overwrites the old one in place.
+  const std::string b_bytes =
+      b.Bytes() + previous.Bytes().substr(b.Bytes().size());
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(a, a.Bytes()));
+  members.push_back(MakeMember(b, b_bytes, /*fail_on_read=*/0,
+                               /*stop_on_report=*/true,
+                               WALRecoveryMode::kPointInTimeRecovery));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome);
+  ASSERT_EQ(std::vector<uint64_t>({1, 2, 3}), DrivenIndices(driven));
+}
+
+// Control for the two above: a checksum failure the reader reports and reads
+// past, or in a recycled file stops at silently, may have dropped data, so a
+// member left with no data record that way is still a damaged head. That
+// holds when a torn end of file follows the failure, too: the stop comes only
+// after the reader read past the corruption.
+TEST_P(LogMergeTest, DataLessMemberWithSkippedCorruptionFailsClosed) {
+  MemberFile a(120, recyclable());
+  MemberFile b(121, recyclable());
+  ASSERT_OK(a.Marker());
+  for (uint64_t i = 1; i <= 3; ++i) {
+    ASSERT_OK(a.Data("a" + std::to_string(i), i, i));
+  }
+  ASSERT_OK(b.Marker());
+  ASSERT_OK(b.Data("b4", 4, 4));
+  ASSERT_OK(b.Data("b5", 5, 5));
+  // A checksum failure in b's first record drops the rest of its block.
+  std::string b_bytes = b.Bytes();
+  const size_t first_payload = static_cast<size_t>(2 * header_size()) + 2;
+  SetByte(&b_bytes, first_payload,
+          static_cast<char>(b_bytes[first_payload] + 1));
+  std::string torn_end = b_bytes;
+  torn_end.resize(kBlockSize, '\0');
+  torn_end += std::string(3, '\x01');
+
+  for (const bool with_torn_end : {false, true}) {
+    SCOPED_TRACE(with_torn_end ? "torn end" : "clean end");
+    if (with_torn_end && fragment_buffered()) {
+      continue;  // Recovery reads with plain readers; this one waits it out.
+    }
+    std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+    members.push_back(MakeMember(a, a.Bytes()));
+    if (with_torn_end) {
+      members.push_back(MakeMember(b, torn_end, /*fail_on_read=*/0,
+                                   /*stop_on_report=*/true,
+                                   WALRecoveryMode::kPointInTimeRecovery));
+    } else {
+      members.push_back(MakeMember(b, b_bytes));
+    }
+    auto merger = MakeMerger(std::move(members), {120, 121});
+    DriveResult driven = Drive(merger.get());
+    ASSERT_EQ(WALIndexMerger::Result::kError, driven.outcome);
+    ASSERT_NE(std::string::npos,
+              merger->GetError().ToString().find("121 head damaged"));
+  }
+}
+
+// GC26 Q2: a span after the first one in a head explains a retired WAL's
+// indices too. 130 attests two retired chain heads, as the first WAL of an
+// open at fewer partitions does for the chains it folds: 119 first, then 120,
+// which bore index 3 before 119 bore anything. Both interleave with the held
+// 121. Neuter: read only the first span (Member::AttestedSpans); the merge
+// stops at index 3.
+TEST_P(LogMergeTest, FurtherSpanExplainsRetiredFoldedHead) {
+  MemberFile held(121, recyclable());
+  MemberFile next(130, recyclable());
+  ASSERT_OK(held.Marker());
+  ASSERT_OK(held.Data("h2", 2, 2));
+  ASSERT_OK(held.Data("h5", 5, 5));
+  ASSERT_OK(next.Marker());
+  ASSERT_OK(next.Span(119, 4, 6));
+  ASSERT_OK(next.Span(120, 3, 6));
+  ASSERT_OK(next.Data("n7", 7, 7));
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(held, held.Bytes()));
+  members.push_back(MakeMember(next, next.Bytes()));
+  auto merger = MakeMerger(std::move(members), {121, 130});
+  merger->SetRetirementBound(121);
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome);
+  ASSERT_EQ(std::vector<uint64_t>({2, 5, 7}), DrivenIndices(driven));
+}
+
+// GC26 Q4 (D-10): with SetSkipUnexplainedHoles, a pristine hole and the
+// indices a lost predecessor bore are skipped and the records above them
+// emitted; the stream still ends once nothing is left above. Superseded
+// copies are still never emitted. Without it the same sets stop at the
+// frontier.
+TEST_P(LogMergeTest, SkipUnexplainedHolesEmitsAboveThem) {
+  for (const bool skip : {false, true}) {
+    SCOPED_TRACE(skip ? "skip" : "strict");
+    {
+      // Pristine hole at 2.
+      MemberFile a(120, recyclable());
+      MemberFile b(121, recyclable());
+      ASSERT_OK(a.Marker());
+      ASSERT_OK(a.Data("a1", 1, 1));
+      ASSERT_OK(a.Data("a3", 3, 3));
+      ASSERT_OK(b.Marker());
+      ASSERT_OK(b.Data("b4", 4, 4));
+      std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+      members.push_back(MakeMember(a, a.Bytes()));
+      members.push_back(MakeMember(b, b.Bytes()));
+      auto merger = MakeMerger(std::move(members), {120, 121});
+      merger->SetSkipUnexplainedHoles(skip);
+      DriveResult driven = Drive(merger.get());
+      if (skip) {
+        ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome);
+        ASSERT_EQ(std::vector<uint64_t>({1, 3, 4}), DrivenIndices(driven));
+        ASSERT_EQ(1U, merger->GetSkippedHoles());
+        ASSERT_EQ(2U, merger->GetFirstSkippedHole());
+      } else {
+        ASSERT_EQ(WALIndexMerger::Result::kFrontier, driven.outcome);
+        ASSERT_EQ(2U, merger->GetFrontier());
+      }
+    }
+    {
+      // 120 is attested but lost; it bore 5 and 6, and 121 holds 7 to 9.
+      MemberFile b(121, recyclable());
+      MemberFile c(122, recyclable());
+      ASSERT_OK(b.Marker());
+      ASSERT_OK(b.Span(120, 5, 6));
+      for (uint64_t i = 7; i <= 9; ++i) {
+        ASSERT_OK(b.Data("b" + std::to_string(i), i, i));
+      }
+      ASSERT_OK(c.Marker());
+      ASSERT_OK(c.Span(119, 1, 3));
+      ASSERT_OK(c.Data("c4", 4, 4));
+      ASSERT_OK(c.Data("c6", 6, 6));
+      std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+      members.push_back(MakeMember(b, b.Bytes()));
+      members.push_back(MakeMember(c, c.Bytes()));
+      auto merger = MakeMerger(std::move(members), {121, 122});
+      merger->SetRetirementBound(120);
+      merger->SetSkipUnexplainedHoles(skip);
+      DriveResult driven = Drive(merger.get());
+      ASSERT_EQ(120U, merger->GetLostPredecessor());
+      if (skip) {
+        ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome);
+        ASSERT_EQ(std::vector<uint64_t>({4, 6, 7, 8, 9}),
+                  DrivenIndices(driven));
+        ASSERT_EQ(1U, merger->GetSkippedHoles());
+        ASSERT_EQ(5U, merger->GetFirstSkippedHole());
+        ASSERT_EQ(10U, merger->GetFrontier());
+      } else {
+        ASSERT_EQ(WALIndexMerger::Result::kFrontier, driven.outcome);
+        ASSERT_EQ(5U, merger->GetFrontier());
+      }
+    }
+    {
+      // 121 supersedes 120 from index 3 and reissues 4; 3 is lost.
+      MemberFile old(120, recyclable());
+      MemberFile young(121, recyclable());
+      ASSERT_OK(old.Marker());
+      for (uint64_t i = 1; i <= 4; ++i) {
+        ASSERT_OK(old.Data("o" + std::to_string(i), i, i));
+      }
+      ASSERT_OK(young.Marker());
+      ASSERT_OK(young.Sup(120, 3));
+      ASSERT_OK(young.Data("n4", 4, 5));
+      std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+      members.push_back(MakeMember(old, old.Bytes()));
+      members.push_back(MakeMember(young, young.Bytes()));
+      auto merger = MakeMerger(std::move(members), {120, 121},
+                               /*continue_past_discarded_holes=*/skip);
+      merger->SetSkipUnexplainedHoles(skip);
+      DriveResult driven = Drive(merger.get());
+      if (skip) {
+        ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome);
+        ASSERT_EQ(std::vector<uint64_t>({1, 2, 4}), DrivenIndices(driven));
+        ASSERT_EQ("n4", driven.records.back().payload.substr(kWALIndexSize));
+      } else {
+        ASSERT_EQ(WALIndexMerger::Result::kFrontier, driven.outcome);
+      }
+    }
+  }
+}
+
+namespace {
+// Drives `merger` to a terminal result, reporting each emitted indexed
+// record's consumption from `consumed` (by index) as recovery reports what
+// replay advanced, and collecting the emitted indices.
+WALIndexMerger::Result DriveNoting(WALIndexMerger* merger,
+                                   const std::map<uint64_t, uint64_t>& consumed,
+                                   std::vector<uint64_t>* indices) {
+  Slice record;
+  for (int rounds = 0; rounds < 10000; ++rounds) {
+    const WALIndexMerger::Result r = merger->Next(&record);
+    if (r == WALIndexMerger::Result::kRecord) {
+      const uint64_t index = merger->GetLastEmittedWALIndex();
+      indices->push_back(index);
+      const auto it = consumed.find(index);
+      if (it != consumed.end()) {
+        merger->NoteConsumed(it->second);
+      }
+    } else if (r != WALIndexMerger::Result::kTailGap &&
+               r != WALIndexMerger::Result::kWaiting) {
+      return r;
+    }
+  }
+  ADD_FAILURE() << "merge did not terminate";
+  return WALIndexMerger::Result::kWaiting;
+}
+}  // namespace
+
+// GC27 Q1 (D-2): a recovery start supersedes the voids of the files it
+// declares as well as their records. 121 starts at index 4 (its span's last
+// is 3) and declares 120 obsolete from 4; 120's records 4 and 5 and its void
+// over 6 are all obsolete, so 121's reissued 4..7 merge. Neuter: check voids
+// before supersession (as before); the merge fails at 6.
+TEST_P(LogMergeTest, GC27SupersededVoidPlusReissuedRecordMerges) {
+  MemberFile old(120, recyclable());
+  MemberFile young(121, recyclable());
+  ASSERT_OK(old.Marker());
+  for (uint64_t i = 1; i <= 5; ++i) {
+    ASSERT_OK(old.Data("o" + std::to_string(i), i, i));
+  }
+  ASSERT_OK(old.Void(6, 6));
+  ASSERT_OK(young.Marker());
+  ASSERT_OK(young.Span(120, 1, 3));
+  ASSERT_OK(young.Sup(120, 4));
+  for (uint64_t i = 4; i <= 7; ++i) {
+    ASSERT_OK(young.Data("n" + std::to_string(i), i, i));
+  }
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(old, old.Bytes()));
+  members.push_back(MakeMember(young, young.Bytes()));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome)
+      << merger->GetError().ToString();
+  ASSERT_EQ(std::vector<uint64_t>({1, 2, 3, 4, 5, 6, 7}),
+            DrivenIndices(driven));
+  for (size_t i = 3; i < 7; ++i) {
+    EXPECT_EQ("n" + std::to_string(i + 1),
+              driven.records[i].payload.substr(kWALIndexSize));
+  }
+}
+
+// GC31 Q12 (D-2, owner ruling 2026-11-02): below its declarer's start a void
+// is superseded by first_obsolete alone. 121 starts at 7 (span last 6) and
+// declares 120 obsolete from 4, which now reaches 120's void over 6 as well
+// as its records 4 and 5: 121's record at 6 no longer contradicts the void.
+// 4 and 5 are superseded-only, so the live record at 6 above them stops the
+// merge there, as for any superseded-only index. (Before the ruling the void
+// stayed live and the merge failed naming both WALs.)
+TEST_P(LogMergeTest, GC27VoidBelowDeclarerStartYieldsToRecord) {
+  MemberFile old(120, recyclable());
+  MemberFile young(121, recyclable());
+  ASSERT_OK(old.Marker());
+  for (uint64_t i = 1; i <= 5; ++i) {
+    ASSERT_OK(old.Data("o" + std::to_string(i), i, i));
+  }
+  ASSERT_OK(old.Void(6, 6));
+  ASSERT_OK(young.Marker());
+  ASSERT_OK(young.Span(120, 1, 6));
+  ASSERT_OK(young.Sup(120, 4));
+  ASSERT_OK(young.Data("n6", 6, 6));
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(old, old.Bytes()));
+  members.push_back(MakeMember(young, young.Bytes()));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kFrontier, driven.outcome)
+      << merger->GetError().ToString();
+  EXPECT_EQ(4U, merger->GetFrontier());
+  EXPECT_TRUE(merger->FrontierIsPendingDiscard());
+  ASSERT_EQ(std::vector<uint64_t>({1, 2, 3}), DrivenIndices(driven));
+}
+
+// The sibling of VoidCoverPlusSupersededDataMerges: the same layout, with
+// the declarer attesting its start at 4 (span last 3), or none. The void over
+// 4..6 that shares a file with the data is obsolete with it either way (GC31
+// Q12: first_obsolete alone decides), and the merge ends clean after 1..3,
+// the superseded indices never reissued.
+TEST_P(LogMergeTest, GC27VoidCoverPlusSupersededDataFromStartMerges) {
+  for (const bool attests_start : {false, true}) {
+    SCOPED_TRACE(attests_start ? "declarer attests its start" : "no start");
+    MemberFile a(120, recyclable());
+    MemberFile b(121, recyclable());
+    ASSERT_OK(a.Marker());
+    ASSERT_OK(a.Data("a1", 1, 1));
+    ASSERT_OK(a.Data("a2", 2, 2));
+    ASSERT_OK(a.Data("a3", 3, 3));
+    ASSERT_OK(a.Void(4, 6));
+    ASSERT_OK(a.Data("a4", 4, 4));
+    ASSERT_OK(a.Data("a5", 5, 5));
+    ASSERT_OK(a.Data("a6", 6, 6));
+    ASSERT_OK(b.Marker());
+    if (attests_start) {
+      ASSERT_OK(b.Span(120, 1, 3));
+    }
+    ASSERT_OK(b.Sup(120, 4));
+
+    std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+    members.push_back(MakeMember(a, a.Bytes()));
+    members.push_back(MakeMember(b, b.Bytes()));
+    auto merger = MakeMerger(std::move(members), {120, 121});
+    DriveResult driven = Drive(merger.get());
+    ASSERT_EQ(std::vector<uint64_t>({1, 2, 3}), DrivenIndices(driven));
+    ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome)
+        << merger->GetError().ToString();
+    EXPECT_EQ(7U, merger->GetFrontier());
+  }
+}
+
+// GC31 Q12 (D-2, owner ruling 2026-11-02), narrowed by GC33 Q2: a superseded
+// void the open seeded past still explains its index when no live record
+// bears it. 121 starts at 4 (span last 3) and declares 120 obsolete from 3,
+// superseding 120's void over 3, which lies below the start, so no record was
+// ever reissued at 3: the void explains it, and 121's record at 4 above it is
+// emitted: no hole, with or without continuing past discarded holes (skip
+// mode). GC31 had 121 start at 3, putting the void at the start; a void there
+// may have been reissued, and explains nothing (see
+// GC27SupersededVoidDoesNotExplainItsIndex).
+// Neuter: let only unsuperseded voids explain; the merge stops at 3 as a
+// superseded-only index.
+TEST_P(LogMergeTest, SupersededVoidStillExplainsUnbornIndex) {
+  for (const bool continue_past_discarded : {false, true}) {
+    SCOPED_TRACE(continue_past_discarded ? "skip" : "every other mode");
+    MemberFile old(120, recyclable());
+    MemberFile young(121, recyclable());
+    ASSERT_OK(old.Marker());
+    ASSERT_OK(old.Data("o1", 1, 1));
+    ASSERT_OK(old.Data("o2", 2, 2));
+    ASSERT_OK(old.Void(3, 3));
+    ASSERT_OK(young.Marker());
+    ASSERT_OK(young.Span(120, 1, 3));
+    ASSERT_OK(young.Sup(120, 3));
+    ASSERT_OK(young.Data("n4", 4, 4));
+
+    std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+    members.push_back(MakeMember(old, old.Bytes()));
+    members.push_back(MakeMember(young, young.Bytes()));
+    auto merger =
+        MakeMerger(std::move(members), {120, 121}, continue_past_discarded);
+    DriveResult driven = Drive(merger.get());
+    ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome)
+        << merger->GetError().ToString();
+    ASSERT_EQ(std::vector<uint64_t>({1, 2, 4}), DrivenIndices(driven));
+    EXPECT_TRUE(driven.gaps.empty());
+  }
+}
+
+// GC31 Q12: a declaration supersedes a void by its first_obsolete alone, even
+// below the declaring WAL's attested start. 121 starts at 5 (span last 4) and
+// declares 120 obsolete from 3; 120's void over 3..4 lies between. The
+// superseded void yields to 121's reissued record at 3 and still explains 4,
+// which no live record bears. Fails at the base, where the void below 5 is
+// not superseded and contradicts the record at 3.
+TEST_P(LogMergeTest, VoidBelowDeclarerStartSupersededByFirstObsolete) {
+  MemberFile old(120, recyclable());
+  MemberFile young(121, recyclable());
+  ASSERT_OK(old.Marker());
+  ASSERT_OK(old.Data("o1", 1, 1));
+  ASSERT_OK(old.Data("o2", 2, 2));
+  ASSERT_OK(old.Void(3, 4));
+  ASSERT_OK(young.Marker());
+  ASSERT_OK(young.Span(120, 1, 4));
+  ASSERT_OK(young.Sup(120, 3));
+  ASSERT_OK(young.Data("n3", 3, 3));
+  ASSERT_OK(young.Data("n5", 5, 5));
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(old, old.Bytes()));
+  members.push_back(MakeMember(young, young.Bytes()));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome)
+      << merger->GetError().ToString();
+  ASSERT_EQ(std::vector<uint64_t>({1, 2, 3, 5}), DrivenIndices(driven));
+  EXPECT_EQ("n3", driven.records[2].payload.substr(kWALIndexSize));
+}
+
+// GC31 Q12: the same with a declarer that attests no span or floor (an older
+// binary's declaration): it supersedes the void as well. Fails at the base,
+// where a declarer attesting no start supersedes no void.
+TEST_P(LogMergeTest, VoidSupersededByDeclarerWithoutStart) {
+  MemberFile old(120, recyclable());
+  MemberFile young(121, recyclable());
+  ASSERT_OK(old.Marker());
+  ASSERT_OK(old.Data("o1", 1, 1));
+  ASSERT_OK(old.Data("o2", 2, 2));
+  ASSERT_OK(old.Void(3, 4));
+  ASSERT_OK(young.Marker());
+  ASSERT_OK(young.Sup(120, 3));
+  ASSERT_OK(young.Data("n3", 3, 3));
+  ASSERT_OK(young.Data("n5", 5, 5));
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(old, old.Bytes()));
+  members.push_back(MakeMember(young, young.Bytes()));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome)
+      << merger->GetError().ToString();
+  ASSERT_EQ(std::vector<uint64_t>({1, 2, 3, 5}), DrivenIndices(driven));
+  EXPECT_EQ("n3", driven.records[2].payload.substr(kWALIndexSize));
+}
+
+// Detection kept (Q1): rotation excludes every writer, so a held predecessor
+// bears nothing above the last index its successor attests. 121 attests 120
+// as [1, 2]; 120's live record at 3 fails, naming both WALs and the index.
+// Neuter: drop the check; the merge emits 1..4.
+TEST_P(LogMergeTest, GC27HeldPredecessorAboveAttestedLastFails) {
+  MemberFile pred(120, recyclable());
+  MemberFile succ(121, recyclable());
+  ASSERT_OK(pred.Marker());
+  ASSERT_OK(pred.Data("p1", 1, 1));
+  ASSERT_OK(pred.Data("p2", 2, 2));
+  ASSERT_OK(pred.Data("p3", 3, 3));
+  ASSERT_OK(succ.Marker());
+  ASSERT_OK(succ.Span(120, 1, 2));
+  ASSERT_OK(succ.Data("s4", 4, 4));
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(pred, pred.Bytes()));
+  members.push_back(MakeMember(succ, succ.Bytes()));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kError, driven.outcome);
+  EXPECT_NE(std::string::npos,
+            merger->GetError().ToString().find(
+                "WAL 120 bears live index 3 above the last index 2 that WAL "
+                "121 attests for it"))
+      << merger->GetError().ToString();
+  ASSERT_EQ(std::vector<uint64_t>({1, 2}), DrivenIndices(driven));
+}
+
+// GC27 Q5 (b) (D-GC27c): with the consumption recovery reports, each record
+// starts at or above the previous one's sequence plus what it consumed.
+// Index 1 at sequence 3 consuming 4 covers 3..6. Without a report (a
+// seq_per_batch opener, or a record whose replay advanced nothing, such as a
+// prepare section) only first sequences are compared. Neuter: compare first
+// sequences only; the overlap passes.
+TEST_P(LogMergeTest, GC27SequenceCheckCountsConsumedSequences) {
+  struct Case {
+    const char* name;
+    uint64_t second_seq;
+    bool report;
+    uint64_t consumed;
+    bool ok;
+  };
+  for (const Case& c :
+       {Case{"reorder", 2, true, 4, false}, Case{"overlap", 5, true, 4, false},
+        Case{"exact follow-on", 7, true, 4, true},
+        Case{"upward gap", 20, true, 4, true},
+        Case{"seq_per_batch overlap", 5, false, 0, true},
+        Case{"prepare section, same stamp", 3, true, 0, true},
+        Case{"unreported, same stamp", 3, false, 0, true}}) {
+    SCOPED_TRACE(c.name);
+    MemberFile a(120, recyclable());
+    MemberFile b(121, recyclable());
+    ASSERT_OK(a.Marker());
+    ASSERT_OK(b.Marker());
+    ASSERT_OK(a.Data("a1", 1, 3));
+    ASSERT_OK(a.Data("e2", 2, 0));
+    ASSERT_OK(b.Data("b3", 3, c.second_seq));
+
+    std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+    members.push_back(MakeMember(a, a.Bytes()));
+    members.push_back(MakeMember(b, b.Bytes()));
+    auto merger = MakeMerger(std::move(members), {120, 121});
+    std::map<uint64_t, uint64_t> consumed;
+    if (c.report) {
+      consumed[1] = c.consumed;
+    }
+    std::vector<uint64_t> indices;
+    const WALIndexMerger::Result r =
+        DriveNoting(merger.get(), consumed, &indices);
+    if (c.ok) {
+      ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, r)
+          << merger->GetError().ToString();
+      ASSERT_EQ(std::vector<uint64_t>({1, 2, 3}), indices);
+    } else {
+      ASSERT_EQ(WALIndexMerger::Result::kError, r);
+      ASSERT_EQ(std::vector<uint64_t>({1, 2}), indices);
+      // Q5 (c): both WALs, both indices and both ranges.
+      const std::string range = c.consumed > 1 ? "3..6" : "3";
+      EXPECT_NE(std::string::npos, merger->GetError().ToString().find(
+                                       "index 3 in WAL 121 at sequence " +
+                                       std::to_string(c.second_seq) +
+                                       " does not advance past sequence " +
+                                       range + " of index 1 in WAL 120"))
+          << merger->GetError().ToString();
+    }
+  }
+}
+
+// GC27 Q5 (c): two live records at one index name both WALs.
+TEST_P(LogMergeTest, GC27DuplicateLiveIndexNamesWals) {
+  MemberFile a(120, recyclable());
+  MemberFile b(121, recyclable());
+  ASSERT_OK(a.Marker());
+  ASSERT_OK(b.Marker());
+  ASSERT_OK(a.Data("a1", 1, 1));
+  ASSERT_OK(b.Data("b1", 1, 2));
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(a, a.Bytes()));
+  members.push_back(MakeMember(b, b.Bytes()));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kError, driven.outcome);
+  EXPECT_NE(std::string::npos,
+            merger->GetError().ToString().find(
+                "two live records share index 1 (WAL 120, WAL 121)"))
+      << merger->GetError().ToString();
+}
+
+// GC27 Q5 (c): a record over a void names the holder and the void's file.
+TEST_P(LogMergeTest, GC27VoidCoverPlusDataNamesWals) {
+  MemberFile a(120, recyclable());
+  MemberFile b(121, recyclable());
+  ASSERT_OK(a.Marker());
+  ASSERT_OK(b.Marker());
+  ASSERT_OK(a.Data("a1", 1, 1));
+  ASSERT_OK(a.Void(2, 3));
+  ASSERT_OK(a.Data("a4", 4, 4));
+  ASSERT_OK(b.Data("b2", 2, 2));
+  ASSERT_OK(b.Data("b3", 3, 3));
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(a, a.Bytes()));
+  members.push_back(MakeMember(b, b.Bytes()));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kError, driven.outcome);
+  EXPECT_NE(std::string::npos,
+            merger->GetError().ToString().find(
+                "index 2 bears records (WAL 121) and a void cover (WAL 120)"))
+      << merger->GetError().ToString();
+}
+
+// GC33 Q2 (restores GC27's test, which GC31 Q12 reversed): a superseded void
+// at or above its declarer's start explains nothing: the open may have
+// reissued its index, so the index is superseded-only, and a live record
+// above it, with the reissue of the void's index missing, stops the merge
+// there rather than skipping it as a void would. GC19's exception (a void
+// below the declarer clears a pending index) counts voids the open seeded
+// past only. Fails at the GC31 base, which ends clean with 1, 2, 4.
+// Neuter: let every superseded void explain its index; 4 is emitted.
+TEST_P(LogMergeTest, GC27SupersededVoidDoesNotExplainItsIndex) {
+  MemberFile old(120, recyclable());
+  MemberFile young(121, recyclable());
+  ASSERT_OK(old.Marker());
+  ASSERT_OK(old.Data("o1", 1, 1));
+  ASSERT_OK(old.Data("o2", 2, 2));
+  ASSERT_OK(old.Void(3, 3));
+  ASSERT_OK(young.Marker());
+  ASSERT_OK(young.Span(120, 1, 2));
+  ASSERT_OK(young.Sup(120, 3));
+  ASSERT_OK(young.Data("n4", 4, 4));
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(old, old.Bytes()));
+  members.push_back(MakeMember(young, young.Bytes()));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kFrontier, driven.outcome);
+  EXPECT_EQ(3U, merger->GetFrontier());
+  EXPECT_TRUE(merger->FrontierIsPendingDiscard());
+  ASSERT_EQ(std::vector<uint64_t>({1, 2}), DrivenIndices(driven));
+}
+
+// GC33 Q2: 3 is superseded-only (121 declares 120 obsolete from 3, so its
+// record there is a pending discard). 120's voids over 4..5 lie at or above
+// 121's start (3), so they do not show that 3 was never reissued, and 121's
+// live record at 6 means its reissued copy was lost: the merge stops at 3,
+// pending discard. Passes at the GC31 base.
+// Neuter: let a superseded void at or above the start clear the pending
+// discard (GC19's exception widened to every superseded void); 6 is emitted.
+TEST_P(LogMergeTest, GC33SupersededVoidAboveStartKeepsPending) {
+  MemberFile old(120, recyclable());
+  MemberFile young(121, recyclable());
+  ASSERT_OK(old.Marker());
+  ASSERT_OK(old.Data("o1", 1, 1));
+  ASSERT_OK(old.Data("o2", 2, 2));
+  ASSERT_OK(old.Data("o3", 3, 3));
+  ASSERT_OK(old.Void(4, 5));
+  ASSERT_OK(young.Marker());
+  ASSERT_OK(young.Span(120, 1, 2));
+  ASSERT_OK(young.Sup(120, 3));
+  ASSERT_OK(young.Data("n6", 6, 6));
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(old, old.Bytes()));
+  members.push_back(MakeMember(young, young.Bytes()));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kFrontier, driven.outcome)
+      << merger->GetError().ToString();
+  EXPECT_EQ(3U, merger->GetFrontier());
+  EXPECT_TRUE(merger->FrontierIsPendingDiscard());
+  ASSERT_EQ(std::vector<uint64_t>({1, 2}), DrivenIndices(driven));
+}
+
+// GC33 Q2 control: the same with 121 starting at 6 (span last 5). The voids
+// over 4..5 lie below the start, so the open seeded past them and nothing was
+// reissued at 3..5: they clear the pending discard and explain 4..5, and the
+// merge ends clean with 1, 2, 6.
+// Neuter: let no superseded void explain; the merge stops at 3.
+TEST_P(LogMergeTest, GC33SupersededVoidBelowStartClearsPending) {
+  MemberFile old(120, recyclable());
+  MemberFile young(121, recyclable());
+  ASSERT_OK(old.Marker());
+  ASSERT_OK(old.Data("o1", 1, 1));
+  ASSERT_OK(old.Data("o2", 2, 2));
+  ASSERT_OK(old.Data("o3", 3, 3));
+  ASSERT_OK(old.Void(4, 5));
+  ASSERT_OK(young.Marker());
+  ASSERT_OK(young.Span(120, 1, 5));
+  ASSERT_OK(young.Sup(120, 3));
+  ASSERT_OK(young.Data("n6", 6, 6));
+
+  std::vector<std::unique_ptr<WALIndexMerger::Member>> members;
+  members.push_back(MakeMember(old, old.Bytes()));
+  members.push_back(MakeMember(young, young.Bytes()));
+  auto merger = MakeMerger(std::move(members), {120, 121});
+  DriveResult driven = Drive(merger.get());
+  ASSERT_EQ(WALIndexMerger::Result::kCleanEnd, driven.outcome)
+      << merger->GetError().ToString();
+  ASSERT_EQ(std::vector<uint64_t>({1, 2, 6}), DrivenIndices(driven));
+  EXPECT_TRUE(driven.gaps.empty());
 }
 
 INSTANTIATE_TEST_CASE_P(LogMerge, LogMergeTest,
