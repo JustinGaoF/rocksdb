@@ -518,6 +518,8 @@ size_t WriteThread::EnterAsBatchGroupLeader(Writer* leader,
     // in particular w->batch is non-null there, so ByteSize is safe, exactly
     // as before.
     bool incompatible =
+        (w->wal_partition != leader->wal_partition) ||
+        // A write group becomes one WAL record and cannot span partitions.
         (w->sync && !leader->sync) ||
         // Do not include a sync write into a batch handled by a non-sync write.
         (w->no_slowdown != leader->no_slowdown) ||
