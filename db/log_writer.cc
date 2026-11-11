@@ -241,6 +241,9 @@ IOStatus Writer::AddRecord(const WriteOptions& write_options,
   if (s.ok()) {
     last_seqno_recorded_ = std::max(last_seqno_recorded_, seqno);
     if (WALIndexEnabled()) {
+      if (first_wal_index_recorded_ == 0) {
+        first_wal_index_recorded_ = wal_index;
+      }
       last_wal_index_recorded_ = wal_index;
     }
   }
@@ -288,20 +291,23 @@ IOStatus Writer::MaybeAddWALIndexMarkerRecord(
     return s;
   }
 
-  // The record type alone identifies the file as carrying wal_index, so the
-  // marker needs no payload. The block check still matters: it reserves room
-  // for the header.
-  const std::string empty_payload;
+  // The record type alone identifies the file as carrying wal_index.
+  // Partition 0 writes no payload, keeping single-partition WALs unchanged.
+  // The block check still matters: it reserves room for the header.
+  std::string payload;
+  if (wal_partition_ != 0) {
+    PutFixed32(&payload, wal_partition_);
+  }
 
-  s = MaybeSwitchToNewBlock(write_options, empty_payload);
+  s = MaybeSwitchToNewBlock(write_options, payload);
   if (!s.ok()) {
     return s;
   }
 
   RecordType type =
       recycle_log_files_ ? kRecyclableWALIndexMarkerType : kWALIndexMarkerType;
-  s = EmitPhysicalRecord(write_options, type, Slice(), empty_payload.data(),
-                         empty_payload.size());
+  s = EmitPhysicalRecord(write_options, type, Slice(), payload.data(),
+                         payload.size());
   if (!s.ok()) {
     return s;
   }
