@@ -32,6 +32,7 @@
 #include "util/defer.h"
 #include "util/random.h"
 #include "util/string_util.h"
+#include "utilities/fault_injection_env.h"
 #include "utilities/merge_operators.h"
 #include "utilities/secondary_index/secondary_index_helper.h"
 #include "utilities/transactions/pessimistic_transaction_db.h"
@@ -10416,6 +10417,244 @@ TEST_P(CommitBypassMemtableTest, WBWIOpCountMismatchWBCount) {
   }
 }
 
+// CDR-F017 with a WriteCommitted prepare: the prepare keeps a WAL written
+// before WAL indexing live across the upgrade to two partitions, so the next
+// recovery set is that unindexed WAL followed by partitioned indexed ones.
+// Recovery replays the unindexed prefix sequentially and merges the rest, so
+// the commit written after the upgrade finds its prepare.
+TEST(TransactionPartitionedWalTest, PreparedUnindexedWalSurvivesPartitioning) {
+  constexpr size_t kPartitions = 2;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::ValidateOptions:AllowWalPartitions",
+      [](void* arg) { *static_cast<bool*>(arg) = true; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  const std::string dbname =
+      test::PerThreadDBPath("transaction_prepare_across_partitioning");
+  Options options;
+  options.create_if_missing = true;
+  options.create_missing_column_families = true;
+  options.avoid_flush_during_recovery = true;
+  options.avoid_flush_during_shutdown = true;
+  options.track_and_verify_wals_in_manifest = true;
+  ASSERT_OK(DestroyDB(dbname, options));
+  // Column family ids follow descriptor order; add families until one routes
+  // to each partition at N = 2.
+  std::vector<ColumnFamilyDescriptor> cfs;
+  cfs.emplace_back(kDefaultColumnFamilyName, ColumnFamilyOptions(options));
+  std::vector<size_t> cf_for_partition(kPartitions, 0);
+  std::vector<bool> covered(kPartitions, false);
+  size_t num_covered = 0;
+  while (num_covered < kPartitions) {
+    const uint32_t cf_id = static_cast<uint32_t>(cfs.size());
+    cfs.emplace_back("cf" + std::to_string(cf_id),
+                     ColumnFamilyOptions(options));
+    WriteBatch batch;
+    ASSERT_OK(WriteBatchInternal::Put(&batch, cf_id, "key", "value"));
+    size_t partition = kPartitions;
+    ASSERT_OK(
+        DBImpl::TEST_WalPartitionForWrite(batch, kPartitions, &partition));
+    if (!covered[partition]) {
+      covered[partition] = true;
+      cf_for_partition[partition] = cf_id;
+      ++num_covered;
+    }
+  }
+  std::vector<ColumnFamilyHandle*> handles;
+  TransactionDB* db = nullptr;
+  Transaction* txn = nullptr;
+  // Releases what the test holds on every exit, including an early
+  // return from a failed assertion.
+  Defer release([&] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    delete txn;
+    if (db != nullptr) {
+      for (ColumnFamilyHandle* handle : handles) {
+        db->DestroyColumnFamilyHandle(handle).PermitUncheckedError();
+      }
+      delete db;
+    }
+  });
+  auto open = [&](uint32_t partitions, PartitionWALUsage usage) {
+    options.wal_partitions = static_cast<uint32_t>(partitions);
+    options.partition_wal_usage = usage;
+    ASSERT_OK(TransactionDB::Open(options, TransactionDBOptions(), dbname, cfs,
+                                  &handles, &db));
+  };
+  auto close = [&] {
+    for (ColumnFamilyHandle* handle : handles) {
+      ASSERT_OK(db->DestroyColumnFamilyHandle(handle));
+    }
+    handles.clear();
+    delete db;
+    db = nullptr;
+  };
+
+  open(1, PartitionWALUsage::kNone);
+  txn = db->BeginTransaction(WriteOptions());
+  ASSERT_OK(txn->SetName("xid"));
+  ASSERT_OK(txn->Put(handles[cf_for_partition[1]], "prepared", "value"));
+  ASSERT_OK(txn->Prepare());
+  ASSERT_OK(db->Put(WriteOptions(), handles[cf_for_partition[0]], "unindexed",
+                    "value"));
+  delete txn;
+  txn = nullptr;
+  close();
+
+  open(kPartitions, PartitionWALUsage::kPartitionByColumnFamily);
+  txn = db->GetTransactionByName("xid");
+  ASSERT_NE(nullptr, txn);
+  ASSERT_OK(txn->Commit());
+  delete txn;
+  txn = nullptr;
+  for (size_t p = 0; p < kPartitions; ++p) {
+    ASSERT_OK(db->Put(WriteOptions(), handles[cf_for_partition[p]],
+                      "indexed" + std::to_string(p), "value"));
+  }
+  close();
+
+  open(kPartitions, PartitionWALUsage::kPartitionByColumnFamily);
+  std::string value;
+  ASSERT_OK(
+      db->Get(ReadOptions(), handles[cf_for_partition[1]], "prepared", &value));
+  ASSERT_OK(db->Get(ReadOptions(), handles[cf_for_partition[0]], "unindexed",
+                    &value));
+  for (size_t p = 0; p < kPartitions; ++p) {
+    ASSERT_OK(db->Get(ReadOptions(), handles[cf_for_partition[p]],
+                      "indexed" + std::to_string(p), &value));
+  }
+  close();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_OK(DestroyDB(dbname, options));
+}
+
+// A rolled-back transaction must stay resolved after the WALs below a
+// still-pending prepare retire. Each rotation numbers its new WALs in
+// partition order, so if the rollback marker went to a lower partition than
+// its prepare (as when a prepare routed by its column family and the marker
+// by XID), it would sit in a lower-numbered WAL of the same rotation, retire
+// with everything below the pending prepare's WAL, and leave its transaction
+// looking prepared after recovery.
+TEST(TransactionPartitionedWalTest, ResolvedPrepareStaysResolvedAfterRotation) {
+  constexpr size_t kPartitions = 8;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::ValidateOptions:AllowWalPartitions",
+      [](void* arg) { *static_cast<bool*>(arg) = true; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  const std::string dbname =
+      test::PerThreadDBPath("transaction_partitioned_wal_rollback_marker");
+  Options options;
+  options.create_if_missing = true;
+  options.create_missing_column_families = true;
+  options.wal_partitions = kPartitions;
+  options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  options.avoid_flush_during_recovery = true;
+  options.avoid_flush_during_shutdown = true;
+  options.track_and_verify_wals_in_manifest = true;
+  ASSERT_OK(DestroyDB(dbname, options));
+  // A column family whose data routes to the highest partition, an XID that
+  // routes there too for the pending prepare, and one that routes to
+  // partition 0 for the resolved transaction.
+  std::vector<ColumnFamilyDescriptor> cfs;
+  cfs.emplace_back(kDefaultColumnFamilyName, ColumnFamilyOptions(options));
+  uint32_t high_cf = 0;
+  for (uint32_t cf_id = 1; high_cf == 0; ++cf_id) {
+    cfs.emplace_back("cf" + std::to_string(cf_id),
+                     ColumnFamilyOptions(options));
+    WriteBatch batch;
+    ASSERT_OK(WriteBatchInternal::Put(&batch, cf_id, "key", "value"));
+    size_t partition = kPartitions;
+    ASSERT_OK(
+        DBImpl::TEST_WalPartitionForWrite(batch, kPartitions, &partition));
+    if (partition == kPartitions - 1) {
+      high_cf = cf_id;
+    }
+  }
+  const std::string high_xid =
+      TwoPhaseNameOnWalPartition("pending-", kPartitions - 1, kPartitions);
+  const std::string low_xid =
+      TwoPhaseNameOnWalPartition("resolved-", 0, kPartitions);
+  std::vector<ColumnFamilyHandle*> handles;
+  TransactionDB* db = nullptr;
+  std::vector<Transaction*> txns;
+  Defer release([&] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    for (Transaction* txn : txns) {
+      delete txn;
+    }
+    if (db != nullptr) {
+      for (ColumnFamilyHandle* handle : handles) {
+        db->DestroyColumnFamilyHandle(handle).PermitUncheckedError();
+      }
+      delete db;
+    }
+  });
+  auto open = [&] {
+    ASSERT_OK(TransactionDB::Open(options, TransactionDBOptions(), dbname, cfs,
+                                  &handles, &db));
+  };
+  auto close = [&] {
+    for (Transaction* txn : txns) {
+      delete txn;
+    }
+    txns.clear();
+    for (ColumnFamilyHandle* handle : handles) {
+      ASSERT_OK(db->DestroyColumnFamilyHandle(handle));
+    }
+    handles.clear();
+    delete db;
+    db = nullptr;
+  };
+
+  for (bool commit : {false, true}) {
+    SCOPED_TRACE(commit ? "commit" : "rollback");
+    ASSERT_OK(DestroyDB(dbname, options));
+    open();
+    // Pinned by its pending prepare, this transaction's WAL is the oldest one
+    // the rotation below keeps.
+    Transaction* pending = db->BeginTransaction(WriteOptions());
+    txns.push_back(pending);
+    ASSERT_OK(pending->SetName(high_xid));
+    ASSERT_OK(pending->Put(handles[high_cf], "pending", "value"));
+    ASSERT_OK(pending->Prepare());
+    Transaction* resolved = db->BeginTransaction(WriteOptions());
+    txns.push_back(resolved);
+    ASSERT_OK(resolved->SetName(low_xid));
+    ASSERT_OK(resolved->Put(handles[high_cf], "resolved", "value"));
+    ASSERT_OK(resolved->Prepare());
+    ASSERT_OK(commit ? resolved->Commit() : resolved->Rollback());
+    for (ColumnFamilyHandle* handle : handles) {
+      ASSERT_OK(db->Put(WriteOptions(), handle, "rotate", "value"));
+      ASSERT_OK(db->Flush(FlushOptions(), handle));
+    }
+    static_cast_with_check<DBImpl>(db->GetRootDB())->TEST_DeleteObsoleteFiles();
+    // Crash with the pending transaction still prepared.
+    close();
+
+    open();
+    std::vector<Transaction*> prepared;
+    db->GetAllPreparedTransactions(&prepared);
+    std::vector<std::string> names;
+    for (Transaction* txn : prepared) {
+      names.push_back(txn->GetName());
+      txns.push_back(txn);
+    }
+    EXPECT_EQ(std::vector<std::string>{high_xid}, names);
+    std::string value;
+    const Status get =
+        db->Get(ReadOptions(), handles[high_cf], "resolved", &value);
+    if (commit) {
+      EXPECT_OK(get);
+    } else {
+      EXPECT_TRUE(get.IsNotFound()) << get.ToString();
+    }
+    close();
+  }
+  ASSERT_OK(DestroyDB(dbname, options));
+}
+
 // G-10: CommitAndTryCreateSnapshot's timestamped snapshot must not publish its
 // commit sequence above the N>1 applied prefix. With A, the lower sequence on
 // partition 0, held in its append, B's commit on partition 1 must leave B's
@@ -10524,6 +10763,109 @@ TEST(TransactionPartitionedWalTest,
   db = nullptr;
   SyncPoint::GetInstance()->DisableProcessing();
   SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_OK(DestroyDB(dbname, options));
+}
+
+// FU14 H1: a WriteCommitted Prepare is a WAL-only write (kDisableMemtable)
+// and consumes no sequence number, so at N>1 its completion gate targets the
+// already-published last sequence L. Once a previous sync write has advanced
+// the coalesced gate-sync frontier to L, a sync=true Prepare is acknowledged
+// without any fsync. Correct behaviour: the acknowledged Prepare survives a
+// power loss that drops every unsynced byte, so the transaction recovers as
+// prepared.
+TEST(TransactionPartitionedWalTest, SyncPrepareAfterSyncCommitSurvivesCrash) {
+  constexpr size_t kPartitions = 2;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::ValidateOptions:AllowWalPartitions",
+      [](void* arg) { *static_cast<bool*>(arg) = true; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  const std::string dbname =
+      test::PerThreadDBPath("transaction_partitioned_wal_sync_prepare");
+  // Drops every byte not synced when the DB closes (simulated power loss),
+  // as SyncWriteMakesPriorPartitionAppendSurviveCrash in db_write_test does.
+  std::unique_ptr<FaultInjectionTestEnv> fault_env(
+      new FaultInjectionTestEnv(Env::Default()));
+  Options options;
+  options.create_if_missing = true;
+  options.wal_partitions = kPartitions;
+  options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  options.track_and_verify_wals_in_manifest = true;
+  options.avoid_flush_during_recovery = true;
+  options.avoid_flush_during_shutdown = true;
+  options.env = fault_env.get();
+  options.statistics = CreateDBStatistics();
+  ASSERT_OK(DestroyDB(dbname, options));
+  TransactionDBOptions txn_db_options;
+  txn_db_options.write_policy = WRITE_COMMITTED;
+  TransactionDB* db = nullptr;
+  Transaction* txn1 = nullptr;
+  Transaction* txn2 = nullptr;
+  Transaction* recovered = nullptr;
+  // Releases what the test holds on every exit, including an early
+  // return from a failed assertion.
+  Defer release([&] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    delete recovered;
+    delete txn2;
+    delete txn1;
+    delete db;
+  });
+  ASSERT_OK(TransactionDB::Open(options, txn_db_options, dbname, &db));
+  ASSERT_EQ(
+      kPartitions,
+      static_cast_with_check<DBImpl>(db->GetRootDB())->TEST_NumWalPartitions());
+
+  WriteOptions sync_wo;
+  sync_wo.sync = true;
+  txn1 = db->BeginTransaction(sync_wo);
+  ASSERT_OK(txn1->SetName("xid1"));
+  ASSERT_OK(txn1->Put("k1", "v1"));
+  ASSERT_OK(txn1->Prepare());
+  ASSERT_OK(txn1->Commit());
+  delete txn1;
+  txn1 = nullptr;
+
+  txn2 = db->BeginTransaction(sync_wo);
+  ASSERT_OK(txn2->SetName("xid2"));
+  ASSERT_OK(txn2->Put("k2", "v2"));
+  const uint64_t synced_before =
+      options.statistics->getTickerCount(WAL_FILE_SYNCED);
+  ASSERT_OK(txn2->Prepare());
+  const uint64_t synced_after =
+      options.statistics->getTickerCount(WAL_FILE_SYNCED);
+  // The sync=true Prepare must sync the WAL before it is acknowledged.
+  EXPECT_GT(synced_after, synced_before)
+      << "sync=true Prepare acknowledged without a WAL sync";
+  delete txn2;
+  txn2 = nullptr;
+
+  // Control: never synced, so the power loss below must drop it.
+  ASSERT_OK(db->Put(WriteOptions(), "control", "v"));
+
+  delete db;
+  db = nullptr;
+  ASSERT_OK(fault_env->DropUnsyncedFileData());
+  fault_env->ResetState();
+
+  ASSERT_OK(TransactionDB::Open(options, txn_db_options, dbname, &db));
+  std::string value;
+  ASSERT_OK(db->Get(ReadOptions(), "k1", &value));
+  ASSERT_EQ("v1", value);
+  ASSERT_TRUE(db->Get(ReadOptions(), "control", &value).IsNotFound());
+  recovered = db->GetTransactionByName("xid2");
+  EXPECT_NE(nullptr, recovered)
+      << "acknowledged sync=true Prepare of xid2 lost after power loss";
+  if (recovered != nullptr) {
+    ASSERT_OK(recovered->Rollback());
+    delete recovered;
+    recovered = nullptr;
+  }
+  delete db;
+  db = nullptr;
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  options.env = Env::Default();
   ASSERT_OK(DestroyDB(dbname, options));
 }
 

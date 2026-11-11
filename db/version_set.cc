@@ -5897,6 +5897,7 @@ void VersionSet::Reset() {
   options_file_size_ = 0;
   has_committed_options_file_number_ = false;
   wal_index_guard_ = 0;
+  wal_partition_guard_ = 0;
   pending_manifest_file_number_ = 0;
   last_sequence_.store(0);
   last_allocated_sequence_.store(0);
@@ -6359,6 +6360,10 @@ Status VersionSet::ProcessManifestWrites(
     if (wal_index_guard_ != 0 && !batch_edits.back()->HasWALIndexGuard()) {
       batch_edits.back()->SetWALIndexGuard(wal_index_guard_);
     }
+    if (wal_partition_guard_ != 0 &&
+        !batch_edits.back()->HasWALPartitionGuard()) {
+      batch_edits.back()->SetWALPartitionGuard(wal_partition_guard_);
+    }
   }
 
   uint64_t new_manifest_file_size = 0;
@@ -6633,6 +6638,9 @@ Status VersionSet::ProcessManifestWrites(
         }
         if (edit->HasWALIndexGuard()) {
           wal_index_guard_ = edit->GetWALIndexGuard();
+        }
+        if (edit->HasWALPartitionGuard()) {
+          wal_partition_guard_ = edit->GetWALPartitionGuard();
         }
       }
       assert(max_last_sequence >= descriptor_last_sequence_);
