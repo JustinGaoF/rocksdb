@@ -1606,6 +1606,59 @@ TEST_F(OptionsTest, DBOptionsComposeImmutable) {
                                                   new_opts));
 }
 
+// GC27 Q9 (a): every value serializes to its enumerator's name (whichever
+// spelling is parsed) and parses back from each spelling, and so does
+// wal_partitions; RandomInitDBOptions covers both fields in
+// DBOptionsSerialization and DBOptionsComposeImmutable.
+TEST_F(OptionsTest, PartitionWALOptionsRoundTrip) {
+  ConfigOptions config_options;
+  config_options.input_strings_escaped = false;
+  config_options.ignore_unknown_options = false;
+
+  const std::vector<std::pair<PartitionWALUsage, std::vector<std::string>>>
+      kSpellings = {
+          {PartitionWALUsage::kNone, {"kNone", "none"}},
+          {PartitionWALUsage::kPartitionByColumnFamily,
+           {"kPartitionByColumnFamily", "partition_by_column_family"}}};
+  for (const auto& [usage, spellings] : kSpellings) {
+    for (uint32_t partitions : {1u, 2u, 64u}) {
+      if (usage == PartitionWALUsage::kNone && partitions > 1) {
+        continue;
+      }
+      DBOptions base_opts;
+      base_opts.partition_wal_usage = usage;
+      base_opts.wal_partitions = partitions;
+      std::string serialized;
+      ASSERT_OK(GetStringFromDBOptions(config_options, base_opts, &serialized));
+      std::unordered_map<std::string, std::string> opts_map;
+      ASSERT_OK(StringToMap(serialized, &opts_map));
+      ASSERT_EQ(spellings.front(), opts_map["partition_wal_usage"]);
+      for (const std::string& spelling : spellings) {
+        DBOptions parsed;
+        ASSERT_OK(GetDBOptionsFromString(config_options, DBOptions(),
+                                         "partition_wal_usage=" + spelling,
+                                         &parsed));
+        ASSERT_EQ(usage, parsed.partition_wal_usage);
+        std::string reserialized;
+        ASSERT_OK(
+            GetStringFromDBOptions(config_options, parsed, &reserialized));
+        std::unordered_map<std::string, std::string> reserialized_map;
+        ASSERT_OK(StringToMap(reserialized, &reserialized_map));
+        ASSERT_EQ(spellings.front(), reserialized_map["partition_wal_usage"]);
+      }
+      ASSERT_EQ(std::to_string(partitions), opts_map["wal_partitions"]);
+
+      DBOptions new_opts;
+      ASSERT_OK(GetDBOptionsFromString(config_options, DBOptions(), serialized,
+                                       &new_opts));
+      ASSERT_EQ(usage, new_opts.partition_wal_usage);
+      ASSERT_EQ(partitions, new_opts.wal_partitions);
+      ASSERT_OK(RocksDBOptionsParser::VerifyDBOptions(config_options, base_opts,
+                                                      new_opts));
+    }
+  }
+}
+
 TEST_F(OptionsTest, PartitionWALUsageFromString) {
   ConfigOptions config_options;
   config_options.input_strings_escaped = false;
