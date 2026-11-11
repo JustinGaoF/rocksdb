@@ -1347,6 +1347,43 @@ const std::string& StressTest::GetSecondariesBase() const {
 
 Env* StressTest::GetDbEnv() const { return db_env_.get(); }
 
+namespace {
+// The WAL latency wrapper for --inject_wal_latency over `base`, or null.
+std::shared_ptr<LatencyInjectionFileSystem> MakeWalLatencyFs(
+    const std::shared_ptr<FileSystem>& base) {
+  if (!FLAGS_inject_wal_latency) {
+    return nullptr;
+  }
+  // MiB/s to bytes/s; a positive bandwidth never rounds down to off.
+  auto bytes_per_sec = [](double mbps) -> uint64_t {
+    return mbps > 0 ? std::max<uint64_t>(
+                          1, static_cast<uint64_t>(mbps * 1048576 + 0.5))
+                    : 0;
+  };
+  LatencyInjectionFileSystem::Latency latency;
+  latency.append_micros = FLAGS_wal_append_latency_us;
+  latency.sync_micros = FLAGS_wal_sync_latency_us;
+  latency.jitter_micros = FLAGS_wal_latency_jitter_us;
+  latency.append_bytes_per_sec = bytes_per_sec(FLAGS_wal_append_bandwidth_mbps);
+  latency.sync_bytes_per_sec = bytes_per_sec(FLAGS_wal_sync_bandwidth_mbps);
+  const uint64_t seed = FLAGS_wal_latency_seed >= 0
+                            ? static_cast<uint64_t>(FLAGS_wal_latency_seed)
+                            : FLAGS_seed;
+  return std::make_shared<LatencyInjectionFileSystem>(base, latency, seed);
+}
+
+// The outermost of the DB's FileSystem wrappers that exist.
+std::shared_ptr<FileSystem> OutermostDbFs(
+    const std::shared_ptr<FileSystem>& stress_fs,
+    const std::shared_ptr<FileSystem>& fault_fs,
+    const std::shared_ptr<FileSystem>& latency_fs) {
+  if (latency_fs) {
+    return latency_fs;
+  }
+  return fault_fs ? fault_fs : stress_fs;
+}
+}  // namespace
+
 StressTest::StressTest(int db_index, const std::string& db_path,
                        const std::string& ev_path, const std::string& sec_path)
     : db_index_(db_index),
@@ -1361,10 +1398,13 @@ StressTest::StressTest(int db_index, const std::string& db_path,
               ? std::make_shared<FaultInjectionTestFS>(
                     db_stress_fs_, GetFaultInjectionLogPath(db_label_))
               : nullptr),
+      db_latency_fs_(MakeWalLatencyFs(
+          db_fault_injection_fs_
+              ? std::shared_ptr<FileSystem>(db_fault_injection_fs_)
+              : std::shared_ptr<FileSystem>(db_stress_fs_))),
       db_env_(std::make_unique<CompositeEnvWrapper>(
-          raw_env, db_fault_injection_fs_
-                       ? std::shared_ptr<FileSystem>(db_fault_injection_fs_)
-                       : std::shared_ptr<FileSystem>(db_stress_fs_))),
+          raw_env, OutermostDbFs(db_stress_fs_, db_fault_injection_fs_,
+                                 db_latency_fs_))),
       filter_policy_(CreateFilterPolicy()),
       db_(nullptr),
       txn_db_(nullptr),
@@ -2089,6 +2129,10 @@ std::string StressTest::DebugString(const Slice& value,
 void StressTest::PrintStatistics() {
   if (FLAGS_merge_before_compaction_filter) {
     GetDbStressMergeFilterCounters().Print();
+  }
+  if (db_latency_fs_) {
+    fprintf(stdout, "WAL latency injection counters:\n%s",
+            db_latency_fs_->PrintCounters().c_str());
   }
   // Print statistics from the DB instance instead of global dbstats
   if (db_) {
