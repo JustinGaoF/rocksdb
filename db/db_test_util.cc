@@ -41,6 +41,26 @@ int64_t MaybeCurrentTime(Env* env) {
 
 }  // anonymous namespace
 
+std::string TwoPhaseNameOnWalPartition(const std::string& base,
+                                       size_t partition,
+                                       size_t num_partitions) {
+  if (partition >= num_partitions) {
+    ADD_FAILURE() << "partition " << partition << " of " << num_partitions;
+    return base;
+  }
+  for (uint64_t i = 0;; ++i) {
+    std::string name = base + std::to_string(i);
+    WriteBatch marker;
+    EXPECT_OK(WriteBatchInternal::MarkRollback(&marker, name));
+    size_t route = num_partitions;
+    EXPECT_OK(
+        DBImpl::TEST_WalPartitionForWrite(marker, num_partitions, &route));
+    if (route == partition) {
+      return name;
+    }
+  }
+}
+
 // Special Env used to delay background operations
 
 SpecialEnv::SpecialEnv(Env* base, bool time_elapse_only_sleep)
