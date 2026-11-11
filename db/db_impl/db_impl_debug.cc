@@ -133,10 +133,10 @@ Status DBImpl::TEST_SwitchMemtable(ColumnFamilyData* cfd) {
   Status s;
   void* writer = TEST_BeginWrite();
   if (two_write_queues_) {
-    WriteThread::Writer nonmem_w;
-    nonmem_write_thread_.EnterUnbatched(&nonmem_w, &mutex_);
+    AllPartitionsWriter nonmem_w(this, /*nonmem=*/true);
+    nonmem_w.EnterUnbatched();
     s = SwitchMemtable(cfd, &write_context);
-    nonmem_write_thread_.ExitUnbatched(&nonmem_w);
+    nonmem_w.ExitUnbatched();
   } else {
     s = SwitchMemtable(cfd, &write_context);
   }
@@ -205,7 +205,9 @@ Status DBImpl::TEST_AtomicFlushMemTables(
 
 void DBImpl::TEST_BeginWriteStall() {
   InstrumentedMutexLock l(&mutex_);
-  write_thread_.BeginWriteStall();
+  for (size_t p = 0; p < NumWalPartitions(); ++p) {
+    PartitionWriteThread(p).BeginWriteStall();
+  }
   if (wbm_flush_initiator_ != nullptr &&
       write_buffer_manager_->ShouldTrackFlushInitiator()) {
     wbm_flush_initiator_->SetFlushable(false);
@@ -214,7 +216,9 @@ void DBImpl::TEST_BeginWriteStall() {
 
 void DBImpl::TEST_EndWriteStall() {
   InstrumentedMutexLock l(&mutex_);
-  write_thread_.EndWriteStall();
+  for (size_t p = 0; p < NumWalPartitions(); ++p) {
+    PartitionWriteThread(p).EndWriteStall();
+  }
   if (wbm_flush_initiator_ != nullptr &&
       write_buffer_manager_->ShouldTrackFlushInitiator()) {
     wbm_flush_initiator_->SetFlushable(true);
@@ -277,14 +281,14 @@ void DBImpl::TEST_UnlockMutex() { mutex_.Unlock(); }
 void DBImpl::TEST_SignalAllBgCv() { bg_cv_.SignalAll(); }
 
 void* DBImpl::TEST_BeginWrite() {
-  auto w = new WriteThread::Writer();
-  write_thread_.EnterUnbatched(w, &mutex_);
+  auto* w = new AllPartitionsWriter(this, /*nonmem=*/false);
+  w->EnterUnbatched();
   return static_cast<void*>(w);
 }
 
 void DBImpl::TEST_EndWrite(void* w) {
-  auto writer = static_cast<WriteThread::Writer*>(w);
-  write_thread_.ExitUnbatched(writer);
+  auto* writer = static_cast<AllPartitionsWriter*>(w);
+  writer->ExitUnbatched();
   delete writer;
 }
 

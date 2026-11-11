@@ -10807,6 +10807,45 @@ TEST_F(CompactionServiceTest, BottommostFileWithEmptySeqnoTimeMapping) {
   }
 }
 
+// GC27 Q8 (b): OpenAndCompact on a valid wal_partitions = 2 primary
+// succeeds, with the default override and with an override map that changes
+// only a WAL-only option the wal_partitions > 1 checks reject
+// (track_and_verify_wals); the worker reads no WAL, so no WAL-only check
+// refuses it.
+// Neuter: OpenAsSecondaryImpl validates whenever wal_partitions != 1, also
+// without recover_wal (as before); the override leg's remote compaction
+// fails and the flush returns Incomplete.
+TEST_F(CompactionServiceTest, OpenAndCompactAtPartitionedPrimary) {
+  for (const bool wal_only_override : {false, true}) {
+    SCOPED_TRACE(wal_only_override ? "track_and_verify_wals override"
+                                   : "default override");
+    Options options = CurrentOptions();
+    options.max_open_files = -1;
+    options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+    options.wal_partitions = 2;
+    options.track_and_verify_wals_in_manifest = true;
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::ValidateOptions:AllowWalPartitions",
+        [](void* arg) { *static_cast<bool*>(arg) = true; });
+    SyncPoint::GetInstance()->EnableProcessing();
+    ReopenWithCompactionService(&options);
+    ASSERT_EQ(2U, dbfull()->TEST_NumWalPartitions());
+    MyTestCompactionService* my_cs = GetCompactionService();
+    if (wal_only_override) {
+      my_cs->SetWorkerOptionOverride("track_and_verify_wals", "true");
+    }
+    GenerateTestData();
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+    VerifyTestData();
+    ASSERT_GE(my_cs->GetCompactionNum(), 1);
+    ASSERT_EQ(CompactionServiceJobStatus::kSuccess,
+              my_cs->GetFinalCompactionServiceJobStatus());
+    CompactionServiceResult result;
+    my_cs->GetResult(&result);
+    ASSERT_OK(result.status);
+  }
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
