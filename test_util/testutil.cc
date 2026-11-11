@@ -365,6 +365,10 @@ void RandomInitDBOptions(DBOptions* db_opt, Random* rnd) {
   db_opt->partition_wal_usage =
       rnd->Uniform(2) ? PartitionWALUsage::kPartitionByColumnFamily
                       : PartitionWALUsage::kNone;
+  db_opt->wal_partitions =
+      db_opt->partition_wal_usage == PartitionWALUsage::kNone
+          ? 1
+          : 1 + rnd->Uniform(64);
 }
 
 void RandomInitCFOptions(ColumnFamilyOptions* cf_opt, DBOptions& db_options,
