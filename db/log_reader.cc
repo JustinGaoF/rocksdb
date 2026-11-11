@@ -75,6 +75,7 @@ Reader::~Reader() {
 bool Reader::ReadRecord(Slice* record, std::string* scratch,
                         WALRecoveryMode wal_recovery_mode,
                         uint64_t* record_checksum) {
+  wal_recovery_stopped_before_end_of_file_ = false;
   scratch->clear();
   record->clear();
   if (record_checksum != nullptr) {
@@ -352,6 +353,7 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch,
       }
 
       case kBadHeader:
+        wal_recovery_stopped_before_end_of_file_ = true;
         if (wal_recovery_mode == WALRecoveryMode::kAbsoluteConsistency ||
             wal_recovery_mode == WALRecoveryMode::kPointInTimeRecovery) {
           // In clean shutdown we don't expect any error in the log files.
@@ -365,6 +367,7 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch,
 
       case kEof:
         if (in_fragmented_record) {
+          wal_recovery_stopped_before_end_of_file_ = true;
           if (wal_recovery_mode == WALRecoveryMode::kAbsoluteConsistency ||
               wal_recovery_mode == WALRecoveryMode::kPointInTimeRecovery) {
             // In clean shutdown we don't expect any error in the log files.
@@ -385,6 +388,7 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch,
 
       case kOldRecord:
         if (wal_recovery_mode != WALRecoveryMode::kSkipAnyCorruptedRecords) {
+          wal_recovery_stopped_before_end_of_file_ = true;
           // Treat a record from a previous instance of the log as EOF.
           if (in_fragmented_record) {
             if (wal_recovery_mode == WALRecoveryMode::kAbsoluteConsistency ||
@@ -421,6 +425,7 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch,
 
       case kBadRecordLen:
         if (eof_) {
+          wal_recovery_stopped_before_end_of_file_ = true;
           if (wal_recovery_mode == WALRecoveryMode::kAbsoluteConsistency ||
               wal_recovery_mode == WALRecoveryMode::kPointInTimeRecovery) {
             // In clean shutdown we don't expect any error in the log files.
@@ -437,6 +442,7 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch,
       case kBadRecordChecksum:
         if (recycled_ && wal_recovery_mode ==
                              WALRecoveryMode::kTolerateCorruptedTailRecords) {
+          wal_recovery_stopped_before_end_of_file_ = true;
           scratch->clear();
           return false;
         }
@@ -937,6 +943,7 @@ bool FragmentBufferedReader::ReadRecord(Slice* record, std::string* scratch,
                                         uint64_t* /* checksum */) {
   assert(record != nullptr);
   assert(scratch != nullptr);
+  wal_recovery_stopped_before_end_of_file_ = false;
   record->clear();
   scratch->clear();
   if (uncompress_) {
@@ -1157,9 +1164,15 @@ bool FragmentBufferedReader::ReadRecord(Slice* record, std::string* scratch,
       }
 
       case kBadHeader:
+        wal_recovery_stopped_before_end_of_file_ = true;
+        FALLTHROUGH_INTENDED;
       case kBadRecord:
       case kEof:
       case kOldRecord:
+        if (fragment_type_or_err == kOldRecord ||
+            (fragment_type_or_err == kEof && in_fragmented_record_)) {
+          wal_recovery_stopped_before_end_of_file_ = true;
+        }
         if (in_fragmented_record_) {
           ReportCorruption(fragments_.size(), "error in middle of record");
           in_fragmented_record_ = false;
@@ -1169,6 +1182,7 @@ bool FragmentBufferedReader::ReadRecord(Slice* record, std::string* scratch,
 
       case kBadRecordChecksum:
         if (recycled_) {
+          wal_recovery_stopped_before_end_of_file_ = true;
           fragments_.clear();
           return false;
         }
