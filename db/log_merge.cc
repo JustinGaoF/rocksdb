@@ -67,6 +67,7 @@ WALIndexMerger::Member::PulledRecord WALIndexMerger::ReaderMember::PullNext() {
     if (idx == 0) {
       pulled.kind = Member::Pull::kUnindexed;
       pulled.payload = record;
+      unindexed_pulled_++;
       return pulled;
     }
     if (swallow_pending_) {
@@ -77,6 +78,7 @@ WALIndexMerger::Member::PulledRecord WALIndexMerger::ReaderMember::PullNext() {
     if (first_indexed_ == 0) {
       first_indexed_ = idx;
     }
+    indexed_pulled_++;
     pulled.kind = Member::Pull::kRecord;
     pulled.wal_index = idx;
     pulled.payload = record;
@@ -265,6 +267,7 @@ bool WALIndexMerger::VoidSeededPast(uint64_t wal_number, uint64_t index,
   return seeded_past;
 }
 
+namespace {
 // "WAL a, WAL b" for a contradiction's message.
 std::string WalList(const std::vector<uint64_t>& wals) {
   std::string list;
@@ -272,6 +275,57 @@ std::string WalList(const std::vector<uint64_t>& wals) {
     list += (list.empty() ? "WAL " : ", WAL ") + std::to_string(wal);
   }
   return list;
+}
+
+// Indexed data from a file whose intact head shows no marker: the writer
+// emits the marker first, so it would have survived. Shared by the
+// lower-bound check and the late-data check so both fail identically.
+Status IndexedWithoutMarker(uint64_t wal_number) {
+  return Status::Corruption("WAL index merge: WAL " +
+                            std::to_string(wal_number) +
+                            " bears indexed data without a WAL index marker; "
+                            "the marker is the file's first record, so an "
+                            "intact head would show it");
+}
+}  // namespace
+
+Status WALIndexMerger::CheckMemberCoherence(const MemberState& state) {
+  const Member* member = state.member;
+  const uint64_t indexed = member->IndexedDataPulled();
+  if (indexed == 0 && member->UnindexedDataPulled() == 0) {
+    return Status::OK();
+  }
+  const uint64_t wal_number = member->wal_number();
+  if (!member->SawWALIndexMarker()) {
+    if (indexed == 0) {
+      // No marker and no index anywhere: the file has no position in the
+      // merged order. Head integrity tells a file that predates the option
+      // apart from one whose marker was lost to damage.
+      return Status::Corruption(
+          "WAL index merge: WAL " + std::to_string(wal_number) +
+          " carries no WAL index (no marker; " +
+          (member->HeadIntact()
+               ? "head intact, predates partition_wal_usage"
+               : "head damaged, a lost marker cannot be ruled out") +
+          "); an unindexed file cannot be ordered in the merge");
+    }
+    if (lower_bound_set_ && member->HeadIntact()) {
+      return IndexedWithoutMarker(wal_number);
+    }
+    // Before the lower bound, indexed data without a marker waits for the
+    // attestation checks in ComputeLowerBound, which own the
+    // marker-lost-to-damage cases.
+    return Status::OK();
+  }
+  if (state.finished && indexed == 0 && member->UnindexedDataPulled() > 0) {
+    // The marker promised indices and every data record broke the promise.
+    // A marker-only file stays legal: it promised nothing about data.
+    return Status::Corruption("WAL index merge: WAL " +
+                              std::to_string(wal_number) +
+                              " carries a WAL index marker but its data "
+                              "records carry no wal_index");
+  }
+  return Status::OK();
 }
 
 Status WALIndexMerger::PullMembers(uint64_t threshold, PullOutcome* outcome) {
@@ -312,10 +366,16 @@ Status WALIndexMerger::PullMembers(uint64_t threshold, PullOutcome* outcome) {
         s.lookahead = pulled;
         s.has_lookahead = true;
         outcome->advanced = true;
+        if (Status coherence = CheckMemberCoherence(s); !coherence.ok()) {
+          return coherence;
+        }
       } else if (pulled.kind == Member::Pull::kUnindexed) {
         unindexed_queue_.push_back({s.member, pulled.payload.ToString(),
                                     s.member->LastRecordChecksum()});
         outcome->advanced = true;
+        if (Status coherence = CheckMemberCoherence(s); !coherence.ok()) {
+          return coherence;
+        }
       } else if (pulled.kind == Member::Pull::kFailedIO) {
         const std::string context = "WAL index merge: WAL " +
                                     std::to_string(s.member->wal_number()) +
@@ -356,6 +416,9 @@ Status WALIndexMerger::PullMembers(uint64_t threshold, PullOutcome* outcome) {
           s.progress = end_bound;
         }
         outcome->advanced = true;
+        if (Status coherence = CheckMemberCoherence(s); !coherence.ok()) {
+          return coherence;
+        }
         break;
       }
     }
@@ -443,6 +506,16 @@ Status WALIndexMerger::ComputeLowerBound() {
       // Two intact heads contradict each other: fail closed.
       return Status::Corruption("WAL index merge: WAL " + std::to_string(pred) +
                                 " attested start mismatch");
+    }
+  }
+  for (auto& s : states_) {
+    // Indexed data without the marker that promises it, from a head intact
+    // enough that the marker would have survived. Runs after the attestation
+    // checks so damaged heads keep their existing verdicts: the marker may
+    // have been lost to the damage, and the attestation owns that question.
+    if (s.member->IndexedDataPulled() > 0 && !s.member->SawWALIndexMarker() &&
+        s.member->HeadIntact()) {
+      return IndexedWithoutMarker(s.member->wal_number());
     }
   }
   // Max doubles as "nothing anchors the bound" below, so track found-ness
