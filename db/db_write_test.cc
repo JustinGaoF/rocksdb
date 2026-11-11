@@ -369,6 +369,96 @@ TEST_P(DBWriteTest, IOErrorOnWALWritePropagateToWriteThreadFollower) {
   Close();
 }
 
+TEST_F(DBWriteTestUnparameterized, PartitionMergeBufferLifecycle) {
+  for (const bool two_write_queues : {false, true}) {
+    SCOPED_TRACE("two_write_queues=" + std::to_string(two_write_queues));
+    Options options = CurrentOptions();
+    options.create_if_missing = true;
+    options.two_write_queues = two_write_queues;
+    options.avoid_flush_during_shutdown = true;
+    DestroyAndReopen(options);
+
+    const WriteBatch* const partition_merge_buffer =
+        dbfull()->TEST_GetWalMergeBuffer(0);
+    std::atomic<bool> expect_merged_batch{false};
+    std::atomic<bool> single_writer_used_merge_buffer{false};
+    std::atomic<bool> group_borrowed_merge_buffer{false};
+    std::atomic<int> group_wal_records{0};
+    std::string group_wal_payload;
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::WriteToWAL:log_entry", [&](void* arg) {
+          const auto* log_entry = static_cast<Slice*>(arg);
+          const Slice merge_buffer_contents =
+              WriteBatchInternal::Contents(partition_merge_buffer);
+          const bool borrowed_merge_buffer =
+              log_entry->data() == merge_buffer_contents.data();
+          if (expect_merged_batch.load()) {
+            group_borrowed_merge_buffer = borrowed_merge_buffer;
+            group_wal_payload.assign(log_entry->data(), log_entry->size());
+            ++group_wal_records;
+          } else {
+            single_writer_used_merge_buffer = borrowed_merge_buffer;
+          }
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+
+    ASSERT_OK(Put("single", "value"));
+    ASSERT_FALSE(single_writer_used_merge_buffer.load());
+
+    std::atomic<bool> follower_started{false};
+    std::atomic<bool> follower_joined{false};
+    Status follower_status;
+    port::Thread follower_thread;
+    SyncPoint::GetInstance()->SetCallBack(
+        "WriteThread::JoinBatchGroup:Wait2", [&](void* arg) {
+          auto* writer = static_cast<WriteThread::Writer*>(arg);
+          if (writer->state != WriteThread::STATE_GROUP_LEADER ||
+              follower_started.exchange(true)) {
+            return;
+          }
+          SyncPoint::GetInstance()->SetCallBack(
+              "WriteThread::JoinBatchGroup:Wait", [&](void* follower_arg) {
+                auto* follower =
+                    static_cast<WriteThread::Writer*>(follower_arg);
+                if (follower->state != WriteThread::STATE_GROUP_LEADER) {
+                  follower_joined = true;
+                }
+              });
+          follower_thread = port::Thread(
+              [&]() { follower_status = Put("follower", "value"); });
+          while (!follower_joined.load()) {
+          }
+        });
+
+    expect_merged_batch = true;
+    const Status leader_status = Put("leader", "value");
+    follower_thread.join();
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+
+    ASSERT_OK(leader_status);
+    ASSERT_OK(follower_status);
+    ASSERT_EQ(1, group_wal_records.load());
+    // ConcurrentWriteGroupToWAL merges into invocation-local scratch and must
+    // never reach the partition buffer.
+    ASSERT_EQ(!two_write_queues, group_borrowed_merge_buffer.load());
+    ASSERT_EQ(0u, WriteBatchInternal::Count(partition_merge_buffer));
+
+    WriteBatch expected_group;
+    ASSERT_OK(expected_group.Put("leader", "value"));
+    ASSERT_OK(expected_group.Put("follower", "value"));
+    WriteBatchInternal::SetSequence(&expected_group, 2);
+    ASSERT_EQ(WriteBatchInternal::Contents(&expected_group), group_wal_payload);
+    ASSERT_EQ("value", Get("leader"));
+    ASSERT_EQ("value", Get("follower"));
+
+    Reopen(options);
+    ASSERT_EQ("value", Get("single"));
+    ASSERT_EQ("value", Get("leader"));
+    ASSERT_EQ("value", Get("follower"));
+  }
+}
+
 TEST_F(DBWriteTestUnparameterized, PipelinedWriteRace) {
   // This test was written to trigger a race in ExitAsBatchGroupLeader in case
   // enable_pipelined_write_ was true.
