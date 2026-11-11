@@ -86,6 +86,10 @@ class WriteThread {
   struct WriteGroup {
     Writer* leader = nullptr;
     Writer* last_writer = nullptr;
+    // The group's sequences are [first_sequence, last_sequence], set by the
+    // leader before parallel memtable writes; first_sequence > last_sequence
+    // when the group consumed none.
+    SequenceNumber first_sequence = 0;
     SequenceNumber last_sequence;
     // before running goes to zero, status needs leader->StateMutex()
     Status status;
