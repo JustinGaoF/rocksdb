@@ -10,6 +10,7 @@
 
 #include <atomic>
 #include <deque>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <set>
@@ -41,15 +42,21 @@ class WalManager {
              const std::shared_ptr<IOTracer>& io_tracer,
              const bool seq_per_batch = false);
 
+  // With need_seqnos, a WAL that holds WAL index metadata but no data record
+  // is skipped as empty, like a WAL with no record, unless its number is in
+  // tracked_wals (sorted): then it is listed with start sequence 1, as a
+  // compression-only WAL is.
   Status GetSortedWalFiles(VectorWalPtr& files, bool need_seqnos = true,
-                           bool include_archived = true);
+                           bool include_archived = true,
+                           const std::vector<uint64_t>* tracked_wals = nullptr);
 
   // Allow user to tail the WAL to find all recent changes to the
-  // database that are newer than `seq_number`.
-  Status GetUpdatesSince(SequenceNumber seq_number,
-                         std::unique_ptr<WalIterator>* iter,
-                         const WalIterator::ReadOptions& read_options,
-                         VersionSet* version_set);
+  // database that are newer than `seq_number`. Refuses with NotSupported if
+  // the stream would read a live WAL for which `refuse_live_wal` is true.
+  Status GetUpdatesSince(
+      SequenceNumber seq_number, std::unique_ptr<WalIterator>* iter,
+      const WalIterator::ReadOptions& read_options, VersionSet* version_set,
+      const std::function<bool(uint64_t)>& refuse_live_wal = nullptr);
 
   // Record the end of a write group's sequence range when its WAL append has
   // an indeterminate outcome. TransactionLogIterator uses this process-lifetime
@@ -81,8 +88,13 @@ class WalManager {
   }
 
  private:
-  Status GetSortedWalsOfType(const std::string& path, VectorWalPtr& log_files,
-                             WalFileType type, bool need_seqnos);
+  Status GetSortedWalsOfType(
+      const std::string& path, VectorWalPtr& log_files, WalFileType type,
+      bool need_seqnos, const std::vector<uint64_t>* tracked_wals = nullptr);
+  // OK to read the WALs in file order, or NotSupported naming a WAL that is
+  // partitioned or, in an indexed DB, unreadable.
+  Status CheckWalsReadableAndUnpartitioned(const VectorWalPtr& wal_files,
+                                           VersionSet* version_set);
   // Requires: all_logs should be sorted with earliest log file first
   // Retains all log files in all_logs which contain updates with seq no.
   // Greater Than or Equal to the requested SequenceNumber.
@@ -97,8 +109,11 @@ class WalManager {
   // order to include that WAL and is inserted in read_first_record_cache_.
   // Therefore, sequence_number is used as boolean if WAL should be included or
   // not and that sequence_number shouldn't be use for any other purpose.
+  // *metadata_only, when given, is set when the WAL holds WAL index metadata
+  // but no data record (*sequence is then 0).
   Status ReadFirstRecord(const WalFileType type, const uint64_t number,
-                         SequenceNumber* sequence);
+                         SequenceNumber* sequence,
+                         bool* metadata_only = nullptr);
 
   // In case of no wal_compression, ReadFirstLine returns status.ok() and
   // sequence == 0 if the file exists, but is empty.
@@ -109,7 +124,7 @@ class WalManager {
   // causing the operations to fail. To avoid that, it sets sequence_number to
   // 1 inorder to include that WAL.
   Status ReadFirstLine(const std::string& fname, const uint64_t number,
-                       SequenceNumber* sequence);
+                       SequenceNumber* sequence, bool* metadata_only = nullptr);
 
   // ------- state from DBImpl ------
   const ImmutableDBOptions& db_options_;
