@@ -1759,7 +1759,8 @@ bool StressTest::BuildOptionsTable() {
             std::to_string(options_.level0_file_num_compaction_trigger + 4),
         });
   }
-  if (FLAGS_unordered_write || FLAGS_rep_factory == kSortedHash) {
+  if (FLAGS_unordered_write || FLAGS_rep_factory == kSortedHash ||
+      FLAGS_wal_partitions > 1) {
     options_tbl.emplace("max_successive_merges", std::vector<std::string>{"0"});
   } else {
     options_tbl.emplace("max_successive_merges",
@@ -2651,6 +2652,9 @@ void StressTest::OperateDb(ThreadState* thread) {
       if (thread->shared->HasVerificationFailedYet()) {
         break;
       }
+      if (!FLAGS_sync && !FLAGS_disable_wal && FLAGS_sync_write_one_in > 0) {
+        write_opts.sync = thread->rand.OneIn(FLAGS_sync_write_one_in);
+      }
       // Change Options
       if (thread->rand.OneInOpt(FLAGS_set_options_one_in)) {
         ScopedThreadOperation op(thread, StressOperationType::kSetOptions);
@@ -2710,7 +2714,10 @@ void StressTest::OperateDb(ThreadState* thread) {
           // And also that WAL is not changed during LockWAL()
           std::unique_ptr<WalFile> old_wal;
           s = db_->GetCurrentWalFile(&old_wal);
-          if (!s.ok()) {
+          if (s.IsNotSupported() && FLAGS_wal_partitions > 1) {
+            // Each partition has its own current WAL, so there is no single
+            // one to compare; the sequence number check below still runs.
+          } else if (!s.ok()) {
             fprintf(stderr, "GetCurrentWalFile() failed: %s\n",
                     s.ToString().c_str());
           } else {
