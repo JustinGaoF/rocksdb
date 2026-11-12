@@ -1112,7 +1112,9 @@ struct DBOptions {
   // it does not become a logical WAL and is not added to WAL tracking until it
   // is consumed by a foreground WAL rotation.
   //
-  // The option is sanitized to false when recycle_log_file_num is non-zero.
+  // The option is sanitized to false when recycle_log_file_num is non-zero,
+  // and when partition_wal_usage is not kNone: a secondary instance cannot
+  // tell the empty precreated file from a WAL whose head is not on disk yet.
   //
   // Default: false
   bool async_wal_precreate = false;
@@ -1228,7 +1230,10 @@ struct DBOptions {
   // The following two fields affect when WALs will be archived and deleted.
   //
   // When both are zero, obsolete WALs will not be archived and will be deleted
-  // immediately. Otherwise, obsolete WALs will be archived prior to deletion.
+  // immediately. Otherwise, obsolete WALs will be archived prior to deletion,
+  // except a WAL holding records that recovery's WAL merge cut dropped
+  // (partition_wal_usage), which is deleted; while it is live,
+  // GetUpdatesSince() refuses a stream that would read it.
   //
   // When `WAL_size_limit_MB` is nonzero, archived WALs starting with the
   // earliest will be deleted until the total size of the archive falls below

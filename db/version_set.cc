@@ -7564,9 +7564,13 @@ Status VersionSet::ListColumnFamiliesFromManifest(
 }
 
 Status VersionSet::ReadWALIndexGuard(const std::string& dbname, FileSystem* fs,
-                                     uint64_t* guard) {
+                                     uint64_t* guard,
+                                     uint64_t* partition_guard) {
   assert(guard != nullptr);
   *guard = 0;
+  if (partition_guard != nullptr) {
+    *partition_guard = 0;
+  }
   std::string manifest_path;
   uint64_t manifest_file_number = 0;
   Status s = GetCurrentManifestPath(dbname, fs, /*is_retry=*/false,
@@ -7592,6 +7596,9 @@ Status VersionSet::ReadWALIndexGuard(const std::string& dbname, FileSystem* fs,
     s = edit.DecodeFrom(record);
     if (s.ok() && edit.HasWALIndexGuard()) {
       *guard = edit.GetWALIndexGuard();
+    }
+    if (s.ok() && partition_guard != nullptr && edit.HasWALPartitionGuard()) {
+      *partition_guard = edit.GetWALPartitionGuard();
     }
   }
   return s;
