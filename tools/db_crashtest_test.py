@@ -418,6 +418,8 @@ class DBCrashTestTest(unittest.TestCase):
 
     def test_cf_consistency_randomizes_secondary(self):
         db_crashtest = self.load_db_crashtest()
+        # wal_partitions > 1 fixes test_secondary to 0 for the series.
+        db_crashtest.default_params["wal_partitions"] = 1
 
         params = db_crashtest.gen_cmd_params(
             self.build_mode_args("blackbox", cf_consistency=True)
@@ -1265,6 +1267,94 @@ class DBCrashTestTest(unittest.TestCase):
                 for _ in range(20):
                     _, finalized = db_crashtest.gen_cmd(dict(params), [])
                     self.assert_inplace_update_incompatible_features_off(finalized)
+
+    def test_inplace_update_support_keeps_one_wal_partition(self):
+        # wal_partitions is also fixed per series; inplace_update_support must
+        # win over it, or every run fails DB::Open.
+        for wal_partitions in (2, 8, 16):
+            with self.subTest(wal_partitions=wal_partitions):
+                db_crashtest = self.load_db_crashtest()
+                db_crashtest.default_params["inplace_update_support"] = 1
+                args = self.build_mode_args(test_type="blackbox", simple=False)
+                params = self.gen_inplace_update_cmd_params(db_crashtest, args)
+                params["wal_partitions"] = wal_partitions
+                _, finalized = db_crashtest.gen_cmd(dict(params), [])
+                self.assert_inplace_update_incompatible_features_off(finalized)
+                self.assertEqual(1, finalized["wal_partitions"])
+
+    def load_db_crashtest_with_wal_partitions(self, wal_partitions):
+        db_crashtest = self.load_db_crashtest()
+        db_crashtest.default_params["wal_partitions"] = wal_partitions
+        db_crashtest.default_params["inplace_update_support"] = 0
+        # Custom trie index modes turn test_secondary off on their own.
+        db_crashtest.default_params["use_trie_index"] = 0
+        db_crashtest.default_params["index_mode"] = 1
+        return db_crashtest
+
+    def test_wal_partitions_steers_randomized_settings(self):
+        db_crashtest = self.load_db_crashtest_with_wal_partitions(8)
+        args = self.build_mode_args(test_type="blackbox")
+        params = self.gen_inplace_update_cmd_params(db_crashtest, args)
+        self.assertEqual(8, params["wal_partitions"])
+        self.assertEqual("partition_by_column_family", params["partition_wal_usage"])
+        self.assertEqual(0, params["disable_wal"])
+        self.assertEqual(0, params["enable_pipelined_write"])
+        self.assertEqual(1, params["allow_concurrent_memtable_write"])
+        self.assertEqual("skip_list", params["memtablerep"])
+        self.assertEqual(0, params["sync"])
+
+    def test_wal_partitions_stays_fixed_across_runs(self):
+        # Every run of a series reopens the previous run's WALs, so a setting
+        # drawn per run must not move wal_partitions between runs.
+        for mode in ({"simple": True}, {"cf_consistency": True}, {}):
+            with self.subTest(mode=mode):
+                db_crashtest = self.load_db_crashtest_with_wal_partitions(8)
+                args = self.build_mode_args(test_type="blackbox", **mode)
+                # Series-level choices (blob profile, file-scoped WAL faults)
+                # are pinned; per-run draws stay random.
+                params = self.gen_inplace_update_cmd_params(db_crashtest, args)
+                seen = set()
+                for _ in range(30):
+                    _, finalized = db_crashtest.gen_cmd(dict(params), [])
+                    seen.add(finalized["wal_partitions"])
+                self.assertEqual({8}, seen)
+
+    def test_explicit_wal_partitions_is_steered(self):
+        db_crashtest = self.load_db_crashtest_with_wal_partitions(1)
+        args = self.build_mode_args(test_type="blackbox", wal_partitions=8)
+        params = self.gen_inplace_update_cmd_params(db_crashtest, args)
+        self.assertEqual("partition_by_column_family", params["partition_wal_usage"])
+        self.assertEqual("skip_list", params["memtablerep"])
+        for _ in range(10):
+            _, finalized = db_crashtest.gen_cmd(dict(params), [])
+            self.assertEqual(8, finalized["wal_partitions"])
+
+    def test_explicit_flag_wins_over_wal_partitions(self):
+        # wal_partitions is drawn, so an explicitly requested setting that
+        # wal_partitions > 1 rejects keeps one partition instead.
+        cases = [
+            {"disable_wal": 1},
+            {"memtablerep": "vector"},
+            {"allow_concurrent_memtable_write": 0},
+            {"enable_pipelined_write": 1},
+            {"test_secondary": 1},
+            {"continuous_verification_interval": 1000},
+        ]
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                db_crashtest = self.load_db_crashtest_with_wal_partitions(8)
+                args = self.build_mode_args(test_type="blackbox", **overrides)
+                params = self.gen_inplace_update_cmd_params(db_crashtest, args)
+                ((key, value),) = overrides.items()
+                self.assertEqual(value, params[key], key)
+                kept = 0
+                for _ in range(20):
+                    _, finalized = db_crashtest.gen_cmd(dict(params), [])
+                    # Other sanitizers may still turn the setting off in a run.
+                    if finalized[key] == value:
+                        kept += 1
+                        self.assertEqual(1, finalized["wal_partitions"])
+                self.assertGreater(kept, 0, key)
 
     def test_explicit_incompatible_flag_disables_inplace_update_support(self):
         cases = [
