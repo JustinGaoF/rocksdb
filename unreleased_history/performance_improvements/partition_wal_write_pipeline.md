@@ -1,0 +1,1 @@
+With `wal_partitions` > 1, a write group inserts into the memtables while its WAL record is appended (Merge batches included), and a sync write is inserted before its sync, becoming visible only once synced, which lowers write latency.

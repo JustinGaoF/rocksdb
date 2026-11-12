@@ -1,0 +1,1 @@
+With `wal_partitions > 1`, a sync write now becomes visible only once it and every write ordered before it are synced, so a write whose sync fails is never visible, and a write ordered after a pending sync write waits for that sync before it becomes visible and returns. As with one WAL, reopening without `DB::Resume()` after a failed sync may recover the failed write.
