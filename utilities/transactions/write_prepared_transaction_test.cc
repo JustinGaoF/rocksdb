@@ -4878,9 +4878,6 @@ class WritePreparedPartitionedWalTest : public testing::Test {
     options_.track_and_verify_wals_in_manifest = true;
     options_.two_write_queues = false;
     txn_db_options_.write_policy = WRITE_PREPARED;
-    SyncPoint::GetInstance()->SetCallBack(
-        "DBImpl::ValidateOptions:AllowWalPartitions",
-        [](void* arg) { *static_cast<bool*>(arg) = true; });
     SyncPoint::GetInstance()->EnableProcessing();
     EXPECT_OK(DestroyDB(dbname_, options_));
   }
@@ -5361,10 +5358,6 @@ TEST_F(WritePreparedPartitionedWalTest, RecoverableStateSlotsTakeHighest) {
         "DBImpl::WriteGroupToWAL:BeforeCacheRecoverableState");
     FlushAll();
     EXPECT_TRUE(db_impl->TEST_CachedRecoverableStateEmpty());
-    SyncPoint::GetInstance()->SetCallBack(
-        "DBImpl::ValidateOptions:AllowWalPartitions",
-        [](void* arg) { *static_cast<bool*>(arg) = true; });
-    SyncPoint::GetInstance()->EnableProcessing();
     Reopen();
     EXPECT_EQ("high", GetState(CfOnPartition(1)));
     EXPECT_EQ("NOT_FOUND", GetState(CfOnPartition(0)));
@@ -5839,10 +5832,6 @@ TEST_F(WritePreparedPartitionedWalTest,
         EXPECT_EQ("NOT_FOUND", read("committed"));
       }
       txn.reset();
-      SyncPoint::GetInstance()->SetCallBack(
-          "DBImpl::ValidateOptions:AllowWalPartitions",
-          [](void* arg) { *static_cast<bool*>(arg) = true; });
-      SyncPoint::GetInstance()->EnableProcessing();
       Reopen();
       EXPECT_EQ(expected, read("committed"));
     }
@@ -6185,10 +6174,6 @@ TEST_F(WritePreparedPartitionedWalTest,
         cf_names_.clear();
         ASSERT_OK(DestroyDB(dbname_, options_));
         txn_db_options_.write_policy = policy;
-        SyncPoint::GetInstance()->SetCallBack(
-            "DBImpl::ValidateOptions:AllowWalPartitions",
-            [](void* arg) { *static_cast<bool*>(arg) = true; });
-        SyncPoint::GetInstance()->EnableProcessing();
         Open(partitions);
         DBImpl* db_impl = static_cast_with_check<DBImpl>(db_->GetRootDB());
         auto read = [&](const std::string& key) {
@@ -6307,10 +6292,6 @@ TEST_F(WritePreparedPartitionedWalTest,
         ASSERT_OK(txn->Rollback());
         EXPECT_EQ("NOT_FOUND", read("committed"));
         txn.reset();
-        SyncPoint::GetInstance()->SetCallBack(
-            "DBImpl::ValidateOptions:AllowWalPartitions",
-            [](void* arg) { *static_cast<bool*>(arg) = true; });
-        SyncPoint::GetInstance()->EnableProcessing();
         Reopen();
         EXPECT_EQ("NOT_FOUND", read("committed"));
         EXPECT_EQ(nullptr, db_->GetTransactionByName(name));

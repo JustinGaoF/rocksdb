@@ -116,7 +116,6 @@ void SetWalPartitions(DBOptions* options, uint32_t wal_partitions) {
   }
   options->track_and_verify_wals_in_manifest = true;
   options->recycle_log_file_num = 0;
-  options->experimental_allow_wal_partitions_for_testing = true;
 }
 
 int RandomSeed() {
