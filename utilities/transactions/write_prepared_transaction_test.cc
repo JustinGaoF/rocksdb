@@ -2660,14 +2660,15 @@ TEST_P(WritePreparedTransactionTest, RollbackPreparedAfterCommitWriteFailure) {
 TEST_P(WritePreparedTransactionTest,
        TwoPhaseCommitSpanningPartitionsRecoversAtomically) {
   // G-55 follow-up (ported from GC14a's Muse candidate): at N in {2, 8}, a
-  // pessimistic TransactionDB (WritePrepared, allow_2pc) prepares a
-  // transaction on one partition (prepare routes by lowest CF id) and commits
-  // it on another (the CF-less commit marker routes by XID). Crashing before
-  // the commit recovers the prepared transaction with neither key visible;
-  // crashing after it recovers both keys committed; never half. Runs its own N
-  // loop once, under every recovery mode. (WriteCommitted cannot span: its
-  // commits carry their keys and co-route with the prepare. See
-  // TwoPhaseCommitRecoversAtomicallyAtWalPartitions in transaction_test.cc.)
+  // pessimistic TransactionDB (WritePrepared, allow_2pc) writes the default
+  // column family, whose ordinary writes route to one partition, in a
+  // transaction whose XID routes to another. Its prepare and its commit
+  // marker both route by the XID, so they share the XID's partition, away
+  // from the data's column family: a prepare and its commit never split
+  // across partitions. Crashing before the commit recovers the prepared
+  // transaction with neither key visible; crashing after it recovers both
+  // keys committed; never half. Runs its own N loop once, under every
+  // recovery mode.
   if (txn_db_options.write_policy != WRITE_PREPARED || use_stackable_db_ ||
       options.two_write_queues || test::WalPartitionsForCurrentTest() != 1 ||
       txn_db_options.use_per_key_point_lock_mgr) {
@@ -2693,33 +2694,21 @@ TEST_P(WritePreparedTransactionTest,
     test::SetWalPartitions(&options, num_partitions);
     ASSERT_OK(ReOpen());
 
-    // Find an XID whose commit marker lands on a different partition than
-    // the prepare (default CF id 0 routes the prepare).
     std::vector<DBImpl::WalAppendOutcome> outcomes;
     SyncPoint::GetInstance()->SetCallBack(
         "DBImpl::WriteToWAL:AppendOutcome", [&](void* arg) {
           outcomes.push_back(*static_cast<DBImpl::WalAppendOutcome*>(arg));
         });
     SyncPoint::GetInstance()->EnableProcessing();
-    std::string spanning_xid;
-    for (int attempt = 0; attempt < 100; ++attempt) {
-      const std::string xid = "span_" + std::to_string(attempt);
-      TransactionOptions txn_options;
-      Transaction* txn = db->BeginTransaction(write_options, txn_options);
-      ASSERT_NE(nullptr, txn);
-      ASSERT_OK(txn->SetName(xid));
-      ASSERT_OK(txn->Put(Slice("probe"), Slice("probe")));
-      outcomes.clear();
-      ASSERT_OK(txn->Prepare());
-      ASSERT_OK(txn->Commit());
-      delete txn;
-      ASSERT_EQ(2U, outcomes.size());
-      if (outcomes[0].wal_partition != outcomes[1].wal_partition) {
-        spanning_xid = xid;
-        break;
-      }
-    }
-    ASSERT_FALSE(spanning_xid.empty());
+    // The default column family's partition, from an ordinary write, and an
+    // XID routed to the next partition.
+    outcomes.clear();
+    ASSERT_OK(db->Put(write_options, "probe", "probe"));
+    ASSERT_EQ(1U, outcomes.size());
+    const size_t data_partition = outcomes[0].wal_partition;
+    const size_t xid_partition = (data_partition + 1) % num_partitions;
+    const std::string spanning_xid =
+        TwoPhaseNameOnWalPartition("span_", xid_partition, num_partitions);
 
     for (const WALRecoveryMode recovery_mode : recovery_modes) {
       for (const bool crash_after_commit : {false, true}) {
@@ -2736,11 +2725,12 @@ TEST_P(WritePreparedTransactionTest,
         outcomes.clear();
         ASSERT_OK(txn->Prepare());
         ASSERT_EQ(1U, outcomes.size());
-        const size_t prepare_partition = outcomes[0].wal_partition;
+        ASSERT_NE(data_partition, outcomes[0].wal_partition);
+        ASSERT_EQ(xid_partition, outcomes[0].wal_partition);
         if (crash_after_commit) {
           ASSERT_OK(txn->Commit());
           ASSERT_EQ(2U, outcomes.size());
-          ASSERT_NE(prepare_partition, outcomes[1].wal_partition);
+          ASSERT_EQ(xid_partition, outcomes[1].wal_partition);
         }
         delete txn;
 
@@ -4943,15 +4933,23 @@ class WritePreparedPartitionedWalTest : public testing::Test {
     return handles_[cf_for_partition_[partition]];
   }
 
-  // Commits a transaction whose commit-time batch, the recoverable state,
-  // puts "state" = `value` into `cf`, so the commit routes by `cf`.
-  Status CommitWithState(ColumnFamilyHandle* cf, const std::string& name,
+  // Name for a transaction whose two-phase records, which route by XID,
+  // go to `partition`.
+  std::string NameOnPartition(const std::string& base, size_t partition) {
+    return TwoPhaseNameOnWalPartition(base, partition, options_.wal_partitions);
+  }
+
+  // Commits a transaction, named so that its prepare and commit route to
+  // `partition`, whose commit-time batch, the recoverable state, puts
+  // "state" = `value` into that partition's column family.
+  Status CommitWithState(size_t partition, const std::string& name,
                          const std::string& value) {
+    ColumnFamilyHandle* cf = CfOnPartition(partition);
     TransactionOptions txn_options;
     txn_options.use_only_the_last_commit_time_batch_for_recovery = true;
     std::unique_ptr<Transaction> txn(
         db_->BeginTransaction(WriteOptions(), txn_options));
-    Status s = txn->SetName(name);
+    Status s = txn->SetName(NameOnPartition(name, partition));
     if (s.ok()) {
       s = txn->Put(cf, name, value);
     }
@@ -5149,8 +5147,9 @@ TEST_F(WritePreparedPartitionedWalTest, ConcurrentRecoverableStateCaching) {
     writers.emplace_back([&, p] {
       ColumnFamilyHandle* cf = CfOnPartition(p);
       for (int i = 0; i < kCommitsPerThread; ++i) {
-        const std::string name =
-            "p" + std::to_string(p) + "_" + std::to_string(i);
+        // Routed by XID, each thread's commits reach partition p's leader.
+        const std::string name = NameOnPartition(
+            "p" + std::to_string(p) + "_" + std::to_string(i) + "_", p);
         TransactionOptions txn_options;
         txn_options.use_only_the_last_commit_time_batch_for_recovery = true;
         std::unique_ptr<Transaction> txn(
@@ -5198,7 +5197,7 @@ TEST_F(WritePreparedPartitionedWalTest, ConcurrentRecoverableStateCaching) {
 
   // The last commit has the highest sequence, so its state is the one
   // persisted and recovered.
-  ASSERT_OK(CommitWithState(CfOnPartition(1), "final", "final"));
+  ASSERT_OK(CommitWithState(1, "final", "final"));
   FlushAll();
   Reopen();
   ASSERT_EQ("final", GetState(CfOnPartition(1)));
@@ -5233,7 +5232,7 @@ TEST_F(WritePreparedPartitionedWalTest, HigherSequenceRecoverableStateWins) {
 
   port::Thread a([&] {
     is_a = true;
-    ASSERT_OK(CommitWithState(CfOnPartition(0), "a", "low"));
+    ASSERT_OK(CommitWithState(0, "a", "low"));
   });
   auto release = [&] {
     std::lock_guard<std::mutex> lock(mu);
@@ -5246,8 +5245,7 @@ TEST_F(WritePreparedPartitionedWalTest, HigherSequenceRecoverableStateWins) {
     ASSERT_TRUE(
         cv.wait_for(lock, std::chrono::seconds(30), [&] { return a_parked; }));
   }
-  port::Thread b(
-      [&] { ASSERT_OK(CommitWithState(CfOnPartition(1), "b", "high")); });
+  port::Thread b([&] { ASSERT_OK(CommitWithState(1, "b", "high")); });
   JoinThreadsOnExit join_b({&b}, release);
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(30);
@@ -5314,22 +5312,21 @@ TEST_F(WritePreparedPartitionedWalTest, RecoverableStateSlotsTakeHighest) {
       // Both prepare first. A's commit takes the lower sequence and is held
       // before caching; B's commit caches, then parks in its gate until A
       // publishes; A caches last.
-      auto prepare = [&](ColumnFamilyHandle* cf, const std::string& name,
+      auto prepare = [&](size_t partition, const std::string& name,
                          const std::string& value) {
+        ColumnFamilyHandle* cf = CfOnPartition(partition);
         TransactionOptions txn_options;
         txn_options.use_only_the_last_commit_time_batch_for_recovery = true;
         std::unique_ptr<Transaction> txn(
             db_->BeginTransaction(WriteOptions(), txn_options));
-        EXPECT_OK(txn->SetName(name));
+        EXPECT_OK(txn->SetName(NameOnPartition(name, partition)));
         EXPECT_OK(txn->Put(cf, name, value));
         EXPECT_OK(txn->Prepare());
         EXPECT_OK(txn->GetCommitTimeWriteBatch()->Put(cf, "state", value));
         return txn;
       };
-      std::unique_ptr<Transaction> txn_a =
-          prepare(CfOnPartition(0), "a", "low");
-      std::unique_ptr<Transaction> txn_b =
-          prepare(CfOnPartition(1), "b", "high");
+      std::unique_ptr<Transaction> txn_a = prepare(0, "a", "low");
+      std::unique_ptr<Transaction> txn_b = prepare(1, "b", "high");
       port::Thread a([&] {
         held_thread = true;
         ASSERT_OK(txn_a->Commit());
@@ -5350,8 +5347,8 @@ TEST_F(WritePreparedPartitionedWalTest, RecoverableStateSlotsTakeHighest) {
       b.join();
     } else {
       // A, on the lower sequence, caches and returns; then B.
-      ASSERT_OK(CommitWithState(CfOnPartition(0), "a", "low"));
-      ASSERT_OK(CommitWithState(CfOnPartition(1), "b", "high"));
+      ASSERT_OK(CommitWithState(0, "a", "low"));
+      ASSERT_OK(CommitWithState(1, "b", "high"));
     }
     SyncPoint::GetInstance()->DisableProcessing();
     SyncPoint::GetInstance()->ClearCallBack(
@@ -5376,8 +5373,9 @@ TEST_F(WritePreparedPartitionedWalTest, ConcurrentPreparesAcrossPartitions) {
   for (size_t p = 0; p < kPartitions; ++p) {
     writers.emplace_back([&, p] {
       for (int i = 0; i < kTxnsPerPartition; ++i) {
-        const std::string name =
-            "p" + std::to_string(p) + "_" + std::to_string(i);
+        // Routed by XID, each thread's prepares go to partition p.
+        const std::string name = NameOnPartition(
+            "p" + std::to_string(p) + "_" + std::to_string(i) + "_", p);
         std::unique_ptr<Transaction> txn(
             db_->BeginTransaction(WriteOptions(), TransactionOptions()));
         ASSERT_OK(txn->SetName(name));
@@ -5438,11 +5436,11 @@ TEST_F(WritePreparedPartitionedWalTest, SnapshotBelowHeapTopMovingBackwards) {
 
   std::unique_ptr<Transaction> txn_a(
       db_->BeginTransaction(WriteOptions(), TransactionOptions()));
-  ASSERT_OK(txn_a->SetName("a"));
+  ASSERT_OK(txn_a->SetName(NameOnPartition("a", 0)));
   ASSERT_OK(txn_a->Put(CfOnPartition(0), "a", "va"));
   std::unique_ptr<Transaction> txn_b(
       db_->BeginTransaction(WriteOptions(), TransactionOptions()));
-  ASSERT_OK(txn_b->SetName("b"));
+  ASSERT_OK(txn_b->SetName(NameOnPartition("b", 1)));
   ASSERT_OK(txn_b->Put(CfOnPartition(1), "b", "vb"));
 
   port::Thread a([&] {
@@ -5560,11 +5558,11 @@ TEST_F(WritePreparedPartitionedWalTest,
 
   std::unique_ptr<Transaction> txn_a(
       db_->BeginTransaction(WriteOptions(), TransactionOptions()));
-  ASSERT_OK(txn_a->SetName("a"));
+  ASSERT_OK(txn_a->SetName(NameOnPartition("a", 0)));
   ASSERT_OK(txn_a->Put(CfOnPartition(0), "a", "va"));
   std::unique_ptr<Transaction> txn_b(
       db_->BeginTransaction(WriteOptions(), TransactionOptions()));
-  ASSERT_OK(txn_b->SetName("b"));
+  ASSERT_OK(txn_b->SetName(NameOnPartition("b", 1)));
   ASSERT_OK(txn_b->Put(CfOnPartition(1), "b", "vb"));
 
   port::Thread a([&] {
@@ -5722,8 +5720,11 @@ TEST_F(WritePreparedPartitionedWalTest,
         EXPECT_OK(s);
         return value;
       };
+      // The commit routes by its XID: named onto partition 0, so that it
+      // forms its own group above the sync write on partition 1.
+      const std::string name = NameOnPartition("committing", 0);
       std::unique_ptr<Transaction> txn(db_->BeginTransaction(WriteOptions()));
-      ASSERT_OK(txn->SetName("committing"));
+      ASSERT_OK(txn->SetName(name));
       ASSERT_OK(txn->Put(CfOnPartition(0), "committed", "v"));
       ASSERT_OK(txn->Prepare());
       const auto statuses = FailSyncUnderParkedWrite(
@@ -5746,7 +5747,7 @@ TEST_F(WritePreparedPartitionedWalTest,
         options_.wal_recovery_mode = mode;
         Reopen();
         EXPECT_EQ("NOT_FOUND", read("committed"));
-        EXPECT_EQ(nullptr, db_->GetTransactionByName("committing"));
+        EXPECT_EQ(nullptr, db_->GetTransactionByName(name));
       }
     }
   }
@@ -5780,8 +5781,10 @@ TEST_F(WritePreparedPartitionedWalTest,
         EXPECT_OK(s);
         return value;
       };
+      // The commit routes by its XID: named onto partition 0, the sync
+      // leader's, so that it can join the leader's group.
       std::unique_ptr<Transaction> txn(db_->BeginTransaction(WriteOptions()));
-      ASSERT_OK(txn->SetName("follower"));
+      ASSERT_OK(txn->SetName(NameOnPartition("follower", 0)));
       ASSERT_OK(txn->Put(cf, "committed", "v"));
       ASSERT_OK(txn->Prepare());
       // The sync leader waits to form its group until the async commit has
@@ -5903,7 +5906,9 @@ TEST_P(WritePreparedTransactionTest, HigherCommitsWaitForHeldPrepareBelowThem) {
 
   std::unique_ptr<Transaction> txn_a(
       db->BeginTransaction(WriteOptions(), TransactionOptions()));
-  ASSERT_OK(txn_a->SetName("a"));
+  // A's prepare routes by its XID: named onto partition 0, below the
+  // writers on the other partitions.
+  ASSERT_OK(txn_a->SetName(TwoPhaseNameOnWalPartition("a", 0, num_partitions)));
   ASSERT_OK(txn_a->Put(cf_on(0), "a", "va"));
   port::Thread a([&] {
     is_a = true;
@@ -6054,7 +6059,9 @@ TEST_P(WritePreparedTransactionTest, PrepareBelowMaxEvictedAtNPartitions) {
 
   std::unique_ptr<Transaction> txn_a(
       db->BeginTransaction(WriteOptions(), TransactionOptions()));
-  ASSERT_OK(txn_a->SetName("a"));
+  // A's prepare routes by its XID: named onto partition 0, below the
+  // writers on the other partitions.
+  ASSERT_OK(txn_a->SetName(TwoPhaseNameOnWalPartition("a", 0, num_partitions)));
   ASSERT_OK(txn_a->Put(cf_on(0), "a", "va"));
   port::Thread a([&] {
     is_a = true;
@@ -6118,22 +6125,6 @@ TEST_P(WritePreparedTransactionTest, PrepareBelowMaxEvictedAtNPartitions) {
   }
 }
 
-// A transaction name whose commit marker, written alone, routes to WAL
-// partition `partition` of `num_partitions` (a commit routes by its XID).
-static std::string TxnNameOnPartition(const std::string& prefix,
-                                      size_t partition, size_t num_partitions) {
-  for (int i = 0;; ++i) {
-    const std::string name = prefix + std::to_string(i);
-    WriteBatch batch;
-    EXPECT_OK(WriteBatchInternal::MarkCommit(&batch, name));
-    size_t route = num_partitions;
-    EXPECT_OK(DBImpl::TEST_WalPartitionForWrite(batch, num_partitions, &route));
-    if (route == partition) {
-      return name;
-    }
-  }
-}
-
 // GC30 Q2 (D-GC30c (i)): a sync commit's pre-release callbacks (AddCommitted)
 // run only once its group can no longer fail: after its own append and
 // fsync, and once every range below it is published, so no fence can reach
@@ -6186,7 +6177,7 @@ TEST_F(WritePreparedPartitionedWalTest,
         WriteOptions sync_wo;
         sync_wo.sync = true;
         // C's commit routes to partition 1, away from the lower write's.
-        const std::string name = TxnNameOnPartition("c", 1, partitions);
+        const std::string name = TwoPhaseNameOnWalPartition("c", 1, partitions);
         std::unique_ptr<Transaction> txn(db_->BeginTransaction(sync_wo));
         ASSERT_OK(txn->SetName(name));
         ASSERT_OK(txn->Put(CfOnPartition(1), "committed", "v"));
@@ -6330,7 +6321,8 @@ TEST_F(WritePreparedPartitionedWalTest,
                               : s.ToString();
       };
       // C's commit routes to partition 0, away from S's.
-      const std::string name = TxnNameOnPartition("committing", 0, partitions);
+      const std::string name =
+          TwoPhaseNameOnWalPartition("committing", 0, partitions);
       std::unique_ptr<Transaction> txn(db_->BeginTransaction(WriteOptions()));
       ASSERT_OK(txn->SetName(name));
       ASSERT_OK(txn->Put(CfOnPartition(0), "committed", "v"));
@@ -6415,7 +6407,7 @@ TEST_P(WritePreparedTransactionTest,
   std::vector<std::string> names;
   std::vector<std::unique_ptr<Transaction>> txns;
   for (size_t p = 1; p <= kCommits; ++p) {
-    names.push_back(TxnNameOnPartition("t", p, num_partitions));
+    names.push_back(TwoPhaseNameOnWalPartition("t", p, num_partitions));
     txns.emplace_back(db->BeginTransaction(WriteOptions()));
     ASSERT_OK(txns.back()->SetName(names.back()));
     ASSERT_OK(txns.back()->Put(cf_on(p), "committed", "v"));

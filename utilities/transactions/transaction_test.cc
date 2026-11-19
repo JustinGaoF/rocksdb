@@ -10580,7 +10580,8 @@ TEST(TransactionPartitionedWalTest, SwitchWALFindsOldestWalAcrossPartitions) {
   };
 
   txn = db->BeginTransaction(WriteOptions());
-  ASSERT_OK(txn->SetName("xid"));
+  // The prepare routes by its XID: named onto partition 1.
+  ASSERT_OK(txn->SetName(TwoPhaseNameOnWalPartition("xid", 1, kPartitions)));
   ASSERT_OK(txn->Put(cf_for_partition[1], "prepared", "value"));
   ASSERT_OK(txn->Prepare());
   const uint64_t prep_log = txn->GetLogNumber();
@@ -10679,7 +10680,8 @@ TEST(TransactionPartitionedWalTest,
   };
 
   txn = db->BeginTransaction(WriteOptions());
-  ASSERT_OK(txn->SetName("xid"));
+  // The prepare routes by its XID: named onto partition 1, with its data.
+  ASSERT_OK(txn->SetName(TwoPhaseNameOnWalPartition("xid", 1, kPartitions)));
   ASSERT_OK(txn->Put(cf_for_partition[1], "prepared", "value"));
   ASSERT_OK(txn->Prepare());
   const uint64_t prep_log = txn->GetLogNumber();
@@ -10847,8 +10849,8 @@ TEST(TransactionPartitionedWalTest, PreparedUnindexedWalSurvivesPartitioning) {
 // A rolled-back transaction must stay resolved after the WALs below a
 // still-pending prepare retire. Each rotation numbers its new WALs in
 // partition order, so if the rollback marker went to a lower partition than
-// its prepare (routing by column family for the prepare, by XID for the
-// marker), it would sit in a lower-numbered WAL of the same rotation, retire
+// its prepare (as when a prepare routed by its column family and the marker
+// by XID), it would sit in a lower-numbered WAL of the same rotation, retire
 // with everything below the pending prepare's WAL, and leave its transaction
 // looking prepared after recovery.
 TEST(TransactionPartitionedWalTest, ResolvedPrepareStaysResolvedAfterRotation) {
@@ -10864,8 +10866,9 @@ TEST(TransactionPartitionedWalTest, ResolvedPrepareStaysResolvedAfterRotation) {
   options.avoid_flush_during_shutdown = true;
   options.track_and_verify_wals_in_manifest = true;
   ASSERT_OK(DestroyDB(dbname, options));
-  // A column family whose data routes to the highest partition, and an XID
-  // that routes to partition 0.
+  // A column family whose data routes to the highest partition, an XID that
+  // routes there too for the pending prepare, and one that routes to
+  // partition 0 for the resolved transaction.
   std::vector<ColumnFamilyDescriptor> cfs;
   cfs.emplace_back(kDefaultColumnFamilyName, ColumnFamilyOptions(options));
   uint32_t high_cf = 0;
@@ -10881,18 +10884,10 @@ TEST(TransactionPartitionedWalTest, ResolvedPrepareStaysResolvedAfterRotation) {
       high_cf = cf_id;
     }
   }
-  std::string low_xid;
-  for (int i = 0; low_xid.empty(); ++i) {
-    const std::string xid = "resolved-" + std::to_string(i);
-    WriteBatch marker;
-    ASSERT_OK(WriteBatchInternal::MarkRollback(&marker, xid));
-    size_t partition = kPartitions;
-    ASSERT_OK(
-        DBImpl::TEST_WalPartitionForWrite(marker, kPartitions, &partition));
-    if (partition == 0) {
-      low_xid = xid;
-    }
-  }
+  const std::string high_xid =
+      TwoPhaseNameOnWalPartition("pending-", kPartitions - 1, kPartitions);
+  const std::string low_xid =
+      TwoPhaseNameOnWalPartition("resolved-", 0, kPartitions);
   std::vector<ColumnFamilyHandle*> handles;
   TransactionDB* db = nullptr;
   std::vector<Transaction*> txns;
@@ -10932,7 +10927,7 @@ TEST(TransactionPartitionedWalTest, ResolvedPrepareStaysResolvedAfterRotation) {
     // the rotation below keeps.
     Transaction* pending = db->BeginTransaction(WriteOptions());
     txns.push_back(pending);
-    ASSERT_OK(pending->SetName("pending"));
+    ASSERT_OK(pending->SetName(high_xid));
     ASSERT_OK(pending->Put(handles[high_cf], "pending", "value"));
     ASSERT_OK(pending->Prepare());
     Transaction* resolved = db->BeginTransaction(WriteOptions());
@@ -10957,7 +10952,7 @@ TEST(TransactionPartitionedWalTest, ResolvedPrepareStaysResolvedAfterRotation) {
       names.push_back(txn->GetName());
       txns.push_back(txn);
     }
-    EXPECT_EQ(std::vector<std::string>{"pending"}, names);
+    EXPECT_EQ(std::vector<std::string>{high_xid}, names);
     std::string value;
     const Status get =
         db->Get(ReadOptions(), handles[high_cf], "resolved", &value);
@@ -12037,8 +12032,10 @@ void RunReplayedPrepareIsNotCut(size_t partitions, TxnDBWritePolicy policy) {
     // So that partition 1's WAL keeps a readable head below the damage.
     ASSERT_OK(db->Put(sync_wo, handles[cf_b], "kb", "vb"));
   }
+  // The prepare routes by its XID: named onto partition 0, with its data.
+  const std::string xid = TwoPhaseNameOnWalPartition("xid", 0, partitions);
   txn = db->BeginTransaction(sync_wo);
-  ASSERT_OK(txn->SetName("xid"));
+  ASSERT_OK(txn->SetName(xid));
   ASSERT_OK(txn->Put(handles[cf_a], "k2", "v2"));
   ASSERT_OK(txn->Prepare());
   if (policy == WRITE_COMMITTED) {
@@ -12093,7 +12090,7 @@ void RunReplayedPrepareIsNotCut(size_t partitions, TxnDBWritePolicy policy) {
   ASSERT_OK(WriteStringToFile(env, contents, wal_path, /*should_sync=*/true));
 
   ASSERT_OK(open_db(dbname, WALRecoveryMode::kPointInTimeRecovery));
-  txn = db->GetTransactionByName("xid");
+  txn = db->GetTransactionByName(xid);
   ASSERT_NE(nullptr, txn) << "prepared transaction not recovered";
   ASSERT_OK(db->Put(sync_wo, "after", "v"));
   ASSERT_OK(txn->Commit());

@@ -16807,12 +16807,12 @@ TEST_P(DBWritePartitionTest, GetUpdatesSinceRefusesPartitionedWals) {
 }
 
 // N-5-4: WritePrepared without two write queues at N=4. Each transaction's
-// prepare routes by its column family and its commit marker by its XID, here
-// always to another partition. From a crash image, committed and rolled-back
-// transactions recover to their outcome, and the ones prepared before the
-// crash recover as prepared and can then be committed or rolled back. Merged
-// recovery replays in sequence order, so each prepare is replayed before its
-// commit whichever partition holds them.
+// prepare and its commit or rollback marker route by its XID, here always to
+// a partition other than the one its column family's ordinary writes use.
+// From a crash image, committed and rolled-back transactions recover to their
+// outcome, and the ones prepared before the crash recover as prepared and can
+// then be committed or rolled back. Merged recovery replays in sequence
+// order, so each transaction recovers whichever partition holds it.
 TEST_P(DBWritePartitionTest, WritePreparedRecoversAcrossPartitions) {
   if (GetParam()) {
     ROCKSDB_GTEST_BYPASS("single-queue path only");
@@ -16825,19 +16825,12 @@ TEST_P(DBWritePartitionTest, WritePreparedRecoversAcrossPartitions) {
   Close();
 
   int next_xid = 0;
-  // An XID whose commit marker routes away from `prepare_partition`.
-  auto xid_committing_elsewhere = [&](size_t prepare_partition) {
-    while (true) {
-      const std::string xid = "xid" + std::to_string(next_xid++);
-      WriteBatch commit;
-      EXPECT_OK(WriteBatchInternal::MarkCommit(&commit, xid));
-      size_t partition = kPartitions;
-      EXPECT_OK(
-          DBImpl::TEST_WalPartitionForWrite(commit, kPartitions, &partition));
-      if (partition != prepare_partition) {
-        return xid;
-      }
-    }
+  // An XID whose two-phase records route to the partition after
+  // `cf_partition`, away from that column family's ordinary writes.
+  auto xid_committing_elsewhere = [&](size_t cf_partition) {
+    return TwoPhaseNameOnWalPartition("xid" + std::to_string(next_xid++) + "_",
+                                      (cf_partition + 1) % kPartitions,
+                                      kPartitions);
   };
   std::vector<ColumnFamilyHandle*> handles;
   std::unique_ptr<TransactionDB> db =
@@ -16957,8 +16950,11 @@ TEST_P(DBWritePartitionTest, WritePreparedConcurrentPreparesKeepHeapSorted) {
     threads.emplace_back([&, p] {
       for (int i = 0; i < kTxnsPerPartition; ++i) {
         Transaction* txn = db->BeginTransaction(WriteOptions());
-        ASSERT_OK(
-            txn->SetName("xid" + std::to_string(p) + "_" + std::to_string(i)));
+        // Each thread's two-phase records, routed by XID, go to partition p
+        // with its data.
+        ASSERT_OK(txn->SetName(TwoPhaseNameOnWalPartition(
+            "xid" + std::to_string(p) + "_" + std::to_string(i) + "_", p,
+            kPartitions)));
         ASSERT_OK(txn->Put(handles[cf_for_partition_[p]],
                            "key" + std::to_string(i), "v"));
         ASSERT_OK(txn->Prepare());
@@ -17014,8 +17010,11 @@ TEST_P(DBWritePartitionTest, PinnedPrepareWalRecoversAfterGenerationRetired) {
   // The prepare's generation holds records of both partitions around it.
   put(0, "before0");
   put(1, "before1");
+  // Named so that its two-phase records, which route by XID, go to
+  // partition 1 with its data.
+  const std::string xid = TwoPhaseNameOnWalPartition("xid", 1, kPartitions);
   Transaction* txn = db->BeginTransaction(WriteOptions());
-  ASSERT_OK(txn->SetName("xid"));
+  ASSERT_OK(txn->SetName(xid));
   ASSERT_OK(txn->Put(handles[cf_for_partition_[1]], "prepared", "v"));
   ASSERT_OK(txn->Prepare());
   const uint64_t prep_log = txn->GetLogNumber();
@@ -17071,7 +17070,7 @@ TEST_P(DBWritePartitionTest, PinnedPrepareWalRecoversAfterGenerationRetired) {
         dbname_ + "_crash" + std::to_string(static_cast<int>(recovery_mode));
     db = OpenWritePreparedTxnDB(crash_dir, kPartitions, options, &handles);
     ASSERT_NE(nullptr, db);
-    Transaction* recovered = db->GetTransactionByName("xid");
+    Transaction* recovered = db->GetTransactionByName(xid);
     ASSERT_NE(nullptr, recovered);
     ASSERT_OK(recovered->Commit());
     delete recovered;
@@ -20476,8 +20475,11 @@ TEST_P(DBWalAppendFailureTest, ResumedTwoPCHoleKeepsAckedWritesAfterCrash) {
       db_impl->TEST_CurrentWalNumber(0) < db_impl->TEST_CurrentWalNumber(1) ? 0
                                                                             : 1;
   const size_t fail_partition = 1 - prep_partition;
+  // A two-phase record routes by its XID, not by the column family it writes.
+  const std::string xid =
+      TwoPhaseNameOnWalPartition("xid", prep_partition, kPartitions);
   Transaction* txn = db->BeginTransaction(WriteOptions());
-  ASSERT_OK(txn->SetName("xid"));
+  ASSERT_OK(txn->SetName(xid));
   ASSERT_OK(
       txn->Put(handles[cf_for_partition_[prep_partition]], "prepared", "v"));
   ASSERT_OK(txn->Prepare());
@@ -20541,7 +20543,7 @@ TEST_P(DBWalAppendFailureTest, ResumedTwoPCHoleKeepsAckedWritesAfterCrash) {
       db.reset();
       continue;
     }
-    Transaction* recovered = db->GetTransactionByName("xid");
+    Transaction* recovered = db->GetTransactionByName(xid);
     EXPECT_NE(nullptr, recovered);
     if (recovered != nullptr) {
       ASSERT_OK(recovered->Rollback());
@@ -20992,8 +20994,11 @@ TEST_P(DBWalAppendFailureTest, RepeatedTwoPCHolesStayExplainedAfterCrash) {
       db_impl->TEST_CurrentWalNumber(0) < db_impl->TEST_CurrentWalNumber(1) ? 0
                                                                             : 1;
   const size_t fail_partition = 1 - prep_partition;
+  // A two-phase record routes by its XID, not by the column family it writes.
+  const std::string xid =
+      TwoPhaseNameOnWalPartition("xid", prep_partition, kPartitions);
   Transaction* txn = db->BeginTransaction(WriteOptions());
-  ASSERT_OK(txn->SetName("xid"));
+  ASSERT_OK(txn->SetName(xid));
   ASSERT_OK(
       txn->Put(handles[cf_for_partition_[prep_partition]], "prepared", "v"));
   ASSERT_OK(txn->Prepare());
@@ -21047,7 +21052,7 @@ TEST_P(DBWalAppendFailureTest, RepeatedTwoPCHolesStayExplainedAfterCrash) {
       db.reset();
       continue;
     }
-    Transaction* recovered = db->GetTransactionByName("xid");
+    Transaction* recovered = db->GetTransactionByName(xid);
     EXPECT_NE(nullptr, recovered);
     if (recovered != nullptr) {
       ASSERT_OK(recovered->Rollback());
@@ -22225,14 +22230,15 @@ TEST_P(DBWalPartitionCoverageTest, MissingMidChainWalPerMode) {
 }
 
 // Q1 (G-55), 2PC spanning partitions: a pessimistic WriteCommitted
-// transaction prepares on one partition and commits on another. Its commit
-// record carries the prepared data past the WAL termination point, so it
-// routes by the lowest column family id like the prepare does; a commit-time
-// write to a lower-id column family on another partition sends it there
-// (checked through the append outcomes). In every mode, an image taken
-// before the commit restores the prepared transaction, one taken after it
-// holds the committed data, and one whose commit record is torn restores the
-// prepared transaction, or fails under kAbsoluteConsistency: never half.
+// transaction writes a column family whose ordinary writes route to one
+// partition, while its two-phase records route by its XID to another. Its
+// prepare and its commit record, which carries commit-time data for that
+// column family past the WAL termination point, both go to the XID's
+// partition (checked through the append outcomes): a prepare and its commit
+// never split across partitions. In every mode, an image taken before the
+// commit restores the prepared transaction, one taken after it holds the
+// committed data, and one whose commit record is torn restores the prepared
+// transaction, or fails under kAbsoluteConsistency: never half.
 TEST_P(DBWalPartitionCoverageTest,
        TwoPhaseCommitAcrossPartitionsRecoversWhole) {
   for (const size_t num_partitions : {size_t{2}, size_t{8}}) {
@@ -22242,10 +22248,11 @@ TEST_P(DBWalPartitionCoverageTest,
     DestroyAndReopen(options);
     OpenWithPartitions(num_partitions, options);
     const std::vector<int> cfs = cf_for_partition_;
-    const size_t commit_partition = static_cast<size_t>(
-        std::min_element(cfs.begin(), cfs.end()) - cfs.begin());
-    const size_t prepare_partition = static_cast<size_t>(
+    const size_t data_partition = static_cast<size_t>(
         std::max_element(cfs.begin(), cfs.end()) - cfs.begin());
+    const size_t xid_partition = (data_partition + 1) % num_partitions;
+    const std::string xid =
+        TwoPhaseNameOnWalPartition("xid", xid_partition, num_partitions);
     Close();
 
     std::vector<ColumnFamilyHandle*> handles;
@@ -22260,30 +22267,33 @@ TEST_P(DBWalPartitionCoverageTest,
               static_cast<DBImpl::WalAppendOutcome*>(arg)->wal_partition);
         });
     for (size_t p = 0; p < num_partitions; ++p) {
+      appended_partitions.clear();
       ASSERT_OK(txn_db->Put(WriteOptions(), handles[cfs[p]], "before",
                             ValueOf("before")));
+      ASSERT_EQ(std::vector<size_t>{p}, appended_partitions);
     }
     Transaction* txn = txn_db->BeginTransaction(WriteOptions());
-    ASSERT_OK(txn->SetName("xid"));
-    ASSERT_OK(txn->Put(handles[cfs[prepare_partition]], "txn_key",
-                       ValueOf("txn_key")));
-    ASSERT_OK(txn->GetCommitTimeWriteBatch()->Put(
-        handles[cfs[commit_partition]], "commit_time_key",
-        ValueOf("commit_time_key")));
+    ASSERT_OK(txn->SetName(xid));
+    ASSERT_OK(
+        txn->Put(handles[cfs[data_partition]], "txn_key", ValueOf("txn_key")));
+    ASSERT_OK(txn->GetCommitTimeWriteBatch()->Put(handles[cfs[data_partition]],
+                                                  "commit_time_key",
+                                                  ValueOf("commit_time_key")));
     appended_partitions.clear();
     ASSERT_OK(txn->Prepare());
-    ASSERT_EQ(std::vector<size_t>{prepare_partition}, appended_partitions);
+    ASSERT_NE(data_partition, xid_partition);
+    ASSERT_EQ(std::vector<size_t>{xid_partition}, appended_partitions);
     const std::string prepared_image = dbname_ + "_prepared";
     CopyDBAsCrashImage(prepared_image);
 
     const uint64_t commit_wal_number =
-        db_impl->TEST_CurrentWalNumber(commit_partition);
+        db_impl->TEST_CurrentWalNumber(xid_partition);
     const std::string commit_wal = LogFileName(dbname_, commit_wal_number);
     uint64_t commit_begin = 0;
     ASSERT_OK(env_->GetFileSize(commit_wal, &commit_begin));
     appended_partitions.clear();
     ASSERT_OK(txn->Commit());
-    ASSERT_EQ(std::vector<size_t>{commit_partition}, appended_partitions);
+    ASSERT_EQ(std::vector<size_t>{xid_partition}, appended_partitions);
     uint64_t commit_end = 0;
     ASSERT_OK(env_->GetFileSize(commit_wal, &commit_end));
     const std::string committed_image = dbname_ + "_committed";
@@ -22314,14 +22324,11 @@ TEST_P(DBWalPartitionCoverageTest,
         EXPECT_OK(copy_db->Get(ReadOptions(), copy_handles[cfs[p]], "before",
                                &value));
       }
-      Transaction* recovered = copy_db->GetTransactionByName("xid");
-      for (const auto& [partition, key] :
-           std::vector<std::pair<size_t, std::string>>{
-               {prepare_partition, "txn_key"},
-               {commit_partition, "commit_time_key"}}) {
+      Transaction* recovered = copy_db->GetTransactionByName(xid);
+      for (const char* key : {"txn_key", "commit_time_key"}) {
         std::string value;
         const Status s = copy_db->Get(
-            ReadOptions(), copy_handles[cfs[partition]], key, &value);
+            ReadOptions(), copy_handles[cfs[data_partition]], key, &value);
         if (committed) {
           EXPECT_OK(s) << key;
           EXPECT_EQ(ValueOf(key), value);
@@ -24497,7 +24504,8 @@ class DBWalPrepareAcrossChangeTest : public DBWalPartitionCoverageTest {
   }
 
   // At `from` partitions: synced writes to every column family, then the
-  // prepare "xid" in partition 1, then more writes, and a crash image of that.
+  // prepare of xid_, named so that it routes to partition 1, then more
+  // writes, and a crash image of that.
   // The image reopens at `to` partitions writing `to_usage`, flushes every
   // column family, purges obsolete WALs, which deletes the old partition 0
   // WAL unless the opener writes kNone, and takes synced writes to every
@@ -24512,6 +24520,7 @@ class DBWalPrepareAcrossChangeTest : public DBWalPartitionCoverageTest {
     OpenWithPartitions(from, options);
     Close();
     acknowledged_.clear();
+    xid_ = TwoPhaseNameOnWalPartition("xid", 1, from);
     WriteOptions sync_wo;
     sync_wo.sync = true;
     std::vector<ColumnFamilyHandle*> handles;
@@ -24534,7 +24543,7 @@ class DBWalPrepareAcrossChangeTest : public DBWalPartitionCoverageTest {
         put(static_cast<int>(cf), "a" + std::to_string(cf));
       }
       Transaction* txn = db->BeginTransaction(sync_wo);
-      ASSERT_OK(txn->SetName("xid"));
+      ASSERT_OK(txn->SetName(xid_));
       ASSERT_OK(txn->Put(handles[cf_for_partition_[1]], "prepared", "v"));
       ASSERT_OK(txn->Prepare());
       old_p0_wal = impl->TEST_CurrentWalNumber(0);
@@ -24552,7 +24561,7 @@ class DBWalPrepareAcrossChangeTest : public DBWalPartitionCoverageTest {
                                &handles, &db));
     DBImpl* impl = static_cast_with_check<DBImpl>(db->GetRootDB());
     ASSERT_EQ(to, impl->TEST_NumWalPartitions());
-    Transaction* recovered = db->GetTransactionByName("xid");
+    Transaction* recovered = db->GetTransactionByName(xid_);
     ASSERT_NE(nullptr, recovered);
     // Two rounds: the first round's flushes may each still see another
     // column family's recovered data below the prepare's WAL.
@@ -24619,7 +24628,7 @@ class DBWalPrepareAcrossChangeTest : public DBWalPartitionCoverageTest {
       }
       const int prepared_cf = cf_for_partition_[1];
       EXPECT_EQ("NOT_FOUND", get(prepared_cf, "prepared"));
-      Transaction* recovered = db->GetTransactionByName("xid");
+      Transaction* recovered = db->GetTransactionByName(xid_);
       EXPECT_NE(nullptr, recovered);
       if (recovered != nullptr) {
         ASSERT_OK(commit ? recovered->Commit() : recovered->Rollback());
@@ -24630,7 +24639,7 @@ class DBWalPrepareAcrossChangeTest : public DBWalPartitionCoverageTest {
       CloseTxnDb(&handles, &db);
       ASSERT_OK(
           OpenPreparedCopy(copy, num_partitions, usage, mode, &handles, &db));
-      EXPECT_EQ(nullptr, db->GetTransactionByName("xid"));
+      EXPECT_EQ(nullptr, db->GetTransactionByName(xid_));
       EXPECT_EQ(outcome, get(prepared_cf, "prepared"));
       for (const auto& [cf, key] : acknowledged_) {
         EXPECT_EQ("v", get(cf, key)) << key;
@@ -24641,6 +24650,9 @@ class DBWalPrepareAcrossChangeTest : public DBWalPartitionCoverageTest {
   }
 
   std::vector<std::pair<int, std::string>> acknowledged_;
+  // The outstanding transaction's name. Its two-phase records route by XID,
+  // not by the column family it writes.
+  std::string xid_;
 };
 
 INSTANTIATE_TEST_CASE_P(DBWalPrepareAcrossChangeTest,
@@ -24707,7 +24719,7 @@ TEST_P(DBWalPrepareAcrossChangeTest, GC26TrueAlternationFailsClosed) {
   ASSERT_OK(OpenPreparedCopy(dbname_, 2,
                              PartitionWALUsage::kPartitionByColumnFamily,
                              kPointInTime, &handles, &db));
-  ASSERT_NE(nullptr, db->GetTransactionByName("xid"));
+  ASSERT_NE(nullptr, db->GetTransactionByName(xid_));
   WriteOptions sync_wo;
   sync_wo.sync = true;
   for (size_t cf = 1; cf < handles.size(); ++cf) {
@@ -24787,9 +24799,13 @@ TEST_P(DBWalPartitionCoverageTest, GC27SecondPointInTimeReopenAfterUnreadVoid) {
       Close();
       const int cf0 = cf_for_partition_[0];
       // The void's partition: the last one, an orphan chain at fewer.
-      const int cf1 =
-          cf_for_partition_[partitions == reopen_partitions ? 1
-                                                            : partitions - 1];
+      const size_t void_partition =
+          partitions == reopen_partitions ? 1 : partitions - 1;
+      const int cf1 = cf_for_partition_[void_partition];
+      // The prepare's two-phase records route by XID: named so that they
+      // land in the void's partition with its data.
+      const std::string xid =
+          TwoPhaseNameOnWalPartition("xid", void_partition, partitions);
       // The column family each partition routes to at `reopen_partitions`.
       std::vector<int> cf_at_reopen(reopen_partitions, -1);
       const int max_cf =
@@ -24825,7 +24841,7 @@ TEST_P(DBWalPartitionCoverageTest, GC27SecondPointInTimeReopenAfterUnreadVoid) {
       auto assert_prepared = [&]() {
         if (variant.prepare) {
           ASSERT_NE(nullptr, static_cast_with_check<TransactionDB>(db.get())
-                                 ->GetTransactionByName("xid"));
+                                 ->GetTransactionByName(xid));
         }
       };
       auto close_db = [&]() {
@@ -24860,7 +24876,7 @@ TEST_P(DBWalPartitionCoverageTest, GC27SecondPointInTimeReopenAfterUnreadVoid) {
           Transaction* txn =
               static_cast_with_check<TransactionDB>(db.get())->BeginTransaction(
                   WriteOptions());
-          ASSERT_OK(txn->SetName("xid"));
+          ASSERT_OK(txn->SetName(xid));
           ASSERT_OK(txn->Put(handles[cf1], "prepared", "v"));
           ASSERT_OK(txn->Prepare());
           delete txn;
@@ -26658,7 +26674,9 @@ TEST_P(DBWalPartitionCoverageTest,
     const int cf_txn = cf_for_partition_[i % 2];
     const int cf_plain = cf_for_partition_[(i + 1) % 2];
     Transaction* txn = db->BeginTransaction(WriteOptions());
-    ASSERT_OK(txn->SetName("xid" + std::to_string(i)));
+    // Its two-phase records route by XID: named onto cf_txn's partition.
+    ASSERT_OK(txn->SetName(TwoPhaseNameOnWalPartition(
+        "xid" + std::to_string(i) + "_", i % 2, /*num_partitions=*/2)));
     for (int k = 0; k < 3; ++k) {
       const std::string key = "t" + std::to_string(i) + "_" + std::to_string(k);
       ASSERT_OK(txn->Put(handles[cf_txn], key, "v"));
@@ -26675,8 +26693,10 @@ TEST_P(DBWalPartitionCoverageTest,
     ASSERT_OK(txn->Commit());
     delete txn;
   }
+  const std::string pending_xid =
+      TwoPhaseNameOnWalPartition("pending", 1, /*num_partitions=*/2);
   Transaction* pending = db->BeginTransaction(WriteOptions());
-  ASSERT_OK(pending->SetName("pending"));
+  ASSERT_OK(pending->SetName(pending_xid));
   ASSERT_OK(pending->Put(handles[cf_for_partition_[1]], "pending", "v"));
   ASSERT_OK(pending->Prepare());
   WriteOptions sync_wo;
@@ -26710,7 +26730,7 @@ TEST_P(DBWalPartitionCoverageTest,
         std::string value;
         EXPECT_OK(db->Get(ReadOptions(), handles[cf], key, &value)) << key;
       }
-      Transaction* recovered = db->GetTransactionByName("pending");
+      Transaction* recovered = db->GetTransactionByName(pending_xid);
       EXPECT_NE(nullptr, recovered);
       if (recovered != nullptr) {
         ASSERT_OK(recovered->Rollback());
@@ -26807,10 +26827,14 @@ class DBWalLandedAppendTest : public DBWalAppendFailureTest {
       }
     }
     const uint64_t failed_wal = db_impl->TEST_CurrentWalNumber(newest);
+    // The prepare's two-phase records route by XID: named onto the partition
+    // with the oldest WAL.
+    const std::string xid =
+        TwoPhaseNameOnWalPartition("xid", oldest, num_partitions);
     Transaction* txn = nullptr;
     if (two_pc) {
       txn = db->BeginTransaction(WriteOptions());
-      ASSERT_OK(txn->SetName("xid"));
+      ASSERT_OK(txn->SetName(xid));
       ASSERT_OK(txn->Put(handles[cf_for_partition_[oldest]], "prepared", "v"));
       ASSERT_OK(txn->Prepare());
       ASSERT_LT(txn->GetLogNumber(), failed_wal);
@@ -26891,7 +26915,7 @@ class DBWalLandedAppendTest : public DBWalAppendFailureTest {
         continue;
       }
       if (two_pc) {
-        Transaction* recovered = db->GetTransactionByName("xid");
+        Transaction* recovered = db->GetTransactionByName(xid);
         EXPECT_NE(nullptr, recovered);
         if (recovered != nullptr) {
           ASSERT_OK(recovered->Rollback());
