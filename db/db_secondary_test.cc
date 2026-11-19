@@ -294,6 +294,355 @@ class DBSecondaryTest : public DBSecondaryTestBase {
   explicit DBSecondaryTest() : DBSecondaryTestBase("db_secondary_test") {}
 };
 
+class DBSecondaryWalPartitionsTest
+    : public DBSecondaryTest,
+      public testing::WithParamInterface<uint32_t> {};
+
+INSTANTIATE_TEST_CASE_P(WalPartitions1, DBSecondaryWalPartitionsTest,
+                        testing::Values(1U));
+INSTANTIATE_TEST_CASE_P(WalPartitions8, DBSecondaryWalPartitionsTest,
+                        testing::Values(test::kTestWalPartitions));
+
+// A secondary replays the primary's WALs one file at a time, so it refuses
+// WALs written at more than one partition before applying any of them: a
+// catch-up after the primary reopens at N partitions fails and exposes none
+// of its writes, and a new OpenAsSecondary fails. At one partition both
+// succeed. The other tests in this file run at one partition, since at more
+// every secondary open or catch-up meets this refusal.
+TEST_P(DBSecondaryWalPartitionsTest, SecondaryAtWalPartitions) {
+  Options options = CurrentOptions();
+  Options one_partition = options;
+  one_partition.wal_partitions = 1;
+  Reopen(one_partition);
+  ASSERT_OK(Put("before", "value"));
+  Options secondary_options = options;
+  secondary_options.max_open_files = -1;
+  OpenSecondary(secondary_options);
+  std::string value;
+  ASSERT_OK(db_secondary_->Get(ReadOptions(), "before", &value));
+
+  Reopen(options);
+  ASSERT_OK(Put("after", "value"));
+  Status s = db_secondary_->TryCatchUpWithPrimary();
+  if (GetParam() == 1) {
+    ASSERT_OK(s);
+    ASSERT_OK(db_secondary_->Get(ReadOptions(), "after", &value));
+  } else {
+    ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+    ASSERT_NE(std::string::npos, s.ToString().find("wal_partitions > 1"))
+        << s.ToString();
+    ASSERT_TRUE(
+        db_secondary_->Get(ReadOptions(), "after", &value).IsNotFound());
+  }
+
+  CloseSecondary();
+  s = TryOpenSecondary(secondary_options);
+  if (GetParam() == 1) {
+    ASSERT_OK(s);
+  } else {
+    ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+    ASSERT_NE(std::string::npos, s.ToString().find("wal_partitions > 1"))
+        << s.ToString();
+  }
+}
+
+// FU14 M-b repro: with manual_wal_flush at N=2, partition 1's WAL can still
+// be 0 bytes on disk (its marker and a lower-sequence record buffered) while
+// partition 0's buffer has spilled to its file. A reader created for the
+// empty file reads as partition 0, so catch-up must not apply partition 0's
+// records: the secondary's view must stay a sequence prefix of the primary.
+TEST_F(DBSecondaryTest, FU14CatchUpRefusesBeforeApplyingPartitionZero) {
+  constexpr size_t kPartitions = 2;
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  const std::vector<std::string> cf_names = {"one", "two", "three"};
+  CreateAndReopenWithCF(cf_names, options);
+
+  // handles_ index == column family id; find one per partition at N=2.
+  std::vector<int> cf_for_partition(kPartitions, -1);
+  for (int cf = 0; cf < static_cast<int>(cf_names.size()) + 1; ++cf) {
+    WriteBatch batch;
+    ASSERT_OK(WriteBatchInternal::Put(&batch, static_cast<uint32_t>(cf), "key",
+                                      "value"));
+    size_t partition = kPartitions;
+    ASSERT_OK(
+        DBImpl::TEST_WalPartitionForWrite(batch, kPartitions, &partition));
+    if (cf_for_partition[partition] < 0) {
+      cf_for_partition[partition] = cf;
+    }
+  }
+  ASSERT_GE(cf_for_partition[0], 0);
+  ASSERT_GE(cf_for_partition[1], 0);
+  ASSERT_OK(Put(cf_for_partition[0], "before", "v"));
+
+  Options secondary_options = options;
+  secondary_options.max_open_files = -1;
+  OpenSecondaryWithColumnFamilies(cf_names, secondary_options);
+  std::string value;
+  ASSERT_OK(db_secondary_->Get(ReadOptions(),
+                               handles_secondary_[cf_for_partition[0]],
+                               "before", &value));
+
+  Options primary_options = options;
+  test::SetWalPartitions(&primary_options, kPartitions);
+  primary_options.manual_wal_flush = true;
+  primary_options.writable_file_max_buffer_size = 64 << 10;
+  ReopenWithColumnFamilies({kDefaultColumnFamilyName, "one", "two", "three"},
+                           primary_options);
+  DBImpl* primary = dbfull();
+  ASSERT_EQ(kPartitions, primary->TEST_NumWalPartitions());
+  // Open flushes every partition's marker; a memtable switch starts new WALs
+  // whose markers stay buffered under manual_wal_flush.
+  ASSERT_OK(Put(cf_for_partition[0], "pre_switch", "v"));
+  ASSERT_OK(Flush(cf_for_partition[0]));
+  const uint64_t wal0 = primary->TEST_CurrentWalNumber(0);
+  const uint64_t wal1 = primary->TEST_CurrentWalNumber(1);
+
+  ASSERT_OK(Put(cf_for_partition[0], "p0_first", "v"));
+  ASSERT_OK(Put(cf_for_partition[1], "p1_lower", "v"));
+  const SequenceNumber p1_seq = db_->GetLatestSequenceNumber();
+  const std::string big(4096, 'x');
+  for (int i = 0; i < 64; ++i) {
+    ASSERT_OK(Put(cf_for_partition[0], "p0_big" + std::to_string(i), big));
+  }
+  ASSERT_GT(db_->GetLatestSequenceNumber(), p1_seq);
+
+  uint64_t wal0_size = 0;
+  uint64_t wal1_size = 0;
+  ASSERT_OK(env_->GetFileSize(LogFileName(dbname_, wal0), &wal0_size));
+  ASSERT_OK(env_->GetFileSize(LogFileName(dbname_, wal1), &wal1_size));
+  fprintf(stderr,
+          "FU14 M-b: wal0=#%" PRIu64 " size=%" PRIu64 " wal1=#%" PRIu64
+          " size=%" PRIu64 " p1_seq=%" PRIu64 "\n",
+          wal0, wal0_size, wal1, wal1_size, p1_seq);
+  // Construction preconditions: partition 0 spilled, partition 1 did not.
+  ASSERT_GT(wal0_size, 0u);
+  ASSERT_EQ(0u, wal1_size);
+
+  Status s = db_secondary_->TryCatchUpWithPrimary();
+  fprintf(stderr, "FU14 M-b: TryCatchUpWithPrimary -> %s\n",
+          s.ToString().c_str());
+  const bool p0_visible =
+      db_secondary_
+          ->Get(ReadOptions(), handles_secondary_[cf_for_partition[0]],
+                "p0_big0", &value)
+          .ok();
+  const bool p1_visible =
+      db_secondary_
+          ->Get(ReadOptions(), handles_secondary_[cf_for_partition[1]],
+                "p1_lower", &value)
+          .ok();
+  fprintf(stderr, "FU14 M-b: secondary sees p0_big0=%d p1_lower=%d\n",
+          p0_visible, p1_visible);
+  // Correct: the catch-up refuses at N>1 before applying anything.
+  EXPECT_TRUE(s.IsNotSupported()) << s.ToString();
+  // Prefix property: a partition-0 key above p1_seq implies p1_lower.
+  EXPECT_FALSE(p0_visible && !p1_visible)
+      << "secondary serves partition-0 writes above sequence " << p1_seq
+      << " while partition 1's write at " << p1_seq << " is missing";
+  EXPECT_FALSE(p0_visible);
+
+  ASSERT_OK(db_->FlushWAL(/*sync=*/false));
+  CloseSecondary();
+}
+
+// GC22: at one partition with indexed WALs, a secondary catches up across a
+// WAL switch whose new marker is on disk. A WAL whose records carry the WAL
+// index but whose marker is missing may be any partition's, so the secondary
+// refuses it before applying anything.
+TEST_F(DBSecondaryTest, GC22RefusesMarkerlessIndexedWal) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  Reopen(options);
+  ASSERT_OK(Put("key", "value"));
+  Options secondary_options = options;
+  secondary_options.max_open_files = -1;
+  OpenSecondary(secondary_options);
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("key2", "value"));
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  std::string value;
+  ASSERT_OK(db_secondary_->Get(ReadOptions(), "key2", &value));
+  CloseSecondary();
+
+  const uint64_t wal = dbfull()->TEST_CurrentWalNumber(0);
+  Close();
+  // The marker is the file's first physical record; drop it.
+  const std::string fname = LogFileName(dbname_, wal);
+  std::string contents;
+  ASSERT_OK(ReadFileToString(env_, fname, &contents));
+  ASSERT_GE(contents.size(), static_cast<size_t>(log::kHeaderSize));
+  const size_t marker_size =
+      log::kHeaderSize + (static_cast<uint8_t>(contents[4]) |
+                          (static_cast<uint8_t>(contents[5]) << 8));
+  ASSERT_GT(contents.size(), marker_size);
+  ASSERT_OK(WriteStringToFile(env_, contents.substr(marker_size), fname,
+                              /*should_sync=*/true));
+
+  Status s = TryOpenSecondary(secondary_options);
+  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+  ASSERT_NE(std::string::npos, s.ToString().find("wal_partitions > 1"))
+      << s.ToString();
+}
+
+// A damaged head (a corrupt checksum on the marker, which drops the rest of
+// its block) leaves a small indexed WAL with nothing readable. The primary
+// refuses it in every recovery mode ("head damaged and unattested"); so does
+// a secondary, rather than open as if the WAL were empty and serve a DB
+// missing the WAL's acknowledged write.
+TEST_F(DBSecondaryTest, RefusesDamagedHeadInIndexedDb) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  Reopen(options);
+  ASSERT_OK(Put("key", "value"));
+  const uint64_t wal = dbfull()->TEST_CurrentWalNumber(0);
+  Close();
+  const std::string fname = LogFileName(dbname_, wal);
+  std::string contents;
+  ASSERT_OK(ReadFileToString(env_, fname, &contents));
+  ASSERT_GT(contents.size(), static_cast<size_t>(log::kHeaderSize));
+  ASSERT_LT(contents.size(), static_cast<size_t>(log::kBlockSize));
+  contents[0] ^= 0x5a;  // the marker's checksum
+  ASSERT_OK(WriteStringToFile(env_, contents, fname, /*should_sync=*/true));
+
+  for (WALRecoveryMode mode : {WALRecoveryMode::kTolerateCorruptedTailRecords,
+                               WALRecoveryMode::kAbsoluteConsistency,
+                               WALRecoveryMode::kPointInTimeRecovery,
+                               WALRecoveryMode::kSkipAnyCorruptedRecords}) {
+    SCOPED_TRACE("wal_recovery_mode " + std::to_string(static_cast<int>(mode)));
+    Options secondary_options = options;
+    secondary_options.max_open_files = -1;
+    secondary_options.wal_recovery_mode = mode;
+    Status s = TryOpenSecondary(secondary_options);
+    ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+  }
+}
+
+// GC23 Q6, ported from GC22's Muse candidate: with manual_wal_flush at N=1
+// and unindexed WALs, a catch-up round whose WAL is still empty on disk
+// proceeds and applies nothing; an empty head with no WAL index anywhere is
+// not a partitioned set. Neuter: refuse any empty head whatever the round's
+// indexing; the first catch-up returns NotSupported.
+TEST_F(DBSecondaryTest, CatchUpEmptyUnindexedWalAppliesNothing) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.manual_wal_flush = true;
+  Reopen(options);
+  Options secondary_options = options;
+  secondary_options.max_open_files = -1;
+  OpenSecondary(secondary_options);
+  ASSERT_OK(Put("buffered", "v"));
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  std::string value;
+  ASSERT_TRUE(
+      db_secondary_->Get(ReadOptions(), "buffered", &value).IsNotFound());
+  ASSERT_OK(db_->FlushWAL(/*sync=*/false));
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  ASSERT_OK(db_secondary_->Get(ReadOptions(), "buffered", &value));
+  ASSERT_EQ("v", value);
+  CloseSecondary();
+}
+
+// GC23 Q6 and Q8 (D-GC23a option (i)), ported from GC22's Muse candidate: at
+// N=1 with indexed WALs and manual_wal_flush, a round holding a WAL with an
+// on-disk marker plus an empty WAL is refused before anything is applied, as
+// documented at DBOptions::wal_partitions: the empty head's partition is
+// unknown, so the set may be partitioned. After FlushWAL lands the empty
+// WAL's marker, the retry proceeds with a prefix-consistent view. Neuter:
+// option (ii), treating the empty head as unpartitioned (here, dropping
+// GC22's empty-head rule); the first catch-up succeeds.
+TEST_F(DBSecondaryTest, CatchUpRefusesIndexedRoundWithEmptyHead) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  options.manual_wal_flush = true;
+  CreateAndReopenWithCF({"b"}, options);
+  Options secondary_options = options;
+  secondary_options.max_open_files = -1;
+  OpenSecondaryWithColumnFamilies({"b"}, secondary_options);
+  // Lands the first WAL's marker and column family "b"'s record on disk; the
+  // WAL stays live because "b" is never flushed.
+  ASSERT_OK(Put(1, "b_key", "v"));
+  ASSERT_OK(db_->FlushWAL(/*sync=*/false));
+  // Flushing the default column family switches to a new WAL, whose marker
+  // stays buffered under manual_wal_flush.
+  ASSERT_OK(Put("a_key", "v"));
+  ASSERT_OK(Flush());
+  uint64_t new_wal_size = 0;
+  ASSERT_OK(env_->GetFileSize(
+      LogFileName(dbname_, dbfull()->TEST_GetCurrentLogNumber()),
+      &new_wal_size));
+  ASSERT_EQ(0u, new_wal_size);
+
+  std::string value;
+  Status s = db_secondary_->TryCatchUpWithPrimary();
+  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+  ASSERT_TRUE(
+      db_secondary_->Get(ReadOptions(), handles_secondary_[1], "b_key", &value)
+          .IsNotFound());
+  ASSERT_OK(db_->FlushWAL(/*sync=*/false));
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  ASSERT_OK(db_secondary_->Get(ReadOptions(), handles_secondary_[1], "b_key",
+                               &value));
+  ASSERT_EQ("v", value);
+  ASSERT_OK(db_secondary_->Get(ReadOptions(), handles_secondary_[0], "a_key",
+                               &value));
+  ASSERT_EQ("v", value);
+  CloseSecondary();
+}
+
+// With async_wal_precreate the primary keeps its next WAL on disk, empty, from
+// every rotation until the next one consumes it. A secondary cannot tell that
+// file from a partition WAL whose head is not on disk yet, so beside an
+// indexed WAL it would refuse every round. An indexed primary therefore opens
+// with async_wal_precreate off, and its secondary opens and catches up.
+TEST_F(DBSecondaryTest, IndexedPrimaryDisablesAsyncWalPrecreate) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  options.async_wal_precreate = true;
+  Reopen(options);
+  ASSERT_OK(Put("a_key", "v"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("b_key", "v"));
+  if (dbfull()->GetDBOptions().async_wal_precreate) {
+    // Without the fix: wait for the precreated WAL the switch scheduled, so
+    // the open below sees it.
+    const uint64_t current = dbfull()->TEST_GetCurrentLogNumber();
+    bool precreated = false;
+    for (int i = 0; i < 1000 && !precreated; ++i) {
+      std::vector<std::string> children;
+      ASSERT_OK(env_->GetChildren(dbname_, &children));
+      for (const auto& child : children) {
+        uint64_t number = 0;
+        FileType type;
+        if (ParseFileName(child, &number, &type) && type == kWalFile &&
+            number > current) {
+          precreated = true;
+        }
+      }
+      if (!precreated) {
+        env_->SleepForMicroseconds(10000);
+      }
+    }
+  }
+
+  Options secondary_options = options;
+  secondary_options.max_open_files = -1;
+  ASSERT_OK(TryOpenSecondary(secondary_options));
+  std::string value;
+  ASSERT_OK(db_secondary_->Get(ReadOptions(), "b_key", &value));
+  ASSERT_EQ("v", value);
+  ASSERT_OK(Put("c_key", "v"));
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  ASSERT_OK(db_secondary_->Get(ReadOptions(), "c_key", &value));
+  ASSERT_EQ("v", value);
+  CloseSecondary();
+  ASSERT_FALSE(dbfull()->GetDBOptions().async_wal_precreate);
+}
+
 TEST_F(DBSecondaryTest, FailOpenIfLoggerCreationFail) {
   Options options = GetDefaultOptions();
   options.create_if_missing = true;

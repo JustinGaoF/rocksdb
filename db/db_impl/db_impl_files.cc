@@ -829,8 +829,16 @@ void DBImpl::PurgeObsoleteFiles(JobContext& state, bool schedule_only) {
               to_delete;
     }
 
-    if (type == kWalFile && (immutable_db_options_.WAL_ttl_seconds > 0 ||
-                             immutable_db_options_.WAL_size_limit_MB > 0)) {
+    bool cut_above = false;
+    if (type == kWalFile) {
+      // Kept after the decision: a purge that fails to delete the file, or
+      // a concurrent one that holds it too, must delete it, not archive it.
+      std::lock_guard<std::mutex> lock(wals_cut_above_mutex_);
+      cut_above = wals_cut_above_.count(number) > 0;
+    }
+    if (type == kWalFile && !cut_above &&
+        (immutable_db_options_.WAL_ttl_seconds > 0 ||
+         immutable_db_options_.WAL_size_limit_MB > 0)) {
       wal_manager_.ArchiveWALFile(fname, number);
       continue;
     }
