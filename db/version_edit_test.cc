@@ -360,7 +360,7 @@ TEST_F(VersionEditTest, WALIndexGuardFailsClosedOnUnawareReaders) {
     PutLengthPrefixedSlice(&encoded, field);
     return encoded;
   };
-  constexpr uint32_t kUnknownTag = kWALIndexGuard + 1;
+  constexpr uint32_t kUnknownTag = kWALPartitionGuard + 1;
   VersionEdit unaware;
   const Status s = unaware.DecodeFrom(encode_with_tag(kUnknownTag));
   ASSERT_TRUE(s.IsCorruption()) << s.ToString();
@@ -369,6 +369,27 @@ TEST_F(VersionEditTest, WALIndexGuardFailsClosedOnUnawareReaders) {
   ASSERT_OK(
       ignoring.DecodeFrom(encode_with_tag(kUnknownTag | kTagSafeIgnoreMask)));
   EXPECT_EQ(66U, ignoring.GetLogNumber());
+}
+
+// The WAL partition guard, like the WAL index guard, is not safely
+// ignorable, round-trips beside it, and shows in the debug dump.
+TEST_F(VersionEditTest, WALPartitionGuardRoundTrips) {
+  static_assert((kWALPartitionGuard & kTagSafeIgnoreMask) == 0,
+                "the WAL partition guard must not be safely ignorable");
+  VersionEdit edit;
+  edit.SetWALIndexGuard(42);
+  edit.SetWALPartitionGuard(41);
+  TestEncodeDecode(edit);
+  std::string encoded;
+  ASSERT_TRUE(edit.EncodeTo(&encoded));
+  VersionEdit decoded;
+  ASSERT_OK(decoded.DecodeFrom(encoded));
+  ASSERT_TRUE(decoded.HasWALPartitionGuard());
+  EXPECT_EQ(41U, decoded.GetWALPartitionGuard());
+  EXPECT_NE(std::string::npos,
+            decoded.DebugString().find("WALPartitionGuard: 41"));
+  EXPECT_NE(std::string::npos,
+            decoded.DebugJSON(0).find("\"WALPartitionGuard\": 41"));
 }
 
 TEST_F(VersionEditTest, IgnorableField) {

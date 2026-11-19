@@ -374,6 +374,13 @@ bool VersionEdit::EncodeTo(std::string* dst,
     PutLengthPrefixedSlice(dst, encoded);
   }
 
+  if (has_wal_partition_guard_) {
+    PutVarint32(dst, kWALPartitionGuard);
+    std::string encoded;
+    PutVarint64(&encoded, wal_partition_guard_);
+    PutLengthPrefixedSlice(dst, encoded);
+  }
+
   return true;
 }
 
@@ -1092,6 +1099,17 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
         break;
       }
 
+      case kWALPartitionGuard: {
+        Slice encoded;
+        if (GetLengthPrefixedSlice(&input, &encoded) &&
+            GetVarint64(&encoded, &wal_partition_guard_) && encoded.empty()) {
+          has_wal_partition_guard_ = true;
+        } else {
+          msg = "WAL partition guard";
+        }
+        break;
+      }
+
       default:
         if (tag & kTagSafeIgnoreMask) {
           // Tag from future which can be safely ignored.
@@ -1291,6 +1309,10 @@ std::string VersionEdit::DebugString(bool hex_key) const {
     r.append("\n  WALIndexGuard: ");
     AppendNumberTo(&r, wal_index_guard_);
   }
+  if (has_wal_partition_guard_) {
+    r.append("\n  WALPartitionGuard: ");
+    AppendNumberTo(&r, wal_partition_guard_);
+  }
   r.append("\n}\n");
   return r;
 }
@@ -1473,6 +1495,9 @@ std::string VersionEdit::DebugJSON(int edit_num, bool hex_key) const {
   }
   if (has_wal_index_guard_) {
     jw << "WALIndexGuard" << wal_index_guard_;
+  }
+  if (has_wal_partition_guard_) {
+    jw << "WALPartitionGuard" << wal_partition_guard_;
   }
 
   jw.EndObject();
