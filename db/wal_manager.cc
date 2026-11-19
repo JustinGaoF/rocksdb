@@ -154,6 +154,11 @@ void WalManager::RecordIndeterminateWriteSequence(uint64_t wal_number,
   recovery_sequence_tracker_->Record(wal_number, start_sequence, end_sequence);
 }
 
+bool WalManager::TEST_HasIndeterminateWriteSequence() const {
+  WalRecoverySequenceGap gap;
+  return recovery_sequence_tracker_->FirstAtOrAfter(0, &gap);
+}
+
 // 1. Go through all archived files and
 //    a. if ttl is enabled, delete outdated files
 //    b. if archive size limit is enabled, delete empty files,
