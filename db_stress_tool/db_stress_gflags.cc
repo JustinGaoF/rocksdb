@@ -1331,6 +1331,11 @@ DEFINE_int32(sync_wal_one_in, 0,
              "If non-zero, then SyncWAL() will be called once for every N ops "
              "on average. 0 indicates that calls to SyncWAL() are disabled.");
 
+DEFINE_int32(sync_write_one_in, 0,
+             "If non-zero and --sync is false, about one in every N write ops "
+             "sets WriteOptions::sync, so one run mixes sync and non-sync "
+             "writes. 0 disables it.");
+
 DEFINE_bool(avoid_unnecessary_blocking_io,
             ROCKSDB_NAMESPACE::Options().avoid_unnecessary_blocking_io,
             "If true, some expensive cleaning up operations will be moved from "
@@ -1570,6 +1575,34 @@ DEFINE_uint32(wal_partitions, ROCKSDB_NAMESPACE::Options().wal_partitions,
               "DBOptions::wal_partitions. Values above 1 also set the "
               "testing-only experimental_allow_wal_partitions_for_testing, "
               "and need --partition_wal_usage other than none.");
+
+DEFINE_bool(inject_wal_latency, false,
+            "Put a LatencyInjectionFileSystem above the DB's FileSystem (and "
+            "above FaultInjectionTestFS, so a simulated crash still loses "
+            "exactly the unsynced data) that delays WAL appends and syncs, "
+            "and no other file, and print its counters with the statistics.");
+DEFINE_uint64(wal_append_latency_us, 0,
+              "With --inject_wal_latency, microseconds added to every WAL "
+              "Append and PositionedAppend.");
+DEFINE_uint64(wal_sync_latency_us, 0,
+              "With --inject_wal_latency, microseconds added to every WAL "
+              "Sync, Fsync and RangeSync.");
+DEFINE_uint64(wal_latency_jitter_us, 0,
+              "With --inject_wal_latency, each WAL operation also gets a "
+              "deterministic extra delay in [0, this] derived from "
+              "--wal_latency_seed, the WAL number and the operation index.");
+DEFINE_double(wal_append_bandwidth_mbps, 0,
+              "With --inject_wal_latency, each WAL append also costs its bytes "
+              "at this many MiB/s. 0 disables.");
+DEFINE_double(wal_sync_bandwidth_mbps, 0,
+              "With --inject_wal_latency, each WAL Sync or Fsync also costs "
+              "the bytes appended to that WAL since its last successful sync "
+              "at this many MiB/s (a RangeSync of n bytes, at most n of them). "
+              "0 disables.");
+DEFINE_int64(wal_latency_seed, -1,
+             "Seed of the WAL latency jitter; -1 uses --seed. The jitter of "
+             "a WAL operation is a function of this seed, the WAL number and "
+             "the operation's index on that WAL.");
 
 DEFINE_bool(
     verify_sst_unique_id_in_manifest, false,
