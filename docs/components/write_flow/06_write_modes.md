@@ -74,11 +74,11 @@ Two-queue mode (`two_write_queues`) decouples WAL-only writes from memtable writ
 
 **WAL-only path** (`WriteImplWALOnly()`):
 
-When `disable_memtable` is true, the write is routed to `nonmem_write_thread_`. The writer joins this queue, and the leader writes all batches to WAL under `wal_write_mutex_`. Sequence numbers are allocated atomically via `FetchAddLastAllocatedSequence()`.
+When `disable_memtable` is true, the write is routed to `nonmem_write_thread_`. The writer joins this queue, and the leader writes all batches to WAL under the selected partition's WAL write mutex. Sequence numbers are allocated atomically via `FetchAddLastAllocatedSequence()`.
 
 **Normal path with two queues:**
 
-When a write needs both WAL and memtable, it uses `write_thread_` as usual, but WAL writes go through `ConcurrentWriteGroupToWAL()` which acquires `wal_write_mutex_` to coordinate with the non-memtable queue.
+When a write needs both WAL and memtable, it uses `write_thread_` as usual, but WAL writes go through `ConcurrentWriteGroupToWAL()` which acquires the selected partition's WAL write mutex to coordinate with the non-memtable queue.
 
 **Primary use case:** WritePreparedTxnDB and WriteUnpreparedTxnDB, where prepare writes go to WAL only (via the non-memtable queue) and commit writes go to both WAL and memtable.
 
