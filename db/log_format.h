@@ -69,6 +69,25 @@ enum RecordType : uint8_t {
   kRecyclableWALIndexMiddleType = 20,
   kRecyclableWALIndexLastType = 21,
 
+  // Declares that a closed range of wal_index values is not part of the live
+  // WAL history and must not be treated as a missing record. A producer may
+  // use it for indices that never carried data or for records it deliberately
+  // discarded. Consumes no wal_index.
+  //
+  // Unlike the marker these are not positionally constrained: a cover is
+  // written after the append it stands in for failed, so it can appear
+  // anywhere. They get their own types rather than a marker payload because
+  // the reader enforces the marker's "first record" rule, which a cover would
+  // violate by construction.
+  kWALIndexVoidType = 22,
+  kRecyclableWALIndexVoidType = 23,
+
+  // Declares that records at or above a wal_index in one identified older WAL
+  // file are obsolete. Records carrying the same indices in other files remain
+  // live. Consumes no wal_index.
+  kWALIndexSupersessionType = 24,
+  kRecyclableWALIndexSupersessionType = 25,
+
   // For WAL verification
   kPredecessorWALInfoType = 130,
   kRecyclePredecessorWALInfoType = 131,
@@ -81,6 +100,8 @@ constexpr uint8_t kMaxRecordType = kRecyclePredecessorWALInfoType;
 // reports an indexed record rather than discarding it without a trace. The
 // report fails only the strict recovery modes; renumbering one of them into
 // the ignorable range would silence it in those modes too.
+// A skipped void record is worse than a skipped marker: the reader would take
+// the covered range for data that is simply missing.
 static_assert(kWALIndexMarkerType < kRecordTypeSafeIgnoreMask &&
                   kRecyclableWALIndexMarkerType < kRecordTypeSafeIgnoreMask &&
                   kWALIndexFullType < kRecordTypeSafeIgnoreMask &&
@@ -90,13 +111,28 @@ static_assert(kWALIndexMarkerType < kRecordTypeSafeIgnoreMask &&
                   kRecyclableWALIndexFullType < kRecordTypeSafeIgnoreMask &&
                   kRecyclableWALIndexFirstType < kRecordTypeSafeIgnoreMask &&
                   kRecyclableWALIndexMiddleType < kRecordTypeSafeIgnoreMask &&
-                  kRecyclableWALIndexLastType < kRecordTypeSafeIgnoreMask,
+                  kRecyclableWALIndexLastType < kRecordTypeSafeIgnoreMask &&
+                  kWALIndexVoidType < kRecordTypeSafeIgnoreMask &&
+                  kRecyclableWALIndexVoidType < kRecordTypeSafeIgnoreMask,
               "WAL index record types must fail closed on older readers");
+static_assert(kWALIndexSupersessionType < kRecordTypeSafeIgnoreMask &&
+                  kRecyclableWALIndexSupersessionType <
+                      kRecordTypeSafeIgnoreMask,
+              "WAL index supersession types must fail closed on older readers");
 
 inline constexpr bool IsWALIndexRecordType(uint8_t type) {
   return (type >= kWALIndexFullType && type <= kWALIndexLastType) ||
          (type >= kRecyclableWALIndexFullType &&
           type <= kRecyclableWALIndexLastType);
+}
+
+// Metadata records that carry wal_index bookkeeping rather than user data.
+// They are never returned as logical records and never consume an index.
+inline constexpr bool IsWALIndexMetadataRecordType(uint8_t type) {
+  return type == kWALIndexMarkerType || type == kRecyclableWALIndexMarkerType ||
+         type == kWALIndexVoidType || type == kRecyclableWALIndexVoidType ||
+         type == kWALIndexSupersessionType ||
+         type == kRecyclableWALIndexSupersessionType;
 }
 
 inline constexpr bool IsRecyclableRecordType(uint8_t type) {
@@ -105,6 +141,8 @@ inline constexpr bool IsRecyclableRecordType(uint8_t type) {
           type <= kRecyclableWALIndexLastType) ||
          type == kRecyclableUserDefinedTimestampSizeType ||
          type == kRecyclableWALIndexMarkerType ||
+         type == kRecyclableWALIndexVoidType ||
+         type == kRecyclableWALIndexSupersessionType ||
          type == kRecyclePredecessorWALInfoType;
 }
 
@@ -113,6 +151,14 @@ constexpr unsigned int kBlockSize = 32768;
 // Number of bytes of the fixed64 wal_index prefixed to each logical record when
 // WAL index is enabled.
 constexpr uint32_t kWALIndexSize = 8;
+
+// A void record's payload is the covered range as fixed64 lo followed by
+// fixed64 hi, both inclusive.
+constexpr uint32_t kWALIndexVoidPayloadSize = 2 * kWALIndexSize;
+
+// A supersession record's payload is the superseded WAL file number followed
+// by its first obsolete wal_index. The index range is open-ended.
+constexpr uint32_t kWALIndexSupersessionPayloadSize = 2 * kWALIndexSize;
 
 // Header is checksum (4 bytes), length (2 bytes), type (1 byte)
 constexpr int kHeaderSize = 4 + 2 + 1;

@@ -75,6 +75,7 @@ Reader::~Reader() {
 bool Reader::ReadRecord(Slice* record, std::string* scratch,
                         WALRecoveryMode wal_recovery_mode,
                         uint64_t* record_checksum) {
+  wal_recovery_stopped_before_end_of_file_ = false;
   scratch->clear();
   record->clear();
   if (record_checksum != nullptr) {
@@ -271,6 +272,53 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch,
         break;  // switch
       }
 
+      case kWALIndexVoidType:
+      case kRecyclableWALIndexVoidType: {
+        // Metadata: skipped rather than returned, consumes no index, and
+        // leaves last_read_wal_index_ alone so the surrounding records still
+        // report their own.
+        DecodeWALIndexVoidRecord(fragment);
+        //
+        // A cover is written after a failed append, which can have torn a
+        // fragmented record, so this drops an in-progress record exactly as
+        // the marker case below does.
+        if (in_fragmented_record && !scratch->empty()) {
+          ReportCorruption(scratch->size(),
+                           "WAL_Index void interspersed partial record");
+          if (record_checksum != nullptr) {
+            XXH3_64bits_reset(hash_state_);
+          }
+        }
+        prospective_record_offset = physical_record_offset;
+        scratch->clear();
+        in_fragmented_record = false;
+        last_record_offset_ = prospective_record_offset;
+        break;  // switch
+      }
+
+      case kWALIndexSupersessionType:
+      case kRecyclableWALIndexSupersessionType: {
+        if (first_record_read_) {
+          ReportCorruption(fragment.size(),
+                           "WAL_Index supersession follows a data record");
+        } else {
+          DecodeWALIndexSupersessionRecord(fragment);
+        }
+        if (in_fragmented_record && !scratch->empty()) {
+          ReportCorruption(
+              scratch->size(),
+              "WAL_Index supersession interspersed partial record");
+          if (record_checksum != nullptr) {
+            XXH3_64bits_reset(hash_state_);
+          }
+        }
+        prospective_record_offset = physical_record_offset;
+        scratch->clear();
+        in_fragmented_record = false;
+        last_record_offset_ = prospective_record_offset;
+        break;  // switch
+      }
+
       case kWALIndexMarkerType:
       case kRecyclableWALIndexMarkerType: {
         // Identifies the file as carrying per-record wal_index values. The
@@ -305,6 +353,7 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch,
       }
 
       case kBadHeader:
+        wal_recovery_stopped_before_end_of_file_ = true;
         if (wal_recovery_mode == WALRecoveryMode::kAbsoluteConsistency ||
             wal_recovery_mode == WALRecoveryMode::kPointInTimeRecovery) {
           // In clean shutdown we don't expect any error in the log files.
@@ -318,6 +367,7 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch,
 
       case kEof:
         if (in_fragmented_record) {
+          wal_recovery_stopped_before_end_of_file_ = true;
           if (wal_recovery_mode == WALRecoveryMode::kAbsoluteConsistency ||
               wal_recovery_mode == WALRecoveryMode::kPointInTimeRecovery) {
             // In clean shutdown we don't expect any error in the log files.
@@ -338,6 +388,7 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch,
 
       case kOldRecord:
         if (wal_recovery_mode != WALRecoveryMode::kSkipAnyCorruptedRecords) {
+          wal_recovery_stopped_before_end_of_file_ = true;
           // Treat a record from a previous instance of the log as EOF.
           if (in_fragmented_record) {
             if (wal_recovery_mode == WALRecoveryMode::kAbsoluteConsistency ||
@@ -374,6 +425,7 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch,
 
       case kBadRecordLen:
         if (eof_) {
+          wal_recovery_stopped_before_end_of_file_ = true;
           if (wal_recovery_mode == WALRecoveryMode::kAbsoluteConsistency ||
               wal_recovery_mode == WALRecoveryMode::kPointInTimeRecovery) {
             // In clean shutdown we don't expect any error in the log files.
@@ -390,6 +442,7 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch,
       case kBadRecordChecksum:
         if (recycled_ && wal_recovery_mode ==
                              WALRecoveryMode::kTolerateCorruptedTailRecords) {
+          wal_recovery_stopped_before_end_of_file_ = true;
           scratch->clear();
           return false;
         }
@@ -503,6 +556,59 @@ void Reader::MaybeStripAndVerifyWALIndex(bool record_has_wal_index,
 
   if (record_checksum != nullptr) {
     *record_checksum = XXH3_64bits(record->data(), record->size());
+  }
+}
+
+void Reader::DecodeWALIndexVoidRecord(const Slice& fragment) {
+  if (fragment.size() < kWALIndexVoidPayloadSize) {
+    ReportCorruption(fragment.size(),
+                     "WAL_Index void record too short to hold a range");
+    return;
+  }
+  if (fragment.size() > kWALIndexVoidPayloadSize) {
+    ReportCorruption(fragment.size(),
+                     "WAL_Index void record longer than its range");
+    return;
+  }
+
+  const uint64_t lo = DecodeFixed64(fragment.data());
+  const uint64_t hi = DecodeFixed64(fragment.data() + kWALIndexSize);
+  if (lo == 0) {
+    ReportCorruption(fragment.size(),
+                     "WAL_Index void range starts at the unassigned index");
+    return;
+  }
+  if (lo > hi) {
+    ReportCorruption(fragment.size(), "WAL_Index void range is reversed");
+    return;
+  }
+  max_void_wal_index_hi_ = std::max(max_void_wal_index_hi_, hi);
+}
+
+void Reader::DecodeWALIndexSupersessionRecord(const Slice& fragment) {
+  if (fragment.size() != kWALIndexSupersessionPayloadSize) {
+    ReportCorruption(fragment.size(),
+                     "WAL_Index supersession record has invalid size");
+    return;
+  }
+
+  const uint64_t superseded_wal_number = DecodeFixed64(fragment.data());
+  const uint64_t first_superseded =
+      DecodeFixed64(fragment.data() + kWALIndexSize);
+  if (superseded_wal_number == 0 || superseded_wal_number >= log_number_) {
+    ReportCorruption(fragment.size(),
+                     "WAL_Index supersession names a non-older WAL");
+    return;
+  }
+  if (first_superseded == 0) {
+    ReportCorruption(fragment.size(),
+                     "WAL_Index supersession starts at the unassigned index");
+    return;
+  }
+  const auto [it, inserted] = first_superseded_wal_indices_.emplace(
+      superseded_wal_number, first_superseded);
+  if (!inserted) {
+    it->second = std::min(it->second, first_superseded);
   }
 }
 
@@ -743,7 +849,7 @@ uint8_t Reader::ReadPhysicalRecord(Slice* result, size_t* drop_size,
         type == kRecyclePredecessorWALInfoType ||
         type == kUserDefinedTimestampSizeType ||
         type == kRecyclableUserDefinedTimestampSizeType ||
-        type == kWALIndexMarkerType || type == kRecyclableWALIndexMarkerType) {
+        IsWALIndexMetadataRecordType(type)) {
       *result = Slice(header + header_size, length);
       return type;
     } else {
@@ -837,6 +943,7 @@ bool FragmentBufferedReader::ReadRecord(Slice* record, std::string* scratch,
                                         uint64_t* /* checksum */) {
   assert(record != nullptr);
   assert(scratch != nullptr);
+  wal_recovery_stopped_before_end_of_file_ = false;
   record->clear();
   scratch->clear();
   if (uncompress_) {
@@ -998,6 +1105,43 @@ bool FragmentBufferedReader::ReadRecord(Slice* record, std::string* scratch,
         break;
       }
 
+      case kWALIndexVoidType:
+      case kRecyclableWALIndexVoidType: {
+        // See Reader::ReadRecord: metadata, skipped, consumes no index, and
+        // drops an interrupted record the same way the marker does. Decoding
+        // is shared so both readers accept exactly the same ranges.
+        DecodeWALIndexVoidRecord(fragment);
+        if (in_fragmented_record_ && !fragments_.empty()) {
+          ReportCorruption(fragments_.size(),
+                           "WAL_Index void interspersed partial record");
+        }
+        fragments_.clear();
+        prospective_record_offset = physical_record_offset;
+        last_record_offset_ = prospective_record_offset;
+        in_fragmented_record_ = false;
+        break;
+      }
+
+      case kWALIndexSupersessionType:
+      case kRecyclableWALIndexSupersessionType: {
+        if (first_record_read_) {
+          ReportCorruption(fragment.size(),
+                           "WAL_Index supersession follows a data record");
+        } else {
+          DecodeWALIndexSupersessionRecord(fragment);
+        }
+        if (in_fragmented_record_ && !fragments_.empty()) {
+          ReportCorruption(
+              fragments_.size(),
+              "WAL_Index supersession interspersed partial record");
+        }
+        fragments_.clear();
+        prospective_record_offset = physical_record_offset;
+        last_record_offset_ = prospective_record_offset;
+        in_fragmented_record_ = false;
+        break;
+      }
+
       case kWALIndexMarkerType:
       case kRecyclableWALIndexMarkerType: {
         if (first_record_read_) {
@@ -1020,9 +1164,15 @@ bool FragmentBufferedReader::ReadRecord(Slice* record, std::string* scratch,
       }
 
       case kBadHeader:
+        wal_recovery_stopped_before_end_of_file_ = true;
+        FALLTHROUGH_INTENDED;
       case kBadRecord:
       case kEof:
       case kOldRecord:
+        if (fragment_type_or_err == kOldRecord ||
+            (fragment_type_or_err == kEof && in_fragmented_record_)) {
+          wal_recovery_stopped_before_end_of_file_ = true;
+        }
         if (in_fragmented_record_) {
           ReportCorruption(fragments_.size(), "error in middle of record");
           in_fragmented_record_ = false;
@@ -1032,6 +1182,7 @@ bool FragmentBufferedReader::ReadRecord(Slice* record, std::string* scratch,
 
       case kBadRecordChecksum:
         if (recycled_) {
+          wal_recovery_stopped_before_end_of_file_ = true;
           fragments_.clear();
           return false;
         }
@@ -1191,7 +1342,7 @@ bool FragmentBufferedReader::TryReadFragment(Slice* fragment, size_t* drop_size,
       type == kRecyclePredecessorWALInfoType ||
       type == kUserDefinedTimestampSizeType ||
       type == kRecyclableUserDefinedTimestampSizeType ||
-      type == kWALIndexMarkerType || type == kRecyclableWALIndexMarkerType) {
+      IsWALIndexMetadataRecordType(type)) {
     *fragment = Slice(header + header_size, length);
     *fragment_type_or_err = type;
     return true;

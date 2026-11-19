@@ -147,6 +147,20 @@ class Writer {
   // marker does not consume a wal_index. No-op when WAL index is disabled.
   IOStatus MaybeAddWALIndexMarkerRecord(const WriteOptions& write_options);
 
+  // Records that the closed range [lo, hi] of wal_index values is not part of
+  // the live WAL history and must not be treated as missing. Consumes no
+  // wal_index and does not advance the writer's high-water mark. No-op when
+  // WAL index is disabled.
+  IOStatus AddWALIndexVoidRecord(const WriteOptions& write_options, uint64_t lo,
+                                 uint64_t hi);
+
+  // Declares that records at or above `first_superseded_wal_index` in the
+  // identified older WAL are obsolete. Records in other WALs remain live even
+  // when they reuse those indices. Consumes no wal_index.
+  IOStatus AddWALIndexSupersessionRecord(const WriteOptions& write_options,
+                                         uint64_t superseded_wal_number,
+                                         uint64_t first_superseded_wal_index);
+
   // Enables WAL indexing for this writer.
   // Must be called before the first record is written and never changed
   // afterwards. A file's records are either all indexed or none are.
@@ -178,6 +192,9 @@ class Writer {
 
   SequenceNumber GetLastSeqnoRecorded() const { return last_seqno_recorded_; }
 
+  // wal_index of the last data record AddRecord completed, or zero.
+  uint64_t last_wal_index_recorded() const { return last_wal_index_recorded_; }
+
  private:
   std::unique_ptr<WritableFileWriter> dest_;
   size_t block_offset_;  // Current offset in block
@@ -202,6 +219,13 @@ class Writer {
 
   IOStatus MaybeSwitchToNewBlock(const WriteOptions& write_options,
                                  const std::string& content_to_write);
+
+  // Emits one whole-block-resident WAL index control record: a record that
+  // describes wal_index values instead of carrying one. Void and supersession
+  // records share this path.
+  IOStatus EmitWALIndexControlRecord(const WriteOptions& write_options,
+                                     RecordType type,
+                                     const std::string& payload);
 
   // If true, it does not flush after each write. Instead it relies on the upper
   // layer to manually does the flush by calling ::WriteBuffer()
