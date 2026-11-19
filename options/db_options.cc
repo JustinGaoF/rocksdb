@@ -474,7 +474,22 @@ static std::unordered_map<std::string, OptionTypeInfo>
         {"partition_wal_usage",
          OptionTypeInfo::Enum<PartitionWALUsage>(
              offsetof(struct ImmutableDBOptions, partition_wal_usage),
-             &GetPartitionWALUsageStringMap())},
+             &GetPartitionWALUsageStringMap())
+             .SetSerializeFunc([](const ConfigOptions&, const std::string& name,
+                                  const void* addr, std::string* value) {
+               // The map parses two spellings of each value; serializing
+               // through it would write whichever one its hash order reaches
+               // first. Always write the enumerator's own name.
+               switch (*static_cast<const PartitionWALUsage*>(addr)) {
+                 case PartitionWALUsage::kNone:
+                   *value = "kNone";
+                   return Status::OK();
+                 case PartitionWALUsage::kPartitionByColumnFamily:
+                   *value = "kPartitionByColumnFamily";
+                   return Status::OK();
+               }
+               return Status::InvalidArgument("No mapping for enum ", name);
+             })},
         {"background_close_inactive_wals",
          {offsetof(struct ImmutableDBOptions, background_close_inactive_wals),
           OptionType::kBoolean, OptionVerificationType::kNormal,

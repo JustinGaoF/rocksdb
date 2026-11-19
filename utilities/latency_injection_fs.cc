@@ -20,14 +20,26 @@
 namespace ROCKSDB_NAMESPACE {
 
 namespace {
-uint64_t JitterMicros(uint64_t seed, uint64_t wal_number, uint64_t op_index,
-                      uint64_t jitter_micros) {
+uint64_t SaturatingAdd(uint64_t a, uint64_t b) {
+  return b > std::numeric_limits<uint64_t>::max() - a
+             ? std::numeric_limits<uint64_t>::max()
+             : a + b;
+}
+}  // namespace
+
+uint64_t LatencyInjectionFileSystem::JitterMicros(uint64_t seed,
+                                                  uint64_t wal_number,
+                                                  uint64_t op_index,
+                                                  uint64_t jitter_micros) {
   char key[16];
   EncodeFixed64(key, wal_number);
   EncodeFixed64(key + 8, op_index);
-  return Hash64(key, sizeof(key), seed) % (jitter_micros + 1);
+  const uint64_t hash = Hash64(key, sizeof(key), seed);
+  // jitter_micros + 1 wraps to 0 at the maximum, whose range is every value.
+  return jitter_micros == std::numeric_limits<uint64_t>::max()
+             ? hash
+             : hash % (jitter_micros + 1);
 }
-}  // namespace
 
 template <typename Op>
 IOStatus LatencyInjectionFileSystem::Delayed(WalState* state, bool is_sync,
@@ -55,7 +67,8 @@ IOStatus LatencyInjectionFileSystem::Delayed(WalState* state, bool is_sync,
   const uint64_t op_index =
       state->next_op.fetch_add(1, std::memory_order_relaxed);
   if (jitter > 0) {
-    delay += JitterMicros(seed_, state->wal_number, op_index, jitter);
+    delay = SaturatingAdd(
+        delay, JitterMicros(seed_, state->wal_number, op_index, jitter));
   }
   // A sync takes the bytes it makes durable out of the unsynced count
   // atomically, so concurrent syncs never charge a byte twice; a sync
@@ -69,7 +82,7 @@ IOStatus LatencyInjectionFileSystem::Delayed(WalState* state, bool is_sync,
         unsynced, unsynced - charged_bytes, std::memory_order_relaxed));
   }
   const uint64_t size_delay = TransferMicros(charged_bytes, bytes_per_sec);
-  delay += size_delay;
+  delay = SaturatingAdd(delay, size_delay);
   if (delay > 0) {
     std::this_thread::sleep_for(std::chrono::microseconds(delay));
   }

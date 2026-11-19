@@ -499,7 +499,9 @@ enum class WALRecoveryMode : char {
 //      unresolved prepare, and every WAL written before step 1 with it, stays
 //      live). If any was outstanding, flush again, after at least one write
 //      if no memtable holds data (a flush with nothing to write records no
-//      progress). Wait for the WAL files written before step 1 to be deleted.
+//      progress). Wait for the WAL files written before step 1 to be deleted:
+//      `DB::GetSortedWalFiles()` lists no live WAL numbered below
+//      `DB::GetCurrentWalFile()` as of the end of step 1.
 //   4. If `WAL_ttl_seconds` or `WAL_size_limit_MB` keeps an archive, purge
 //      `archive/` or wait until those limits expire the same WAL files there.
 //   5. Close, reopen once more with `kNone`, and close. The MANIFEST record

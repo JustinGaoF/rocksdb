@@ -205,6 +205,17 @@ def collect_environment(args):
     return env
 
 
+def trigger_profile(args):
+    """The (append_us, sync, value_size) profile the abandon trigger reads at
+    N=8: the designated injected-latency profile, or under --quick the quick
+    matrix's latency and value size with its last sync mode. build_matrix
+    runs the trigger and slow cells at this profile and compute_trigger
+    takes its verdict from it, so the two cannot disagree."""
+    if args.quick:
+        return QUICK_LATENCIES[0], QUICK_SYNC_MODES[-1], QUICK_VALUE_SIZES[0]
+    return TRIGGER_LATENCY_US, TRIGGER_SYNC_MODE, TRIGGER_VALUE_SIZE
+
+
 def build_matrix(args):
     """The full matrix, or the --quick subset, or an explicit selection."""
     if args.quick:
@@ -262,8 +273,7 @@ def build_matrix(args):
     # The trigger profile, or the --quick one, at N=8 and every trigger
     # thread count, for every sync mode, with both N=1 baselines at each
     # thread count so every N=8 trigger cell has its comparison.
-    t_lat, t_size = ((lats[0], sizes[0]) if args.quick else
-                     (TRIGGER_LATENCY_US, TRIGGER_VALUE_SIZE))
+    t_lat, t_sync, t_size = trigger_profile(args)
     if 8 in ns and t_lat in lats and t_size in sizes:
         for threads in TRIGGER_THREAD_COUNTS:
             for sync in syncs:
@@ -282,7 +292,6 @@ def build_matrix(args):
         # One slow partition at N=8, mirroring the trigger profile (or the
         # --quick one) so the straggler cost reads directly against the
         # even N=8 cell.
-        t_sync = syncs[-1] if args.quick else TRIGGER_SYNC_MODE
         for rep in range(reps):
             add({
                 "n": 8, "usage": "partition_by_column_family",
@@ -579,7 +588,7 @@ def slow_vs_even(aggregates):
     return rows
 
 
-def compute_trigger(aggregates, threads):
+def compute_trigger(aggregates, threads, profile):
     """The abandon trigger: p99 gate wait over p99 write latency at N=8,
     injected.
 
@@ -601,10 +610,10 @@ def compute_trigger(aggregates, threads):
                      "gate_p99_us": gate, "write_p99_us": write,
                      "ratio": gate / write if write else None})
     verdict = None
+    t_lat, t_sync, t_size = profile
     for r in rows:
-        if (r["append_us"] == TRIGGER_LATENCY_US and
-                r["sync"] == TRIGGER_SYNC_MODE and
-                r["value_size"] == TRIGGER_VALUE_SIZE and
+        if (r["append_us"] == t_lat and r["sync"] == t_sync and
+                r["value_size"] == t_size and
                 r["threads"] == threads and not r["bandwidth_mbps"]):
             verdict = {"cell": r, "threshold": TRIGGER_THRESHOLD,
                        "fires": r["ratio"] is not None and
@@ -666,11 +675,36 @@ def render_table(aggregates, keys, title):
     return "\n".join(lines)
 
 
-def reproducibility(results, previous_path):
-    """--compare_to: this run against an earlier results.json, by the
-    criterion fixed at REPRO_METRICS / REPRO_MAX_DELTA above."""
-    with open(previous_path) as f:
-        previous = json.load(f)
+def load_previous(path):
+    """Reads and checks a --compare_to results.json up front, so a missing or
+    malformed file fails before any cell runs instead of after the sweep.
+    Raises ValueError naming the problem."""
+    try:
+        with open(path) as f:
+            previous = json.load(f)
+    except (OSError, ValueError) as e:
+        raise ValueError("cannot read %s: %s" % (path, e))
+    if not isinstance(previous, dict):
+        raise ValueError("%s is not a results.json object" % path)
+    try:
+        for a in previous.get("aggregates", []):
+            stored_key(a["config"])
+            for metric in REPRO_METRICS:
+                float(a["agg"][metric]["median"])
+        for r in previous.get("comparisons", []):
+            _ = (r["cell"], r["baseline"], r["verdict"])
+        v = previous.get("trigger_verdict")
+        if v is not None:
+            _ = v["fires"]
+    except (KeyError, TypeError, ValueError) as e:
+        raise ValueError("%s is not a usable results.json: %r" % (path, e))
+    return previous
+
+
+def reproducibility(results, previous_path, previous):
+    """--compare_to: this run against an earlier results.json (already
+    loaded and checked by load_previous), by the criterion fixed at
+    REPRO_METRICS / REPRO_MAX_DELTA above."""
     lines = ["## Reproducibility against %s" % previous_path,
              "criterion: helps/neutral/hurts and trigger verdicts unchanged, "
              "and every %s median within %d%% of the earlier median"
@@ -765,7 +799,8 @@ def write_outputs(args, results):
         md.append("%s | %.3f | %.3f | %s | %s"
                   % (r["cell"], r["throughput_ratio"], r["write_p99_ratio"],
                      fmt(r["gate_p99_even"]), fmt(r["gate_p99_slow"])))
-    trigger_rows, verdict = compute_trigger(aggregates, args.threads)
+    profile = trigger_profile(args)
+    trigger_rows, verdict = compute_trigger(aggregates, args.threads, profile)
     results["trigger_rows"] = trigger_rows
     results["trigger_verdict"] = verdict
     md += ["", "## Abandon trigger at N=8",
@@ -782,8 +817,7 @@ def write_outputs(args, results):
     if verdict is None:
         verdict_line = ("TRIGGER: no (append=%d, sync=%s, size=%d) cell at "
                         "N=8; no verdict%s"
-                        % (TRIGGER_LATENCY_US, TRIGGER_SYNC_MODE,
-                           TRIGGER_VALUE_SIZE, worst_text))
+                        % (profile + (worst_text,)))
     else:
         verdict_line = ("TRIGGER: ratio %.4f at %s %s (threshold %.2f)%s"
                         % (verdict["cell"]["ratio"], verdict["cell"]["cell"],
@@ -792,7 +826,7 @@ def write_outputs(args, results):
     md += ["", verdict_line, ""]
     if args.compare_to:
         repro_lines, results["reproducible"] = reproducibility(
-            results, args.compare_to)
+            results, args.compare_to, args.previous)
         md += repro_lines + [""]
         verdict_line += "\n" + repro_lines[-1]
     with open(os.path.join(args.output_dir, "results.json"), "w") as f:
@@ -807,6 +841,13 @@ def main(argv):
     if not os.path.isfile(args.db_bench) or not os.access(args.db_bench, os.X_OK):
         print("not an executable: %s" % args.db_bench, file=sys.stderr)
         return 2
+    args.previous = None
+    if args.compare_to:
+        try:
+            args.previous = load_previous(args.compare_to)
+        except ValueError as e:
+            print("bad --compare_to: %s" % e, file=sys.stderr)
+            return 2
     os.makedirs(args.output_dir, exist_ok=True)
     try:
         cells = build_matrix(args)

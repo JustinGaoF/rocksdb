@@ -161,8 +161,12 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch,
           const bool is_wal_index_fragment_type =
               IsWALIndexRecordType(record_type);
           if (is_wal_index_fragment_type != fragmented_record_has_wal_index) {
-            ReportCorruption(fragment.size(),
-                             "inconsistent WAL index fragment types");
+            DropInconsistentFragmentedRecord(scratch, fragment);
+            in_fragmented_record = false;
+            if (record_checksum != nullptr) {
+              XXH3_64bits_reset(hash_state_);
+            }
+            break;  // switch
           }
           if (record_checksum != nullptr) {
             XXH3_64bits_update(hash_state_, fragment.data(), fragment.size());
@@ -182,8 +186,12 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch,
           const bool is_wal_index_fragment_type =
               IsWALIndexRecordType(record_type);
           if (is_wal_index_fragment_type != fragmented_record_has_wal_index) {
-            ReportCorruption(fragment.size(),
-                             "inconsistent WAL index fragment types");
+            DropInconsistentFragmentedRecord(scratch, fragment);
+            in_fragmented_record = false;
+            if (record_checksum != nullptr) {
+              XXH3_64bits_reset(hash_state_);
+            }
+            break;  // switch
           }
           if (record_checksum != nullptr) {
             XXH3_64bits_update(hash_state_, fragment.data(), fragment.size());
@@ -810,6 +818,17 @@ void Reader::UnmarkEOFInternal() {
   }
 }
 
+void Reader::DropInconsistentFragmentedRecord(std::string* fragments,
+                                              const Slice& fragment) {
+  // The fragments disagree on whether the record carries a WAL index, so the
+  // index can be neither stripped nor verified: abandon the whole record
+  // (the fragments read so far and this one), as for a checksum mismatch,
+  // rather than return it under a recovery mode that tolerates corruption.
+  ReportCorruption(fragments->size() + fragment.size(),
+                   "inconsistent WAL index fragment types");
+  fragments->clear();
+}
+
 void Reader::ReportCorruption(size_t bytes, const char* reason,
                               uint64_t log_number) {
   ReportDrop(bytes, Status::Corruption(reason), log_number);
@@ -1132,8 +1151,9 @@ bool FragmentBufferedReader::ReadRecord(Slice* record, std::string* scratch,
           const bool is_wal_index_fragment_type =
               IsWALIndexRecordType(fragment_type_or_err);
           if (is_wal_index_fragment_type != fragmented_record_has_wal_index_) {
-            ReportCorruption(fragment.size(),
-                             "inconsistent WAL index fragment types");
+            DropInconsistentFragmentedRecord(&fragments_, fragment);
+            in_fragmented_record_ = false;
+            break;
           }
           fragments_.append(fragment.data(), fragment.size());
         }
@@ -1150,8 +1170,9 @@ bool FragmentBufferedReader::ReadRecord(Slice* record, std::string* scratch,
           const bool is_wal_index_fragment_type =
               IsWALIndexRecordType(fragment_type_or_err);
           if (is_wal_index_fragment_type != fragmented_record_has_wal_index_) {
-            ReportCorruption(fragment.size(),
-                             "inconsistent WAL index fragment types");
+            DropInconsistentFragmentedRecord(&fragments_, fragment);
+            in_fragmented_record_ = false;
+            break;
           }
           fragments_.append(fragment.data(), fragment.size());
           scratch->assign(fragments_.data(), fragments_.size());

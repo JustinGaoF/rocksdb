@@ -35,8 +35,11 @@ if [ "$#" -ne 2 ]; then
 fi
 DB_BENCH_A=$1
 DB_BENCH_B=$2
+# Install the cleanup first, so an interrupt between mktemp and the trap
+# cannot leave the directory behind.
+WORK_DIR=
+trap 'if [ -n "$WORK_DIR" ]; then rm -rf "$WORK_DIR"; fi' EXIT
 WORK_DIR=$(mktemp -d "${TEST_TMPDIR:-/tmp}/wal_byte_identity.XXXXXX")
-trap 'rm -rf "$WORK_DIR"' EXIT
 
 COMMON_ARGS="--benchmarks=fillseq --threads=1 --num=10000 --seed=20260928 \
 --disable_auto_compactions=1"

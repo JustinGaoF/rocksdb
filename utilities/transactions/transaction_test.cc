@@ -10844,6 +10844,133 @@ TEST(TransactionPartitionedWalTest, PreparedUnindexedWalSurvivesPartitioning) {
   ASSERT_OK(DestroyDB(dbname, options));
 }
 
+// A rolled-back transaction must stay resolved after the WALs below a
+// still-pending prepare retire. Each rotation numbers its new WALs in
+// partition order, so if the rollback marker went to a lower partition than
+// its prepare (routing by column family for the prepare, by XID for the
+// marker), it would sit in a lower-numbered WAL of the same rotation, retire
+// with everything below the pending prepare's WAL, and leave its transaction
+// looking prepared after recovery.
+TEST(TransactionPartitionedWalTest, ResolvedPrepareStaysResolvedAfterRotation) {
+  constexpr size_t kPartitions = 8;
+  const std::string dbname =
+      test::PerThreadDBPath("transaction_partitioned_wal_rollback_marker");
+  Options options;
+  options.create_if_missing = true;
+  options.create_missing_column_families = true;
+  options.wal_partitions = kPartitions;
+  options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  options.avoid_flush_during_recovery = true;
+  options.avoid_flush_during_shutdown = true;
+  options.track_and_verify_wals_in_manifest = true;
+  ASSERT_OK(DestroyDB(dbname, options));
+  // A column family whose data routes to the highest partition, and an XID
+  // that routes to partition 0.
+  std::vector<ColumnFamilyDescriptor> cfs;
+  cfs.emplace_back(kDefaultColumnFamilyName, ColumnFamilyOptions(options));
+  uint32_t high_cf = 0;
+  for (uint32_t cf_id = 1; high_cf == 0; ++cf_id) {
+    cfs.emplace_back("cf" + std::to_string(cf_id),
+                     ColumnFamilyOptions(options));
+    WriteBatch batch;
+    ASSERT_OK(WriteBatchInternal::Put(&batch, cf_id, "key", "value"));
+    size_t partition = kPartitions;
+    ASSERT_OK(
+        DBImpl::TEST_WalPartitionForWrite(batch, kPartitions, &partition));
+    if (partition == kPartitions - 1) {
+      high_cf = cf_id;
+    }
+  }
+  std::string low_xid;
+  for (int i = 0; low_xid.empty(); ++i) {
+    const std::string xid = "resolved-" + std::to_string(i);
+    WriteBatch marker;
+    ASSERT_OK(WriteBatchInternal::MarkRollback(&marker, xid));
+    size_t partition = kPartitions;
+    ASSERT_OK(
+        DBImpl::TEST_WalPartitionForWrite(marker, kPartitions, &partition));
+    if (partition == 0) {
+      low_xid = xid;
+    }
+  }
+  std::vector<ColumnFamilyHandle*> handles;
+  TransactionDB* db = nullptr;
+  std::vector<Transaction*> txns;
+  Defer release([&] {
+    for (Transaction* txn : txns) {
+      delete txn;
+    }
+    if (db != nullptr) {
+      for (ColumnFamilyHandle* handle : handles) {
+        db->DestroyColumnFamilyHandle(handle).PermitUncheckedError();
+      }
+      delete db;
+    }
+  });
+  auto open = [&] {
+    ASSERT_OK(TransactionDB::Open(options, TransactionDBOptions(), dbname, cfs,
+                                  &handles, &db));
+  };
+  auto close = [&] {
+    for (Transaction* txn : txns) {
+      delete txn;
+    }
+    txns.clear();
+    for (ColumnFamilyHandle* handle : handles) {
+      ASSERT_OK(db->DestroyColumnFamilyHandle(handle));
+    }
+    handles.clear();
+    delete db;
+    db = nullptr;
+  };
+
+  for (bool commit : {false, true}) {
+    SCOPED_TRACE(commit ? "commit" : "rollback");
+    ASSERT_OK(DestroyDB(dbname, options));
+    open();
+    // Pinned by its pending prepare, this transaction's WAL is the oldest one
+    // the rotation below keeps.
+    Transaction* pending = db->BeginTransaction(WriteOptions());
+    txns.push_back(pending);
+    ASSERT_OK(pending->SetName("pending"));
+    ASSERT_OK(pending->Put(handles[high_cf], "pending", "value"));
+    ASSERT_OK(pending->Prepare());
+    Transaction* resolved = db->BeginTransaction(WriteOptions());
+    txns.push_back(resolved);
+    ASSERT_OK(resolved->SetName(low_xid));
+    ASSERT_OK(resolved->Put(handles[high_cf], "resolved", "value"));
+    ASSERT_OK(resolved->Prepare());
+    ASSERT_OK(commit ? resolved->Commit() : resolved->Rollback());
+    for (ColumnFamilyHandle* handle : handles) {
+      ASSERT_OK(db->Put(WriteOptions(), handle, "rotate", "value"));
+      ASSERT_OK(db->Flush(FlushOptions(), handle));
+    }
+    static_cast_with_check<DBImpl>(db->GetRootDB())->TEST_DeleteObsoleteFiles();
+    // Crash with the pending transaction still prepared.
+    close();
+
+    open();
+    std::vector<Transaction*> prepared;
+    db->GetAllPreparedTransactions(&prepared);
+    std::vector<std::string> names;
+    for (Transaction* txn : prepared) {
+      names.push_back(txn->GetName());
+      txns.push_back(txn);
+    }
+    EXPECT_EQ(std::vector<std::string>{"pending"}, names);
+    std::string value;
+    const Status get =
+        db->Get(ReadOptions(), handles[high_cf], "resolved", &value);
+    if (commit) {
+      EXPECT_OK(get);
+    } else {
+      EXPECT_TRUE(get.IsNotFound()) << get.ToString();
+    }
+    close();
+  }
+  ASSERT_OK(DestroyDB(dbname, options));
+}
+
 // G-10: CommitAndTryCreateSnapshot's timestamped snapshot must not publish its
 // commit sequence above the N>1 applied prefix. With A, the lower sequence on
 // partition 0, held in its append, B's commit on partition 1 must leave B's

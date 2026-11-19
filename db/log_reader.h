@@ -370,6 +370,10 @@ class Reader {
 
   // Reports dropped bytes to the reporter.
   // buffer_ must be updated to remove the dropped bytes prior to invocation.
+  // Reports a fragmented record whose fragments disagree on carrying a WAL
+  // index as corrupt and discards it.
+  void DropInconsistentFragmentedRecord(std::string* fragments,
+                                        const Slice& fragment);
   void ReportCorruption(size_t bytes, const char* reason,
                         uint64_t log_number = kMaxSequenceNumber);
   void ReportDrop(size_t bytes, const Status& reason,

@@ -1606,8 +1606,9 @@ TEST_F(OptionsTest, DBOptionsComposeImmutable) {
                                                   new_opts));
 }
 
-// GC27 Q9 (a): every value serializes to one of its spellings and parses
-// back, and so does wal_partitions; RandomInitDBOptions covers both fields in
+// GC27 Q9 (a): every value serializes to its enumerator's name (whichever
+// spelling is parsed) and parses back from each spelling, and so does
+// wal_partitions; RandomInitDBOptions covers both fields in
 // DBOptionsSerialization and DBOptionsComposeImmutable.
 TEST_F(OptionsTest, PartitionWALOptionsRoundTrip) {
   ConfigOptions config_options;
@@ -1631,10 +1632,19 @@ TEST_F(OptionsTest, PartitionWALOptionsRoundTrip) {
       ASSERT_OK(GetStringFromDBOptions(config_options, base_opts, &serialized));
       std::unordered_map<std::string, std::string> opts_map;
       ASSERT_OK(StringToMap(serialized, &opts_map));
-      ASSERT_NE(std::find(spellings.begin(), spellings.end(),
-                          opts_map["partition_wal_usage"]),
-                spellings.end())
-          << opts_map["partition_wal_usage"];
+      ASSERT_EQ(spellings.front(), opts_map["partition_wal_usage"]);
+      for (const std::string& spelling : spellings) {
+        DBOptions parsed;
+        ASSERT_OK(GetDBOptionsFromString(config_options, DBOptions(),
+                                         "partition_wal_usage=" + spelling,
+                                         &parsed));
+        ASSERT_EQ(usage, parsed.partition_wal_usage);
+        std::string reserialized;
+        ASSERT_OK(GetStringFromDBOptions(config_options, parsed, &reserialized));
+        std::unordered_map<std::string, std::string> reserialized_map;
+        ASSERT_OK(StringToMap(reserialized, &reserialized_map));
+        ASSERT_EQ(spellings.front(), reserialized_map["partition_wal_usage"]);
+      }
       ASSERT_EQ(std::to_string(partitions), opts_map["wal_partitions"]);
 
       DBOptions new_opts;

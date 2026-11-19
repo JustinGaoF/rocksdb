@@ -117,14 +117,28 @@ size_t DBImpl::WalPartitionForWrite(
     return 0;
   }
 
-  // The route reads only the lowest column family id, else the lowest XID,
-  // so a scan of the record headers suffices: no handler dispatch, no set,
-  // and it stops at column family 0, below which nothing routes. The tags
-  // are the ones WriteBatch::Iterate hands a ColumnFamilyCollector (column
-  // families) and the commit, rollback and end-prepare markers (XIDs). A
-  // record the scan cannot parse ends it: the route stays deterministic
-  // (what was read before it, else partition 0), and the write path reports
-  // the corruption exactly as with one partition.
+  // A batch carrying a two-phase commit marker (end-prepare, commit or
+  // rollback) routes by its lowest XID alone, ignoring any column family
+  // data in it, so a transaction's prepare and its commit or rollback
+  // marker share one partition. WAL numbers only grow within a partition, so
+  // the marker is never in a WAL numbered below its prepare's: WAL retirement
+  // keeps everything from the oldest WAL holding a pending prepare up, and
+  // would otherwise retire a marker that another partition received in a
+  // lower-numbered WAL of the same rotation, leaving its transaction looking
+  // prepared after recovery. Every other batch routes by its lowest column
+  // family id. The content flags make this check free for batches built
+  // through the WriteBatch API.
+  const bool route_by_xid =
+      batch.HasEndPrepare() || batch.HasCommit() || batch.HasRollback();
+
+  // Either way a scan of the record headers suffices: no handler dispatch,
+  // no set. A column family scan stops at column family 0, below which
+  // nothing routes; an XID scan reads to the end, as the markers follow the
+  // data. The tags are the ones WriteBatch::Iterate hands a
+  // ColumnFamilyCollector (column families) and the commit, rollback and
+  // end-prepare markers (XIDs). A record the scan cannot parse ends it: the
+  // route stays deterministic (what was read before it, else partition 0),
+  // and the write path reports the corruption exactly as with one partition.
   std::optional<uint32_t> column_family_id;
   bool has_xid = false;
   Slice xid;
@@ -137,7 +151,8 @@ size_t DBImpl::WalPartitionForWrite(
   Slice key;
   Slice value;
   Slice blob;
-  while (!input.empty() && column_family_id.value_or(1) != 0) {
+  while (!input.empty() &&
+         (route_by_xid || column_family_id.value_or(1) != 0)) {
     char tag = 0;
     uint32_t record_column_family = 0;
     Slice record_xid;
@@ -164,9 +179,11 @@ size_t DBImpl::WalPartitionForWrite(
       case kTypeWideColumnEntity:
       case kTypeColumnFamilyValuePreferredSeqno:
       case kTypeValuePreferredSeqno:
-        column_family_id =
-            std::min(column_family_id.value_or(record_column_family),
-                     record_column_family);
+        if (!route_by_xid) {
+          column_family_id =
+              std::min(column_family_id.value_or(record_column_family),
+                       record_column_family);
+        }
         break;
       case kTypeEndPrepareXID:
       case kTypeCommitXID:
@@ -181,7 +198,7 @@ size_t DBImpl::WalPartitionForWrite(
         break;
     }
   }
-  if (deferred_put_entities != nullptr) {
+  if (!route_by_xid && deferred_put_entities != nullptr) {
     for (const auto& op : deferred_put_entities->ops) {
       column_family_id = std::min(
           column_family_id.value_or(op.column_family_id), op.column_family_id);
@@ -189,12 +206,12 @@ size_t DBImpl::WalPartitionForWrite(
   }
 
   uint64_t hash = 0;
-  if (column_family_id.has_value()) {
+  if (has_xid) {
+    hash = Hash64(xid.data(), xid.size(), kWalXidRoutingSeed);
+  } else if (column_family_id.has_value()) {
     char encoded_id[sizeof(uint32_t)];
     EncodeFixed32(encoded_id, column_family_id.value());
     hash = Hash64(encoded_id, sizeof(encoded_id), kWalColumnFamilyRoutingSeed);
-  } else if (has_xid) {
-    hash = Hash64(xid.data(), xid.size(), kWalXidRoutingSeed);
   } else {
     return 0;
   }

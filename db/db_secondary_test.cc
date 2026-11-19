@@ -486,6 +486,40 @@ TEST_F(DBSecondaryTest, GC22RefusesMarkerlessIndexedWal) {
       << s.ToString();
 }
 
+// A damaged head (a corrupt checksum on the marker, which drops the rest of
+// its block) leaves a small indexed WAL with nothing readable. The primary
+// refuses it in every recovery mode ("head damaged and unattested"); so does
+// a secondary, rather than open as if the WAL were empty and serve a DB
+// missing the WAL's acknowledged write.
+TEST_F(DBSecondaryTest, RefusesDamagedHeadInIndexedDb) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.partition_wal_usage = PartitionWALUsage::kPartitionByColumnFamily;
+  Reopen(options);
+  ASSERT_OK(Put("key", "value"));
+  const uint64_t wal = dbfull()->TEST_CurrentWalNumber(0);
+  Close();
+  const std::string fname = LogFileName(dbname_, wal);
+  std::string contents;
+  ASSERT_OK(ReadFileToString(env_, fname, &contents));
+  ASSERT_GT(contents.size(), static_cast<size_t>(log::kHeaderSize));
+  ASSERT_LT(contents.size(), static_cast<size_t>(log::kBlockSize));
+  contents[0] ^= 0x5a;  // the marker's checksum
+  ASSERT_OK(WriteStringToFile(env_, contents, fname, /*should_sync=*/true));
+
+  for (WALRecoveryMode mode : {WALRecoveryMode::kTolerateCorruptedTailRecords,
+                               WALRecoveryMode::kAbsoluteConsistency,
+                               WALRecoveryMode::kPointInTimeRecovery,
+                               WALRecoveryMode::kSkipAnyCorruptedRecords}) {
+    SCOPED_TRACE("wal_recovery_mode " + std::to_string(static_cast<int>(mode)));
+    Options secondary_options = options;
+    secondary_options.max_open_files = -1;
+    secondary_options.wal_recovery_mode = mode;
+    Status s = TryOpenSecondary(secondary_options);
+    ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+  }
+}
+
 // GC23 Q6, ported from GC22's Muse candidate: with manual_wal_flush at N=1
 // and unindexed WALs, a catch-up round whose WAL is still empty on disk
 // proceeds and applies nothing; an empty head with no WAL index anywhere is

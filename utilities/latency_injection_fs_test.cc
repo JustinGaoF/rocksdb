@@ -734,6 +734,28 @@ TEST_F(LatencyInjectionFSTest, TransferMicrosIsExactAndCannotOverflow) {
   }
 }
 
+TEST_F(LatencyInjectionFSTest, JitterStaysInRangeForEveryBound) {
+  // Every bound gives a value in [0, bound]; the largest bound, where
+  // bound + 1 wraps, must not divide by zero and spans the whole range.
+  constexpr uint64_t kMax = std::numeric_limits<uint64_t>::max();
+  for (uint64_t bound : {uint64_t{0}, uint64_t{1}, uint64_t{2}, uint64_t{1000},
+                         kMax - 1, kMax}) {
+    SCOPED_TRACE("bound " + std::to_string(bound));
+    uint64_t largest = 0;
+    for (uint64_t op = 0; op < 1000; ++op) {
+      const uint64_t jitter =
+          LatencyInjectionFileSystem::JitterMicros(1001, 7, op, bound);
+      ASSERT_LE(jitter, bound);
+      largest = std::max(largest, jitter);
+    }
+    if (bound >= 1000) {
+      EXPECT_GT(largest, bound / 2);
+    } else {
+      EXPECT_EQ(bound, largest);
+    }
+  }
+}
+
 TEST_F(LatencyInjectionFSTest, AppendDelayScalesWithBytes) {
   // Q1: with base 0, each append is delayed by exactly its bytes at the
   // append bandwidth, rounded up, and the size term is reported apart.

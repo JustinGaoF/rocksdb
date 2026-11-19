@@ -1797,6 +1797,52 @@ TEST_P(LogTest, WALIndexInconsistentFragmentTypesReportsCorruption) {
   ASSERT_EQ("OK", MatchError("inconsistent WAL index fragment types"));
 }
 
+// A fragmented record whose fragments disagree about carrying a wal_index is
+// dropped whole, even in a recovery mode that skips corruption: its index can
+// be neither stripped nor verified, so returning it would hand back bytes that
+// were never written as one record. The record after it is still read.
+TEST_P(LogTest, WALIndexInconsistentMiddleFragmentDropsRecord) {
+  const bool recyclable = std::get<0>(GetParam()) != 0;
+  EnableWALIndex(/*write_marker=*/false);
+  // first, middle and last fragments; the second one starts the next block.
+  Write(BigString("x", 2 * kBlockSize));
+  Write("next");
+  const int second_header = kBlockSize;
+  const std::string contents = get_reader_contents()->ToString();
+  const uint32_t len =
+      (static_cast<uint32_t>(contents[second_header + 4]) & 0xff) |
+      ((static_cast<uint32_t>(contents[second_header + 5]) & 0xff) << 8);
+  SetByte(second_header + 6,
+          static_cast<char>(recyclable ? kRecyclableMiddleType : kMiddleType));
+  FixChecksum(second_header, static_cast<int>(len), recyclable);
+
+  ASSERT_EQ("next", Read(WALRecoveryMode::kSkipAnyCorruptedRecords));
+  ASSERT_EQ("EOF", Read(WALRecoveryMode::kSkipAnyCorruptedRecords));
+  ASSERT_EQ("OK", MatchError("inconsistent WAL index fragment types"));
+  ASSERT_GE(DroppedBytes(), static_cast<size_t>(kBlockSize));
+}
+
+TEST_P(LogTest, WALIndexInconsistentLastFragmentDropsRecord) {
+  const bool recyclable = std::get<0>(GetParam()) != 0;
+  EnableWALIndex(/*write_marker=*/false);
+  // first and last fragments; the second one starts the next block.
+  Write(BigString("x", kBlockSize + kBlockSize / 2));
+  Write("next");
+  const int second_header = kBlockSize;
+  const std::string contents = get_reader_contents()->ToString();
+  const uint32_t len =
+      (static_cast<uint32_t>(contents[second_header + 4]) & 0xff) |
+      ((static_cast<uint32_t>(contents[second_header + 5]) & 0xff) << 8);
+  SetByte(second_header + 6,
+          static_cast<char>(recyclable ? kRecyclableLastType : kLastType));
+  FixChecksum(second_header, static_cast<int>(len), recyclable);
+
+  ASSERT_EQ("next", Read(WALRecoveryMode::kSkipAnyCorruptedRecords));
+  ASSERT_EQ("EOF", Read(WALRecoveryMode::kSkipAnyCorruptedRecords));
+  ASSERT_EQ("OK", MatchError("inconsistent WAL index fragment types"));
+  ASSERT_GE(DroppedBytes(), static_cast<size_t>(kBlockSize));
+}
+
 // wal_index is consecutive across the WAL partition as a whole. With two
 // writers sharing one counter neither file is internally consecutive, but the
 // union of the indices that actually landed on disk is exactly the run the
@@ -2290,6 +2336,8 @@ TEST_P(LogTest, GC27InvalidWALIndexControlRecordsFailBeforeWriting) {
   expect_corruption(
       writer_->AddWALIndexPredecessorSpanRecord(WriteOptions(), 122, 61, 60),
       "predecessor span of WAL 122 [61, 60] in WAL 123");
+  expect_corruption(writer_->AddWALIndexProgressRecord(WriteOptions(), 0),
+                    "invalid WAL index progress bound 0 in WAL 123");
 
   ASSERT_EQ("before", Read());
   ASSERT_EQ("EOF", Read());

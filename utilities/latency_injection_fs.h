@@ -117,6 +117,12 @@ class LatencyInjectionFileSystem : public FileSystemWrapper {
   // any bandwidth.
   static uint64_t TransferMicros(uint64_t bytes, uint64_t bytes_per_sec);
 
+  // The jitter added to the op_index-th operation on WAL `wal_number`: a
+  // deterministic function of `seed`, uniform over [0, jitter_micros] for
+  // every bound, the maximum included.
+  static uint64_t JitterMicros(uint64_t seed, uint64_t wal_number,
+                               uint64_t op_index, uint64_t jitter_micros);
+
  private:
   struct AtomicCounters {
     std::atomic<uint64_t> appends{0};

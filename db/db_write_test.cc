@@ -157,6 +157,45 @@ TEST(WalRoutingTest, HashesXidForZeroColumnFamilyBatches) {
   EXPECT_EQ(no_xid_partition, 0);
 }
 
+TEST(WalRoutingTest, RoutesTwoPhaseRecordsByXid) {
+  // A transaction's prepare (with its data in any column family), its commit
+  // (alone or with a commit-time batch) and its rollback share one partition.
+  constexpr size_t kNumPartitions = 8;
+  std::vector<bool> covered(kNumPartitions, false);
+  for (uint32_t i = 0; i < 1000; ++i) {
+    const std::string xid = "transaction-" + std::to_string(i);
+    WriteBatch marker;
+    ASSERT_OK(WriteBatchInternal::MarkCommit(&marker, xid));
+    size_t expected_partition = kNumPartitions;
+    ASSERT_OK(DBImpl::TEST_WalPartitionForWrite(marker, kNumPartitions,
+                                                &expected_partition));
+    ASSERT_LT(expected_partition, kNumPartitions);
+    covered[expected_partition] = true;
+
+    const uint32_t cf_id = i % 17;
+    WriteBatch prepare;
+    ASSERT_OK(WriteBatchInternal::InsertNoop(&prepare));
+    ASSERT_OK(WriteBatchInternal::Put(&prepare, cf_id, "key", "value"));
+    ASSERT_OK(WriteBatchInternal::MarkEndPrepare(&prepare, xid));
+    WriteBatch commit_with_data;
+    ASSERT_OK(WriteBatchInternal::Put(&commit_with_data, cf_id, "commit-time",
+                                      "value"));
+    ASSERT_OK(WriteBatchInternal::MarkCommit(&commit_with_data, xid));
+    WriteBatch rollback;
+    ASSERT_OK(WriteBatchInternal::MarkRollback(&rollback, xid));
+    for (const WriteBatch* batch : {&prepare, &commit_with_data, &rollback}) {
+      size_t partition = kNumPartitions;
+      ASSERT_OK(DBImpl::TEST_WalPartitionForWrite(*batch, kNumPartitions,
+                                                  &partition));
+      ASSERT_EQ(expected_partition, partition) << xid;
+    }
+  }
+  for (size_t partition = 0; partition < kNumPartitions; ++partition) {
+    EXPECT_TRUE(covered[partition])
+        << "no XID routed to partition " << partition;
+  }
+}
+
 TEST(WalRoutingTest, OnePartitionIsNeutered) {
   WriteBatch cf_batch;
   ASSERT_OK(WriteBatchInternal::Put(&cf_batch, 123, "key", "value"));
@@ -265,9 +304,10 @@ TEST(WalRoutingTest, HashesPrepareAndTimestampedCommitXids) {
 
 namespace {
 
-// The router as D122869562 wrote it: a full WriteBatch::Iterate into a
+// The router as D122869562 defines it: a full WriteBatch::Iterate into a
 // ColumnFamilyCollector that also keeps the smallest XID, then the same seeds
-// and tie-breaks. Kept as the reference the header-scan router must match.
+// and tie-breaks (an XID, when the batch has one, before any column family).
+// Kept as the reference the header-scan router must match.
 class ReferenceRoutingCollector final : public ColumnFamilyCollector {
  public:
   Status MarkEndPrepare(const Slice& xid) override { return AddXid(xid); }
@@ -303,14 +343,14 @@ size_t ReferenceWalPartition(const WriteBatch& batch,
     cf = std::min(cf.value_or(id), id);
   }
   uint64_t hash = 0;
-  if (cf.has_value()) {
+  if (collector.has_xid_) {
+    hash = Hash64(collector.xid_.data(), collector.xid_.size(),
+                  /*kWalXidRoutingSeed=*/0xbb67ae8584caa73bULL);
+  } else if (cf.has_value()) {
     char encoded_id[sizeof(uint32_t)];
     EncodeFixed32(encoded_id, cf.value());
     hash = Hash64(encoded_id, sizeof(encoded_id),
                   /*kWalColumnFamilyRoutingSeed=*/0x6a09e667f3bcc909ULL);
-  } else if (collector.has_xid_) {
-    hash = Hash64(collector.xid_.data(), collector.xid_.size(),
-                  /*kWalXidRoutingSeed=*/0xbb67ae8584caa73bULL);
   } else {
     return 0;
   }
@@ -322,7 +362,7 @@ size_t ReferenceWalPartition(const WriteBatch& batch,
 TEST(WalRoutingTest, HeaderScanMatchesIteratingRouter) {
   // G-19b: the router reads record headers instead of iterating the batch
   // through a handler, and must route every batch exactly as the iterating
-  // router did: same seeds, smallest CF id first, else smallest XID, else 0,
+  // router did: same seeds, smallest XID first, else smallest CF id, else 0,
   // deferred PutEntity ops counted. The corpus mixes every record kind the
   // router reads (and LogData and Noop, which it skips) across single-CF,
   // multi-CF, XID-only, LogData-only and deferred-entity batches. Changing

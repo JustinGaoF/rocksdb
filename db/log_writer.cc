@@ -374,7 +374,12 @@ IOStatus Writer::AddWALIndexProgressRecord(const WriteOptions& write_options,
   if (!WALIndexEnabled()) {
     return IOStatus::OK();
   }
-  assert(bound != 0);
+  if (bound == 0) {
+    // A bound counts from 1, and the reader rejects a zero one: fail before
+    // writing rather than leave a record the next open cannot read.
+    return IOStatus::Corruption("invalid WAL index progress bound 0 in WAL " +
+                                std::to_string(log_number_));
+  }
   if (bound < last_progress_bound_recorded_) {
     return IOStatus::Corruption(
         "WAL index progress bound moves backward: " + std::to_string(bound) +
