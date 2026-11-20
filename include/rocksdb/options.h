@@ -480,8 +480,11 @@ enum class WALRecoveryMode : char {
 // flushed.
 // So while a live WAL may be in the new format, the MANIFEST carries a record
 // that older versions reject, and their DB::Open fails in every recovery mode
-// instead. Backups and checkpoints taken in that state carry it too: restoring
-// them needs a version that supports this option.
+// instead. While a live WAL may have been written with `wal_partitions` > 1,
+// it carries a second such record, so that recovery merges those WALs in
+// their written order even if a power loss left only partition 0's files.
+// Backups and checkpoints taken in that state carry it too: restoring them
+// needs a version that supports this option.
 //
 // This option and `DBOptions::wal_partitions` are two independent settings.
 // `partition_wal_usage` chooses the WAL record format: `kNone` is the vanilla
@@ -504,10 +507,10 @@ enum class WALRecoveryMode : char {
 //      `DB::GetCurrentWalFile()` as of the end of step 1.
 //   4. If `WAL_ttl_seconds` or `WAL_size_limit_MB` keeps an archive, purge
 //      `archive/` or wait until those limits expire the same WAL files there.
-//   5. Close, reopen once more with `kNone`, and close. The MANIFEST record
-//      is cleared by the first open that finds none of those WALs live, which
+//   5. Close, reopen once more with `kNone`, and close. The MANIFEST records
+//      are cleared by the first open that finds none of those WALs live, which
 //      may already be step 1's (avoid_flush_during_recovery=false flushes at
-//      open).
+//      open; so does any open of WALs written with `wal_partitions` > 1).
 //   6. On the closed DB, run `ldb check_wal_index` and require that it reports
 //      no live or archived WAL in the new format.
 //   7. Require that it also reports `WAL index guard: clear`; it exits 0 only

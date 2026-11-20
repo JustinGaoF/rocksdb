@@ -667,6 +667,10 @@ Status VersionEditHandler::ExtractInfoFromVersionEdit(ColumnFamilyData* cfd,
       assert(version_set_ != nullptr);
       version_set_->wal_index_guard_ = edit.GetWALIndexGuard();
     }
+    if (edit.HasWALPartitionGuard()) {
+      assert(version_set_ != nullptr);
+      version_set_->wal_partition_guard_ = edit.GetWALPartitionGuard();
+    }
     if (!version_edit_params_.HasPrevLogNumber()) {
       version_edit_params_.SetPrevLogNumber(0);
     }
