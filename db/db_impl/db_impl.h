@@ -3860,6 +3860,36 @@ class DBImpl : public DB
   // Takes mutex_ then; call without it.
   void EndUnpublishedSyncGroup();
 
+  // A sync group (N>1) counted in unpublished_sync_groups_ whose completion
+  // gate never ran (the group failed first) leaves the count as it returns.
+  // WriteImpl holds one; InstallWriteCompletionGate counts it (`db = this`),
+  // and the installed sync gate ends the count by clearing `db` before
+  // running RunSyncGate.
+  struct UnpublishedSyncGroup {
+    DBImpl* db = nullptr;
+    ~UnpublishedSyncGroup() {
+      if (db != nullptr) {
+        db->EndUnpublishedSyncGroup();
+      }
+    }
+  };
+
+  // N>1 only. Installs a write group's completion gate (and a sync group's
+  // async_writers_gate) on `write_group`: cold and never inlined into
+  // WriteImpl, so the N==1 hot frame carries none of the gate's
+  // lambda/empty-index plumbing. Same installs, order, captures (except the
+  // async gate's unused gate_low capture, which is dropped) and
+  // unpublished-sync-group accounting as the inline block it replaces.
+  // Returns whether any writer in `write_group` has a post-memtable
+  // callback.
+  bool InstallWriteCompletionGate(
+      WriteThread::WriteGroup& write_group, bool disable_wal, bool append_ok,
+      bool sync_group, SequenceNumber last_sequence, size_t seq_inc,
+      uint64_t wal_index, size_t async_seq_count, size_t wal_partition,
+      bool disable_memtable, size_t pre_release_callback_cnt,
+      size_t async_pre_release_callback_cnt, bool sync_writers_insert,
+      bool has_async_writer, UnpublishedSyncGroup* pending);
+
   // N>1 only. A sync write's own fsync, run from its completion gate once
   // its group has inserted, so no write on another partition waits for it.
   // Claims every WAL holding an unsynced record at or below `claim_bound`

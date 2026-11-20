@@ -1061,6 +1061,108 @@ void DBImpl::JoinBatchGroupTimed(WriteThread& write_thread,
   write_thread.JoinBatchGroup(w);
 }
 
+// Installs a write group's completion gate above one WAL partition (and a
+// sync group's async_writers_gate with it). Cold and never inlined into
+// WriteImpl: at one partition no group installs a gate, so the N==1 hot
+// frame and instruction footprint carry none of the gate's
+// lambda/empty-index plumbing (see the pipelined-writer frame note at the
+// stats in WriteImpl). Same installs, in the same order, with the same
+// captures (except the async gate's unused gate_low capture, which never
+// reached the gate and only padded WriteImpl's frame), the same
+// unpublished-sync-group count (which the installed sync gate ends), and
+// the same post-memtable-callback scan, whose outcome it returns.
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline, cold))
+#endif
+bool DBImpl::InstallWriteCompletionGate(
+    WriteThread::WriteGroup& write_group, bool disable_wal, bool append_ok,
+    bool sync_group, SequenceNumber last_sequence, size_t seq_inc,
+    uint64_t wal_index, size_t async_seq_count, size_t wal_partition,
+    bool disable_memtable, size_t pre_release_callback_cnt,
+    size_t async_pre_release_callback_cnt, bool sync_writers_insert,
+    bool has_async_writer, UnpublishedSyncGroup* pending) {
+  bool has_post_memtable_callback = false;
+  if (NumWalPartitions() > 1) {
+    for (auto* writer : write_group) {
+      has_post_memtable_callback |= writer->post_memtable_callback != nullptr;
+    }
+  }
+  if (NumWalPartitions() > 1 && !disable_wal && append_ok && !sync_group) {
+    // An async write never syncs; its gate waits only for every record at
+    // or below it to be written, and for its range to be published.
+    const SequenceNumber gate_target = last_sequence;
+    const uint64_t empty_wal_index = seq_inc == 0 ? wal_index : 0;
+    write_group.completion_gate = [this, gate_target, empty_wal_index]() {
+      return RunCompletionGate(gate_target, /*published=*/true,
+                               empty_wal_index);
+    };
+  } else if (sync_group && append_ok) {
+    // The sync writers' range, [sync_low, gate_target], is inserted
+    // with the group but published only once it and everything below it
+    // is fsynced (RunSyncGate). Counted until then, so no memtable switch
+    // comes while its fsync, and so the range, can still fail
+    // (WaitForPendingWrites).
+    const SequenceNumber sync_low = write_group.sync_first_sequence;
+    const SequenceNumber gate_target = last_sequence;
+    const uint64_t empty_wal_index = seq_inc == 0 ? wal_index : 0;
+    const size_t gate_partition = wal_partition;
+    const size_t sync_pre_release_callback_cnt =
+        pre_release_callback_cnt - async_pre_release_callback_cnt;
+    const WriteThread::WriteGroup* const group = &write_group;
+    unpublished_sync_groups_.fetch_add(1);
+    pending->db = this;
+    if (has_async_writer) {
+      // The async writers' range ends below sync_low and publishes as the
+      // group exits; they complete once it is visible, before the fsync.
+      // The async writers' stamp is the group's first sequence; with no
+      // sequence of their own it is also that of any lower-index record
+      // that consumes none, which only the WAL index orders.
+      const uint64_t async_empty_wal_index =
+          async_seq_count == 0 ? wal_index : 0;
+      write_group.async_writers_gate = [this, sync_low, group,
+                                        disable_memtable,
+                                        async_empty_wal_index]() {
+        Status s = WaitForWalDurability(sync_low - 1, /*wal_record=*/true,
+                                        /*published=*/true, /*applied=*/true,
+                                        async_empty_wal_index);
+        if (s.ok()) {
+          for (auto* writer : *group) {
+            if (!writer->sync && writer->post_memtable_callback) {
+              Status tmp_s = (*writer->post_memtable_callback)(
+                  sync_low - 1, disable_memtable);
+              assert(tmp_s.ok());
+            }
+          }
+        }
+        return s;
+      };
+    }
+    write_group.completion_gate =
+        [this, gate_partition, sync_low, gate_target, group, disable_memtable,
+         sync_pre_release_callback_cnt, sync_writers_insert, empty_wal_index,
+         pending]() {
+          // RunSyncGate ends the count.
+          pending->db = nullptr;
+          return RunSyncGate(gate_partition, sync_low, gate_target, *group,
+                             disable_memtable, sync_pre_release_callback_cnt,
+                             sync_writers_insert, empty_wal_index);
+        };
+  } else if (NumWalPartitions() > 1 &&
+             (seq_inc > 0 || has_post_memtable_callback) && append_ok) {
+    // A disableWAL group has nothing to make durable, but its sequences
+    // become visible only once every range below them is applied. Waiting
+    // for that keeps OK meaning read-your-writes. A group that consumes no
+    // sequence waits too when it creates a snapshot, which must not lie
+    // above the published frontier.
+    const SequenceNumber gate_target = last_sequence;
+    write_group.completion_gate = [this, gate_target]() {
+      return WaitForWalDurability(gate_target, /*wal_record=*/false,
+                                  /*published=*/true, /*applied=*/true);
+    };
+  }
+  return has_post_memtable_callback;
+}
+
 Status DBImpl::WriteImpl(
     const WriteOptions& write_options, WriteBatch* my_batch,
     WriteCallback* callback, UserWriteCallback* user_write_cb,
@@ -1416,19 +1518,16 @@ Status DBImpl::WriteImpl(
   bool group_inserts = false;
   bool sync_writers_insert = false;
   size_t async_seq_count = 0;
-  // The group's WAL index if it consumes no sequence, else 0 (see
-  // WalGateFence::empty_wal_index).
-  uint64_t group_empty_wal_index = 0;
+  // The group's WAL index if one was allocated, else 0. Function-scope so
+  // the WALIOStatusCheck error path below can stamp the group's empty index
+  // from it (see WalGateFence::empty_wal_index); the gate installs take it
+  // by value, so no second empty-index local is hoisted for them.
+  uint64_t wal_index = 0;
   // A sync group (N>1) counted in unpublished_sync_groups_ whose completion
   // gate never ran (the group failed first) leaves the count as it returns.
-  struct UnpublishedSyncGroup {
-    DBImpl* db = nullptr;
-    ~UnpublishedSyncGroup() {
-      if (db != nullptr) {
-        db->EndUnpublishedSyncGroup();
-      }
-    }
-  } unpublished_sync_group;
+  // InstallWriteCompletionGate counts it; the gate it installs ends the
+  // count (see UnpublishedSyncGroup).
+  UnpublishedSyncGroup unpublished_sync_group;
 
   assert(!two_write_queues_ || !disable_memtable);
   {
@@ -1631,10 +1730,11 @@ Status DBImpl::WriteImpl(
     // that nobody else can be writing to these particular stats.
     // We're optimistic, updating the stats before we successfully
     // commit.  That lets us release our leader status early.
-    // Branches rather than a per-stat lambda: with the completion gate's
-    // capture below, they keep WriteImpl's stack frame as it was before the
-    // DB stats were sharded, and so the stack placement of the pipelined
-    // writers below it, which one-partition throughput depends on.
+    // Branches rather than a per-stat lambda: they keep WriteImpl's stack
+    // frame as it was before the DB stats were sharded, and so the stack
+    // placement of the pipelined writers below it, which one-partition
+    // throughput depends on. The completion gate's install, with its
+    // captures, lives in InstallWriteCompletionGate for the same reason.
     auto stats = default_cf_internal_stats_;
     auto write_done_by_other = write_group.size - 1;
     if (NumWalPartitions() > 1 && !two_write_queues_) {
@@ -1683,7 +1783,6 @@ Status DBImpl::WriteImpl(
 
     PERF_TIMER_STOP(write_pre_and_post_process_time);
 
-    uint64_t wal_index = 0;
     // Appends the group's merged batch, its first sequence `sequence`.
     auto append_group = [&](SequenceNumber sequence) {
       assert(wal_context.wal_file_number_size);
@@ -1731,7 +1830,6 @@ Status DBImpl::WriteImpl(
         if (io_s.ok() && sync_group) {
           write_group.sync_first_sequence = last_sequence + 1 + async_seq_count;
         }
-        group_empty_wal_index = seq_inc == 0 ? wal_index : 0;
       }
       // Above one partition the append runs once the memtable writers are
       // launched, below.
@@ -1853,91 +1951,18 @@ Status DBImpl::WriteImpl(
     // runs it after promoting the next leader, and only if the append
     // succeeded: a failed append stays pinned and must never be waited on.
     // disableWAL groups never registered for durability and get the
-    // publication-only gate below. At one partition the first condition is
-    // false and the exit path is untouched.
+    // publication-only gate below. At one partition no gate is installed
+    // and the exit path is untouched; the install itself lives in
+    // InstallWriteCompletionGate, cold and never inlined, so none of its
+    // lambda/empty-index plumbing sits in this hot frame.
     bool has_post_memtable_callback = false;
-    if (NumWalPartitions() > 1) {
-      for (auto* writer : write_group) {
-        has_post_memtable_callback |= writer->post_memtable_callback != nullptr;
-      }
-    }
-    if (NumWalPartitions() > 1 && !write_options.disableWAL && io_s.ok() &&
-        !sync_group) {
-      // An async write never syncs; its gate waits only for every record at
-      // or below it to be written, and for its range to be published.
-      // gate_low is captured, unused, for WriteImpl's stack frame (see the
-      // DB stats above).
-      const SequenceNumber gate_low = current_sequence;
-      const SequenceNumber gate_target = last_sequence;
-      const uint64_t empty_wal_index = seq_inc == 0 ? wal_index : 0;
-      write_group.completion_gate = [this, gate_low, gate_target,
-                                     empty_wal_index]() {
-        (void)gate_low;
-        return RunCompletionGate(gate_target, /*published=*/true,
-                                 empty_wal_index);
-      };
-    } else if (sync_group && io_s.ok()) {
-      // The sync writers' range, [sync_low, gate_target], is inserted
-      // with the group but published only once it and everything below it
-      // is fsynced (RunSyncGate). Counted until then, so no memtable switch
-      // comes while its fsync, and so the range, can still fail
-      // (WaitForPendingWrites).
-      const SequenceNumber sync_low = write_group.sync_first_sequence;
-      const SequenceNumber gate_target = last_sequence;
-      const uint64_t empty_wal_index = seq_inc == 0 ? wal_index : 0;
-      const size_t gate_partition = wal_context.wal_partition;
-      const size_t sync_pre_release_callback_cnt =
-          pre_release_callback_cnt - async_pre_release_callback_cnt;
-      const WriteThread::WriteGroup* const group = &write_group;
-      unpublished_sync_groups_.fetch_add(1);
-      unpublished_sync_group.db = this;
-      if (has_async_writer) {
-        // The async writers' range ends below sync_low and publishes as the
-        // group exits; they complete once it is visible, before the fsync.
-        // The async writers' stamp is the group's first sequence; with no
-        // sequence of their own it is also that of any lower-index record
-        // that consumes none, which only the WAL index orders.
-        const uint64_t async_empty_wal_index =
-            async_seq_count == 0 ? wal_index : 0;
-        write_group.async_writers_gate =
-            [this, sync_low, group, disable_memtable, async_empty_wal_index]() {
-              Status s = WaitForWalDurability(
-                  sync_low - 1, /*wal_record=*/true,
-                  /*published=*/true, /*applied=*/true, async_empty_wal_index);
-              if (s.ok()) {
-                for (auto* writer : *group) {
-                  if (!writer->sync && writer->post_memtable_callback) {
-                    Status tmp_s = (*writer->post_memtable_callback)(
-                        sync_low - 1, disable_memtable);
-                    assert(tmp_s.ok());
-                  }
-                }
-              }
-              return s;
-            };
-      }
-      write_group.completion_gate =
-          [this, gate_partition, sync_low, gate_target, group, disable_memtable,
-           sync_pre_release_callback_cnt, sync_writers_insert, empty_wal_index,
-           pending = &unpublished_sync_group]() {
-            // RunSyncGate ends the count.
-            pending->db = nullptr;
-            return RunSyncGate(gate_partition, sync_low, gate_target, *group,
-                               disable_memtable, sync_pre_release_callback_cnt,
-                               sync_writers_insert, empty_wal_index);
-          };
-    } else if (NumWalPartitions() > 1 &&
-               (seq_inc > 0 || has_post_memtable_callback) && io_s.ok()) {
-      // A disableWAL group has nothing to make durable, but its sequences
-      // become visible only once every range below them is applied. Waiting
-      // for that keeps OK meaning read-your-writes. A group that consumes no
-      // sequence waits too when it creates a snapshot, which must not lie
-      // above the published frontier.
-      const SequenceNumber gate_target = last_sequence;
-      write_group.completion_gate = [this, gate_target]() {
-        return WaitForWalDurability(gate_target, /*wal_record=*/false,
-                                    /*published=*/true, /*applied=*/true);
-      };
+    if (NumWalPartitions() > 1 || sync_group) {
+      has_post_memtable_callback = InstallWriteCompletionGate(
+          write_group, write_options.disableWAL, io_s.ok(), sync_group,
+          last_sequence, seq_inc, wal_index, async_seq_count,
+          wal_context.wal_partition, disable_memtable, pre_release_callback_cnt,
+          async_pre_release_callback_cnt, sync_writers_insert, has_async_writer,
+          &unpublished_sync_group);
     }
     if (has_post_memtable_callback && write_group.completion_gate) {
       // A post-memtable callback (CommitAndTryCreateSnapshot's timestamped
@@ -2089,16 +2114,22 @@ Status DBImpl::WriteImpl(
   if (!io_s.ok()) {
     // Check WriteToWAL status
     TEST_SYNC_POINT_CALLBACK("DBImpl::WriteImpl:BeforeWALIOStatusCheck", &io_s);
-    WALIOStatusCheck(
-        io_s,
-        wal_context.sync_failed_wal_number != 0
-            ? wal_context.sync_failed_wal_number
-            : wal_write_number,
-        last_sequence, last_sequence + 1 - seq_inc,
-        registered_applied_range ? wal_context.wal_partition
-                                 : kNoPinnedWalRange,
-        sync_group && async_seq_count > 0 ? write_group.sync_first_sequence : 0,
-        group_empty_wal_index);
+    WALIOStatusCheck(io_s,
+                     wal_context.sync_failed_wal_number != 0
+                         ? wal_context.sync_failed_wal_number
+                         : wal_write_number,
+                     last_sequence, last_sequence + 1 - seq_inc,
+                     registered_applied_range ? wal_context.wal_partition
+                                              : kNoPinnedWalRange,
+                     sync_group && async_seq_count > 0
+                         ? write_group.sync_first_sequence
+                         : 0,
+                     // The group's WAL index if it consumes no sequence,
+                     // else 0 (see WalGateFence::empty_wal_index),
+                     // recomputed here on the error path only, so the hot
+                     // frame carries no empty-index local (wal_index and
+                     // seq_inc are unchanged since the allocate above).
+                     seq_inc == 0 ? wal_index : 0);
   }
   if (!w.CallbackFailed()) {
     if (!io_s.ok()) {
