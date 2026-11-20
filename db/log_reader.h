@@ -134,6 +134,18 @@ class Reader {
     return !first_record_read_ && compression_type_record_read_;
   }
 
+  // Returns true once a record in the recyclable format has been read.
+  bool IsRecycled() const { return recycled_; }
+
+  // Returns true when ReadRecord stopped at a record from a previous use of
+  // the log, in any mode that stops there.
+  bool StoppedAtOldRecord() const { return stopped_at_old_record_; }
+
+  // Returns true when a report may have dropped a record of this log: every
+  // report except a dropped block remainder that holds no recyclable header
+  // naming this log past its first byte.
+  bool MayHaveDroppedOwnRecord() const { return may_have_dropped_own_record_; }
+
   // Returns true when ReadRecord stopped at bytes that were not a clean EOF,
   // such as a truncated record or a stale recycled-file tail.
   bool WALRecoveryStoppedBeforeEndOfFile() const {
@@ -146,6 +158,11 @@ class Reader {
   // if that record did not carry one, so this is per-record state: a file may
   // hold both indexed and non-indexed records.
   uint64_t GetLastReadWALIndex() const { return last_read_wal_index_; }
+
+  // Whether a WAL index marker record has been consumed so far. The writer
+  // emits it first, so after the first ReadRecord returns this already tells
+  // whether the file claims to carry indices, before its data is consumed.
+  bool SawWALIndexMarker() const { return saw_wal_index_marker_; }
 
   // Highest wal_index covered by any valid void record read so far, or zero
   // if no void record has been read.
@@ -206,6 +223,13 @@ class Reader {
     return it == first_superseded_wal_indices_.end() ? 0 : it->second;
   }
 
+  // Whether a supersession record was read after a data or progress record.
+  // Such a record is reported and dropped, so it supersedes nothing, and a
+  // replay that already applied the records it names cannot honor it.
+  bool SawMisplacedWALIndexSupersession() const {
+    return saw_misplaced_supersession_;
+  }
+
  protected:
   std::shared_ptr<Logger> info_log_;
   const std::unique_ptr<SequentialFileReader> file_;
@@ -247,6 +271,11 @@ class Reader {
   // Whether the first record has been read or not.
   bool first_record_read_;
   bool wal_recovery_stopped_before_end_of_file_ = false;
+  bool stopped_at_old_record_ = false;
+  // Set by ReadPhysicalRecord when the bytes it just dropped hold no header of
+  // this log; consumed by the report of that drop.
+  bool drop_holds_no_own_header_ = false;
+  bool may_have_dropped_own_record_ = false;
   // Type of compression used
   CompressionType compression_type_;
   // Track whether the compression type record has been read or not.
@@ -266,31 +295,43 @@ class Reader {
   UnorderedMap<uint32_t, size_t> recorded_cf_to_ts_sz_;
 
   // WAL index (LSN) state. See db/log_writer.h.
+  //
+  // Declaration order here is deliberate: the word-sized members are grouped
+  // ahead of the flags so the flags pack together instead of each one forcing
+  // seven bytes of padding between two uint64_ts.
+  //
   // wal_index extracted from the most recent logical record.
   uint64_t last_read_wal_index_ = 0;
   // Highest `hi` of any valid void range read so far. Tracked separately
   // because a void record deliberately leaves last_read_wal_index_ alone.
   uint64_t max_void_wal_index_hi_ = 0;
-  // Valid void ranges read so far, in file order. Covers are order-constrained
-  // (see log_format.h), so ranges arrive lo-ordered in a well-formed file.
-  std::vector<std::pair<uint64_t, uint64_t>> wal_index_void_ranges_;
   // Highest data index or void lower bound read so far. A void range may not
   // start at or below this mark: it would trail behind data the merge has
   // already passed, hence be invisible when the merge decides the hole.
   uint64_t wal_index_order_mark_ = 0;
-  // Lowest open-ended supersession boundary declared for each older WAL.
-  UnorderedMap<uint64_t, uint64_t> first_superseded_wal_indices_;
   // Highest progress bound asserted so far, or zero when no valid progress
   // record has been read. A nonzero bound also proves the head is complete:
   // supersessions and spans must precede the first progress record.
   uint64_t last_progress_bound_read_ = 0;
-  // Predecessor span attested by this file's head, if one was read.
-  bool has_predecessor_span_ = false;
+  // Predecessor span attested by this file's head, if one was read. Valid
+  // only when has_predecessor_span_ below is set.
   uint64_t predecessor_span_wal_ = 0;
   uint64_t predecessor_span_first_ = 0;
   uint64_t predecessor_span_last_ = 0;
   // Spans read after the first; see GetFurtherWALIndexPredecessorSpans().
   std::vector<std::array<uint64_t, 3>> further_predecessor_spans_;
+  // Valid void ranges read so far, in file order. Covers are order-constrained
+  // (see log_format.h), so ranges arrive lo-ordered in a well-formed file.
+  std::vector<std::pair<uint64_t, uint64_t>> wal_index_void_ranges_;
+  // Lowest open-ended supersession boundary declared for each older WAL.
+  UnorderedMap<uint64_t, uint64_t> first_superseded_wal_indices_;
+  // Whether a WAL index marker record has been consumed. Set by both
+  // logical-reader implementations; never cleared.
+  bool saw_wal_index_marker_ = false;
+  // Whether this file's head attested a predecessor span.
+  bool has_predecessor_span_ = false;
+  // Whether a supersession record followed a data or progress record.
+  bool saw_misplaced_supersession_ = false;
 
   // Extend record types with the following special values
   enum : uint8_t {
@@ -333,6 +374,8 @@ class Reader {
   void ReportDrop(size_t bytes, const Status& reason,
                   uint64_t log_number = kMaxSequenceNumber);
   void ReportOldLogRecord(size_t bytes);
+  // Whether `bytes` holds a recyclable record header naming this log.
+  bool HoldsOwnRecyclableHeader(const Slice& bytes) const;
 
   void InitCompression(const CompressionTypeRecord& compression_record);
 

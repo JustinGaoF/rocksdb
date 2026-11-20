@@ -2765,6 +2765,25 @@ class DBImpl : public DB
                          RecoveryContext* recovery_ctx,
                          std::vector<WALIndexSupersession>* supersessions);
 
+  // Indexed-WAL recovery through the N-file merge: one ordered stream feeds
+  // the same per-record path as ProcessLogFile. Predecessor chaining is
+  // absent (track_and_verify_wals falls back to ProcessLogFiles), so this
+  // takes no predecessor info.
+  Status ProcessLogFilesMerged(
+      const std::vector<uint64_t>& wal_numbers, bool read_only, bool is_retry,
+      uint64_t min_wal_number, int job_id, SequenceNumber* next_sequence,
+      std::unordered_map<int, VersionEdit>* version_edits,
+      bool* corrupted_wal_found, RecoveryContext* recovery_ctx,
+      std::vector<WALIndexSupersession>* supersessions);
+
+  // Pre-replay peek at each WAL head: sets *all_indexed unless some live WAL
+  // carries no index, in which case the set must replay sequentially. Fails
+  // fast on indexed data without a marker over an intact head; a damaged
+  // head stays merge-side for the attestation path.
+  Status CheckWALFilesCarryWALIndex(const std::vector<uint64_t>& wal_numbers,
+                                    uint64_t min_wal_number, bool is_retry,
+                                    bool* all_indexed);
+
   Status ProcessLogFile(uint64_t wal_number, uint64_t min_wal_number,
                         bool is_retry, bool read_only, int job_id,
                         SequenceNumber* next_sequence,
@@ -2777,6 +2796,10 @@ class DBImpl : public DB
                         std::vector<WALIndexSupersession>* supersessions);
 
   void SetupLogFileProcessing(uint64_t wal_number);
+
+  // Opens the physical stream shared by every recovery-time WAL reader.
+  Status OpenWALForRecovery(const std::string& fname, bool is_retry,
+                            std::unique_ptr<SequentialFileReader>* file_reader);
 
   Status InitializeLogReader(uint64_t wal_number, bool is_retry,
                              std::string& fname,
@@ -2797,7 +2820,8 @@ class DBImpl : public DB
       SequenceNumber* last_seqno_observed, SequenceNumber* next_sequence,
       bool* stop_replay_for_corruption, Status* status,
       bool* stop_replay_by_wal_filter,
-      std::unordered_map<int, VersionEdit>* version_edits, bool* flushed);
+      std::unordered_map<int, VersionEdit>* version_edits, bool* flushed,
+      bool* applied);
 
   Status InitializeWriteBatchForLogRecord(
       Slice record, const std::unique_ptr<log::Reader>& reader,
