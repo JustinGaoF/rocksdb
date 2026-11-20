@@ -284,6 +284,12 @@ class DBImpl : public DB
 
   ~DBImpl() override;
 
+  // Largest DBOptions::wal_partitions Open() accepts. Each partition owns a
+  // write thread, a WAL file and a merge buffer, sized at construction, and
+  // appends gain nothing once partitions outnumber the device's queue depth;
+  // 64 is four times the most any test or the crash test runs.
+  static constexpr uint32_t kMaxWalPartitions = 64;
+
   // ---- Implementations of the DB interface ----
 
   using DB::Resume;
@@ -1615,8 +1621,7 @@ class DBImpl : public DB
 
   uint64_t TEST_GetCurrentLogNumber() const {
     InstrumentedMutexLock l(mutex());
-    assert(!logs_.empty());
-    return logs_.back().number;
+    return CurrentWal().number;
   }
 
   // Acquisitions of sequence_wal_index_mutex_ so far. Tests use it to prove
@@ -3215,15 +3220,29 @@ class DBImpl : public DB
                                log::Writer* log_writer, uint64_t wal_index,
                                bool wal_mutex_held);
 
+  // Binds `wal_context` to the WAL that writes should be appended to, and to
+  // that WAL's file-number/size accounting.
+  //
+  // There is exactly one WAL, so this unconditionally selects the newest. It
+  // exists as a named seam rather than an inline `CurrentWal()` because it is
+  // the single point at which a future `wal_partitions > 1` would choose among
+  // several WALs, and because the three callers were open-coding the same pair
+  // of `.back()` calls plus the same consistency assertion.
+  //
+  // REQUIRES: wal_write_mutex_ held, or called from Open() before the DB is
+  // visible to other threads. See the synchronization notes on logs_ and
+  // alive_wal_files_.
+  void SelectWalForWrite(WalContext* wal_context);
+
+  // `wal_context` names the WAL these writes go to and carries the sync
+  // requirements for it. It is populated by PreprocessWrite().
   // `sequence` is the sequence number of `merged_batch` and `seq_inc` is how
   // many sequence numbers WAL recovery advances by when replaying it.
   IOStatus WriteToWAL(const WriteBatch& merged_batch,
                       const WriteOptions& write_options,
-                      log::Writer* log_writer, uint64_t* wal_used,
-                      uint64_t* log_size,
-                      WalFileNumberSize& wal_file_number_size,
-                      SequenceNumber sequence, size_t seq_inc,
-                      uint64_t wal_index);
+                      WalContext& wal_context, uint64_t* wal_used,
+                      uint64_t* log_size, SequenceNumber sequence,
+                      size_t seq_inc, uint64_t wal_index);
 
   // With recycle_log_file_num > 0, point-in-time recovery treats a record left
   // over from a previous incarnation of a recycled WAL as possible corruption,
@@ -3248,11 +3267,9 @@ class DBImpl : public DB
   }
 
   IOStatus WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
-                           log::Writer* log_writer, uint64_t* wal_used,
-                           bool need_wal_sync, bool need_wal_dir_sync,
+                           WalContext& wal_context, uint64_t* wal_used,
                            SequenceNumber sequence, size_t seq_inc,
-                           uint64_t wal_index,
-                           WalFileNumberSize& wal_file_number_size);
+                           uint64_t wal_index);
 
   IOStatus ConcurrentWriteGroupToWAL(const WriteThread::WriteGroup& write_group,
                                      uint64_t* wal_used,
@@ -4147,6 +4164,7 @@ class DBImpl : public DB
   //  from the same thread that has set getting_synced=true
   std::deque<LogWriterNumber> logs_;
 
+  // The WAL currently being appended to -- the newest entry in logs_.
   // Takes sequence_wal_index_mutex_, counting the acquisition in debug
   // builds (TEST_SequenceWalIndexMutexTakes).
   class SequenceWalIndexLock {
@@ -4164,6 +4182,24 @@ class DBImpl : public DB
    private:
     InstrumentedMutexLock lock_;
   };
+
+  //
+  // There is exactly one. Named rather than spelled `logs_.back()` at each use
+  // because "the current WAL" is the concept the callers actually want, and
+  // because it is the set of accesses that becomes per-partition if
+  // wal_partitions > 1 is ever implemented.
+  //
+  // REQUIRES: wal_write_mutex_ held, per the synchronization notes above. Note
+  // that back() itself is not safe to call unsynchronized: implementations may
+  // touch other deque members.
+  LogWriterNumber& CurrentWal() {
+    assert(!logs_.empty());
+    return logs_.back();
+  }
+  const LogWriterNumber& CurrentWal() const {
+    assert(!logs_.empty());
+    return logs_.back();
+  }
 
   // Signaled when getting_synced becomes false for some of the logs_.
   InstrumentedCondVar wal_sync_cv_;
