@@ -127,6 +127,13 @@ class FlushJob {
     return &committed_flush_jobs_info_;
   }
 
+  // Leaves every entry at or above `sequence` out of the flush output, point
+  // entries and range tombstones alike. Set before PickMemTable() with the
+  // DB mutex held.
+  void DropEntriesAtOrAbove(SequenceNumber sequence) {
+    drop_entries_at_or_above_ = sequence;
+  }
+
  private:
   friend class FlushJobTest_GetRateLimiterPriorityForWrite_Test;
 
@@ -246,6 +253,7 @@ class FlushJob {
   const std::string full_history_ts_low_;
   BlobFileCompletionCallback* blob_callback_;
   bool fast_sst_open_;
+  SequenceNumber drop_entries_at_or_above_ = kMaxSequenceNumber;
   // Write-path blob files that should be committed with this flush.
   std::vector<BlobFileAddition> external_blob_file_additions_;
   // Initial garbage for write-path blob files that were partially abandoned
