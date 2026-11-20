@@ -11,6 +11,7 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -15798,6 +15799,100 @@ TEST_P(DBWritePartitionTest, ReadOnlyCompactedOpenAppliesPartitionChecks) {
   EXPECT_NE(std::string::npos,
             s.ToString().find("requires partition_wal_usage other than kNone"))
       << s.ToString();
+}
+
+// r21 B F-001: a checkpoint or backup at N > 1 that starts while a partition
+// is stalled holds no write queue while it waits. A no_slowdown write on
+// another partition fails fast with Incomplete, as it would with no
+// checkpoint, instead of queueing behind the checkpoint until the stall ends.
+// Neuter: enter the queues blocking again; the checkpoint holds partition 0's
+// queue while it waits on partition 1's stall, and the write waits with it.
+TEST_P(DBWritePartitionTest, CheckpointQuiesceHoldsNoQueueDuringStall) {
+  if (GetParam()) {
+    ROCKSDB_GTEST_BYPASS("single-queue path only");
+    return;
+  }
+  Options options = IndexedWalOptions(CurrentOptions());
+  OpenWithPartitions(2, options);
+  ASSERT_OK(Put(cf_for_partition_[0], "before0", "v"));
+  ASSERT_OK(Put(cf_for_partition_[1], "before1", "v"));
+
+  std::mutex mu;
+  std::condition_variable cv;
+  bool stall_begun = false;
+  bool checkpoint_waiting = false;
+  auto notify = [&](bool* flag) {
+    std::lock_guard<std::mutex> lock(mu);
+    *flag = true;
+    cv.notify_all();
+  };
+  auto wait_for = [&](bool* flag) {
+    std::unique_lock<std::mutex> lock(mu);
+    return cv.wait_for(lock, std::chrono::seconds(30), [&] { return *flag; });
+  };
+  SyncPoint::GetInstance()->SetCallBack("DBImpl::DelayWrite:Wait",
+                                        [&](void*) { notify(&stall_begun); });
+  // Fixed: the checkpoint retries. Neuter: it blocks on the stall.
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::GetLiveFilesStorageInfo:QuiesceRetry",
+      [&](void*) { notify(&checkpoint_waiting); });
+  SyncPoint::GetInstance()->SetCallBack(
+      "WriteThread::WriteStall::Wait",
+      [&](void*) { notify(&checkpoint_waiting); });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  std::unique_ptr<WriteControllerToken> token;
+  auto end_stall = [&] {
+    dbfull()->TEST_LockMutex();
+    token.reset();
+    dbfull()->TEST_SignalAllBgCv();
+    dbfull()->TEST_UnlockMutex();
+  };
+  dbfull()->TEST_LockMutex();
+  token = dbfull()->TEST_write_controler().GetStopToken();
+  dbfull()->TEST_UnlockMutex();
+  // Partition 1's leader stalls holding a stall barrier in its queue.
+  port::Thread stalled(
+      [&] { ASSERT_OK(Put(cf_for_partition_[1], "stalled", "v")); });
+  if (!wait_for(&stall_begun)) {
+    end_stall();
+    stalled.join();
+    FAIL() << "partition 1's write never stalled";
+  }
+
+  LiveFilesStorageInfoOptions live_options;
+  live_options.wal_size_for_flush = std::numeric_limits<uint64_t>::max();
+  std::vector<LiveFileStorageInfo> live_files;
+  Status checkpoint_status;
+  ASSERT_OK(db_->DisableFileDeletions());
+  port::Thread checkpoint([&] {
+    checkpoint_status = db_->GetLiveFilesStorageInfo(live_options, &live_files);
+  });
+  const bool reached = wait_for(&checkpoint_waiting);
+
+  WriteOptions no_slowdown;
+  no_slowdown.no_slowdown = true;
+  auto fast = std::async(std::launch::async, [&] {
+    return Put(cf_for_partition_[0], "fast", "v", no_slowdown);
+  });
+  const bool fast_returned =
+      fast.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+
+  end_stall();
+  stalled.join();
+  checkpoint.join();
+  const Status fast_status = fast.get();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_OK(db_->EnableFileDeletions());
+
+  ASSERT_TRUE(reached) << "the checkpoint never waited on the stall";
+  EXPECT_TRUE(fast_returned)
+      << "the no_slowdown write queued behind the checkpoint";
+  EXPECT_TRUE(fast_status.IsIncomplete()) << fast_status.ToString();
+  ASSERT_OK(checkpoint_status);
+  EXPECT_EQ("v", Get(cf_for_partition_[1], "stalled"));
+  EXPECT_EQ("NOT_FOUND", Get(cf_for_partition_[0], "fast"));
 }
 
 // G-30 / G-31 / F014: a checkpoint or backup at N > 1 copies every

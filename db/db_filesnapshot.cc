@@ -584,18 +584,28 @@ Status DBImpl::GetLiveFilesStorageInfoImpl(
   // is in flight, and waiting on its stall would never end. Instead this
   // thread takes one more LockWAL count under the same mutex_ hold, so that
   // another thread's UnlockWAL cannot let writes resume before the sizes are
-  // read.
-  AllPartitionsWriter quiesce(this, /*nonmem=*/false);
+  // read. The queues are entered non-blocking: while any partition is
+  // stalled this thread holds none of them (writers on the other partitions
+  // are not queued behind it), waits, and tries again, checking LockWAL
+  // each time.
+  std::unique_ptr<AllPartitionsWriter> quiesce;
   bool quiesced = false;
   bool wal_lock_pinned = false;
   if (NumWalPartitions() > 1) {
     InstrumentedMutexLock l(&mutex_);
-    if (lock_wal_owner_thread_id_counts_.empty()) {
-      quiesce.EnterUnbatched();
-      quiesced = true;
-    } else {
-      ++lock_wal_owner_thread_id_counts_[env_->GetThreadID()];
-      wal_lock_pinned = true;
+    while (!quiesced && !wal_lock_pinned) {
+      if (!lock_wal_owner_thread_id_counts_.empty()) {
+        ++lock_wal_owner_thread_id_counts_[env_->GetThreadID()];
+        wal_lock_pinned = true;
+        break;
+      }
+      // A refused attempt leaves its writers completed: use fresh ones.
+      quiesce.reset(new AllPartitionsWriter(this, /*nonmem=*/false));
+      quiesced = quiesce->EnterUnbatchedNonBlocking();
+      if (!quiesced) {
+        TEST_SYNC_POINT("DBImpl::GetLiveFilesStorageInfo:QuiesceRetry");
+        bg_cv_.TimedWait(immutable_db_options_.clock->NowMicros() + 1000);
+      }
     }
   }
 
@@ -640,7 +650,7 @@ Status DBImpl::GetLiveFilesStorageInfoImpl(
     s = GetOpenWalSizes(open_wal_number_to_size);
   }
   if (quiesced) {
-    quiesce.ExitUnbatched();
+    quiesce->ExitUnbatched();
   }
   if (wal_lock_pinned) {
     Status unlock_status = UnlockWAL();
