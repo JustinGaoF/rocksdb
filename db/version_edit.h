@@ -64,6 +64,8 @@ enum Tag : uint32_t {
 
   // Forward incompatible on purpose: see VersionEdit::SetWALIndexGuard.
   kWALIndexGuard = 500,
+  // Forward incompatible on purpose: see VersionEdit::SetWALPartitionGuard.
+  kWALPartitionGuard = 501,
 
   // Mask for an unidentified tag from the future which can be safely ignored.
   kTagSafeIgnoreMask = 1 << 13,
@@ -1172,6 +1174,20 @@ class VersionEdit {
   bool HasWALIndexGuard() const { return has_wal_index_guard_; }
   uint64_t GetWALIndexGuard() const { return wal_index_guard_; }
 
+  // Records that live WALs numbered at or below `max_wal_number` may have been
+  // written with wal_partitions > 1. Recovery merges such a set even when no
+  // surviving file names a partition above 0 (a power loss can take every
+  // such file, marker included, while partition 0's survive). At or below the
+  // WAL index guard; absent means no live WAL was written with more than one
+  // partition, and, like the WAL index guard, that state is reached only by
+  // writing a MANIFEST without it. Binaries that predate it fail to open.
+  void SetWALPartitionGuard(uint64_t max_wal_number) {
+    has_wal_partition_guard_ = true;
+    wal_partition_guard_ = max_wal_number;
+  }
+  bool HasWALPartitionGuard() const { return has_wal_partition_guard_; }
+  uint64_t GetWALPartitionGuard() const { return wal_partition_guard_; }
+
   // Marks a live OPTIONS-only MANIFEST write as DB-wide metadata that does not
   // change an LSM Version. This is intentionally not encoded; recovery applies
   // the persisted fields through VersionEditHandler instead.
@@ -1238,6 +1254,7 @@ class VersionEdit {
   uint64_t last_compacted_manifest_file_size_ = 0;
   uint64_t committed_options_file_number_ = 0;
   uint64_t wal_index_guard_ = 0;
+  uint64_t wal_partition_guard_ = 0;
 
   // Compaction cursors for round-robin compaction policy
   CompactCursors compact_cursors_;
@@ -1293,6 +1310,7 @@ class VersionEdit {
   bool has_last_compacted_manifest_file_size_ = false;
   bool has_committed_options_file_number_ = false;
   bool has_wal_index_guard_ = false;
+  bool has_wal_partition_guard_ = false;
 
   // Non-persisted marker for the live MANIFEST writer fast path.
   bool is_options_file_manipulation_ = false;
