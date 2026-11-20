@@ -285,6 +285,28 @@ Status DBImpl::ValidateOptions(
   return s;
 }
 
+// Dispositions by (partition_wal_usage, wal_partitions), as Open
+// enforces them without the test hook. "Indexed" is any usage that writes WAL
+// index records. "N>1 rejection" is the NotSupported "wal_partitions > 1 is
+// not supported yet (for any partition_wal_usage)" below. "Option rejection"
+// is a NotSupported naming wal_partitions and the option, checked before the
+// N>1 rejection and kept with the test hook.
+//
+//   Option                  (kNone, 1)    (indexed, 1)  (any, >1)
+//   manual_wal_flush        Open OK       Open OK       N>1 rejection
+//   recycle_log_file_num    Open OK (a)   Open OK (a)   Option rejection (b)
+//   unordered_write         Open OK       Open OK       Option rejection
+//   enable_pipelined_write  Open OK       Open OK       Option rejection
+//   track_and_verify_wals   Open OK       Open OK       Option rejection
+//   two_write_queues        Open OK       NotSupported  Option rejection
+//                                         (c)
+//
+// With the test hook, (kNone, >1) stays rejected after the N>1 rejection.
+//
+// (a) SanitizeOptions zeroes it under WAL_ttl_seconds, WAL_size_limit_MB,
+//     kTolerateCorruptedTailRecords and kAbsoluteConsistency, for any usage.
+// (b) Checked before SanitizeOptions, so also when it would be zeroed.
+// (c) "partition_wal_usage is not supported with two_write_queues. " below.
 Status DBImpl::ValidateOptions(const DBOptions& db_options) {
   if (db_options.read_io_executor_threads < 0) {
     return Status::InvalidArgument(
@@ -330,6 +352,33 @@ Status DBImpl::ValidateOptions(const DBOptions& db_options) {
 
   if (db_options.keep_log_file_num == 0) {
     return Status::InvalidArgument("keep_log_file_num must be greater than 0");
+  }
+
+  if (db_options.wal_partitions == 0) {
+    return Status::InvalidArgument("wal_partitions must be greater than 0");
+  }
+
+  if (db_options.wal_partitions > kMaxWalPartitions) {
+    return Status::InvalidArgument("wal_partitions must be at most " +
+                                   std::to_string(kMaxWalPartitions));
+  }
+
+  if (db_options.wal_partitions > 1) {
+    // The option is plumbed so it can be configured, persisted and
+    // round-tripped, but no code reads it yet. Reject rather than silently
+    // accept a value that has no effect.
+    return Status::NotSupported(
+        "wal_partitions > 1 is not supported yet: the partitioned write path "
+        "and multi-WAL recovery are not implemented (for any "
+        "partition_wal_usage)");
+  }
+
+  if (db_options.wal_partitions > 1 &&
+      !log::WALIndexEnabled(db_options.partition_wal_usage)) {
+    // Recovery orders N WALs only by their WAL index records; unindexed WALs
+    // cannot be merged. Permanent, whatever the sync point above allows.
+    return Status::NotSupported(
+        "wal_partitions > 1 requires partition_wal_usage other than kNone");
   }
 
   if (db_options.unordered_write &&
@@ -3946,10 +3995,8 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
         WriteBatchInternal::SetSequence(&empty_batch, recovered_seq);
         uint64_t wal_used;
         uint64_t log_size;
-        log::Writer* log_writer = impl->logs_.back().writer;
-        WalFileNumberSize& wal_file_number_size = impl->alive_wal_files_.back();
-
-        assert(log_writer->get_log_number() == wal_file_number_size.number);
+        WalContext wal_context;
+        impl->SelectWalForWrite(&wal_context);
         impl->mutex_.AssertHeld();
         uint64_t wal_index = 0;
         if (log::WALIndexEnabled(
@@ -3964,9 +4011,9 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
           // so the DB never becomes writable and nothing can be acknowledged
           // above the burned index. The file is discarded with the failed
           // open rather than left holding an undeclared hole.
-          s = impl->WriteToWAL(empty_batch, write_options, log_writer,
-                               &wal_used, &log_size, wal_file_number_size,
-                               recovered_seq, /*seq_inc=*/0, wal_index);
+          s = impl->WriteToWAL(empty_batch, write_options, wal_context,
+                               &wal_used, &log_size, recovered_seq,
+                               /*seq_inc=*/0, wal_index);
         }
         if (s.ok()) {
           // Need to fsync, otherwise it might get lost after a power reset.
@@ -3978,8 +4025,8 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
           }
           if (s.ok()) {
             s = impl->immutable_db_options_.use_fsync
-                    ? log_writer->file()->Fsync(opts)
-                    : log_writer->file()->Sync(opts);
+                    ? wal_context.writer->file()->Fsync(opts)
+                    : wal_context.writer->file()->Sync(opts);
           }
         }
       }
@@ -4187,7 +4234,7 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
       if (s.ok()) {
         // Sync is needed otherwise WAL buffered data might get lost after a
         // power reset.
-        log::Writer* log_writer = impl->logs_.back().writer;
+        log::Writer* log_writer = impl->CurrentWal().writer;
         IOOptions opts;
         s = WritableFileWriter::PrepareIOOptions(write_options, opts);
         if (s.ok()) {
