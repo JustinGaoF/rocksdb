@@ -126,8 +126,11 @@ Status DBImpl::GetSortedWalFilesImpl(VectorWalPtr& files, bool need_seqnos) {
 
   // NOTE: need to include archived WALs because needed WALs might have been
   // archived since getting required_by_manifest set
+  // A tracked WAL that holds only WAL index metadata (an idle partition's WAL
+  // that coupled rotation retired) is listed too.
   Status s = wal_manager_.GetSortedWalFiles(files, need_seqnos,
-                                            /*include_archived*/ true);
+                                            /*include_archived*/ true,
+                                            &required_by_manifest);
 
   // DisableFileDeletions / EnableFileDeletions not supported in read-only DB
   if (deletions_disabled.ok()) {
