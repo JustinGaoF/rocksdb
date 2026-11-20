@@ -155,14 +155,6 @@ extern ROCKSDB_LIBRARY_API void rocksdb_options_set_wal_partitions(
 extern ROCKSDB_LIBRARY_API uint32_t
 rocksdb_options_get_wal_partitions(rocksdb_options_t* opt);
 
-extern ROCKSDB_LIBRARY_API void
-rocksdb_options_set_experimental_allow_wal_partitions_for_testing(
-    rocksdb_options_t* opt, unsigned char v);
-
-extern ROCKSDB_LIBRARY_API unsigned char
-rocksdb_options_get_experimental_allow_wal_partitions_for_testing(
-    rocksdb_options_t* opt);
-
 extern ROCKSDB_LIBRARY_API void rocksdb_options_set_write_thread_max_yield_usec(
     rocksdb_options_t* opt, uint64_t v);
 
