@@ -937,6 +937,11 @@ Status WriteCommittedTxn::CommitInternal() {
   if (bypass_memtable && db_impl_->HasAnyBlobDirectWriteColumnFamily()) {
     bypass_memtable = false;
   }
+  // With wal_partitions > 1 WriteImpl refuses WBWI ingestion, which assumes no
+  // other partition's leader is inserting, so commit through the memtable.
+  if (bypass_memtable && db_impl_->NumWalPartitions() > 1) {
+    bypass_memtable = false;
+  }
   if (!bypass_memtable) {
     // insert prepared batch into Memtable only skipping WAL.
     // Memtable will ignore BeginPrepare/EndPrepare markers
