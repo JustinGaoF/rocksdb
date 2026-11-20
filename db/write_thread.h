@@ -91,6 +91,10 @@ class WriteThread {
     Status status;
     std::atomic<size_t> running;
     size_t size = 0;
+    // Writers excluded from this group by max_write_batch_group_size_bytes:
+    // writers compatible with the leader in every way except that adding them
+    // would exceed the cap. Set by EnterAsBatchGroupLeader only.
+    size_t num_cap_excluded = 0;
 
     struct Iterator {
       Writer* writer;
@@ -137,6 +141,9 @@ class WriteThread {
     size_t protection_bytes_per_key;
     PreReleaseCallback* pre_release_callback;
     PostMemTableCallback* post_memtable_callback;
+    // Resolved before this writer joins a batch group. A write group may not
+    // span WAL partitions because it is serialized as one WAL record.
+    size_t wal_partition;
     uint64_t wal_used;  // log number that this batch was inserted into
     uint64_t log_ref;   // log number that memtable insert should reference
     WriteCallback* callback;
@@ -168,6 +175,7 @@ class WriteThread {
           protection_bytes_per_key(0),
           pre_release_callback(nullptr),
           post_memtable_callback(nullptr),
+          wal_partition(0),
           wal_used(0),
           log_ref(0),
           callback(nullptr),
@@ -199,6 +207,7 @@ class WriteThread {
           protection_bytes_per_key(_batch->GetProtectionBytesPerKey()),
           pre_release_callback(_pre_release_callback),
           post_memtable_callback(_post_memtable_callback),
+          wal_partition(0),
           wal_used(0),
           log_ref(_log_ref),
           callback(_callback),
