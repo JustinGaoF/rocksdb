@@ -14,6 +14,7 @@
 #include "db/db_test_util.h"
 #include "db/forward_iterator.h"
 #include "port/stack_trace.h"
+#include "util/defer.h"
 
 namespace {
 static bool enable_io_uring = true;
@@ -31,6 +32,116 @@ class DBTestTailingIterator : public DBTestBase,
 
 INSTANTIATE_TEST_CASE_P(DBTestTailingIterator, DBTestTailingIterator,
                         ::testing::Bool());
+// The same tests with WAL partitions (CurrentOptions applies
+// test::kTestWalPartitions), where a write is inserted before it is
+// published.
+INSTANTIATE_TEST_CASE_P(WalPartitions8, DBTestTailingIterator,
+                        ::testing::Bool());
+
+// Above one partition a write is inserted into the memtable before it is
+// published, and parks in its completion gate while a lower write is not yet
+// durable. A tailing iterator reads the memtables at kMaxSequenceNumber, so
+// it is bounded by the published sequence: it never shows the parked write,
+// and shows it, without a Refresh(), once it publishes. A sync write S is
+// held ahead of its gate fsync; an async write above it inserts and parks.
+// Neuter: tail at kMaxSequenceNumber with no read callback
+// (NewTailingDBIter); "zebra" shows while parked.
+TEST_P(DBTestTailingIterator, TailingIteratorHidesParkedWrite) {
+  if (test::WalPartitionsForCurrentTest() <= 1) {
+    ROCKSDB_GTEST_BYPASS("needs more than one WAL partition");
+    return;
+  }
+  ReadOptions read_options;
+  read_options.tailing = true;
+  if (GetParam()) {
+    read_options.async_io = true;
+  }
+  Options options = CurrentOptions();
+  DestroyAndReopen(options);
+  ASSERT_EQ(test::kTestWalPartitions, dbfull()->TEST_NumWalPartitions());
+  ASSERT_OK(Put("f", "value_f"));
+  std::unique_ptr<Iterator> early(db_->NewIterator(read_options));
+  auto keys = [](Iterator* it) {
+    std::vector<std::string> result;
+    for (it->SeekToFirst(); it->Valid(); it->Next()) {
+      result.push_back(it->key().ToString());
+    }
+    EXPECT_OK(it->status());
+    return result;
+  };
+  const std::vector<std::string> kOnlyF = {"f"};
+  ASSERT_EQ(kOnlyF, keys(early.get()));
+
+  std::mutex mu;
+  std::condition_variable cv;
+  bool held = false;
+  bool release = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::CompletionGate:BeforeCoalescedSync", [&](void*) {
+        std::unique_lock<std::mutex> lock(mu);
+        if (held) {
+          return;
+        }
+        held = true;
+        cv.notify_all();
+        cv.wait_for(lock, std::chrono::seconds(30), [&] { return release; });
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  Status s_status;
+  port::Thread s_thread([&] {
+    WriteOptions sync_wo;
+    sync_wo.sync = true;
+    s_status = db_->Put(sync_wo, "s", "value_s");
+  });
+  Status z_status;
+  port::Thread z_thread;
+  Defer join_threads([&] {
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      release = true;
+      cv.notify_all();
+    }
+    for (port::Thread* thread : {&s_thread, &z_thread}) {
+      if (thread->joinable()) {
+        thread->join();
+      }
+    }
+  });
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    ASSERT_TRUE(
+        cv.wait_for(lock, std::chrono::seconds(30), [&] { return held; }));
+  }
+  z_thread = port::Thread([&] { z_status = Put("zebra", "value_zebra"); });
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while (dbfull()->TEST_WalDurabilityWaiters() != 1) {
+    ASSERT_LT(std::chrono::steady_clock::now(), deadline);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  // "zebra" is inserted and parked, "s" inserted and held: neither shows.
+  {
+    std::unique_ptr<Iterator> fresh(db_->NewIterator(read_options));
+    EXPECT_EQ(kOnlyF, keys(fresh.get()));
+    EXPECT_EQ(kOnlyF, keys(early.get()));
+  }
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    release = true;
+    cv.notify_all();
+  }
+  s_thread.join();
+  z_thread.join();
+  ASSERT_OK(s_status);
+  ASSERT_OK(z_status);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  // Published writes show without a refresh.
+  const std::vector<std::string> kAll = {"f", "s", "zebra"};
+  EXPECT_EQ(kAll, keys(early.get()));
+  std::unique_ptr<Iterator> fresh(db_->NewIterator(read_options));
+  EXPECT_EQ(kAll, keys(fresh.get()));
+}
 
 TEST_P(DBTestTailingIterator, TailingIteratorSingle) {
   ReadOptions read_options;
@@ -389,6 +500,12 @@ TEST_P(DBTestTailingIterator, TailingIteratorPrefixSeek) {
   options.prefix_extractor.reset(NewFixedPrefixTransform(2));
   options.memtable_factory.reset(NewHashSkipListRepFactory(16));
   options.allow_concurrent_memtable_write = false;
+  if (test::WalPartitionsForCurrentTest() > 1) {
+    // Above one partition Open requires the SkipList memtable.
+    Destroy(last_options_);
+    ASSERT_TRUE(TryReopen(options).IsNotSupported());
+    return;
+  }
   DestroyAndReopen(options);
   CreateAndReopenWithCF({"pikachu"}, options);
 
