@@ -50,6 +50,8 @@ enum RecordType : uint8_t {
   // as an unknown record type instead of silently skipping it. A report is not
   // a failure: under point-in-time or skip recovery, an older binary stops
   // replaying the file there and opens without its records.
+  // The MANIFEST's WAL index guard (VersionEdit::SetWALIndexGuard) is what
+  // makes such a binary fail to open the DB.
   //
   // The marker carries no payload and no reader acts on its contents. Its
   // value is positional: it is the first record in the file, so an older

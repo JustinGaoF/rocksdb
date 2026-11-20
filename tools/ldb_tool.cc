@@ -122,6 +122,7 @@ void LDBCommandRunner::PrintHelp(const LDBOptions& ldb_options,
   ret.append("\n\n");
   ret.append("Admin Commands:\n");
   WALDumperCommand::Help(ret);
+  CheckWALIndexCommand::Help(ret);
   CompactorCommand::Help(ret);
   ReduceDBLevelsCommand::Help(ret);
   ChangeCompactionStyleCommand::Help(ret);
