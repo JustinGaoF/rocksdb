@@ -237,6 +237,10 @@ class LogTest
     dest_contents()[offset] = new_byte;
   }
 
+  void SetFixed64(int offset, uint64_t value) {
+    EncodeFixed64(&dest_contents()[offset], value);
+  }
+
   void ShrinkSize(int bytes) { sink_->Drop(bytes); }
 
   void FixChecksum(int header_offset, int len, bool recyclable) {
@@ -1046,6 +1050,312 @@ TEST_P(LogTest, WALIndexMarkerInsidePartialRecordAfterFirstRecord) {
   ASSERT_EQ("EOF", Read());
   ASSERT_EQ("OK", MatchError("not the first record"));
   ASSERT_EQ("OK", MatchError("interspersed partial record"));
+}
+
+// A void record declares a closed range of wal_index values that were
+// allocated but will never carry data. The range is the whole payload.
+TEST_P(LogTest, WALIndexVoidRecordByteLayout) {
+  const bool recyclable = std::get<0>(GetParam()) != 0;
+  const int header_size = recyclable ? kRecyclableHeaderSize : kHeaderSize;
+  EnableWALIndex();
+
+  constexpr uint64_t kLo = 7;
+  constexpr uint64_t kHi = 9;
+  ASSERT_OK(writer_->AddWALIndexVoidRecord(WriteOptions(), kLo, kHi));
+
+  // The marker leads the file, so the void record starts one header in.
+  const std::string contents = get_reader_contents()->ToString();
+  const size_t void_header = static_cast<size_t>(header_size);
+  ASSERT_GE(contents.size(),
+            void_header + header_size + kWALIndexVoidPayloadSize);
+
+  const uint8_t type = static_cast<uint8_t>(contents[void_header + 6]);
+  ASSERT_TRUE(type == kWALIndexVoidType || type == kRecyclableWALIndexVoidType);
+  const uint32_t length =
+      (static_cast<uint32_t>(contents[void_header + 4]) & 0xff) |
+      ((static_cast<uint32_t>(contents[void_header + 5]) & 0xff) << 8);
+  ASSERT_EQ(kWALIndexVoidPayloadSize, length);
+
+  const char* payload = contents.data() + void_header + header_size;
+  ASSERT_EQ(kLo, DecodeFixed64(payload));
+  ASSERT_EQ(kHi, DecodeFixed64(payload + kWALIndexSize));
+}
+
+// The reader treats a void record as metadata: it is skipped rather than
+// returned, and leaves the reported index of the records on either side alone.
+TEST_P(LogTest, WALIndexVoidRecordIsSkipped) {
+  EnableWALIndex();
+  Write("before");
+  const uint64_t burned = next_wal_index_++;
+  ASSERT_OK(writer_->AddWALIndexVoidRecord(WriteOptions(), burned, burned));
+  Write("after");
+
+  ASSERT_EQ("before", Read());
+  ASSERT_EQ(kWALIndexStartNumber, reader_->GetLastReadWALIndex());
+  ASSERT_EQ("after", Read());
+  ASSERT_EQ(burned + 1, reader_->GetLastReadWALIndex());
+  ASSERT_EQ("EOF", Read());
+  ASSERT_EQ(0U, DroppedBytes());
+  ASSERT_EQ("", ReportMessage());
+}
+
+// A cover is written after the append it stands in for failed, so its range is
+// behind the writer's high-water mark by construction. That must not trip the
+// strictly-increasing check that guards data records, and must not move the
+// mark either.
+TEST_P(LogTest, WALIndexVoidRecordMayTrailTheHighWaterMark) {
+  EnableWALIndex();
+  next_wal_index_ = kWALIndexStartNumber + 4;
+  Write("data");
+
+  ASSERT_OK(writer_->AddWALIndexVoidRecord(WriteOptions(), kWALIndexStartNumber,
+                                           kWALIndexStartNumber + 1));
+
+  const uint64_t next = next_wal_index_++;
+  ASSERT_OK(
+      writer_->AddRecord(WriteOptions(), Slice("more"), /*seqno=*/0, next));
+
+  ASSERT_EQ("data", Read());
+  ASSERT_EQ(kWALIndexStartNumber + 4, reader_->GetLastReadWALIndex());
+  ASSERT_EQ("more", Read());
+  ASSERT_EQ(kWALIndexStartNumber + 5, reader_->GetLastReadWALIndex());
+  ASSERT_EQ("EOF", Read());
+  ASSERT_EQ(0U, DroppedBytes());
+}
+
+// A supersession is an open-ended cut over one older WAL file, not over the
+// wal_index namespace. The same index is therefore obsolete in the named file
+// while remaining live in the WAL that bears the supersession record.
+TEST_P(LogTest, WALIndexSupersessionIsBearerScoped) {
+  const bool recyclable = std::get<0>(GetParam()) != 0;
+  const int header_size = recyclable ? kRecyclableHeaderSize : kHeaderSize;
+  constexpr uint64_t kFirstSuperseded = 7;
+
+  Slice older_contents;
+  std::unique_ptr<FSWritableFile> older_sink(
+      new test::StringSink(&older_contents));
+  std::unique_ptr<WritableFileWriter> older_file_writer(
+      new WritableFileWriter(std::move(older_sink), "", FileOptions()));
+  Writer older_writer(std::move(older_file_writer), 122, recyclable);
+  older_writer.SetPartitionWALUsage(
+      PartitionWALUsage::kPartitionByColumnFamily);
+  ASSERT_OK(older_writer.MaybeAddWALIndexMarkerRecord(WriteOptions()));
+  ASSERT_OK(older_writer.AddRecord(WriteOptions(), Slice("older"),
+                                   /*seqno=*/0, kFirstSuperseded));
+
+  EnableWALIndex();
+  ASSERT_OK(writer_->AddWALIndexSupersessionRecord(WriteOptions(), 122,
+                                                   kFirstSuperseded));
+  next_wal_index_ = kFirstSuperseded;
+  Write("newer");
+  const std::string contents = get_reader_contents()->ToString();
+
+  const std::vector<uint64_t> expected = {kFirstSuperseded};
+  EXPECT_EQ(expected, DecodeWALIndices(older_contents.ToString(), {5}));
+  ASSERT_EQ("newer", Read());
+  ASSERT_EQ(kFirstSuperseded, reader_->GetLastReadWALIndex());
+  ASSERT_EQ("EOF", Read());
+  EXPECT_EQ(kFirstSuperseded, reader_->GetFirstSupersededWALIndex(122));
+  EXPECT_EQ(0U, reader_->GetFirstSupersededWALIndex(121));
+  EXPECT_FALSE(reader_->IsWALIndexSuperseded(122, kFirstSuperseded - 1));
+  EXPECT_TRUE(reader_->IsWALIndexSuperseded(122, kFirstSuperseded));
+  EXPECT_TRUE(
+      reader_->IsWALIndexSuperseded(122, std::numeric_limits<uint64_t>::max()));
+  EXPECT_FALSE(reader_->IsWALIndexSuperseded(123, kFirstSuperseded));
+  EXPECT_FALSE(reader_->IsWALIndexSuperseded(124, kFirstSuperseded));
+
+  const size_t supersession_header = static_cast<size_t>(header_size);
+  ASSERT_GE(contents.size(), supersession_header + header_size +
+                                 kWALIndexSupersessionPayloadSize);
+  const uint8_t type = static_cast<uint8_t>(contents[supersession_header + 6]);
+  EXPECT_EQ(recyclable ? kRecyclableWALIndexSupersessionType
+                       : kWALIndexSupersessionType,
+            type);
+  const uint32_t length =
+      (static_cast<uint32_t>(contents[supersession_header + 4]) & 0xff) |
+      ((static_cast<uint32_t>(contents[supersession_header + 5]) & 0xff) << 8);
+  ASSERT_EQ(kWALIndexSupersessionPayloadSize, length);
+  const char* payload = contents.data() + supersession_header + header_size;
+  EXPECT_EQ(122U, DecodeFixed64(payload));
+  EXPECT_EQ(kFirstSuperseded, DecodeFixed64(payload + kWALIndexSize));
+}
+
+TEST_P(LogTest, WALIndexSupersessionWithInvalidSizeReportsCorruption) {
+  const bool recyclable = std::get<0>(GetParam()) != 0;
+  const int header_size = recyclable ? kRecyclableHeaderSize : kHeaderSize;
+  EnableWALIndex();
+  ASSERT_OK(writer_->AddWALIndexSupersessionRecord(WriteOptions(), 122, 7));
+
+  const int supersession_header = header_size;
+  SetByte(supersession_header + 4,
+          static_cast<char>(kWALIndexSupersessionPayloadSize - 1));
+  SetByte(supersession_header + 5, 0);
+  FixChecksum(supersession_header, kWALIndexSupersessionPayloadSize - 1,
+              recyclable);
+
+  ASSERT_EQ("EOF", Read());
+  EXPECT_EQ("OK", MatchError("supersession record has invalid size"));
+  EXPECT_EQ(0U, reader_->GetFirstSupersededWALIndex(122));
+}
+
+TEST_P(LogTest, WALIndexSupersessionAtZeroReportsCorruption) {
+  const bool recyclable = std::get<0>(GetParam()) != 0;
+  const int header_size = recyclable ? kRecyclableHeaderSize : kHeaderSize;
+  EnableWALIndex();
+  ASSERT_OK(writer_->AddWALIndexSupersessionRecord(WriteOptions(), 122, 7));
+
+  const int supersession_header = header_size;
+  SetFixed64(supersession_header + header_size + kWALIndexSize, 0);
+  FixChecksum(supersession_header, kWALIndexSupersessionPayloadSize,
+              recyclable);
+
+  ASSERT_EQ("EOF", Read());
+  EXPECT_EQ("OK", MatchError("starts at the unassigned index"));
+  EXPECT_EQ(0U, reader_->GetFirstSupersededWALIndex(122));
+}
+
+TEST_P(LogTest, WALIndexSupersessionForNonOlderWALReportsCorruption) {
+  const bool recyclable = std::get<0>(GetParam()) != 0;
+  const int header_size = recyclable ? kRecyclableHeaderSize : kHeaderSize;
+  EnableWALIndex();
+  ASSERT_OK(writer_->AddWALIndexSupersessionRecord(WriteOptions(), 122, 7));
+
+  const int supersession_header = header_size;
+  SetFixed64(supersession_header + header_size, 123);
+  FixChecksum(supersession_header, kWALIndexSupersessionPayloadSize,
+              recyclable);
+
+  ASSERT_EQ("EOF", Read());
+  EXPECT_EQ("OK", MatchError("names a non-older WAL"));
+  EXPECT_EQ(0U, reader_->GetFirstSupersededWALIndex(123));
+}
+
+TEST_P(LogTest, WALIndexSupersessionAfterDataReportsCorruption) {
+  EnableWALIndex();
+  Write("before");
+  ASSERT_OK(writer_->AddWALIndexSupersessionRecord(WriteOptions(), 122, 7));
+
+  ASSERT_EQ("before", Read());
+  ASSERT_EQ("EOF", Read());
+  EXPECT_EQ("OK", MatchError("supersession follows a data record"));
+  EXPECT_EQ(0U, reader_->GetFirstSupersededWALIndex(122));
+}
+
+// The reader folds valid void range ends into a separate high-water mark
+// without disturbing the per-record index.
+TEST_P(LogTest, WALIndexVoidHiIsTrackedSeparately) {
+  EnableWALIndex();
+  Write("before");
+  ASSERT_OK(writer_->AddWALIndexVoidRecord(WriteOptions(), kWALIndexStartNumber,
+                                           kWALIndexStartNumber + 4));
+  Write("after");
+
+  ASSERT_EQ("before", Read());
+  ASSERT_EQ(kWALIndexStartNumber, reader_->GetLastReadWALIndex());
+  ASSERT_EQ("after", Read());
+  ASSERT_EQ(kWALIndexStartNumber + 1, reader_->GetLastReadWALIndex());
+  ASSERT_EQ("EOF", Read());
+  EXPECT_EQ(kWALIndexStartNumber + 4, reader_->GetMaxVoidWALIndexHi());
+  ASSERT_EQ(0U, DroppedBytes());
+}
+
+// A void record too short to hold its range fails closed.
+TEST_P(LogTest, WALIndexShortVoidRecordReportsCorruption) {
+  const bool recyclable = std::get<0>(GetParam()) != 0;
+  const int header_size = recyclable ? kRecyclableHeaderSize : kHeaderSize;
+  EnableWALIndex();
+  Write("before");
+  const uint64_t burned = next_wal_index_++;
+  ASSERT_OK(writer_->AddWALIndexVoidRecord(WriteOptions(), burned, burned));
+
+  const int void_header = 2 * header_size + static_cast<int>(kWALIndexSize) + 6;
+  SetByte(void_header + 4, 8);
+  SetByte(void_header + 5, 0);
+  FixChecksum(void_header, 8, recyclable);
+
+  ASSERT_EQ("before", Read());
+  ASSERT_EQ("EOF", Read());
+  ASSERT_EQ("OK", MatchError("too short to hold a range"));
+  EXPECT_EQ(0U, reader_->GetMaxVoidWALIndexHi());
+}
+
+// The format has no extension bytes, so accepting a longer payload would let
+// malformed declarations acquire accidental meaning.
+TEST_P(LogTest, WALIndexLongVoidRecordReportsCorruption) {
+  const bool recyclable = std::get<0>(GetParam()) != 0;
+  const int header_size = recyclable ? kRecyclableHeaderSize : kHeaderSize;
+  EnableWALIndex();
+  Write("before");
+  const uint64_t burned = next_wal_index_++;
+  ASSERT_OK(writer_->AddWALIndexVoidRecord(WriteOptions(), burned, burned));
+  Write("after");
+
+  const int void_header = 2 * header_size + static_cast<int>(kWALIndexSize) + 6;
+  SetByte(void_header + 4, static_cast<char>(kWALIndexVoidPayloadSize + 1));
+  FixChecksum(void_header, kWALIndexVoidPayloadSize + 1, recyclable);
+
+  ASSERT_EQ("before", Read());
+  ASSERT_EQ("EOF", Read());
+  ASSERT_EQ("OK", MatchError("longer than its range"));
+  EXPECT_EQ(0U, reader_->GetMaxVoidWALIndexHi());
+}
+
+// Zero is the unassigned sentinel, not a valid member of a void range.
+TEST_P(LogTest, WALIndexZeroVoidRangeStartReportsCorruption) {
+  const bool recyclable = std::get<0>(GetParam()) != 0;
+  const int header_size = recyclable ? kRecyclableHeaderSize : kHeaderSize;
+  EnableWALIndex();
+  ASSERT_OK(writer_->AddWALIndexVoidRecord(WriteOptions(), 1, 2));
+
+  const int void_header = header_size;
+  const int void_payload = void_header + header_size;
+  SetFixed64(void_payload, 0);
+  FixChecksum(void_header, kWALIndexVoidPayloadSize, recyclable);
+
+  ASSERT_EQ("EOF", Read());
+  ASSERT_EQ("OK", MatchError("starts at the unassigned index"));
+  EXPECT_EQ(0U, reader_->GetMaxVoidWALIndexHi());
+}
+
+// An empty or descending closed range cannot truthfully declare any indices.
+TEST_P(LogTest, WALIndexReversedVoidRangeReportsCorruption) {
+  const bool recyclable = std::get<0>(GetParam()) != 0;
+  const int header_size = recyclable ? kRecyclableHeaderSize : kHeaderSize;
+  EnableWALIndex();
+  ASSERT_OK(writer_->AddWALIndexVoidRecord(WriteOptions(), 8, 9));
+
+  const int void_header = header_size;
+  const int void_payload = void_header + header_size;
+  SetFixed64(void_payload, 10);
+  FixChecksum(void_header, kWALIndexVoidPayloadSize, recyclable);
+
+  ASSERT_EQ("EOF", Read());
+  ASSERT_EQ("OK", MatchError("range is reversed"));
+  EXPECT_EQ(0U, reader_->GetMaxVoidWALIndexHi());
+}
+
+// A cover written after a torn append lands mid-record, so both readers must
+// abandon the interrupted record exactly as they do for the marker.
+TEST_P(LogTest, WALIndexVoidInsidePartialRecordReportsCorruption) {
+  const bool recyclable = std::get<0>(GetParam()) != 0;
+  const int header_size = recyclable ? kRecyclableHeaderSize : kHeaderSize;
+  EnableWALIndex();
+
+  constexpr int kTailSize = 100;
+  const int first_fragment = static_cast<int>(kBlockSize) - 2 * header_size;
+  const int middle_fragment = static_cast<int>(kBlockSize) - header_size;
+  Write(BigString("abcd", static_cast<size_t>(first_fragment) +
+                              middle_fragment - kWALIndexSize + kTailSize));
+
+  const int middle_header = static_cast<int>(kBlockSize);
+  SetByte(middle_header + 6,
+          static_cast<char>(recyclable ? kRecyclableWALIndexVoidType
+                                       : kWALIndexVoidType));
+  FixChecksum(middle_header, middle_fragment, recyclable);
+
+  ASSERT_EQ("EOF", Read());
+  ASSERT_EQ("OK", MatchError("void interspersed partial record"));
+  ASSERT_EQ("OK", MatchError("missing start of fragmented record(2)"));
 }
 
 // The separate index prefix must produce the same bytes as a contiguous
@@ -2001,6 +2311,66 @@ TEST_P(CompressionLogTest, WALIndexReadWrite) {
 // in a single Compress() call. Incompressible data forces the streaming
 // compressor to return output across several calls, which is the path where
 // the wal_index prefix has to survive `compress_remaining > 0` looping.
+// A void record bypasses the compressor -- EmitPhysicalRecord is called with
+// the range directly, the way the marker is -- and the reader's metadata
+// allowlist keeps it from being run through decompression on the way back. So
+// its payload must be the same plain bytes on a compressed WAL as on a plain
+// one, and the data records around it must still decode.
+TEST_P(CompressionLogTest, WALIndexVoidRecordIsNotCompressed) {
+  CompressionType compression_type = std::get<2>(GetParam());
+  if (!StreamingCompressionTypeSupported(compression_type)) {
+    ROCKSDB_GTEST_SKIP("Test requires support for compression type");
+    return;
+  }
+  const bool recyclable = std::get<0>(GetParam()) != 0;
+  const int header_size = recyclable ? kRecyclableHeaderSize : kHeaderSize;
+  ASSERT_OK(SetupTestEnv());
+  EnableWALIndex();
+
+  Write("foo");
+  const uint64_t burned = next_wal_index_++;
+  ASSERT_OK(writer_->AddWALIndexVoidRecord(WriteOptions(), burned, burned));
+  Write("bar");
+
+  // Find the void record and decode its payload straight out of the file.
+  const std::string contents = get_reader_contents()->ToString();
+  size_t offset = 0;
+  bool found = false;
+  while (offset + header_size <= contents.size()) {
+    const size_t block_remaining = kBlockSize - (offset % kBlockSize);
+    if (block_remaining < static_cast<size_t>(header_size)) {
+      offset += block_remaining;
+      continue;
+    }
+    const uint8_t type = static_cast<uint8_t>(contents[offset + 6]);
+    if (type == kZeroType) {
+      break;
+    }
+    const size_t length =
+        (static_cast<size_t>(static_cast<uint8_t>(contents[offset + 4]))) |
+        (static_cast<size_t>(static_cast<uint8_t>(contents[offset + 5])) << 8);
+    const size_t this_header =
+        IsRecyclableRecordType(type) ? kRecyclableHeaderSize : kHeaderSize;
+    if (type == kWALIndexVoidType || type == kRecyclableWALIndexVoidType) {
+      ASSERT_EQ(kWALIndexVoidPayloadSize, length);
+      const char* payload = contents.data() + offset + this_header;
+      ASSERT_EQ(burned, DecodeFixed64(payload));
+      ASSERT_EQ(burned, DecodeFixed64(payload + kWALIndexSize));
+      found = true;
+      break;
+    }
+    offset += this_header + length;
+  }
+  ASSERT_TRUE(found) << "no void record found on the compressed WAL";
+
+  ASSERT_EQ("foo", Read());
+  ASSERT_EQ(kWALIndexStartNumber, reader_->GetLastReadWALIndex());
+  ASSERT_EQ("bar", Read());
+  ASSERT_EQ(burned + 1, reader_->GetLastReadWALIndex());
+  ASSERT_EQ("EOF", Read());
+  ASSERT_EQ(0U, DroppedBytes());
+}
+
 TEST_P(CompressionLogTest, WALIndexLargeIncompressible) {
   CompressionType compression_type = std::get<2>(GetParam());
   if (!StreamingCompressionTypeSupported(compression_type)) {
