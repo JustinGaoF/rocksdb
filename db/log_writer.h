@@ -210,6 +210,16 @@ class Writer {
   // wal_index of the last data record AddRecord completed, or zero.
   uint64_t last_wal_index_recorded() const { return last_wal_index_recorded_; }
 
+  // The highest sequence a DBImpl append to this file has consumed. Not part
+  // of the file format: DBImpl keeps it only to assert that sequence order
+  // equals byte order within the file.
+  SequenceNumber last_sequence_consumed() const {
+    return last_sequence_consumed_;
+  }
+  void set_last_sequence_consumed(SequenceNumber sequence) {
+    last_sequence_consumed_ = sequence;
+  }
+
  private:
   std::unique_ptr<WritableFileWriter> dest_;
   size_t block_offset_;  // Current offset in block
@@ -261,6 +271,7 @@ class Writer {
   bool track_and_verify_wals_;
 
   SequenceNumber last_seqno_recorded_;
+  SequenceNumber last_sequence_consumed_ = 0;
 
   // See `DBOptions::partition_wal_usage`.
   PartitionWALUsage partition_wal_usage_ = PartitionWALUsage::kNone;
