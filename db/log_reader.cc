@@ -356,6 +356,7 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch,
       case kRecyclableWALIndexMarkerType: {
         // Identifies the file as carrying per-record wal_index values. The
         // marker itself does not consume a wal_index.
+        saw_wal_index_marker_ = true;
         if (first_record_read_) {
           // The writer emits it when the file is started, so a marker after a
           // data record means the file is not what it claims to be.
@@ -444,6 +445,7 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch,
               ReportOldLogRecord(scratch->size());
             }
           }
+          stopped_at_old_record_ = true;
           return false;
         }
         FALLTHROUGH_INTENDED;
@@ -631,6 +633,7 @@ void Reader::DecodeWALIndexSupersessionRecord(const Slice& fragment) {
   // readers inherit the same rule. A progress record closes the head: reading
   // one proves no supersession is still coming.
   if (first_record_read_ || last_progress_bound_read_ != 0) {
+    saw_misplaced_supersession_ = true;
     ReportCorruption(
         fragment.size(),
         "WAL_Index supersession follows a data record or progress assertion");
@@ -827,8 +830,13 @@ void Reader::ReportCorruption(size_t bytes, const char* reason,
 
 void Reader::ReportDrop(size_t bytes, const Status& reason,
                         uint64_t log_number) {
+  may_have_dropped_own_record_ |= !drop_holds_no_own_header_;
+  drop_holds_no_own_header_ = false;
   if (reporter_ != nullptr) {
     reporter_->Corruption(bytes, reason, log_number);
+  } else {
+    // A head check reads with no reporter: the drop is still noted above.
+    reason.PermitUncheckedError();
   }
 }
 
@@ -836,6 +844,16 @@ void Reader::ReportOldLogRecord(size_t bytes) {
   if (reporter_ != nullptr) {
     reporter_->OldLogRecord(bytes);
   }
+}
+
+bool Reader::HoldsOwnRecyclableHeader(const Slice& bytes) const {
+  for (size_t i = 0; i + kRecyclableHeaderSize <= bytes.size(); ++i) {
+    if (IsRecyclableRecordType(static_cast<uint8_t>(bytes[i + 6])) &&
+        DecodeFixed32(bytes.data() + i + 7) == log_number_) {
+      return true;
+    }
+  }
+  return false;
 }
 
 bool Reader::ReadMore(size_t* drop_size, uint8_t* error) {
@@ -922,6 +940,11 @@ uint8_t Reader::ReadPhysicalRecord(Slice* result, size_t* drop_size,
     if (header_size + length > buffer_.size()) {
       assert(buffer_.size() >= static_cast<size_t>(header_size));
       *drop_size = buffer_.size();
+      // The dropped record's own header may name this log: it is the one
+      // that failed, not one lost with it.
+      drop_holds_no_own_header_ =
+          recycled_ &&
+          !HoldsOwnRecyclableHeader(Slice(buffer_.data() + 1, *drop_size - 1));
       buffer_.clear();
       // If the end of the read has been reached without seeing
       // `header_size + length` bytes of payload, report a corruption. The
@@ -958,6 +981,9 @@ uint8_t Reader::ReadPhysicalRecord(Slice* result, size_t* drop_size,
         // fragment of a real log record that just happens to look
         // like a valid log record.
         *drop_size = buffer_.size();
+        drop_holds_no_own_header_ =
+            recycled_ && !HoldsOwnRecyclableHeader(
+                             Slice(buffer_.data() + 1, *drop_size - 1));
         buffer_.clear();
         return kBadRecordChecksum;
       }
@@ -1292,6 +1318,7 @@ bool FragmentBufferedReader::ReadRecord(Slice* record, std::string* scratch,
 
       case kWALIndexMarkerType:
       case kRecyclableWALIndexMarkerType: {
+        saw_wal_index_marker_ = true;
         if (first_record_read_) {
           // The writer emits it when the file is started, so a marker after a
           // data record means the file is not what it claims to be.
