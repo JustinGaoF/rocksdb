@@ -557,6 +557,9 @@ default_params = {
     "partition_wal_usage": lambda: random.choice(
         ["none", "partition_by_column_family"]
     ),
+    # Fixed for the whole invocation, so every run reopens the same layout.
+    "wal_partitions": random.choice([1] * 6 + [2, 8, 16]),
+    "sync_write_one_in": lambda: random.choice([0, 0, 10, 100]),
     "verify_sst_unique_id_in_manifest": 1,  # always do unique_id verification
     "fast_sst_open": lambda: random.choice([0, 1]),
     "secondary_cache_uri": lambda: random.choice(
@@ -2333,6 +2336,37 @@ def finalize_and_sanitize(src_params):
         if dest_params.get("read_index", -1) > 0:
             dest_params["read_index"] = -1
 
+    if dest_params.get("wal_partitions", 1) > 1:
+        if (
+            dest_params.get("disable_wal", 0) == 1
+            or dest_params.get("partition_wal_usage") == "none"
+            or dest_params.get("two_write_queues", 0) == 1
+            or dest_params.get("enable_pipelined_write", 0) == 1
+            or dest_params.get("allow_concurrent_memtable_write", 0) == 0
+            or dest_params.get("memtablerep") != "skip_list"
+            or dest_params.get("inplace_update_support", 0) == 1
+            or dest_params.get("unordered_write", 0) == 1
+            or dest_params.get("enable_blob_direct_write", 0) == 1
+            or dest_params.get("recycle_log_file_num", 0) > 0
+            or dest_params.get("track_and_verify_wals", 0) == 1
+            # db_stress turns track_and_verify_wals_in_manifest off for this
+            # mode, and N > 1 requires it.
+            or dest_params.get("file_scope_wal_write_faults", 0) == 1
+            or (
+                dest_params.get("use_optimistic_txn", 0) == 1
+                and dest_params.get("occ_validation_policy", 1) == 0
+            )
+            # A secondary instance refuses partitioned WALs, and continuous
+            # verification reads through one.
+            or dest_params.get("test_secondary", 0) == 1
+            or dest_params.get("continuous_verification_interval", 0) > 0
+        ):
+            dest_params["wal_partitions"] = 1
+        else:
+            # Both ingest a WriteBatchWithIndex, which fails at N > 1.
+            dest_params["ingest_wbwi_one_in"] = 0
+            dest_params["commit_bypass_memtable_one_in"] = 0
+
     # With WAL indexing, disableWAL writes stay rejected when
     # recycle_log_file_num > 0: a seqno gap filler would need a WAL index.
     if (
@@ -2416,6 +2450,37 @@ def gen_cmd_params(args, unknown_params=None):
         params["compaction_style"] = (
             0 if not args.test_tiered_storage else random.choice([0, 1])
         )
+
+    wal_partitions = getattr(args, "wal_partitions", None)
+    if wal_partitions is None:
+        wal_partitions = params.get("wal_partitions", 1)
+    if wal_partitions > 1:
+        # Open admits wal_partitions > 1 only with an indexed WAL and rejects
+        # these. Steer the randomized settings before merging command line
+        # arguments, so an explicitly requested incompatible setting wins and
+        # finalize_and_sanitize() falls back to one partition. Settings drawn
+        # per run are fixed here so that wal_partitions stays the same for every
+        # run of the series. Writes mix sync levels rather than syncing all or
+        # none.
+        params["partition_wal_usage"] = "partition_by_column_family"
+        if "disable_wal" in params:
+            # Absent (liveness), db_stress already keeps the WAL on.
+            params["disable_wal"] = 0
+        params["enable_pipelined_write"] = 0
+        params["allow_concurrent_memtable_write"] = 1
+        params["memtablerep"] = "skip_list"
+        params["sync"] = 0
+        if params.get("sync_write_one_in", 0) == 0:
+            params["sync_write_one_in"] = 10
+        # A secondary instance refuses partitioned WALs, and continuous
+        # verification reads through one.
+        params["test_secondary"] = 0
+        params["continuous_verification_interval"] = 0
+        # two_write_queues turns indexing off; txn modes draw it per run.
+        params["two_write_queues"] = 0
+        # Turns allow_concurrent_memtable_write off for txn modes; drawn, it
+        # gives way to N > 1.
+        params["commit_bypass_memtable_one_in"] = 0
 
     for k, v in vars(args).items():
         if v is not None:
