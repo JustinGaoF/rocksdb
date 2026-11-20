@@ -38,9 +38,9 @@ Step 6 - After memtable insertion completes, publish the new sequence: `versions
 
 ## Two-Queue Path
 
-With `two_write_queues_`, sequence allocation uses `versions_->FetchAddLastAllocatedSequence(total_count)` atomically under `wal_write_mutex_`. The `LastAllocatedSequence` may advance ahead of `LastSequence` because WAL-only writes (e.g., 2PC prepare) allocate sequences before the corresponding memtable writes publish them.
+With `two_write_queues_`, sequence allocation uses `versions_->FetchAddLastAllocatedSequence(total_count)` atomically under the selected partition's WAL write mutex. The `LastAllocatedSequence` may advance ahead of `LastSequence` because WAL-only writes (e.g., 2PC prepare) allocate sequences before the corresponding memtable writes publish them.
 
-`ConcurrentWriteGroupToWAL()` performs the WAL write and sequence allocation under `wal_write_mutex_`, ensuring WAL order matches sequence order even with concurrent write groups.
+`ConcurrentWriteGroupToWAL()` performs the WAL write and sequence allocation under the selected partition's WAL write mutex, ensuring WAL order matches sequence order even with concurrent write groups.
 
 ## Sequence Per Batch vs Sequence Per Key
 
