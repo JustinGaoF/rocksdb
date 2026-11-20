@@ -129,12 +129,17 @@ IOStatus Writer::AddRecord(const WriteOptions& write_options,
     // is a symptom worth catching in debug rather than grounds for failing a
     // production write.
     assert(seqno >= last_seqno_recorded_);
-    // TODO(justingao): the index is consumed by DBImpl before this append. If
-    // the append or compression path below fails, the index is burned: it was
-    // allocated but never reached disk, and nothing distinguishes that from a
-    // record that was lost. Resolve before any completeness check lands, by
-    // allocating after a successful append or by emitting an explicit
-    // placeholder for the burned index.
+    // The index is consumed by DBImpl before this append, so the append below
+    // can still fail after it was handed out. The invariant gap detection has
+    // to be written against, in full -- all three clauses matter:
+    //
+    //   Every allocated wal_index is on a data record, or under a void record
+    //   covering it, or above every index whose write was acknowledged.
+    //
+    // The third clause is the terminal case: when neither the record nor its
+    // cover can be written, the write path fails and nothing above the burned
+    // index is ever acknowledged, so a gap check that stops at the highest
+    // acknowledged index never reaches it.
     if (compress_) {
       indexed_payload.reserve(kWALIndexSize + slice.size());
       PutFixed64(&indexed_payload, wal_index);
@@ -297,6 +302,85 @@ IOStatus Writer::MaybeAddWALIndexMarkerRecord(
       recycle_log_files_ ? kRecyclableWALIndexMarkerType : kWALIndexMarkerType;
   s = EmitPhysicalRecord(write_options, type, Slice(), empty_payload.data(),
                          empty_payload.size());
+  if (!s.ok()) {
+    return s;
+  }
+
+  if (!manual_flush_) {
+    IOOptions io_opts;
+    s = WritableFileWriter::PrepareIOOptions(write_options, io_opts);
+    if (s.ok()) {
+      s = dest_->Flush(io_opts);
+    }
+  }
+  return s;
+}
+
+IOStatus Writer::AddWALIndexVoidRecord(const WriteOptions& write_options,
+                                       uint64_t lo, uint64_t hi) {
+  if (!WALIndexEnabled()) {
+    return IOStatus::OK();
+  }
+  if (lo == 0 || lo > hi) {
+    return IOStatus::Corruption("invalid WAL index void [" +
+                                std::to_string(lo) + ", " + std::to_string(hi) +
+                                "]");
+  }
+
+  std::string payload;
+  payload.reserve(kWALIndexVoidPayloadSize);
+  PutFixed64(&payload, lo);
+  PutFixed64(&payload, hi);
+  return EmitWALIndexControlRecord(
+      write_options,
+      recycle_log_files_ ? kRecyclableWALIndexVoidType : kWALIndexVoidType,
+      payload);
+}
+
+IOStatus Writer::AddWALIndexSupersessionRecord(
+    const WriteOptions& write_options, uint64_t superseded_wal_number,
+    uint64_t first_superseded_wal_index) {
+  if (!WALIndexEnabled()) {
+    return IOStatus::OK();
+  }
+  if (superseded_wal_number == 0 || superseded_wal_number >= log_number_ ||
+      first_superseded_wal_index == 0) {
+    return IOStatus::Corruption("invalid WAL index supersession of WAL " +
+                                std::to_string(superseded_wal_number) +
+                                " from wal_index " +
+                                std::to_string(first_superseded_wal_index) +
+                                " in WAL " + std::to_string(log_number_));
+  }
+
+  std::string payload;
+  payload.reserve(kWALIndexSupersessionPayloadSize);
+  PutFixed64(&payload, superseded_wal_number);
+  PutFixed64(&payload, first_superseded_wal_index);
+  return EmitWALIndexControlRecord(write_options,
+                                   recycle_log_files_
+                                       ? kRecyclableWALIndexSupersessionType
+                                       : kWALIndexSupersessionType,
+                                   payload);
+}
+
+IOStatus Writer::EmitWALIndexControlRecord(const WriteOptions& write_options,
+                                           RecordType type,
+                                           const std::string& payload) {
+  IOStatus s = MaybeHandleSeenFileWriterError();
+  if (!s.ok()) {
+    return s;
+  }
+
+  s = MaybeSwitchToNewBlock(write_options, payload);
+  if (!s.ok()) {
+    return s;
+  }
+
+  // Deliberately does not touch last_wal_index_recorded_. A control record
+  // describes indices at or behind the high water mark by construction, so the
+  // strictly-increasing check that guards data records would reject it.
+  s = EmitPhysicalRecord(write_options, type, Slice(), payload.data(),
+                         payload.size());
   if (!s.ok()) {
     return s;
   }
