@@ -8442,6 +8442,317 @@ TEST_F(DBWALIndexTest, RollbackProcedureLeavesNoIndexedWAL) {
   }
 }
 
+// The rollback procedure in PartitionWALUsage's comment, from N partitions
+// (FU4): step 1 sets wal_partitions = 1 with kNone. The parameter is N.
+class DBWALIndexRollbackTest : public DBWALIndexTest,
+                               public testing::WithParamInterface<uint32_t> {
+ protected:
+  // Options writing indexed WALs at `partitions` partitions.
+  Options IndexedOptions(uint32_t partitions) {
+    Options options =
+        WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+    test::SetWalPartitions(&options, partitions);
+    return options;
+  }
+
+  // Writes key "<prefix><cf>" with value "<prefix>" to every column family,
+  // synced, and records it in written_.
+  void WriteEveryColumnFamily(const std::string& prefix) {
+    WriteOptions sync;
+    sync.sync = true;
+    for (int cf = 0; cf < static_cast<int>(handles_.size()); ++cf) {
+      const std::string key = prefix + std::to_string(cf);
+      ASSERT_OK(db_->Put(sync, handles_[cf], key, prefix));
+      written_.emplace_back(cf, key);
+    }
+  }
+
+  void VerifyWritten() {
+    for (const auto& [cf, key] : written_) {
+      EXPECT_EQ(key.substr(0, 1), Get(cf, key)) << key;
+    }
+  }
+
+  std::vector<std::pair<int, std::string>> written_;
+};
+
+INSTANTIATE_TEST_CASE_P(DBWALIndexRollbackTest, DBWALIndexRollbackTest,
+                        testing::Values(1u, 4u));
+
+// R2-R4: the documented steps one by one, from a history with an unflushed,
+// indexed tail on every partition. With an archive (WAL_ttl_seconds) the
+// check names the archived indexed WALs until step 4 purges them; with a
+// crash that drops unsynced data after step 1's reopen, before the guard
+// clears, the DB reopens with kNone at one partition with every key, and
+// the procedure repeated from step 1 completes. At N > 1, step 1 without
+// wal_partitions = 1 is refused and changes nothing.
+TEST_P(DBWALIndexRollbackTest,
+       RollbackProcedureLeavesNoIndexedWALAtAnyPartitionCount) {
+  const uint32_t partitions = GetParam();
+  const std::vector<std::string> names = ColumnFamilyNamesThrough(
+      ColumnFamilyIdsCoveringWalPartitions(partitions));
+  const std::vector<std::string> cfs(names.begin() + 1, names.end());
+  for (const bool archive : {false, true}) {
+    for (const bool crash : {false, true}) {
+      SCOPED_TRACE("archive=" + std::to_string(archive) +
+                   " crash=" + std::to_string(crash));
+      Options indexed = IndexedOptions(partitions);
+      indexed.WAL_ttl_seconds = archive ? 1000 : 0;
+      ASSERT_NO_FATAL_FAILURE(DestroyAndReopen(indexed));
+      ASSERT_NO_FATAL_FAILURE(CreateAndReopenWithCF(cfs, indexed));
+      written_.clear();
+      ASSERT_NO_FATAL_FAILURE(WriteEveryColumnFamily("a"));
+      // Every partition holds records, none of them flushed.
+      if (partitions > 1) {
+        EXPECT_EQ(partitions, WalPartitionsAppendedTo(db_.get()));
+      }
+      Close();
+      const std::vector<uint64_t> indexed_wals = ListWalNumbers();
+      ASSERT_GE(indexed_wals.size(), partitions);
+      std::string output;
+      EXPECT_NE(0, RunCheckWALIndex(dbname_, indexed, &output));
+      EXPECT_NE(std::string::npos, output.find("WAL index guard: set"))
+          << output;
+
+      Options none = indexed;
+      none.partition_wal_usage = PartitionWALUsage::kNone;
+      if (partitions > 1) {
+        // Step 1 without wal_partitions = 1 is refused.
+        SyncPoint::GetInstance()->SetCallBack(
+            "DBImpl::ValidateOptions:AllowWalPartitions",
+            [](void* arg) { *static_cast<bool*>(arg) = true; });
+        SyncPoint::GetInstance()->EnableProcessing();
+        const Status s = TryReopenWithColumnFamilies(names, none);
+        ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+        EXPECT_NE(std::string::npos,
+                  s.ToString().find("wal_partitions > 1 requires "
+                                    "partition_wal_usage other than kNone"))
+            << s.ToString();
+        EXPECT_EQ(indexed_wals, ListWalNumbers());
+      }
+      none.wal_partitions = 1;
+
+      // 1. Reopen with kNone at one partition. The crash leg tracks what
+      // this instance writes, to drop what it left unsynced.
+      std::unique_ptr<FaultInjectionTestEnv> fault_env(
+          new FaultInjectionTestEnv(env_));
+      // On any exit, the DB, which may be on fault_env, closes first.
+      Defer close_before_env([&] { Close(); });
+      if (crash) {
+        none.env = fault_env.get();
+      }
+      ASSERT_NO_FATAL_FAILURE(ReopenWithColumnFamilies(names, none));
+      ASSERT_EQ(1u, dbfull()->TEST_NumWalPartitions());
+      VerifyWritten();
+      ASSERT_NO_FATAL_FAILURE(WriteEveryColumnFamily("b"));
+      // With one partition the indexed WALs stay live until step 2's flush
+      // (avoid_flush_during_recovery), and so does the guard. A kNone open
+      // of a partitioned set flushes it at open, so the guard clears there
+      // (step 5's "may already be step 1's").
+      const bool guard_at_step_1 = partitions == 1;
+      EXPECT_EQ(guard_at_step_1, ManifestWALIndexGuard(env_, dbname_) != 0);
+      if (crash) {
+        // Lose everything unsynced before the guard clears, then start over
+        // from step 1.
+        fault_env->SetFilesystemActive(false);
+        Close();
+        ASSERT_OK(fault_env->DropUnsyncedFileData());
+        none.env = env_;
+        ASSERT_NO_FATAL_FAILURE(ReopenWithColumnFamilies(names, none));
+        VerifyWritten();
+        EXPECT_EQ(guard_at_step_1, ManifestWALIndexGuard(env_, dbname_) != 0);
+      }
+
+      // 2. Flush every column family.
+      for (int cf = 0; cf < static_cast<int>(handles_.size()); ++cf) {
+        ASSERT_OK(Flush(cf));
+      }
+      // 3. No prepared transaction here; the WALs written before step 1 are
+      // deleted, or moved to the archive.
+      Close();
+      for (const uint64_t wal_number : indexed_wals) {
+        EXPECT_TRUE(env_->FileExists(WALPath(wal_number)).IsNotFound())
+            << wal_number;
+        EXPECT_EQ(
+            archive,
+            env_->FileExists(ArchivedLogFileName(dbname_, wal_number)).ok())
+            << wal_number;
+      }
+      output.clear();
+      EXPECT_EQ(guard_at_step_1 || archive,
+                RunCheckWALIndex(dbname_, none, &output) != 0)
+          << output;
+      // 4. Purge the archive. Until then the check names every archived
+      // indexed WAL.
+      for (const uint64_t wal_number : indexed_wals) {
+        const std::string archived = ArchivedLogFileName(dbname_, wal_number);
+        if (archive) {
+          EXPECT_NE(std::string::npos,
+                    output.find("archived WAL " + archived + ": indexed"))
+              << output;
+        }
+      }
+      if (archive) {
+        const std::string archive_dir = ArchivalDirectory(dbname_);
+        std::vector<std::string> files;
+        ASSERT_OK(env_->GetChildren(archive_dir, &files));
+        for (const std::string& file : files) {
+          if (file != "." && file != "..") {
+            ASSERT_OK(env_->DeleteFile(archive_dir + "/" + file));
+          }
+        }
+      }
+
+      // 5. Reopen once more with kNone, and close: the guard clears.
+      ASSERT_NO_FATAL_FAILURE(ReopenWithColumnFamilies(names, none));
+      Close();
+      // 6, 7. The check finds no indexed WAL and the guard clear.
+      output.clear();
+      EXPECT_EQ(0, RunCheckWALIndex(dbname_, none, &output)) << output;
+      EXPECT_NE(std::string::npos,
+                output.find("No WAL index records and no WAL index guard"))
+          << output;
+      EXPECT_EQ(0u, ManifestWALIndexGuard(env_, dbname_));
+
+      // An open with kNone at one partition accepts the DB, with every key.
+      ASSERT_NO_FATAL_FAILURE(ReopenWithColumnFamilies(names, none));
+      VerifyWritten();
+      Close();
+      Destroy(none);
+    }
+  }
+}
+
+// R5: a prepared transaction outstanding at step 1 keeps the WALs written
+// before step 1 live, and with them the guard, until it commits or rolls
+// back; then steps 3-7 complete and the transaction's outcome stands.
+// Re-enabling partitioning before the rollback completes, with the prepare
+// still outstanding, is GC26TrueAlternationFailsClosed (db_write_test.cc).
+TEST_P(DBWALIndexRollbackTest, RollbackProcedureWaitsForPreparedTransaction) {
+  const uint32_t partitions = GetParam();
+  const std::vector<std::string> names = ColumnFamilyNamesThrough(
+      ColumnFamilyIdsCoveringWalPartitions(partitions));
+  const std::vector<std::string> cfs(names.begin() + 1, names.end());
+  const int prepared_cf = static_cast<int>(names.size()) - 1;
+  for (const bool commit : {true, false}) {
+    SCOPED_TRACE("commit=" + std::to_string(commit));
+    Options indexed = IndexedOptions(partitions);
+    ASSERT_NO_FATAL_FAILURE(DestroyAndReopen(indexed));
+    ASSERT_NO_FATAL_FAILURE(CreateAndReopenWithCF(cfs, indexed));
+    Close();
+
+    std::vector<ColumnFamilyHandle*> handles;
+    std::unique_ptr<TransactionDB> txn_db;
+    // On any exit, every handle is destroyed before the DB closes.
+    Defer close_on_exit([&] {
+      for (ColumnFamilyHandle* handle : handles) {
+        EXPECT_OK(txn_db->DestroyColumnFamilyHandle(handle));
+      }
+      handles.clear();
+      txn_db.reset();
+    });
+    auto open = [&](const Options& options) {
+      std::vector<ColumnFamilyDescriptor> column_families;
+      for (const std::string& name : names) {
+        column_families.emplace_back(name, options);
+      }
+      TransactionDB* opened = nullptr;
+      ASSERT_OK(TransactionDB::Open(options, TransactionDBOptions(), dbname_,
+                                    column_families, &handles, &opened));
+      txn_db.reset(opened);
+    };
+    auto close = [&]() {
+      // Each handle leaves `handles` once destroyed, so that close_on_exit
+      // destroys only what is left.
+      while (!handles.empty()) {
+        ASSERT_OK(txn_db->DestroyColumnFamilyHandle(handles.back()));
+        handles.pop_back();
+      }
+      txn_db.reset();
+    };
+    auto get = [&](int cf, const std::string& key) {
+      std::string value;
+      const Status s = txn_db->Get(ReadOptions(), handles[cf], key, &value);
+      EXPECT_TRUE(s.ok() || s.IsNotFound()) << s.ToString();
+      return s.ok() ? value : "NOT_FOUND";
+    };
+    auto flush_all = [&]() {
+      ASSERT_OK(txn_db->Flush(FlushOptions(), handles));
+      // The WALs recovered from the previous instance leave only by a full
+      // scan, which re-enabling deletions forces.
+      ASSERT_OK(txn_db->DisableFileDeletions());
+      ASSERT_OK(txn_db->EnableFileDeletions());
+    };
+    WriteOptions sync;
+    sync.sync = true;
+
+    ASSERT_NO_FATAL_FAILURE(open(indexed));
+    for (int cf = 0; cf < static_cast<int>(handles.size()); ++cf) {
+      ASSERT_OK(txn_db->Put(sync, handles[cf], "a" + std::to_string(cf), "a"));
+    }
+    {
+      std::unique_ptr<Transaction> txn(txn_db->BeginTransaction(sync));
+      ASSERT_OK(txn->SetName("xid"));
+      ASSERT_OK(txn->Put(handles[prepared_cf], "prepared", "v"));
+      ASSERT_OK(txn->Prepare());
+    }
+    ASSERT_NO_FATAL_FAILURE(close());
+    const std::vector<uint64_t> indexed_wals = ListWalNumbers();
+
+    // 1. kNone at one partition; 2. flush every column family. 3. cannot
+    // complete: the prepare keeps the indexed WALs live.
+    Options none = indexed;
+    none.partition_wal_usage = PartitionWALUsage::kNone;
+    none.wal_partitions = 1;
+    ASSERT_NO_FATAL_FAILURE(open(none));
+    ASSERT_NE(nullptr, txn_db->GetTransactionByName("xid"));
+    ASSERT_NO_FATAL_FAILURE(flush_all());
+    ASSERT_NO_FATAL_FAILURE(close());
+    EXPECT_OK(env_->FileExists(WALPath(indexed_wals.front())));
+    std::string output;
+    EXPECT_NE(0, RunCheckWALIndex(dbname_, none, &output));
+    EXPECT_NE(
+        std::string::npos,
+        output.find("live WAL " + WALPath(indexed_wals.front()) + ": indexed"))
+        << output;
+    EXPECT_NE(0u, ManifestWALIndexGuard(env_, dbname_));
+
+    // 3. Resolve the prepare, flush again; the WALs written before step 1
+    // are deleted.
+    ASSERT_NO_FATAL_FAILURE(open(none));
+    {
+      std::unique_ptr<Transaction> recovered(
+          txn_db->GetTransactionByName("xid"));
+      ASSERT_NE(nullptr, recovered);
+      ASSERT_OK(commit ? recovered->Commit() : recovered->Rollback());
+    }
+    // A rollback leaves every memtable empty, and a flush with nothing to
+    // write records nothing, so one write gives the flush its edit.
+    ASSERT_OK(txn_db->Put(sync, handles[0], "c", "c"));
+    ASSERT_NO_FATAL_FAILURE(flush_all());
+    ASSERT_NO_FATAL_FAILURE(close());
+    for (const uint64_t wal_number : indexed_wals) {
+      EXPECT_TRUE(env_->FileExists(WALPath(wal_number)).IsNotFound())
+          << wal_number;
+    }
+    // 5. Reopen once more and close. 6, 7. The check passes.
+    ASSERT_NO_FATAL_FAILURE(open(none));
+    ASSERT_NO_FATAL_FAILURE(close());
+    output.clear();
+    EXPECT_EQ(0, RunCheckWALIndex(dbname_, none, &output)) << output;
+    EXPECT_EQ(0u, ManifestWALIndexGuard(env_, dbname_));
+
+    ASSERT_NO_FATAL_FAILURE(open(none));
+    EXPECT_EQ(nullptr, txn_db->GetTransactionByName("xid"));
+    EXPECT_EQ(commit ? "v" : "NOT_FOUND", get(prepared_cf, "prepared"));
+    for (int cf = 0; cf < static_cast<int>(handles.size()); ++cf) {
+      EXPECT_EQ("a", get(cf, "a" + std::to_string(cf))) << cf;
+    }
+    ASSERT_NO_FATAL_FAILURE(close());
+    Destroy(none);
+  }
+}
+
 // RunCheckWALIndex with one more argument, appending standard error to
 // `output` after standard output.
 static int RunCheckWALIndexWithArg(const std::string& db,
@@ -8658,6 +8969,686 @@ TEST_F(DBWALIndexTest, CheckWALIndexFailsWithoutTheOptionsFile) {
         env_->RenameFile(dbname_ + "/hidden_" + file, dbname_ + "/" + file));
   }
   Destroy(none);
+}
+
+// Review round 16 (area 2 F-001): after power loss one partition's WAL pages
+// may have been written back while another's, its marker included, never
+// were. A set written at wal_partitions = 2 whose partition-1 WALs are lost
+// (empty, or missing) keeps only files whose markers name partition 0, yet
+// partition 1 held the lower write: the only prefix of the written history
+// left is the one without both. No opener may recover the higher write
+// without the lower: the indexed opener's merge refuses the unexplained hole,
+// and a kNone opener (the rollback procedure's step 1) must too, rather than
+// replay the files in order. Neuter: let a kNone opener replay an all-indexed
+// set in file order when no marker names a partition above 0; it recovers
+// the higher write alone.
+TEST_F(DBWALIndexTest, LostPartitionWALsKeepTheSetPartitioned) {
+  const std::vector<uint32_t> ids = ColumnFamilyIdsCoveringWalPartitions(2);
+  const std::vector<std::string> names = ColumnFamilyNamesThrough(ids);
+  const std::vector<std::string> cfs(names.begin() + 1, names.end());
+  const int cf_p0 = static_cast<int>(ids[0]);
+  const int cf_p1 = static_cast<int>(ids[1]);
+  for (const bool missing : {false, true}) {
+    for (const bool none_opener : {false, true}) {
+      SCOPED_TRACE(std::string(missing ? "missing" : "empty") +
+                   (none_opener ? " kNone opener" : " indexed opener"));
+      Options indexed =
+          WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+      test::SetWalPartitions(&indexed, 2);
+      ASSERT_NO_FATAL_FAILURE(DestroyAndReopen(indexed));
+      ASSERT_NO_FATAL_FAILURE(CreateAndReopenWithCF(cfs, indexed));
+      ASSERT_OK(Put(cf_p1, "lower", "v"));
+      ASSERT_OK(Put(cf_p0, "higher", "v"));
+      Close();
+
+      size_t lost = 0;
+      for (const uint64_t wal_number : ListWalNumbers()) {
+        uint32_t partition = 0;
+        ASSERT_OK(log::ReadWALPartition(env_->GetFileSystem().get(),
+                                        WALPath(wal_number), FileOptions(),
+                                        wal_number, &partition));
+        if (partition != 1) {
+          continue;
+        }
+        ++lost;
+        if (missing) {
+          ASSERT_OK(env_->DeleteFile(WALPath(wal_number)));
+        } else {
+          std::unique_ptr<WritableFile> truncated;
+          ASSERT_OK(env_->NewWritableFile(WALPath(wal_number), &truncated,
+                                          EnvOptions()));
+          ASSERT_OK(truncated->Close());
+        }
+      }
+      ASSERT_GT(lost, 0u);
+
+      Options opener = indexed;
+      if (none_opener) {
+        opener.partition_wal_usage = PartitionWALUsage::kNone;
+        opener.wal_partitions = 1;
+      }
+      const Status s = TryReopenWithColumnFamilies(names, opener);
+      if (s.ok()) {
+        EXPECT_EQ("NOT_FOUND", Get(cf_p1, "lower"));
+        EXPECT_EQ("NOT_FOUND", Get(cf_p0, "higher"));
+      } else {
+        // The merge cannot bound a hole with records above it, and refuses.
+        EXPECT_TRUE(s.IsCorruption()) << s.ToString();
+      }
+      Close();
+    }
+  }
+}
+
+// The WAL partition guard: an instance with wal_partitions > 1 records that
+// every WAL it writes may be partitioned; a one-partition instance narrows the
+// guard to the earlier instance's WALs still live, keeps it in every new
+// MANIFEST (each open writes one), and clears it once none is live. It never
+// exceeds the WAL index guard. Neuter: never narrow it; it stays at the
+// maximum after the multi-partition WALs are gone.
+TEST_F(DBWALIndexTest, WALPartitionGuardNarrowsAndClears) {
+  const std::vector<uint32_t> ids = ColumnFamilyIdsCoveringWalPartitions(2);
+  const std::vector<std::string> names = ColumnFamilyNamesThrough(ids);
+  const std::vector<std::string> cfs(names.begin() + 1, names.end());
+  Options indexed =
+      WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+  test::SetWalPartitions(&indexed, 2);
+  ASSERT_NO_FATAL_FAILURE(DestroyAndReopen(indexed));
+  ASSERT_NO_FATAL_FAILURE(CreateAndReopenWithCF(cfs, indexed));
+  auto guards = [&]() {
+    VersionSet* versions = dbfull()->GetVersionSet();
+    EXPECT_LE(versions->wal_partition_guard(), versions->wal_index_guard());
+    return versions->wal_partition_guard();
+  };
+  EXPECT_EQ(std::numeric_limits<uint64_t>::max(), guards());
+  for (const uint32_t id : ids) {
+    ASSERT_OK(Put(static_cast<int>(id), "key", "v"));
+  }
+  const std::vector<uint64_t> written = ListWalNumbers();
+  ASSERT_FALSE(written.empty());
+  const uint64_t highest_written =
+      *std::max_element(written.begin(), written.end());
+  Close();
+
+  // One partition: while the old WALs are live the guard narrows to them,
+  // and the next open's new MANIFEST still carries it; once they are gone it
+  // clears.
+  for (const PartitionWALUsage usage :
+       {PartitionWALUsage::kPartitionByColumnFamily,
+        PartitionWALUsage::kNone}) {
+    Options one = indexed;
+    one.partition_wal_usage = usage;
+    one.wal_partitions = 1;
+    one.avoid_flush_during_recovery = true;
+    for (int open = 0; open < 2; ++open) {
+      SCOPED_TRACE(
+          std::string(usage == PartitionWALUsage::kNone ? "kNone" : "indexed") +
+          " open " + std::to_string(open));
+      ASSERT_OK(TryReopenWithColumnFamilies(names, one));
+      // A partitioned set merges, which flushes at open whatever
+      // avoid_flush_during_recovery says, so the old WALs may already be gone.
+      bool old_live = false;
+      for (const uint64_t wal_number : ListWalNumbers()) {
+        old_live = old_live || wal_number <= highest_written;
+      }
+      EXPECT_EQ(old_live ? highest_written : 0, guards());
+      for (const uint32_t id : ids) {
+        EXPECT_EQ("v", Get(static_cast<int>(id), "key"));
+      }
+      Close();
+    }
+  }
+
+  // Flushed, the old WALs are gone: the next open clears it.
+  Options none = indexed;
+  none.partition_wal_usage = PartitionWALUsage::kNone;
+  none.wal_partitions = 1;
+  none.avoid_flush_during_recovery = true;
+  ASSERT_OK(TryReopenWithColumnFamilies(names, none));
+  for (size_t i = 0; i < handles_.size(); ++i) {
+    ASSERT_OK(Flush(static_cast<int>(i)));
+  }
+  Close();
+  ASSERT_OK(TryReopenWithColumnFamilies(names, none));
+  EXPECT_EQ(0u, guards());
+  EXPECT_EQ(0u, dbfull()->GetVersionSet()->wal_index_guard());
+  Close();
+}
+
+// The power-loss state of LostPartitionWALsKeepTheSetPartitioned, made for
+// the tests below: written at two partitions, then every partition-1 WAL
+// lost (deleted or emptied). Partition 1 held the lower write.
+void LosePartitionOneWALs(Env* env, const std::vector<uint64_t>& wal_numbers,
+                          const std::function<std::string(uint64_t)>& path,
+                          bool missing, size_t* lost) {
+  *lost = 0;
+  for (const uint64_t wal_number : wal_numbers) {
+    uint32_t partition = 0;
+    ASSERT_OK(log::ReadWALPartition(env->GetFileSystem().get(),
+                                    path(wal_number), FileOptions(), wal_number,
+                                    &partition));
+    if (partition != 1) {
+      continue;
+    }
+    ++*lost;
+    if (missing) {
+      ASSERT_OK(env->DeleteFile(path(wal_number)));
+    } else {
+      std::unique_ptr<WritableFile> truncated;
+      ASSERT_OK(
+          env->NewWritableFile(path(wal_number), &truncated, EnvOptions()));
+      ASSERT_OK(truncated->Close());
+    }
+  }
+}
+
+// RepairDB converts each WAL on its own, so it refuses a set written with
+// more than one partition. With every partition-1 WAL lost no surviving
+// marker names a partition above 0, but the MANIFEST WAL partition guard
+// still covers partition 0's WAL: RepairDB refuses, rather than convert
+// partition 0's WAL alone and keep the higher write without the lower.
+// Neuter: RepairDB ignores the WAL partition guard; it converts partition
+// 0's WAL and the higher write survives alone.
+TEST_F(DBWALIndexTest, RepairRefusesSetWithLostPartitionWALs) {
+  const std::vector<uint32_t> ids = ColumnFamilyIdsCoveringWalPartitions(2);
+  const std::vector<std::string> names = ColumnFamilyNamesThrough(ids);
+  const std::vector<std::string> cfs(names.begin() + 1, names.end());
+  const int cf_p0 = static_cast<int>(ids[0]);
+  const int cf_p1 = static_cast<int>(ids[1]);
+  for (const bool missing : {false, true}) {
+    SCOPED_TRACE(missing ? "missing" : "empty");
+    Options indexed =
+        WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+    test::SetWalPartitions(&indexed, 2);
+    ASSERT_NO_FATAL_FAILURE(DestroyAndReopen(indexed));
+    ASSERT_NO_FATAL_FAILURE(CreateAndReopenWithCF(cfs, indexed));
+    // RepairDB rebuilds column families from table files, so give each one.
+    for (size_t cf = 0; cf < handles_.size(); ++cf) {
+      ASSERT_OK(Put(static_cast<int>(cf), "seed", "v"));
+      ASSERT_OK(Flush(static_cast<int>(cf)));
+    }
+    ASSERT_OK(Put(cf_p1, "lower", "v"));
+    ASSERT_OK(Put(cf_p0, "higher", "v"));
+    Close();
+    size_t lost = 0;
+    ASSERT_NO_FATAL_FAILURE(LosePartitionOneWALs(
+        env_, ListWalNumbers(), [&](uint64_t n) { return WALPath(n); }, missing,
+        &lost));
+    ASSERT_GT(lost, 0u);
+
+    // The rollback procedure's options: one partition, no index.
+    Options none = indexed;
+    none.partition_wal_usage = PartitionWALUsage::kNone;
+    none.wal_partitions = 1;
+    std::vector<ColumnFamilyDescriptor> descriptors;
+    for (const std::string& name : names) {
+      descriptors.emplace_back(name, none);
+    }
+    const Status s = RepairDB(dbname_, none, descriptors);
+    if (s.ok()) {
+      // Repair keeps only the column families with data.
+      std::vector<std::string> present;
+      ASSERT_OK(DB::ListColumnFamilies(none, dbname_, &present));
+      std::vector<ColumnFamilyDescriptor> open_cfs;
+      for (const std::string& name : present) {
+        open_cfs.emplace_back(name, none);
+      }
+      std::vector<ColumnFamilyHandle*> handles;
+      std::unique_ptr<DB> repaired;
+      ASSERT_OK(DB::Open(none, dbname_, open_cfs, &handles, &repaired));
+      ASSERT_NE(present.end(),
+                std::find(present.begin(), present.end(), names[cf_p0]));
+      for (size_t i = 0; i < present.size(); ++i) {
+        std::string value;
+        if (present[i] == names[cf_p0]) {
+          EXPECT_TRUE(repaired->Get(ReadOptions(), handles[i], "higher", &value)
+                          .IsNotFound())
+              << "repair kept the higher write without the lower";
+        }
+        if (present[i] == names[cf_p1]) {
+          EXPECT_TRUE(repaired->Get(ReadOptions(), handles[i], "lower", &value)
+                          .IsNotFound());
+        }
+        ASSERT_OK(repaired->DestroyColumnFamilyHandle(handles[i]));
+      }
+      ASSERT_OK(repaired->Close());
+    } else {
+      EXPECT_TRUE(s.IsNotSupported()) << s.ToString();
+    }
+  }
+}
+
+// RC-20: the change stream of a kNone instance must not run past the hole
+// either. Point-in-time recovery cuts at the hole and drops the higher write;
+// partition 0's WAL, which holds it, is deleted rather than archived, so
+// GetUpdatesSince cannot read it from the archive after new writes reuse its
+// sequence numbers. Neuter: archive every obsolete WAL; GetUpdatesSince
+// returns the higher write without the lower.
+TEST_F(DBWALIndexTest, GetUpdatesSinceStopsAtLostPartitionHole) {
+  const std::vector<uint32_t> ids = ColumnFamilyIdsCoveringWalPartitions(2);
+  const std::vector<std::string> names = ColumnFamilyNamesThrough(ids);
+  const std::vector<std::string> cfs(names.begin() + 1, names.end());
+  const int cf_p0 = static_cast<int>(ids[0]);
+  const int cf_p1 = static_cast<int>(ids[1]);
+  for (const bool missing : {false, true}) {
+    for (const WALRecoveryMode mode :
+         {WALRecoveryMode::kPointInTimeRecovery,
+          WALRecoveryMode::kTolerateCorruptedTailRecords,
+          WALRecoveryMode::kAbsoluteConsistency,
+          WALRecoveryMode::kSkipAnyCorruptedRecords}) {
+      SCOPED_TRACE(std::string(missing ? "missing" : "empty") + " mode " +
+                   std::to_string(static_cast<int>(mode)));
+      Options indexed =
+          WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+      test::SetWalPartitions(&indexed, 2);
+      indexed.WAL_ttl_seconds = 1000;
+      ASSERT_NO_FATAL_FAILURE(DestroyAndReopen(indexed));
+      ASSERT_NO_FATAL_FAILURE(CreateAndReopenWithCF(cfs, indexed));
+      const SequenceNumber first = db_->GetLatestSequenceNumber() + 1;
+      ASSERT_OK(Put(cf_p1, "lower", "v"));
+      ASSERT_OK(Put(cf_p0, "higher", "v"));
+      Close();
+      size_t lost = 0;
+      ASSERT_NO_FATAL_FAILURE(LosePartitionOneWALs(
+          env_, ListWalNumbers(), [&](uint64_t n) { return WALPath(n); },
+          missing, &lost));
+      ASSERT_GT(lost, 0u);
+
+      Options none = indexed;
+      none.partition_wal_usage = PartitionWALUsage::kNone;
+      none.wal_partitions = 1;
+      none.wal_recovery_mode = mode;
+      const Status open = TryReopenWithColumnFamilies(names, none);
+      if (!open.ok()) {
+        EXPECT_TRUE(open.IsCorruption()) << open.ToString();
+        continue;
+      }
+      if (mode == WALRecoveryMode::kSkipAnyCorruptedRecords) {
+        // Salvage: recovery skips the hole and keeps the higher write, and the
+        // change stream may show what the DB holds.
+        Close();
+        continue;
+      }
+      EXPECT_EQ("NOT_FOUND", Get(cf_p0, "higher"));
+      // New writes take the sequences the lost and dropped writes had.
+      ASSERT_OK(Put(cf_p0, "after1", "v"));
+      ASSERT_OK(Put(cf_p0, "after2", "v"));
+      std::unique_ptr<TransactionLogIterator> iter;
+      const Status s = db_->GetUpdatesSince(first, &iter);
+      if (s.ok()) {
+        for (; iter->Valid(); iter->Next()) {
+          const BatchResult batch = iter->GetBatch();
+          EXPECT_EQ(std::string::npos,
+                    batch.writeBatchPtr->Data().find("higher"))
+              << "change stream returned the higher write at sequence "
+              << batch.sequence << " without the lower";
+        }
+        iter->status().PermitUncheckedError();
+      } else {
+        EXPECT_TRUE(s.IsNotSupported() || s.IsCorruption() || s.IsNotFound())
+            << s.ToString();
+      }
+      Close();
+    }
+  }
+}
+
+// RC-20, which WALs leave the archive: a WAL holding records both below and
+// above the cut (partition 0's current WAL: "below", then "higher" above the
+// lost "lower") is deleted, not archived, while one wholly below the cut
+// (partition 0's WAL before a rotation, holding "early") is still archived.
+// The records below the cut stay readable. Neuter: archive every obsolete WAL;
+// the WAL above the cut appears in the archive.
+TEST_F(DBWALIndexTest, ArchiveDropsOnlyWalsAboveThePointInTimeCut) {
+  const std::vector<uint32_t> ids = ColumnFamilyIdsCoveringWalPartitions(2);
+  const std::vector<std::string> names = ColumnFamilyNamesThrough(ids);
+  const std::vector<std::string> cfs(names.begin() + 1, names.end());
+  const int cf_p0 = static_cast<int>(ids[0]);
+  const int cf_p1 = static_cast<int>(ids[1]);
+  for (const bool missing : {false, true}) {
+    SCOPED_TRACE(missing ? "missing" : "empty");
+    Options indexed =
+        WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+    test::SetWalPartitions(&indexed, 2);
+    indexed.WAL_ttl_seconds = 1000;
+    ASSERT_NO_FATAL_FAILURE(DestroyAndReopen(indexed));
+    ASSERT_NO_FATAL_FAILURE(CreateAndReopenWithCF(cfs, indexed));
+    ASSERT_OK(Put(cf_p0, "early", "v"));
+    // Rotate every partition's WAL; the old ones stay live, unflushed.
+    ASSERT_OK(dbfull()->TEST_SwitchWAL());
+    ASSERT_OK(Put(cf_p0, "below", "v"));
+    ASSERT_OK(Put(cf_p1, "lower", "v"));
+    ASSERT_OK(Put(cf_p0, "higher", "v"));
+    Close();
+    // Partition 0's WALs: the one holding "early", then the current one.
+    std::vector<uint64_t> p0_wals;
+    for (const uint64_t wal_number : ListWalNumbers()) {
+      uint32_t partition = 0;
+      ASSERT_OK(log::ReadWALPartition(env_->GetFileSystem().get(),
+                                      WALPath(wal_number), FileOptions(),
+                                      wal_number, &partition));
+      if (partition == 0) {
+        p0_wals.push_back(wal_number);
+      }
+    }
+    ASSERT_GE(p0_wals.size(), 2u);
+    const uint64_t below_wal = p0_wals[p0_wals.size() - 2];
+    const uint64_t cut_wal = p0_wals.back();
+    // The rotation synced the old WALs; only the current partition-1 WAL,
+    // never synced, is lost. A rotation numbers its WALs in partition order.
+    std::vector<uint64_t> current;
+    for (const uint64_t wal_number : ListWalNumbers()) {
+      if (wal_number > cut_wal) {
+        current.push_back(wal_number);
+      }
+    }
+    size_t lost = 0;
+    ASSERT_NO_FATAL_FAILURE(LosePartitionOneWALs(
+        env_, current, [&](uint64_t n) { return WALPath(n); }, missing, &lost));
+    ASSERT_EQ(1u, lost);
+
+    Options none = indexed;
+    none.partition_wal_usage = PartitionWALUsage::kNone;
+    none.wal_partitions = 1;
+    none.wal_recovery_mode = WALRecoveryMode::kPointInTimeRecovery;
+    ASSERT_OK(TryReopenWithColumnFamilies(names, none));
+    EXPECT_EQ("v", Get(cf_p0, "early"));
+    EXPECT_EQ("v", Get(cf_p0, "below"));
+    EXPECT_EQ("NOT_FOUND", Get(cf_p1, "lower"));
+    EXPECT_EQ("NOT_FOUND", Get(cf_p0, "higher"));
+    EXPECT_FALSE(env_->FileExists(WALPath(below_wal)).ok());
+    EXPECT_FALSE(env_->FileExists(WALPath(cut_wal)).ok());
+    EXPECT_OK(env_->FileExists(ArchivedLogFileName(dbname_, below_wal)))
+        << "WAL " << below_wal << ", wholly below the cut, was not archived";
+    EXPECT_TRUE(
+        env_->FileExists(ArchivedLogFileName(dbname_, cut_wal)).IsNotFound())
+        << "WAL " << cut_wal << ", holding the dropped higher write, was "
+        << "archived";
+    Close();
+  }
+}
+
+// RC-20 while the cut WAL is still live: the open that cut it restored it
+// alive (avoid_flush_during_recovery), so it is neither archived nor deleted
+// yet, and a change-stream reader of the WAL directory would return the
+// dropped "higher" write. GetUpdatesSince refuses a stream that would read
+// the WAL until it is gone, and serves one starting after it; once a flush
+// retires (deletes) it, every stream works and has no "higher".
+// Neuter: drop the refusal; the stream returns "higher". Refuse whenever a
+// marked WAL exists: the later stream fails.
+TEST_F(DBWALIndexTest, ChangeStreamRefusesLiveCutWal) {
+  const std::vector<uint32_t> ids = ColumnFamilyIdsCoveringWalPartitions(2);
+  const std::vector<std::string> names = ColumnFamilyNamesThrough(ids);
+  const std::vector<std::string> cfs(names.begin() + 1, names.end());
+  const int cf_p0 = static_cast<int>(ids[0]);
+  const int cf_p1 = static_cast<int>(ids[1]);
+  Options indexed =
+      WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+  test::SetWalPartitions(&indexed, 2);
+  indexed.WAL_ttl_seconds = 1000;
+  ASSERT_NO_FATAL_FAILURE(DestroyAndReopen(indexed));
+  ASSERT_NO_FATAL_FAILURE(CreateAndReopenWithCF(cfs, indexed));
+  ASSERT_OK(Put(cf_p0, "early", "v"));
+  const SequenceNumber first = db_->GetLatestSequenceNumber() + 1;
+  ASSERT_OK(dbfull()->TEST_SwitchWAL());
+  ASSERT_OK(Put(cf_p1, "lower", "v"));
+  ASSERT_OK(Put(cf_p0, "higher", "v"));
+  Close();
+  std::vector<uint64_t> p0_wals;
+  for (const uint64_t wal_number : ListWalNumbers()) {
+    uint32_t partition = 0;
+    ASSERT_OK(log::ReadWALPartition(env_->GetFileSystem().get(),
+                                    WALPath(wal_number), FileOptions(),
+                                    wal_number, &partition));
+    if (partition == 0) {
+      p0_wals.push_back(wal_number);
+    }
+  }
+  ASSERT_GE(p0_wals.size(), 2u);
+  const uint64_t cut_wal = p0_wals.back();
+  std::vector<uint64_t> current;
+  for (const uint64_t wal_number : ListWalNumbers()) {
+    if (wal_number > cut_wal) {
+      current.push_back(wal_number);
+    }
+  }
+  size_t lost = 0;
+  ASSERT_NO_FATAL_FAILURE(LosePartitionOneWALs(
+      env_, current, [&](uint64_t n) { return WALPath(n); },
+      /*missing=*/true, &lost));
+  ASSERT_EQ(1u, lost);
+  Options one = indexed;
+  one.wal_partitions = 1;
+  one.wal_recovery_mode = WALRecoveryMode::kPointInTimeRecovery;
+  one.avoid_flush_during_recovery = true;
+  ASSERT_OK(TryReopenWithColumnFamilies(names, one));
+  ASSERT_OK(env_->FileExists(WALPath(cut_wal)));
+  ASSERT_OK(Put(cf_p0, "after1", "v"));
+  ASSERT_OK(Put(cf_p0, "after2", "v"));
+  ASSERT_OK(Put(cf_p0, "after3", "v"));
+  // Past the cut WAL's first sequence: the stream reads only newer WALs.
+  const SequenceNumber later = db_->GetLatestSequenceNumber();
+  // The first batch returned (sequence and data) goes to `*first_batch`.
+  auto read_stream =
+      [&](bool* returned_higher, SequenceNumber from = kMaxSequenceNumber,
+          std::pair<SequenceNumber, std::string>* first_batch = nullptr) {
+        std::unique_ptr<TransactionLogIterator> iter;
+        const Status s = db_->GetUpdatesSince(
+            from == kMaxSequenceNumber ? first : from, &iter);
+        *returned_higher = false;
+        if (s.ok()) {
+          for (; iter->Valid(); iter->Next()) {
+            BatchResult batch = iter->GetBatch();
+            if (first_batch != nullptr && first_batch->second.empty()) {
+              *first_batch = {batch.sequence, batch.writeBatchPtr->Data()};
+            }
+            *returned_higher |=
+                batch.writeBatchPtr->Data().find("higher") != std::string::npos;
+          }
+          if (first_batch != nullptr) {
+            EXPECT_OK(iter->status());
+          } else {
+            iter->status().PermitUncheckedError();
+          }
+        }
+        return s;
+      };
+  bool returned_higher = false;
+  Status s = read_stream(&returned_higher);
+  EXPECT_FALSE(returned_higher) << "the stream returned a dropped write";
+  EXPECT_TRUE(s.IsNotSupported()) << s.ToString();
+  std::pair<SequenceNumber, std::string> first_batch;
+  s = read_stream(&returned_higher, later, &first_batch);
+  EXPECT_FALSE(returned_higher) << "the stream returned a dropped write";
+  EXPECT_OK(s);
+  EXPECT_EQ(later, first_batch.first);
+  EXPECT_NE(std::string::npos, first_batch.second.find("after3"))
+      << "the stream from a later sequence returned nothing";
+  // Retired by a flush, the cut WAL is deleted, not archived.
+  ASSERT_OK(Flush(cf_p0));
+  ASSERT_OK(dbfull()->TEST_SwitchWAL());
+  ASSERT_OK(Flush(cf_p0));
+  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+  ASSERT_TRUE(env_->FileExists(WALPath(cut_wal)).IsNotFound());
+  s = read_stream(&returned_higher);
+  EXPECT_FALSE(returned_higher) << "the stream returned a dropped write";
+  EXPECT_FALSE(s.IsNotSupported()) << s.ToString();
+  s.PermitUncheckedError();
+  Close();
+}
+
+// A WAL that a purge archives after GetUpdatesSince listed it as live is read
+// from the archive, as the iterator does, not refused as a WAL that may be
+// partitioned: the stream works, a damaged head in the archived copy is still
+// refused, and a WAL deleted meanwhile is not called partitioned. Neuters: drop
+// the archive retry, and the damaged copy is streamed; treat PathNotFound as a
+// failed head read again, and the deleted WAL is reported as maybe partitioned.
+TEST_F(DBWALIndexTest, ChangeStreamReadsWalArchivedAfterListing) {
+  enum class Move { kArchive, kArchiveDamaged, kDelete };
+  for (const Move move :
+       {Move::kArchive, Move::kArchiveDamaged, Move::kDelete}) {
+    SCOPED_TRACE(static_cast<int>(move));
+    Options options =
+        WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+    options.WAL_ttl_seconds = 1000;
+    ASSERT_NO_FATAL_FAILURE(DestroyAndReopen(options));
+    // No flush may retire (and so archive) a WAL behind the test's back.
+    env_->SetBackgroundThreads(1, Env::HIGH);
+    test::SleepingBackgroundTask sleeping_task;
+    env_->Schedule(&test::SleepingBackgroundTask::DoSleepTask, &sleeping_task,
+                   Env::Priority::HIGH);
+    ASSERT_OK(Put("first", "v"));
+    const SequenceNumber first = db_->GetLatestSequenceNumber();
+    ASSERT_OK(dbfull()->TEST_SwitchWAL());
+    ASSERT_OK(Put("second", "v"));
+    const std::vector<uint64_t> wals = ListWalNumbers();
+    ASSERT_GE(wals.size(), 2u);
+    const uint64_t oldest = wals.front();
+    ASSERT_OK(env_->CreateDirIfMissing(ArchivalDirectory(dbname_)));
+    const std::string archived = ArchivedLogFileName(dbname_, oldest);
+    std::string saved;
+    ASSERT_OK(ReadFileToString(env_, WALPath(oldest), &saved));
+    bool moved = false;
+    SyncPoint::GetInstance()->SetCallBack(
+        "WalManager::CheckWalsReadableAndUnpartitioned:BeforeHead",
+        [&](void* arg) {
+          if (moved || *static_cast<uint64_t*>(arg) != oldest) {
+            return;
+          }
+          moved = true;
+          if (move == Move::kDelete) {
+            ASSERT_OK(env_->DeleteFile(WALPath(oldest)));
+            return;
+          }
+          ASSERT_OK(env_->RenameFile(WALPath(oldest), archived));
+          if (move == Move::kArchiveDamaged) {
+            std::string damaged = saved;
+            damaged[0] = static_cast<char>(damaged[0] ^ 0xff);  // header CRC
+            ASSERT_OK(WriteStringToFile(env_, damaged, archived));
+          }
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+    std::unique_ptr<TransactionLogIterator> iter;
+    const Status s = db_->GetUpdatesSince(first, &iter);
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    ASSERT_TRUE(moved);
+    if (move == Move::kArchive) {
+      ASSERT_OK(s);
+      ASSERT_TRUE(iter->Valid());
+      EXPECT_EQ(first, iter->GetBatch().sequence);
+    } else if (move == Move::kArchiveDamaged) {
+      EXPECT_TRUE(s.IsNotSupported()) << s.ToString();
+    } else {
+      EXPECT_FALSE(s.IsNotSupported()) << s.ToString();
+    }
+    iter.reset();
+    // Put the WAL back as it was, so the DB closes over its own files.
+    if (move != Move::kDelete) {
+      ASSERT_OK(env_->DeleteFile(archived));
+    }
+    ASSERT_OK(WriteStringToFile(env_, saved, WALPath(oldest)));
+    sleeping_task.WakeUp();
+    sleeping_task.WaitUntilDone();
+    Close();
+  }
+}
+
+// RC-20 when the cut WAL outlives the open that cut it: an indexed opener
+// with avoid_flush_during_recovery restores the recovered WALs alive, so the
+// WAL holding the dropped "higher" write is not deleted at that open. New
+// writes reuse its sequences; after a Close and a reopen, which reads the WAL
+// again behind the first open's declaration, a flush retires it. It must be
+// deleted, not archived, and the change stream must never return "higher".
+// Neuter: mark only the WALs this open's own cut names; the reopen re-reads
+// the WAL behind the earlier declaration, marks nothing, and archives it.
+TEST_F(DBWALIndexTest, CutWalOutlivingItsOpenIsNeverArchived) {
+  const std::vector<uint32_t> ids = ColumnFamilyIdsCoveringWalPartitions(2);
+  const std::vector<std::string> names = ColumnFamilyNamesThrough(ids);
+  const std::vector<std::string> cfs(names.begin() + 1, names.end());
+  const int cf_p0 = static_cast<int>(ids[0]);
+  const int cf_p1 = static_cast<int>(ids[1]);
+  Options indexed =
+      WALIndexOptions(PartitionWALUsage::kPartitionByColumnFamily);
+  test::SetWalPartitions(&indexed, 2);
+  indexed.WAL_ttl_seconds = 1000;
+  ASSERT_NO_FATAL_FAILURE(DestroyAndReopen(indexed));
+  ASSERT_NO_FATAL_FAILURE(CreateAndReopenWithCF(cfs, indexed));
+  ASSERT_OK(Put(cf_p0, "early", "v"));
+  const SequenceNumber first = db_->GetLatestSequenceNumber() + 1;
+  // Rotate every partition's WAL; the old ones stay live, unflushed.
+  ASSERT_OK(dbfull()->TEST_SwitchWAL());
+  ASSERT_OK(Put(cf_p1, "lower", "v"));
+  ASSERT_OK(Put(cf_p0, "higher", "v"));
+  Close();
+  std::vector<uint64_t> p0_wals;
+  for (const uint64_t wal_number : ListWalNumbers()) {
+    uint32_t partition = 0;
+    ASSERT_OK(log::ReadWALPartition(env_->GetFileSystem().get(),
+                                    WALPath(wal_number), FileOptions(),
+                                    wal_number, &partition));
+    if (partition == 0) {
+      p0_wals.push_back(wal_number);
+    }
+  }
+  ASSERT_GE(p0_wals.size(), 2u);
+  const uint64_t cut_wal = p0_wals.back();
+  std::vector<uint64_t> current;
+  for (const uint64_t wal_number : ListWalNumbers()) {
+    if (wal_number > cut_wal) {
+      current.push_back(wal_number);
+    }
+  }
+  size_t lost = 0;
+  ASSERT_NO_FATAL_FAILURE(LosePartitionOneWALs(
+      env_, current, [&](uint64_t n) { return WALPath(n); },
+      /*missing=*/true, &lost));
+  ASSERT_EQ(1u, lost);
+
+  // An indexed N=1 opener that keeps the recovered WALs alive.
+  Options one = indexed;
+  one.wal_partitions = 1;
+  one.wal_recovery_mode = WALRecoveryMode::kPointInTimeRecovery;
+  one.avoid_flush_during_recovery = true;
+  ASSERT_OK(TryReopenWithColumnFamilies(names, one));
+  EXPECT_EQ("v", Get(cf_p0, "early"));
+  EXPECT_EQ("NOT_FOUND", Get(cf_p1, "lower"));
+  EXPECT_EQ("NOT_FOUND", Get(cf_p0, "higher"));
+  // The precondition: the cut WAL outlives this open.
+  ASSERT_OK(env_->FileExists(WALPath(cut_wal)));
+  // New writes take the sequences the lost and dropped writes had.
+  ASSERT_OK(Put(cf_p0, "after1", "v"));
+  ASSERT_OK(Put(cf_p0, "after2", "v"));
+  Close();
+
+  ASSERT_OK(TryReopenWithColumnFamilies(names, one));
+  EXPECT_EQ("NOT_FOUND", Get(cf_p0, "higher"));
+  EXPECT_EQ("v", Get(cf_p0, "after2"));
+  for (size_t i = 0; i < handles_.size(); ++i) {
+    ASSERT_OK(Flush(static_cast<int>(i)));
+  }
+  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+  EXPECT_TRUE(env_->FileExists(WALPath(cut_wal)).IsNotFound())
+      << "WAL " << cut_wal << " outlived the flush that retired it";
+  EXPECT_TRUE(
+      env_->FileExists(ArchivedLogFileName(dbname_, cut_wal)).IsNotFound())
+      << "WAL " << cut_wal << ", holding the dropped higher write, was "
+      << "archived";
+  std::unique_ptr<TransactionLogIterator> iter;
+  const Status s = db_->GetUpdatesSince(first, &iter);
+  if (s.ok()) {
+    for (; iter->Valid(); iter->Next()) {
+      const BatchResult batch = iter->GetBatch();
+      EXPECT_EQ(std::string::npos, batch.writeBatchPtr->Data().find("higher"))
+          << "change stream returned the higher write at sequence "
+          << batch.sequence << " without the lower";
+    }
+    iter->status().PermitUncheckedError();
+  } else {
+    EXPECT_TRUE(s.IsNotSupported() || s.IsCorruption() || s.IsNotFound())
+        << s.ToString();
+  }
+  Close();
 }
 
 // kNone must take the established sequential recovery path directly. Counting

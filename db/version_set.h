@@ -1666,9 +1666,11 @@ class VersionSet {
   // As ClearWALIndexGuard.
   void ClearWALPartitionGuard() { wal_partition_guard_ = 0; }
 
-  // Reads the guard from the MANIFEST that CURRENT names in `dbname`.
+  // Reads the guard from the MANIFEST that CURRENT names in `dbname`, and the
+  // WAL partition guard into `partition_guard` when given.
   static Status ReadWALIndexGuard(const std::string& dbname, FileSystem* fs,
-                                  uint64_t* guard);
+                                  uint64_t* guard,
+                                  uint64_t* partition_guard = nullptr);
 
   uint64_t pending_manifest_file_number() const {
     return pending_manifest_file_number_;
