@@ -126,6 +126,14 @@ struct OptionsOverride {
 
 }  // namespace anon
 
+// A two-phase commit transaction name, `base` followed by a number, whose
+// end-prepare, commit and rollback records route to WAL partition
+// `partition` of `num_partitions`: a batch carrying such a marker routes by
+// its XID, so a test names a transaction with this to place its two-phase
+// records on a chosen partition.
+std::string TwoPhaseNameOnWalPartition(const std::string& base,
+                                       size_t partition, size_t num_partitions);
+
 enum SkipPolicy { kSkipNone = 0, kSkipNoSnapshot = 1, kSkipNoPrefix = 2 };
 
 // Special Env used to delay background operations

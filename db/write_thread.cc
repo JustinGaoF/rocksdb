@@ -227,28 +227,42 @@ bool WriteThread::LinkOne(Writer* w, std::atomic<Writer*>* newest_writer) {
   assert(newest_writer != nullptr);
   assert(w->state == STATE_INIT);
   Writer* writers = newest_writer->load(std::memory_order_relaxed);
+  auto refuses_stall = [&] {
+    return w->no_slowdown ||
+           (w->non_blocking_join &&
+            !(w->through_timed_stall &&
+              stall_is_timed_.load(std::memory_order_acquire)));
+  };
   while (true) {
     assert(writers != w);
     // If a write stall is in effect, fail fast when requested. Otherwise,
     // block here until the stall is cleared.
     if (writers == &write_stall_dummy_) {
-      if (w->no_slowdown || w->non_blocking_join) {
-        w->status = Status::Incomplete("Write stall");
-        SetState(w, STATE_COMPLETED);
-        return false;
-      }
-      // Since no_slowdown is false, wait here to be notified of the write
-      // stall clearing
-      {
+      bool refused = refuses_stall();
+      if (!refused) {
+        TEST_SYNC_POINT_CALLBACK("WriteThread::LinkOne:BeforeStallMu", w);
+        // Since no_slowdown is false, wait here to be notified of the write
+        // stall clearing
         MutexLock lock(&stall_mu_);
-        writers = newest_writer->load(std::memory_order_relaxed);
+        writers = newest_writer->load(std::memory_order_acquire);
         if (writers == &write_stall_dummy_) {
+          // The timed stall seen above may have ended and a stop begun before
+          // this thread took stall_mu_. Check again: a later change needs
+          // EndWriteStall, which takes stall_mu_ and wakes this waiter.
+          refused = refuses_stall();
+        }
+        if (!refused && writers == &write_stall_dummy_) {
           TEST_SYNC_POINT_CALLBACK("WriteThread::WriteStall::Wait", w);
           stall_cv_.Wait();
           // Load newest_writers_ again since it may have changed
           writers = newest_writer->load(std::memory_order_relaxed);
           continue;
         }
+      }
+      if (refused) {
+        w->status = Status::Incomplete("Write stall");
+        SetState(w, STATE_COMPLETED);
+        return false;
       }
     }
     w->link_older = writers;
@@ -324,8 +338,9 @@ void WriteThread::CompleteFollower(Writer* w, WriteGroup& write_group) {
   SetState(w, STATE_COMPLETED);
 }
 
-void WriteThread::BeginWriteStall() {
+void WriteThread::BeginWriteStall(bool timed) {
   ++stall_begun_count_;
+  stall_is_timed_.store(timed, std::memory_order_release);
   LinkOne(&write_stall_dummy_, &newest_writer_);
 
   // Walk writer list until w->write_group != nullptr. The current write group
@@ -338,7 +353,8 @@ void WriteThread::BeginWriteStall() {
     // no_slowdown case, it must finish and hand off to the stall barrier;
     // unlinking it would strand newer writers.
     const bool is_leader = w->link_older == nullptr;
-    if (w->no_slowdown || (!is_leader && w->non_blocking_join)) {
+    if (w->no_slowdown || (!is_leader && w->non_blocking_join &&
+                           !(timed && w->through_timed_stall))) {
       prev->link_older = w->link_older;
       w->status = Status::Incomplete("Write stall");
       SetState(w, STATE_COMPLETED);
@@ -510,7 +526,17 @@ size_t WriteThread::EnterAsBatchGroupLeader(Writer* leader,
     assert(w->link_newer);
     w = w->link_newer;
 
-    if ((w->sync && !leader->sync) ||
+    // Whether w joins the group, and if not, why. The three tests below
+    // evaluate the same clauses in the same order as the single disjunction
+    // they replace, so group formation is unchanged; splitting them attributes
+    // a size-cap exclusion separately from the compatibility exclusions. The
+    // cap test runs only for writers that passed every compatibility check --
+    // in particular w->batch is non-null there, so ByteSize is safe, exactly
+    // as before.
+    bool incompatible =
+        (w->wal_partition != leader->wal_partition) ||
+        // A write group becomes one WAL record and cannot span partitions.
+        (w->sync && !leader->sync) ||
         // Do not include a sync write into a batch handled by a non-sync write.
         (w->no_slowdown != leader->no_slowdown) ||
         // Do not mix writes that are ok with delays with the ones that request
@@ -524,13 +550,18 @@ size_t WriteThread::EnterAsBatchGroupLeader(Writer* leader,
         (w->batch == nullptr) ||
         // Do not include those writes with nullptr batch. Those are not writes
         // those are something else. They want to be alone
-        (w->callback != nullptr && !w->callback->AllowWriteBatching()) ||
         // dont batch writes that don't want to be batched
-        (size + WriteBatchInternal::ByteSize(w->batch) > max_size) ||
-        // Do not make batch too big
-        (leader->ingest_wbwi || w->ingest_wbwi)
-        // ingesting WBWI needs to be its own group
-    ) {
+        (w->callback != nullptr && !w->callback->AllowWriteBatching());
+    // Do not make batch too big
+    bool over_cap = !incompatible &&
+                    (size + WriteBatchInternal::ByteSize(w->batch) > max_size);
+    // ingesting WBWI needs to be its own group
+    bool ingest_wbwi =
+        !incompatible && !over_cap && (leader->ingest_wbwi || w->ingest_wbwi);
+    if (incompatible || over_cap || ingest_wbwi) {
+      if (over_cap) {
+        ++write_group->num_cap_excluded;
+      }
       // remove from list
       w->link_older->link_newer = w->link_newer;
       if (w->link_newer != nullptr) {
@@ -908,9 +939,11 @@ void WriteThread::EnterUnbatched(Writer* w, InstrumentedMutex* mu) {
   mu->Lock();
 }
 
-bool WriteThread::EnterUnbatchedNonBlocking(Writer* w, InstrumentedMutex* mu) {
+bool WriteThread::EnterUnbatchedNonBlocking(Writer* w, InstrumentedMutex* mu,
+                                            bool through_timed_stall) {
   assert(w != nullptr && w->batch == nullptr);
   w->non_blocking_join = true;
+  w->through_timed_stall = through_timed_stall;
   mu->Unlock();
   const bool linked_as_leader = LinkOne(w, &newest_writer_);
   if (!linked_as_leader) {
@@ -921,6 +954,7 @@ bool WriteThread::EnterUnbatchedNonBlocking(Writer* w, InstrumentedMutex* mu) {
   TEST_SYNC_POINT("WriteThread::EnterUnbatchedNonBlocking:BeforeLock");
   mu->Lock();
   w->non_blocking_join = false;
+  w->through_timed_stall = false;
   if (w->state.load(std::memory_order_acquire) == STATE_COMPLETED) {
     assert(!w->status.ok());
     return false;

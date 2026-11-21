@@ -91,6 +91,10 @@ class WriteThread {
     Status status;
     std::atomic<size_t> running;
     size_t size = 0;
+    // Writers excluded from this group by max_write_batch_group_size_bytes:
+    // writers compatible with the leader in every way except that adding them
+    // would exceed the cap. Set by EnterAsBatchGroupLeader only.
+    size_t num_cap_excluded = 0;
 
     struct Iterator {
       Writer* writer;
@@ -130,6 +134,9 @@ class WriteThread {
     bool sync;
     bool no_slowdown;
     bool non_blocking_join;
+    // With non_blocking_join: wait through a timed-delay stall instead of
+    // refusing it; any other stall (a stop) is still refused.
+    bool through_timed_stall;
     bool disable_wal;
     Env::IOPriority rate_limiter_priority;
     bool disable_memtable;
@@ -137,6 +144,9 @@ class WriteThread {
     size_t protection_bytes_per_key;
     PreReleaseCallback* pre_release_callback;
     PostMemTableCallback* post_memtable_callback;
+    // Resolved before this writer joins a batch group. A write group may not
+    // span WAL partitions because it is serialized as one WAL record.
+    size_t wal_partition;
     uint64_t wal_used;  // log number that this batch was inserted into
     uint64_t log_ref;   // log number that memtable insert should reference
     WriteCallback* callback;
@@ -161,6 +171,7 @@ class WriteThread {
           sync(false),
           no_slowdown(false),
           non_blocking_join(false),
+          through_timed_stall(false),
           disable_wal(false),
           rate_limiter_priority(Env::IOPriority::IO_TOTAL),
           disable_memtable(false),
@@ -168,6 +179,7 @@ class WriteThread {
           protection_bytes_per_key(0),
           pre_release_callback(nullptr),
           post_memtable_callback(nullptr),
+          wal_partition(0),
           wal_used(0),
           log_ref(0),
           callback(nullptr),
@@ -192,6 +204,7 @@ class WriteThread {
           sync(write_options.sync),
           no_slowdown(write_options.no_slowdown),
           non_blocking_join(false),
+          through_timed_stall(false),
           disable_wal(write_options.disableWAL),
           rate_limiter_priority(write_options.rate_limiter_priority),
           disable_memtable(_disable_memtable),
@@ -199,6 +212,7 @@ class WriteThread {
           protection_bytes_per_key(_batch->GetProtectionBytesPerKey()),
           pre_release_callback(_pre_release_callback),
           post_memtable_callback(_post_memtable_callback),
+          wal_partition(0),
           wal_used(0),
           log_ref(_log_ref),
           callback(_callback),
@@ -394,8 +408,11 @@ class WriteThread {
   void EnterUnbatched(Writer* w, InstrumentedMutex* mu);
 
   // Refuses an existing or newly started stall. Call ExitUnbatched() only when
-  // this returns true; false leaves `w` unlinked with Incomplete status.
-  bool EnterUnbatchedNonBlocking(Writer* w, InstrumentedMutex* mu);
+  // this returns true; false leaves `w` unlinked with Incomplete status. With
+  // through_timed_stall, waits out a timed-delay stall instead and refuses only
+  // the others (stops), including one that begins while it waits.
+  bool EnterUnbatchedNonBlocking(Writer* w, InstrumentedMutex* mu,
+                                 bool through_timed_stall = false);
 
   // Completes a Writer begun with EnterUnbatched, unblocking subsequent
   // writers.
@@ -415,7 +432,8 @@ class WriteThread {
   // Insert a dummy writer at the tail of the write queue to indicate a write
   // stall, and fail any writers in the queue with no_slowdown set to true
   // REQUIRES: db mutex held, no other stall on this queue outstanding
-  void BeginWriteStall();
+  // timed: the stall is a write-controller delay that ends on its own.
+  void BeginWriteStall(bool timed = false);
 
   // Remove the dummy writer and wake up waiting writers
   // REQUIRES: db mutex held
@@ -476,6 +494,9 @@ class WriteThread {
   // Because of the contract on BeginWriteStall() / EndWriteStall(),
   // stall_ended_count_ <= stall_begun_count_ <= stall_ended_count_ + 1.
   uint64_t stall_begun_count_ = 0;
+  // Whether the outstanding (or last) stall is a timed delay. Set before the
+  // stall's dummy writer is linked; read by joiners that see the dummy.
+  std::atomic<bool> stall_is_timed_{false};
   // Count the number of stalls ended, so that we can check whether
   // a particular stall has cleared (even if caught in another stall).
   // Writes controlled by DB mutex + stall_mu_, signalled by stall_cv_.
