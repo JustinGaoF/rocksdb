@@ -5826,6 +5826,17 @@ class DBImpl : public DB
     SequenceNumber sync_first_sequence = 0;
   };
   std::vector<FailedWalRange> failed_wal_ranges_;
+  // WALs whose records above a WAL merge cut were dropped (this open's cut or
+  // one declared earlier in a WAL recovery read): deleted, never archived,
+  // once obsolete, so no reader of the archive (GetUpdatesSince) returns a
+  // write recovery dropped. Never erased (WAL numbers are not reused). Not
+  // persisted: a cut WAL that becomes obsolete without being read by any open
+  // of this instance (a crash between the recovery edit and the purge, a
+  // deferred purge, or an open failing after its recovery edit) can still be
+  // archived. While a marked WAL is live, GetUpdatesSince refuses a stream that
+  // would read it.
+  std::mutex wals_cut_above_mutex_;
+  std::unordered_set<uint64_t> wals_cut_above_;
   // N>1 WAL indices whose append reported failure, with the WAL that burned
   // each, until ExplainBurnedWALIndices explains them durably.
   // Guarded by wal_durability_wait_mutex_.
