@@ -719,6 +719,11 @@ Status ErrorHandler::ClearBGError() {
           db_options_.listeners, old_bg_error, bg_error_, db_mutex_);
       allow_db_shutdown_ = true;
     }
+    // Shutdown readiness changed above. A Close() may have started waiting
+    // for it, also while the listeners ran without db_mutex_, and not every
+    // caller signals afterwards (RecoverFromBGError clears some errors here
+    // directly), so wake it (DBImpl::CloseHelper).
+    db_->bg_cv_.SignalAll();
   }
   return recovery_error_;
 }
