@@ -1,0 +1,1 @@
+With `wal_partitions` > 1, write groups take fewer cross-partition locks: no memtable-switch quiesce when the WAL switch or flush scheduling has nothing to do, per-partition DB stats and WAL size accounting, and no DB mutex or all-partition lock in a sync write's WAL sync unless a waiter needs it.
