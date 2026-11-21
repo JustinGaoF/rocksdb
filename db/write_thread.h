@@ -10,6 +10,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <type_traits>
 #include <vector>
@@ -79,13 +80,27 @@ class WriteThread {
     // by calling SetMemWritersEachStride. After doing
     // this, it will also write to memtable.
     STATE_PARALLEL_MEMTABLE_CALLER = 64,
+
+    // The state used to hand the exit of a parallel group whose exit must run
+    // on its leader's thread (WriteGroup::leader_exits) to that leader, once
+    // every other writer of the group has finished its memtable write.
+    STATE_PARALLEL_GROUP_EXIT = 128,
   };
 
   struct Writer;
 
   struct WriteGroup {
+    // Set and read only above one WAL partition.
+    WriteGroup() {
+      gate_status.PermitUncheckedError();
+      wal_status.PermitUncheckedError();
+    }
     Writer* leader = nullptr;
     Writer* last_writer = nullptr;
+    // The group's sequences are [first_sequence, last_sequence], set by the
+    // leader before parallel memtable writes; first_sequence > last_sequence
+    // when the group consumed none.
+    SequenceNumber first_sequence = 0;
     SequenceNumber last_sequence;
     // before running goes to zero, status needs leader->StateMutex()
     Status status;
@@ -95,6 +110,46 @@ class WriteThread {
     // writers compatible with the leader in every way except that adding them
     // would exceed the cap. Set by EnterAsBatchGroupLeader only.
     size_t num_cap_excluded = 0;
+    // Optional completion gate, installed by DBImpl on write groups whose WAL
+    // record participates in the cross-partition durability frontier, and on
+    // disableWAL groups that must wait for publication. Runs
+    // inside ExitAsBatchGroupLeader after the next leader is promoted and
+    // before followers complete, so the wait costs acknowledgment latency and
+    // never blocks the next append. Empty for groups that need no gate (any
+    // single-WAL group, groups that consume no sequence without a record,
+    // ingestion), which exit exactly as before.
+    std::function<Status()> completion_gate;
+    // Above one WAL partition, a group led by a sync write gives its async
+    // writers its lower sequences, in group order, and its sync writers the
+    // rest, from sync_first_sequence on; the merged WAL batch follows that
+    // order. kMaxSequenceNumber in every other group. Set by DBImpl.
+    SequenceNumber sync_first_sequence = kMaxSequenceNumber;
+    // Set by DBImpl on such a group that has async writers. Runs before
+    // completion_gate, which fsyncs: once it returns, ExitAsBatchGroupLeader
+    // completes the async writers with its outcome and leaves only the
+    // leader and the sync writers in the group.
+    std::function<Status()> async_writers_gate;
+    // Outcome of completion_gate, set by ExitAsBatchGroupLeader when it runs
+    // the gate. Lets ExitAsBatchGroupFollower hand the gate outcome to the
+    // leader, whose own status is otherwise untouched by the exit.
+    Status gate_status;
+    // Above one WAL partition the leader appends the group's WAL record
+    // while the parallel memtable writers insert. Outcome of that append and
+    // of the leader's steps after it, set by the leader before it completes
+    // its own memtable write, so whichever thread exits the group reads it.
+    // Non-OK: the leader classified the failure, and the exit publishes
+    // nothing of the group.
+    Status wal_status;
+    // Set by DBImpl on a group whose exit must run on its leader's thread
+    // (above one WAL partition, a group led by a sync write, whose exit runs
+    // the fsync): the last other writer to finish its memtable write hands
+    // the exit to the leader (STATE_PARALLEL_GROUP_EXIT) instead of running
+    // it.
+    bool leader_exits = false;
+    // Set by DBImpl on every group above one WAL partition. A follower that
+    // exits such a group hands the leader any failed group status; at one
+    // partition the follower exit is upstream's.
+    bool multi_partition = false;
 
     struct Iterator {
       Writer* writer;
@@ -517,6 +572,10 @@ class WriteThread {
 
   // Set writer state and wake the writer up if it is waiting.
   void SetState(Writer* w, uint8_t new_state);
+
+  // Completes every async writer of an exiting group with `status`, and
+  // relinks the rest (the leader and the sync writers) as the group.
+  void CompleteAsyncWriters(WriteGroup& write_group, const Status& status);
 
   // Links w into the newest_writer list. Return true if w was linked directly
   // into the leader position.  Safe to call from multiple threads without
