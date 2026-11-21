@@ -132,6 +132,7 @@ Status DBImpl::TEST_SwitchMemtable(ColumnFamilyData* cfd) {
 
   Status s;
   void* writer = TEST_BeginWrite();
+  WaitForUnpublishedSyncGroups();
   if (two_write_queues_) {
     AllPartitionsWriter nonmem_w(this, /*nonmem=*/true);
     nonmem_w.EnterUnbatched();
@@ -267,6 +268,18 @@ void DBImpl::TEST_SetBGError(const IOStatus& error,
                              BackgroundErrorReason reason) {
   InstrumentedMutexLock l(&mutex_);
   error_handler_.SetBGError(error, reason);
+  // The wake, if the error lands, comes from the transition hook inside
+  // SetBGError, exactly as in production; a suppressed error wakes nothing.
+}
+
+std::vector<std::pair<uint64_t, bool>> DBImpl::TEST_WalSyncMarks(
+    size_t partition) {
+  WalWriteMutexLock wl(&WalWriteMutex(partition));
+  std::vector<std::pair<uint64_t, bool>> marks;
+  for (auto& log : logs_[partition]) {
+    marks.emplace_back(log.number, log.IsSyncing());
+  }
+  return marks;
 }
 
 bool DBImpl::TEST_IsRecoveryInProgress() {

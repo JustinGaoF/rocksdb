@@ -297,7 +297,8 @@ void ErrorHandler::CancelErrorRecoveryForShutDown() {
 void ErrorHandler::HandleKnownErrors(const Status& bg_err,
                                      BackgroundErrorReason reason,
                                      const DBRecoverContext& context,
-                                     bool allow_auto_recovery) {
+                                     bool wal_related, bool allow_auto_recovery,
+                                     bool fences_writes) {
   db_mutex_->AssertHeld();
   if (bg_err.ok()) {
     return;
@@ -356,12 +357,31 @@ void ErrorHandler::HandleKnownErrors(const Status& bg_err,
     Status s = new_bg_err;
     EventHelpers::NotifyOnBackgroundError(db_options_.listeners, reason, &s,
                                           db_mutex_, &auto_recovery);
-    if (!s.ok() && s.severity() > bg_error_.severity()) {
-      bg_error_ = s;
-      UpdateRecoveryContext(context, /*replace_existing_context=*/true);
+    if (((wal_related && reason == BackgroundErrorReason::kWriteCallback) ||
+         fences_writes) &&
+        db_->NumWalPartitions() > 1 &&
+        (s.ok() || s.severity() < new_bg_err.severity())) {
+      // Above one partition a failed WAL write leaves its range pinned
+      // below every later write on every partition, and only recovery from
+      // this error releases it; so does the fence a failed insert or gate
+      // installs (SetBGErrorBeforeFence). Listeners are told, but cannot
+      // suppress or soften it.
+      s = new_bg_err;
+    }
+    if (!s.ok() && (s.severity() > bg_error_.severity())) {
+      // Same store as the severity paths in SetBGError, including the
+      // durability wake.
+      CheckAndSetRecoveryAndBGError(s, context);
     } else {
       if (!s.ok()) {
         UpdateRecoveryContext(context, /*replace_existing_context=*/false);
+        // A repeat at the recorded severity re-wakes parked completion
+        // gates without recording anything, as CheckAndSetRecoveryAndBGError
+        // does. With nothing recorded (e.g. kNoError under
+        // paranoid_checks=false) nothing wakes and the flag stays clear.
+        if (!bg_error_.ok() && s.severity() >= bg_error_.severity()) {
+          db_->SignalWalDurabilityWaitersOnBGError();
+        }
       }
       ROCKS_LOG_INFO(db_options_.info_log,
                      "ErrorHandler: Hit less severe background error\n");
@@ -421,26 +441,33 @@ void ErrorHandler::HandleKnownErrors(const Status& bg_err,
 void ErrorHandler::SetBGError(const Status& bg_status,
                               BackgroundErrorReason reason, bool wal_related) {
   SetBGErrorImpl(bg_status, reason, wal_related, DBRecoverContext(),
-                 /*allow_auto_recovery=*/true);
+                 /*allow_auto_recovery=*/true, /*fences_writes=*/false);
 }
 
 void ErrorHandler::SetBGError(const Status& bg_status,
                               BackgroundErrorReason reason, bool wal_related,
                               DBRecoverContext context) {
   SetBGErrorImpl(bg_status, reason, wal_related, std::move(context),
-                 /*allow_auto_recovery=*/true);
+                 /*allow_auto_recovery=*/true, /*fences_writes=*/false);
 }
 
 void ErrorHandler::SetBGErrorNoAutoRecovery(const Status& bg_status,
                                             BackgroundErrorReason reason) {
   SetBGErrorImpl(bg_status, reason, /*wal_related=*/false, DBRecoverContext(),
-                 /*allow_auto_recovery=*/false);
+                 /*allow_auto_recovery=*/false, /*fences_writes=*/false);
+}
+
+void ErrorHandler::SetBGErrorBeforeFence(const Status& bg_status,
+                                         BackgroundErrorReason reason) {
+  SetBGErrorImpl(bg_status, reason, /*wal_related=*/false, DBRecoverContext(),
+                 /*allow_auto_recovery=*/true, /*fences_writes=*/true);
 }
 
 void ErrorHandler::SetBGErrorImpl(const Status& bg_status,
                                   BackgroundErrorReason reason,
                                   bool wal_related, DBRecoverContext context,
-                                  bool allow_auto_recovery) {
+                                  bool allow_auto_recovery,
+                                  bool fences_writes) {
   db_mutex_->AssertHeld();
   Status tmp_status = bg_status;
   IOStatus bg_io_err = status_to_io_status(std::move(tmp_status));
@@ -585,7 +612,8 @@ void ErrorHandler::SetBGErrorImpl(const Status& bg_status,
     StartRecoverFromRetryableBGIOError(bg_io_err);
     return;
   }
-  HandleKnownErrors(new_bg_io_err, reason, context, allow_auto_recovery);
+  HandleKnownErrors(new_bg_io_err, reason, context, wal_related,
+                    allow_auto_recovery, fences_writes);
 }
 
 void ErrorHandler::AddFilesToQuarantine(
@@ -666,6 +694,10 @@ Status ErrorHandler::ClearBGError() {
     Status old_bg_error = bg_error_;
     // old_bg_error is only for notifying listeners, so may not be checked
     old_bg_error.PermitUncheckedError();
+    // Releases the failed WAL ranges and closes their gate fences before the
+    // stopped flag clears, so every write it admits allocates above them.
+    db_->ClearWalDurabilityBGError();
+    TEST_SYNC_POINT("ErrorHandler::ClearBGError:BeforeClearStopped");
     // Clear and check the recovery IO and BG error
     is_db_stopped_.store(false, std::memory_order_release);
     bg_error_ = Status::OK();
@@ -898,14 +930,27 @@ void ErrorHandler::CheckAndSetRecoveryAndBGError(
     const Status& bg_err, const DBRecoverContext& context) {
   assert(context.flush_reason != FlushReason::kErrorRecoveryRetryFlush ||
          bg_err.severity() == Status::Severity::kSoftError);
+  db_mutex_->AssertHeld();
   if (recovery_in_prog_ && recovery_error_.ok()) {
     recovery_error_ = status_to_io_status(Status(bg_err));
   }
-  if (!bg_err.ok() && bg_err.severity() > bg_error_.severity()) {
+  if (bg_err.severity() > bg_error_.severity()) {
     bg_error_ = bg_err;
     UpdateRecoveryContext(context, /*replace_existing_context=*/true);
   } else {
     UpdateRecoveryContext(context, /*replace_existing_context=*/false);
+  }
+  // Wake parked gates only while an error is recorded: on the store above
+  // or on a repeat at the recorded severity (a spurious wake only
+  // rechecks). Never setting the flag while bg_error_ is OK keeps a gate
+  // from spinning on a flag that GetBGError cannot back.
+  if (!bg_error_.ok() && bg_err.severity() >= bg_error_.severity()) {
+    // Whatever the source (WAL, flush, compaction, MANIFEST): parked
+    // completion gates wake to recheck their exits. A gate fails only on a
+    // fence covering its range or at shutdown; otherwise it parks again and
+    // is acknowledged once covered. mutex_ is held; the wake takes
+    // wal_durability_wait_mutex_ below it (see the LOCK ORDER note).
+    db_->SignalWalDurabilityWaitersOnBGError();
   }
   if (bg_error_.severity() >= Status::Severity::kHardError) {
     is_db_stopped_.store(true, std::memory_order_release);
