@@ -8,6 +8,7 @@
 #include <cassert>
 
 #include "db/column_family.h"
+#include "test_util/sync_point.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -53,6 +54,7 @@ ColumnFamilyData* FlushScheduler::TakeNextColumnFamily() {
       checking_set_.erase(iter);
     }
 #endif  // NDEBUG
+    TEST_SYNC_POINT("FlushScheduler::TakeNextColumnFamily:Dequeued");
 
     if (!cfd->IsDropped()) {
       // success
@@ -65,9 +67,16 @@ ColumnFamilyData* FlushScheduler::TakeNextColumnFamily() {
 }
 
 bool FlushScheduler::Empty() {
-  auto rv = head_.load(std::memory_order_relaxed) == nullptr;
 #ifndef NDEBUG
+  // The head is read under the lock that guards the checking set: with more
+  // than one WAL partition, another write leader can take a column family
+  // concurrently, and a dequeue between the read and the check would fail
+  // the assertion below.
   std::lock_guard<std::mutex> lock(checking_mutex_);
+#endif  // NDEBUG
+  auto rv = head_.load(std::memory_order_relaxed) == nullptr;
+  TEST_SYNC_POINT_CALLBACK("FlushScheduler::Empty:AfterLoad", &rv);
+#ifndef NDEBUG
   // Empty is allowed to be called concurrnetly with ScheduleFlush. It would
   // only miss the recent schedules.
   assert((rv == checking_set_.empty()) || rv);
