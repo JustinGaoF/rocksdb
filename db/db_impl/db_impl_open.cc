@@ -139,6 +139,17 @@ DBOptions SanitizeOptions(const std::string& dbname, const DBOptions& src,
                    "recycle_log_file_num is non-zero");
   }
 
+  if (result.async_wal_precreate &&
+      log::WALIndexEnabled(result.partition_wal_usage)) {
+    // The precreated WAL sits on disk, empty, until a rotation consumes it. A
+    // secondary instance cannot tell it from a partition WAL whose head is not
+    // written yet, so beside an indexed WAL it would refuse every catch-up.
+    result.async_wal_precreate = false;
+    ROCKS_LOG_WARN(result.info_log,
+                   "async_wal_precreate is disabled since "
+                   "partition_wal_usage indexes the WAL");
+  }
+
   if (result.db_paths.size() == 0) {
     result.db_paths.emplace_back(dbname, std::numeric_limits<uint64_t>::max());
   } else if (result.wal_dir.empty()) {
@@ -1038,7 +1049,11 @@ Status DBImpl::Recover(
         s = versions_->GetWalSet().CheckWals(env_, wal_files);
       }  // else since best effort recovery does not recover from WALs, no need
          // to check WALs.
-    } else if (!versions_->GetWalSet().GetWals().empty()) {
+    } else if (!read_only && !versions_->GetWalSet().GetWals().empty()) {
+      // A read-only open writes no MANIFEST edit (it has no recovery context),
+      // and a DB written with wal_partitions > 1 always tracks its WALs, so a
+      // read-only open with tracking off leaves them as they are.
+      //
       // Tracking is disabled, clear previously tracked WALs from MANIFEST,
       // otherwise, in the future, if WAL tracking is enabled again,
       // since the WALs deleted when WAL tracking is disabled are not persisted
@@ -2853,6 +2868,38 @@ Status DBImpl::ProcessLogFilesMerged(
             " at or above the next wal_index " +
             std::to_string(next_wal_index_) + "; a write would reissue it" +
             pending_stop);
+      }
+    }
+  }
+
+  // A WAL holding records a cut dropped (read, or never read: an unfinished
+  // member) leaves no archived copy once obsolete. The cut is this open's
+  // own or one an earlier open declared in a WAL read here: a WAL that
+  // outlived the open that cut it is marked again at every open that reads
+  // it, since the mark itself is not persisted.
+  if (status.ok() && !read_only) {
+    for (const auto* reader : readers) {
+      const uint64_t wal_number = reader->wal_number();
+      uint64_t first_obsolete = 0;
+      auto lower = [&first_obsolete](uint64_t index) {
+        if (index != 0 && (first_obsolete == 0 || index < first_obsolete)) {
+          first_obsolete = index;
+        }
+      };
+      for (const WALIndexSupersession& supersession : *supersessions) {
+        if (supersession.wal_number == wal_number) {
+          lower(supersession.first_obsolete_wal_index);
+        }
+      }
+      for (const auto* declarer : readers) {
+        lower(declarer->reader()->GetFirstSupersededWALIndex(wal_number));
+      }
+      if (first_obsolete != 0 &&
+          (reader->LastIndexed() >= first_obsolete ||
+           merger.GetMemberEnd(wal_number) ==
+               log::WALIndexMerger::MemberEnd::kUnfinished)) {
+        std::lock_guard<std::mutex> lock(wals_cut_above_mutex_);
+        wals_cut_above_.insert(wal_number);
       }
     }
   }
