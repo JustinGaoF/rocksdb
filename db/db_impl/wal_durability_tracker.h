@@ -93,15 +93,24 @@ class WalDurabilityTracker {
   // all-idle, which is also unchanged).
   // high == low - 1 is an empty range (a record that consumes no sequence):
   // it pins low while outstanding, and completes durable only through
-  // low - 1, the last sequence allocated when it registered.
-  void Register(size_t partition, uint64_t low, uint64_t high) {
+  // low - 1, the last sequence allocated when it registered. Such a record
+  // passes `empty_wal_index`, its WAL index: records stamped alike are
+  // ordered only by it (MinPendingEmptyWalIndex).
+  void Register(size_t partition, uint64_t low, uint64_t high,
+                uint64_t empty_wal_index = 0) {
     assert(partition < partitions_.size());
     assert(low <= high + 1);
     assert(high != kIdle);
     Partition& part = partitions_[partition];
     {
       MutexLock lock(&part.mu);
-      part.inflight.push_back({low, high});
+      part.inflight.push_back({low, high, empty_wal_index});
+      if (empty_wal_index != 0 &&
+          empty_wal_index <
+              part.pending_empty_wal_index.load(std::memory_order_relaxed)) {
+        part.pending_empty_wal_index.store(empty_wal_index,
+                                           std::memory_order_seq_cst);
+      }
       uint64_t new_pending = kIdle;
       for (const Range& r : part.inflight) {
         if (r.low < new_pending) {
@@ -156,6 +165,17 @@ class WalDurabilityTracker {
     return safe_point_.load(std::memory_order_acquire);
   }
 
+  // The lowest WAL index of a pending record that consumes no sequence, on
+  // any partition; kIdle with none.
+  uint64_t MinPendingEmptyWalIndex() const {
+    uint64_t min_index = kIdle;
+    for (const Partition& part : partitions_) {
+      min_index = std::min(min_index, part.pending_empty_wal_index.load(
+                                          std::memory_order_seq_cst));
+    }
+    return min_index;
+  }
+
   uint64_t PendingLow(size_t partition) const {
     assert(partition < partitions_.size());
     return partitions_[partition].pending_low.load(std::memory_order_acquire);
@@ -205,6 +225,7 @@ class WalDurabilityTracker {
   struct Range {
     uint64_t low;
     uint64_t high;
+    uint64_t empty_wal_index;
   };
 
   void AdvanceSafePoint(uint64_t candidate) {
@@ -222,10 +243,13 @@ class WalDurabilityTracker {
     MutexLock lock(&part.mu);
     std::vector<Range>& fifo = part.inflight;
     size_t index = fifo.size();
+    // Of equal ranges, the lowest WAL index: one partition appends in index
+    // order.
     for (size_t i = 0; i < fifo.size(); ++i) {
-      if (fifo[i].low == low && fifo[i].high == high) {
+      if (fifo[i].low == low && fifo[i].high == high &&
+          (index == fifo.size() ||
+           fifo[i].empty_wal_index < fifo[index].empty_wal_index)) {
         index = i;
-        break;
       }
     }
     *found = index != fifo.size();
@@ -242,11 +266,16 @@ class WalDurabilityTracker {
       part.durable_upto.store(high, std::memory_order_release);
     }
     uint64_t new_pending = kIdle;
+    uint64_t new_empty = kIdle;
     for (const Range& r : fifo) {
       if (r.low < new_pending) {
         new_pending = r.low;
       }
+      if (r.empty_wal_index != 0 && r.empty_wal_index < new_empty) {
+        new_empty = r.empty_wal_index;
+      }
     }
+    part.pending_empty_wal_index.store(new_empty, std::memory_order_seq_cst);
     part.pending_low.store(new_pending, std::memory_order_seq_cst);
     // Minimum unchanged (a duplicate remains, or several entries shared the
     // old minimum): the global frontier cannot have moved.
@@ -262,6 +291,8 @@ class WalDurabilityTracker {
     port::Mutex mu;
     // Lowest outstanding low, or kIdle when empty.
     std::atomic<uint64_t> pending_low{kIdle};
+    // Lowest WAL index of an outstanding empty range, or kIdle.
+    std::atomic<uint64_t> pending_empty_wal_index{kIdle};
     // Highest completed high. Only read when all partitions are idle, where
     // the safe point is their maximum: with nothing outstanding, every
     // allocated sequence completed, so the maximum completed is the maximum

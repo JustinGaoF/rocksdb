@@ -1660,6 +1660,11 @@ class VersionSet {
   // Only for a caller about to write a new MANIFEST without the guard: an
   // edit cannot clear it from the current MANIFEST.
   void ClearWALIndexGuard() { wal_index_guard_ = 0; }
+  // Highest WAL number that may have been written with wal_partitions > 1, or
+  // zero when none may (see VersionEdit::SetWALPartitionGuard).
+  uint64_t wal_partition_guard() const { return wal_partition_guard_; }
+  // As ClearWALIndexGuard.
+  void ClearWALPartitionGuard() { wal_partition_guard_ = 0; }
 
   // Reads the guard from the MANIFEST that CURRENT names in `dbname`.
   static Status ReadWALIndexGuard(const std::string& dbname, FileSystem* fs,
@@ -2184,6 +2189,7 @@ class VersionSet {
   uint64_t options_file_size_;
   bool has_committed_options_file_number_;
   uint64_t wal_index_guard_ = 0;
+  uint64_t wal_partition_guard_ = 0;
   uint64_t pending_manifest_file_number_;
   // The last seq visible to reads. It normally indicates the last sequence in
   // the memtable but when using two write queues it could also indicate the
